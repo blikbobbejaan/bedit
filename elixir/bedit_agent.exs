@@ -199,7 +199,9 @@ defmodule Bedit.Agent do
 
   # What `dbg` printed since the last drain, minus the `[file:line: context]` header line
   # `Macro.dbg` opens each block with — which names the agent's own temp script and a line
-  # number in it, and so is worse than nothing to a reader.
+  # number in it, and so is worse than nothing to a reader. ANSI escapes go first: an
+  # Elixir that colours `dbg` (1.21) wraps the header in them, which hid it from the match,
+  # and the dbg pane is plain text.
   defp drain_dbg do
     case Process.whereis(@dbg_device) do
       nil ->
@@ -208,6 +210,7 @@ defmodule Bedit.Agent do
       device ->
         device
         |> StringIO.flush()
+        |> String.replace(~r/\e\[[0-9;]*m/, "")
         |> String.split("\n")
         |> Enum.reject(&Regex.match?(~r/^\[.*:\d+: .*\]$/, &1))
         |> Enum.join("\n")
@@ -1787,9 +1790,13 @@ defmodule Bedit.Agent do
   end
 
   # The compiler's own inference, per exported function, as `%{{name, arity} => text}`.
+  # The chunk's tag carries a format version (`elixir_checker_v9` on a 1.21-dev snapshot,
+  # `v10` on 1.19); the `exports` map and its `sig` shape are what is read, so any version
+  # carrying them is accepted, and one that does not falls through to "no inferred types".
   defp inferred_signatures(binary) do
     {:ok, {_, [{~c"ExCk", data}]}} = :beam_lib.chunks(binary, [~c"ExCk"])
-    {:elixir_checker_v10, %{exports: exports}} = :erlang.binary_to_term(data)
+    {version, %{exports: exports}} = :erlang.binary_to_term(data)
+    true = String.starts_with?(Atom.to_string(version), "elixir_checker_v")
 
     Map.new(exports, fn {name_arity, %{sig: sig}} -> {name_arity, render_signature(sig)} end)
   rescue
