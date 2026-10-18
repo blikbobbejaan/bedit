@@ -21,6 +21,8 @@
   (test "nil yields no labels"
     (assert= (lsp-completion-labels nil) '())))
 
+(purge-stale-temp "bedit-applyedit-")
+
 (describe "lsp: request/response correlation (pure)"
   (test "a completion request records pending and syncs the document first"
     (let (state {:proc :fake :buf "" :next-id 1 :pending {} :opened {} :version 5}
@@ -617,7 +619,7 @@
   (test "a server's own applyEdit lands on the buffers it names"
     ;; what a chosen action's `workspace/executeCommand` produces: edits arriving as a
     ;; request TO us, not as the reply to anything
-    (let (path (str "/tmp/bedit-applyedit-" (:id (proc/info (self))) ".ex")
+    (let (path (str (temp-dir "bedit-applyedit-") ".ex")
           _ (file/spit path "abc\n")
           m (pool/ed-find-file (model/ed-init (editor/buffer/make-buffer "x")) path)
           m2 (lsp-commands/ed-ev-lsp-apply-edit m
@@ -658,17 +660,33 @@
             "does not offer code actions"))))
 
   (test "the idle beat asks once per position, and only where nothing else answers"
-    (let (m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1, 2)")) :lsp :fake-conn)
+    (let (m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1, 2)"))
+              :lsp (self) ; live, which is what the predicate asks
+              :lsp-caps {:signatureHelpProvider {:triggerCharacters ["("]}})
           b (model/ed-current-buf m))
-      (is (eldoc/ed-signature-stale? m)) ; never asked here yet
+      (is (lsp-commands/ed-signature-due? m)) ; never asked here yet
       (let (asked (assoc m
                     :signature-at [(editor/buffer/buffer-point b) (editor/buffer/buffer-rope b)]))
-        (is (not (eldoc/ed-signature-stale? asked))) ; and not again for the same point
+        (is (not (lsp-commands/ed-signature-due? asked))) ; and not again for the same point
         ;; point moved: ask again
-        (is (eldoc/ed-signature-stale? (model/ed-set-buf asked
-                                         (editor/buffer/goto-char (model/ed-current-buf asked) 4)))))
+        (is (lsp-commands/ed-signature-due? (model/ed-set-buf asked
+                                              (editor/buffer/goto-char (model/ed-current-buf asked)
+                                                4)))))
       ;; no server, nothing to ask
-      (is (not (eldoc/ed-signature-stale? (dissoc m :lsp))))))
+      (is (not (lsp-commands/ed-signature-due? (dissoc m :lsp))))))
+
+  ;; The predicate is the idle job's `:stale?` — what keeps the beat ARMED. True whenever
+  ;; `:lsp` was set, it kept the beat firing on every debounce, forever, for a server that
+  ;; had died or that never offered signature help: the ask declined, `:signature-at` never
+  ;; moved, and the job stayed "stale".
+  (test "a dead server, or one without signature help, never keeps the beat armed"
+    (let (dead (spawn (fn () :done))
+          _ (receive ([:never] nil) (after 50 nil))
+          m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1, 2)"))
+              :lsp (self)
+              :lsp-caps {:signatureHelpProvider {:triggerCharacters ["("]}}))
+      (is (not (lsp-commands/ed-signature-due? (assoc m :lsp dead))))
+      (is (not (lsp-commands/ed-signature-due? (assoc m :lsp-caps {:hoverProvider true}))))))
 
   (test "a mutating reply is rope-guarded: format edits after a buffer change drop"
     (let (me (self)
@@ -853,6 +871,26 @@
     (binding (*lsp-autostart* false)
       (binding (*lsp-servers* {"ex" ["expert" ["--stdio"]]})
         (let (m (lspa-model "m.ex" "/tmp/m.ex"))
+          (assert= (lsp-commands/ed-lsp-autostart m) m)))))
+
+  ;; A server that dies — a rustup `rust-analyzer` stub for a component that is not
+  ;; installed passes `os/which` and exits at once — used to be respawned on every idle
+  ;; beat. Bound inside a loop (`*ui-loop*`), because headless the autostart does nothing.
+  (test "a server that died is said once and not respawned"
+    (binding (*ui-loop* (self))
+      (binding (*lsp-servers* {"ex" ["sh" []]})
+        (let (dead (spawn (fn () :done))
+              _ (receive ([:never] nil) (after 50 nil))
+              m (assoc (lspa-model "m.ex" "/tmp/m.ex") :lsp dead :lsp-caps {})
+              m2 (lsp-commands/ed-lsp-autostart m))
+          (is (nil? (:lsp m2)))
+          (is (includes? (:echo m2) "exited"))))))
+
+  (test "autostart tries a server once per project root"
+    (binding (*ui-loop* (self))
+      (binding (*lsp-servers* {"ex" ["sh" []]})
+        (let (m (assoc (lspa-model "m.ex" "/tmp/m.ex")
+                  :lsp-autostarted #{["sh" (lsp-commands/ed-lsp-root "/tmp/m.ex")]}))
           (assert= (lsp-commands/ed-lsp-autostart m) m))))))
 
 ;; ---- the document sync that is not a question ---------------------------------------

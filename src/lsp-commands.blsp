@@ -7,7 +7,6 @@ the server's replies, notices, diagnostics and edits into the model. The connect
 
 Split out of `commands.blsp` (issues.md X1)."
   (:use model) ; message / ed-current-buf / ed-set-buf / the diagnostics cache
-  (:use eldoc) ; ed-signature-stale? — when the idle beat's signature hint is due
   (:use pool) ; ed-find-file / ed-select / ed-name-prompt — the prompts and jumps a lookup ends in
   (:use editor/buffer) ; points, lines and the edits a server's answer applies
   (:use interactive) ; defcommand — the LSP commands, on M-x
@@ -477,20 +476,36 @@ knows whether it is still about where the cursor is."
         at [(buffer-point buf) (buffer-rope buf)])
     (ed-lsp-ask-server (assoc m :signature-at at) (:conn cx) (lsp-signature) cx {:at at} note)))
 
+(defn ed-signature-due? (m)
+  "True when the LSP argument hint (`textDocument/signatureHelp`) is due a refresh: a LIVE
+server that offers signature help, point or the text moved since the last ask
+(`:signature-at`), and a buffer mode that does not answer for itself.
+
+This is the idle job's `:stale?`, which is what keeps the beat ARMED — so it must be false
+whenever the ask would not happen. When it only asked whether `:lsp` was set, a server that
+had died, or one that never offered signature help, left it true for good: the beat fired
+on every debounce forever, with nothing typed.
+
+The mode's own `:eldoc` service wins where there is one, and not by seniority: it is
+local, instant and always right about the language it was written for, whereas this costs
+a round-trip. They share the `:eldoc` slot, so letting both write it would make the hint
+depend on which reply landed last."
+  (let (buf (ed-current-buf m))
+    (and (ed-lsp-live m)
+      (lsp/lsp-capable? (:lsp-caps m) :signatureHelpProvider)
+      (nil? (ed-mode-service buf :eldoc))
+      (not (= [(buffer-point buf) (buffer-rope buf)] (:signature-at m))))))
+
 (defn ed-launch-signature (m)
   "The idle beat's argument hints: ask the connected language server what call point is
-inside, and show its signature in the eldoc slot (`eldoc/ed-signature-stale?` decides when).
+inside, and show its signature in the eldoc slot ([[ed-signature-due?]] decides when).
 
 This is eglot's `eglot-signature-eldoc-function` and it is the feature that makes a server
 worth having open while you TYPE rather than when you stop and ask a question — every
 other LSP command here is one you invoke. Silent in every direction: it never starts a
 server (`ed-lsp-autostart` owns that), never messages, and a server that does not offer
 signature help is never asked — Expert is one, so in Elixir this costs exactly nothing."
-  (if (or (not (:lsp m))
-        (ed-headless?)
-        (not (lsp/lsp-capable? (:lsp-caps m) :signatureHelpProvider))
-        (not (ed-signature-stale? m))
-        (nil? (buffer-file (ed-current-buf m))))
+  (if (or (ed-headless?) (not (ed-signature-due? m)) (nil? (buffer-file (ed-current-buf m))))
     m
     (ed-lsp-signature-ask m :quiet)))
 
@@ -632,6 +647,14 @@ request sites."
   (let (conn (:lsp m))
     (when (and conn (proc/alive? conn)) conn)))
 
+(sig ed-lsp-root (string -> string))
+(defn ed-lsp-root (file)
+  "The directory a server for `file` starts in: its project's root, or — for a file outside
+any project — its own directory."
+  (let (dir (path/dirname file)
+        root (project-root dir))
+    (if (string? root) root dir)))
+
 (defn ed-lsp-start (m)
   "Start the language server configured for the current buffer's file, store it on the
 model (`:lsp`) and register the completion source — `[m2 conn]`, with `conn` nil and an
@@ -657,8 +680,7 @@ proc-spawn expert: No such file or directory` trace where a sentence belongs.
         (let ([cmd args] srv)
           (if (nil? (os/which cmd))
             [(message m (str "lsp: " cmd " is not installed (not on PATH)")) nil]
-            ;; a file outside any project is its own root: its directory
-            (let (root (or (project-root (path/dirname file)) (path/dirname file))
+            (let (root (ed-lsp-root file)
                   conn (lsp/lsp-connect cmd args (lsp/lsp-path->uri root)))
               (complete-at-point/complete-add-source! 'lsp/lsp-complete-source)
               ;; …and the sync that lets its request carry no text: run before the sources
@@ -760,18 +782,31 @@ of opening it.
 
 Silent about every reason not to: no file, no server configured for the extension, the
 server not installed, one already connected. A message for each of those would fire on
-every idle beat in every buffer that has no server, which is most of them."
-  (if (or (not *lsp-autostart*) (ed-lsp-live m) (ed-headless?))
-    m
-    (let (buf (ed-current-buf m)
-          file (buffer-file buf)
-          srv (when file (lsp/lsp-server-for file)))
-      (if (nil? srv)
-        m
-        (let ([cmd _] srv)
-          (if (nil? (os/which cmd))
-            m
-            (let ([m2 _] (ed-lsp-start (dissoc m :lsp))) m2)))))))
+every idle beat in every buffer that has no server, which is most of them.
+
+ONE try per server and project root (`:lsp-autostarted`). A server that dies — a rustup
+`rust-analyzer` stub for a component that is not installed passes `os/which` and exits at
+once — used to be respawned on every idle beat, a process every few hundred milliseconds
+with nothing typed. Now its death is said once, and `M-x lsp-connect` is the retry."
+  (let (file (buffer-file (ed-current-buf m)))
+    (if (or (not *lsp-autostart*) (ed-lsp-live m) (ed-headless?) (nil? file))
+      m
+      (let (srv (lsp/lsp-server-for file)
+            tried [(first srv) (ed-lsp-root file)])
+        (cond
+          (nil? srv) m
+          ;; a connection this editor made, whose process is gone
+          (:lsp m)
+            (message (dissoc m :lsp :lsp-caps)
+              "lsp: the language server exited (M-x lsp-connect to start it again)")
+          (contains? (:lsp-autostarted m #{}) tried) m
+          ;; not installed counts as the one try too: a `PATH` search on every idle beat,
+          ;; in every buffer of a language whose server nobody installed, was the cost
+          (nil? (os/which (first srv)))
+            (update m :lsp-autostarted (fn (started) (conj (or started #{}) tried)))
+          else
+            (let ([m2 _] (ed-lsp-start m))
+              (update m2 :lsp-autostarted (fn (started) (conj (or started #{}) tried)))))))))
 
 ;; ---- registration: the events and idle-beat jobs this module owns ----------------
 ;; Registered at load, so neither the dispatcher's event table nor its idle beat names a
@@ -808,5 +843,5 @@ every idle beat in every buffer that has no server, which is most of them."
 (register-idle-job :lsp-signature
   {:order 50
    :run 'lsp-commands/ed-launch-signature
-   :stale? 'eldoc/ed-signature-stale?
+   :stale? 'lsp-commands/ed-signature-due?
    :held-key-gated? true})

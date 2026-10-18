@@ -413,13 +413,16 @@ everything derived from it: the margin mark, the `*Diagnostics*` row and the mod
 count all read THIS, not the raw list, so that they cannot disagree with each other. An
 unplaceable finding is therefore invisible, which is the price of having one answer; every
 producer bedit has (the checker, every language server) gives a line."
-  (fold diags
+  ;; Consed onto each line's list from the LAST finding back, so every list comes out in
+  ;; order with no `append` — which rebuilt the line's list per finding, and made this fold
+  ;; most of what a language server's publish cost on the loop.
+  (fold (reverse diags)
     {}
     (fn (acc d)
       (let (ln (ed-diag-line0 d))
         (if (nil? ln)
           acc
-          (assoc acc ln (append (get acc ln '()) (list d))))))))
+          (assoc acc ln (cons d (get acc ln '()))))))))
 
 (defn ed-call-deferred (m sym fallback)
   "Call `sym` — a `(model) -> model` hook in a DEFERRED module — if that module has been
@@ -656,8 +659,33 @@ reads the table unsorted."
 
 (defn ed-run-idle-jobs (m)
   "The `:idle-recompute` beat: every registered job's `:run`, in `:order`, each seeing the
-model the previous one left."
+model the previous one left. All of them at once — the headless path (tests, a batch run);
+a live loop runs the beat in slices ([[ed-run-idle-slice]])."
   (fold (ed-idle-jobs) m (fn (acc job) (ed-call-deferred acc (:run job) acc))))
+
+(defdyn *idle-slice-ms* 3)
+;; How much of ONE loop turn the idle beat may take before it yields. The beat runs a dozen
+;; jobs — the LSP push, eldoc, the check's launch, the git summary, auto-save, auto-revert —
+;; and run as one turn it cost 6–18 ms on the loop (25 ms in a live window), all of which a
+;; key pressed in the middle of it waited out. Sliced, a key waits for one slice: the loop
+;; takes queued input before it fires a timer, so the next slice runs after the key.
+
+(sig ed-run-idle-slice (model int -> model))
+(defn ed-run-idle-slice (m from)
+  "Run the idle beat's jobs from index `from`, in `:order`, until `*idle-slice-ms*` has gone
+— at least one job per slice, so the beat always progresses. Unfinished, the model keeps
+`:idle-resume` (the next job's index) and the `:idle-continue` ticker that picks it up;
+finished, both are gone. Each job still sees the model every earlier one left, across
+slices as within one."
+  (let (jobs (into [] (ed-idle-jobs))
+        deadline (+ (os/now) *idle-slice-ms*))
+    (letrec (step (fn (acc i)
+                    (cond
+                      (>= i (count jobs)) (ed-drop-timer (dissoc acc :idle-resume) :idle-continue)
+                      (and (> i from) (>= (os/now) deadline))
+                        (ed-set-timer (assoc acc :idle-resume i) :idle-continue {:every 1})
+                      else (step (ed-call-deferred acc (:run (nth jobs i)) acc) (inc i)))))
+      (step m from))))
 
 (defn ed-run-blink-jobs (m)
   "The jobs that also ride the `:cursor-blink` tick (`:on-blink?`), in `:order`."
@@ -862,22 +890,33 @@ key suppresses the idle one-shots (as the old held-key short-circuit did). Also 
 
 ;; ---- overlay scrollbar fade (macOS-style auto-hide) -------------------------
 ;; The scrollbar thumb is hidden at rest. Any scroll wakes it to full opacity
-;; (`ed-scrollbar-wake`, called from every `:top` change) and arms the
-;; `:scrollbar-fade` timer, which holds it opaque for `*scrollbar-hold-ticks*`
-;; then ramps to 0 over `*scrollbar-fade-ticks*` (`input/ed-timer-fire`),
-;; dropping itself when done so the editor returns to fully idle. Dragging the
-;; thumb pins it opaque. The opacity (`ed-scrollbar-opacity`) is read by the
-;; pure view (`view/ed-scrollbar-ops`).
-(def *scrollbar-fade-ms* 16) ; the fade timer beat (~60fps while visible)
-(defdyn *scrollbar-hold-ticks* 50) ; ticks held fully opaque after a scroll (~800ms)
+;; (`ed-scrollbar-wake`, called from every `:top` change) and arms ONE quiet one-shot,
+;; `:scrollbar-hold` — idle-anchored, so every further scroll pushes it out. Only when it
+;; fires does the `:scrollbar-fade` ticker start, ramping the opacity to 0 over
+;; `*scrollbar-fade-ticks*` (`input/ed-timer-fire`) and dropping itself when done, so the
+;; editor returns to fully idle. Dragging the thumb pins it opaque. The opacity
+;; (`ed-scrollbar-opacity`) is read by the pure view (`view/ed-scrollbar-ops`).
+;;
+;; The hold used to be 50 ticks of the 16 ms fade timer: a whole loop turn — update, view,
+;; paint — sixty times a second for 800 ms after every scroll, to draw a thumb that did not
+;; change. That is the moment a reader presses the next key, and each of those turns was
+;; one it had to queue behind.
+(def *scrollbar-fade-ms* 16) ; the fade timer beat (~60fps while it ramps)
+(defdyn *scrollbar-hold-ms* 800) ; how long the thumb stays fully opaque after a scroll
 (defdyn *scrollbar-fade-ticks* 14) ; ticks to ramp opacity 1→0 after the hold (~220ms)
 (sig ed-scrollbar-wake (model -> model))
 (defn ed-scrollbar-wake (m)
-  "Show the overlay scrollbar at full opacity and (re)arm the fade timer. Called from
-every scroll path (`ed-set-top`, `panes/ed-scroll-pane`) so the thumb appears whenever
-the view moves, then auto-hides."
-  (ed-set-timer (assoc m :sb-fade (+ *scrollbar-hold-ticks* *scrollbar-fade-ticks*))
-    :scrollbar-fade {:every *scrollbar-fade-ms*}))
+  "Show the overlay scrollbar at full opacity and (re)arm its hold. Called from every
+scroll path (`ed-set-top`, `panes/ed-scroll-pane`) so the thumb appears whenever the view
+moves, then auto-hides. A fade already running stops: the thumb is back to full."
+  (ed-set-timer (ed-drop-timer (assoc m :sb-fade *scrollbar-fade-ticks*) :scrollbar-fade)
+    :scrollbar-hold {:after *scrollbar-hold-ms* :idle? true}))
+
+(sig ed-scrollbar-start-fade (model -> model))
+(defn ed-scrollbar-start-fade (m)
+  "The hold is over: drop it (a fired one-shot is dead until its entry is recreated, which
+is what lets the next scroll arm a fresh one) and start the fade ticker."
+  (ed-set-timer (ed-drop-timer m :scrollbar-hold) :scrollbar-fade {:every *scrollbar-fade-ms*}))
 
 (defn ed-scrollbar-opacity (m)
   "The overlay scrollbar's opacity this frame (0..1): pinned full while dragging it,
