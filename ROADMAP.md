@@ -332,7 +332,7 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
   `std/editor/{markdown,dotenv,dockerfile}`.
 - ✅ **visual-line-mode** (2026-09-13) — `src/wrap.blsp` + the pane row table; markdown
   wraps by default, `M-x visual-line-mode` toggles. Tabs paint on their stops (Brood
-  ADR-342). `C-n`/`C-p` still move by logical line (Emacs moves visually — deferred).
+  ADR-342). `C-n`/`C-p` move by screen row when the buffer wraps (§I.4).
 - ✅ **Quit / kill / save safety + auto-revert** (2026-09-13) — `save-buffers-kill-terminal`
   on `C-x C-c` and the window's ✕ (Brood `:close-is-input?`), `C-x k` asks, a save onto a
   file changed on disk asks, a clean buffer auto-reverts on the idle beat (Brood
@@ -454,12 +454,13 @@ formats. What it leaves, in the order to take it up:
 3. ⬜ **Org-mode** — parked by decision on 2026-09-13; a `std/editor/org` lexer (headings,
    TODO keywords, lists, links, `#+BEGIN_SRC` blocks) plus TAB visibility cycling and
    `C-c C-t`, on markdown-mode's shape. The one thing an Emacs person asks about first.
-4. ⬜ **`C-n`/`C-p` by visual line** in `visual-line-mode` (Emacs moves visually; we move by
-   logical line — the row table in `panes/ed-pane-rows` has what the motion needs).
-5. ⬜ **The wheel and the cursor** — scrolling leaves point where it was, so the cursor
-   vanishes once point is off-screen (it looks like blinking stopped). Emacs's
-   `mwheel-scroll` drags point along. Small: clamp point into the viewport in
-   `panes/ed-scroll-pane`, drop `ed-point-into-view`. Waiting on a preference.
+4. ✅ **`C-n`/`C-p` by visual line** in a wrapped buffer (2026-10-18): one screen row per
+   press, at a goal column kept across short rows and lines — which bedit had never had,
+   wrapped or not (`commands/ed-line-move`).
+5. ✅ **The wheel and the cursor** (2026-10-18): the wheel carries point to the nearest
+   comfortable row, as Emacs's `mwheel-scroll` does (`panes/ed-wheel-point`). On the way,
+   `ed-scroll` counts the margin ABOVE point in rows too in a wrapped buffer — it counted
+   lines, so a long wrapped line above point was one row of context instead of nine.
 6. ⬜ **Kill ring across frames** — per frame today (the OS clipboard makes yank cross
    anyway); registers and bookmarks likewise.
 7. ⬜ Two pre-existing red tests (`gitdiff_async_test`, `strict_ratchet_test` — the latter

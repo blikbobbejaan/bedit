@@ -980,25 +980,94 @@ click can make its pane current without the point-move a full press does."
       m
       (assoc m :layout (pane-select-at (:layout m) layout [row col])))))
 
+;; ---- the wheel carries point along (Emacs `mwheel-scroll`) ----------------------
+;; Scrolling used to leave point where it was, so once the view moved past it the cursor
+;; was simply gone — it read as the blink having stopped. Point now moves to the nearest
+;; row that `scroll/ed-scroll` would leave alone (the scroll margin kept, relaxed at the
+;; buffer's ends), at the same column of its row, so the next key neither loses the cursor
+;; nor snaps the view back.
+
+(sig ed-pane-screen-rows (pane buffer int -> seqable))
+(defn- ed-pane-screen-rows (pane buf top)
+  "`[line from to inlay]` for each row `pane` shows with its top at `top`: the row table of
+a wrapped (or inlaid) buffer, else one whole line per row (`from` 0, `to` nil)."
+  (let (textrows (math/max 1 (ed-pane-vrows pane buf))
+        table (ed-pane-rows (assoc-in pane [:payload :top] top) buf))
+    (if (nil? table)
+      (map (range top (math/min (buffer-line-count buf) (+ top textrows)))
+        (fn (line) [line 0 nil nil]))
+      (take table textrows))))
+
+(sig ed-wheel-point (pane buffer int number -> (or nil int)))
+(defn- ed-wheel-point (pane buf top maxtop)
+  "Where point goes once the wheel has put `pane`'s top at `top`: nil while it already sits
+on a comfortable row, else the offset on the nearest one."
+  (let (textrows (math/max 1 (ed-pane-vrows pane buf))
+        margin (ed-margin textrows)
+        rows (vec (ed-pane-screen-rows pane buf top))
+        first-ok (if (= top 0) 0 margin)
+        last-ok (if (>= top maxtop) (dec textrows) (- textrows 1 margin))
+        comfortable (seq/filter (range (count rows))
+                      (fn (i)
+                        (let ([_ _ _ inlay] (nth rows i))
+                          (and (>= i first-ok) (<= i last-ok) (nil? inlay)))))
+        line (buffer-current-line buf)
+        col (buffer-column buf)
+        on-row? (fn (i)
+                  (let ([row-line from to _] (nth rows i))
+                    (and (= row-line line)
+                      (or (nil? to)
+                        (and (>= col from)
+                          (or (< col to) (= to (string/length (wrap/line-text buf line)))))))))
+        rope (buffer-rope buf))
+    (cond
+      (empty? comfortable) nil
+      (any? comfortable on-row?) nil
+      else
+        (let ([first-line first-from _ _] (nth rows (first comfortable))
+              above? (or (< line first-line) (and (= line first-line) (< col first-from)))
+              [target-line from to _] (nth rows (if above? (first comfortable) (last comfortable)))
+              text (wrap/line-text buf target-line)
+              ;; the column within its own row, carried onto the target row
+              in-row (if (nil? to)
+                       col
+                       (let (segs (wrap/line-segments buf line (ed-pane-text-cols pane buf)))
+                         (let ([row-from _] (nth segs (wrap/row-of segs col))) (- col row-from))))
+              last (cond
+                     (nil? to) (string/length text)
+                     (= to (string/length text)) to
+                     else (if (> (dec to) from) (dec to) from)))
+          ;; the row table is untyped data (`[line from to inlay]`, an inlay row carrying a
+          ;; string), so the offset is an int by this guard rather than by declaration
+          (let (column (+ from in-row)
+                offset (+ (text/line->char rope target-line) (if (< column last) column last)))
+            (if (int? offset) offset nil))))))
+
+(defn- ed-pane-scrolled (pane buf top maxtop frac)
+  "The payload update for `pane` scrolled to `top` (smooth-scroll fraction `frac`): the
+new top and fraction, and point carried along when the view left it behind."
+  (let (point (ed-wheel-point pane buf (if (int? top) top 0) maxtop))
+    (fn (w)
+      (let (scrolled (assoc w :top top :scroll-frac frac))
+        (if (nil? point) scrolled (assoc scrolled :point point))))))
+
 (sig ed-scroll-pane (model pane int -> model))
 (defn ed-scroll-pane (m pane delta)
   "Plain mouse-wheel: scroll the *hovered* `pane`'s viewport by `delta` buffer lines,
-moving its `:top` — point is left alone (you can scroll freely past the cursor). The next
-keystroke brings the cursor back into view via `input/ed-point-into-view`, so the view
-doesn't snap when you resume. Negative scrolls toward the top. Clamped at end-of-buffer
-(the last line at the bottom row, no scrolling into blank space past EOF — same bound as
-the keyboard `ed-scroll`). Also resets `:scroll-frac` to 0.0 (whole-line jumps clear
-any accumulated sub-line fractional offset)."
+moving its `:top`, and carry point along once the view would leave it behind
+(`ed-wheel-point`). Negative scrolls toward the top. Clamped at end-of-buffer (the last
+line at the bottom row, no scrolling into blank space past EOF — same bound as the
+keyboard `ed-scroll`). Also resets `:scroll-frac` to 0.0 (whole-line jumps clear any
+accumulated sub-line fractional offset)."
   (let (buf (ed-pane-buf m pane)
         top (or (get-in pane [:payload :top]) 0)
-        [px py pw ph] (or (:rect pane) [0 0 80 24])
         maxtop (ed-max-top buf (math/max 1 (ed-pane-vrows pane buf)) (ed-pane-text-cols pane buf))
         new-top (math/max 0 (math/min maxtop (+ top delta)))
         m2 (assoc m
              :layout
                (pane-update-path (:layout m)
                  (:path pane)
-                 (fn (w) (assoc w :top new-top :scroll-frac 0.0)))))
+                 (ed-pane-scrolled pane buf new-top maxtop 0.0))))
     (if (= new-top top) m2 (ed-scrollbar-wake m2))))
 
 (sig ed-smooth-scroll-pane (model pane number -> model))
@@ -1035,7 +1104,7 @@ value crosses a whole line, advance `:top` and keep the remainder. `:scroll-frac
              :layout
                (pane-update-path (:layout m)
                  (:path pane)
-                 (fn (w) (assoc w :top new-top :scroll-frac new-frac)))))
+                 (ed-pane-scrolled pane buf new-top maxtop new-frac))))
     (if (= new-top top) m2 (ed-scrollbar-wake m2))))
 
 (defn ed-toggle-line-numbers (m)
