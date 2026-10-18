@@ -169,8 +169,9 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             service set — checked against
                             editor/treesit/language-contract, so an incomplete language
                             fails at load rather than at the keypress that needed it.
-                            Ruby / Elixir / Python, plus the lexer-only layers: env,
-                            shell, Dockerfile, JSON / YAML / TOML / Makefile / INI / commit
+                            Ruby / Elixir / Python / Rust, plus the lexer-only layers: env,
+                            shell, Dockerfile, JSON / YAML / TOML / Makefile / INI / commit,
+                            mbox (C-c C-n / C-c C-p between messages)
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
                             marks (● ✓ ✗ ⚠) read through one precedence table that both

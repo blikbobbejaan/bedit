@@ -9,11 +9,16 @@
 # button dead behind it. Only the released binary, opened on a file of that mode with no
 # project around it, shows the gap. `ed-view` prints every such failure to stdout.
 #
-#     make check-modes             # ~6 s per mode, needs a display (it opens the window)
+#     make check-modes             # ~6 s per mode
 #     BEDIT=./bedit tools/check-modes.sh
+#     HEADLESS=0 tools/check-modes.sh   # open the real window for each file
+#
+# Headless by default (BROOD_GUI_HEADLESS): the view still runs every turn and prints its
+# failures, but no window is opened over whatever you are working in.
 set -u
 bedit=${BEDIT:-$HOME/.local/bin/bedit}
 seconds=${SECONDS_PER_FILE:-6}
+if [ "${HEADLESS:-1}" != 0 ]; then export BROOD_GUI_HEADLESS=1; fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -28,9 +33,11 @@ printf '[core]\n\tautocrlf = false\n; c\n' > "$work/x.ini"
 printf 'feat(x): subject\n\n# Please enter\n' > "$work/COMMIT_EDITMSG"
 printf '# Title\n\nSome *text* and `code`.\n' > "$work/x.md"
 printf '(defn f (x) (+ x 1))\n' > "$work/x.blsp"
+printf 'From a@b Mon Oct 12 10:00:00 2026\nSubject: hi\n\n> quoted\n' > "$work/x.mbox"
+printf '// c\nfn main() {\n    let s = r#"raw"#;\n}\n' > "$work/x.rs"
 
 fail=0
-for f in .bashrc .env Dockerfile x.json x.yaml x.toml Makefile x.ini COMMIT_EDITMSG x.md x.blsp; do
+for f in .bashrc .env Dockerfile x.json x.yaml x.toml Makefile x.ini COMMIT_EDITMSG x.md x.blsp x.mbox x.rs; do
   ( cd "$HOME" && timeout "$seconds" "$bedit" "$work/$f" > "$work/$f.log" 2>&1 )
   n=$(grep -c 'render error' "$work/$f.log")
   if [ "$n" -gt 0 ]; then
