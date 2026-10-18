@@ -1,76 +1,60 @@
 # Handoff — what to do next, and the traps
 
 **Replaced each session; this is the *current* picture, not history.** The narrative lives
-in [`devlog.md`](devlog.md) and brood's `docs/devlog.md`; decisions in brood's
-`docs/decisions.md`; the open backlog is [`../issues.md`](../issues.md). Read this to pick
-the work back up cold.
+in brood's `docs/devlog.md` (bedit's own [`devlog.md`](devlog.md) stops in July); decisions
+in brood's `docs/decisions.md`; the open backlog is [`../issues.md`](../issues.md). Read
+this to pick the work back up cold.
 
-## State when written — 2026-09-23, evening
+## State when written — 2026-10-18, late
 
-- **bedit** `main` is pushed and the tree is `nest format`-clean (the whole tree was
-  reformatted once today; CI's `nest format --check` had kept it red since 09-22).
-  `~/.local/bin/bedit` was rebuilt today on brood `50161f5d`.
-- **brood** `main` carries today's three landings: the Magit support (`std/editor/section`,
-  `std/diff` reading a unified diff — ADR-388), **native regex** (ADR-389, below), and the
-  pre-push hook no longer leaking `GIT_DIR` into the tests (`1054c7ba`).
-- **Installed `nest`** is `0.33.0 (50161f5d-dirty)` — built from the `ci-green` worktree,
-  i.e. `main` plus the unpushed CI fixes below. bedit's whole suite (2,426), `nest check`
-  and `--check-boot` are green on it.
-- **brood CI was red** on v0.33.0 (six gates) and on the regex push (same six plus the
-  downstream smoke's old pin). The fixes exist twice: a brood session live in
-  `~/src/broodlang/brood` (uncommitted there, its own KI-187), and this session's
-  `~/.cache/brood-wt-ci` branch `ci-green` (`55f306cd`, `39dc66ba`: the adopted fixes,
-  KI-186, KI-187 and `BEDIT_REF` → `6cbe57e6`). Whichever lands first, the other rebases or
-  is dropped; **the `BEDIT_REF` bump must land either way** (the smoke job is red on the old
-  pin's callers of changed APIs).
+- **brood** `v0.41.0` is tagged (`f9878a63`): `std/mime`, `(string/bytes-> b :lossy)`, and
+  a backward rope search that walks back from point instead of scanning from offset 0.
+  The work was done in the worktree `~/.cache/brood-wt-mime` (branch `mime`), because a
+  brood session was live in `~/src/broodlang/brood` with uncommitted `json` work.
+- **bedit** requires `brood >= 0.41.0`. It carries mail (`src/mail.blsp`): mbox-mode moved
+  out of `languages`, eml-mode, and C-c C-v — the message at point decoded in `*Message*`,
+  RET on an attachment saves it.
+- **LSP**: a server's `window/logMessage` goes to `*lsp-log*` only (capped at 2 MB of
+  text); progress and `showMessage` reach the echo area, deduplicated. Expert's indexer
+  (`Could not expand alias: …`) no longer floods the echo area. Not yet watched live against
+  Expert — its engine had not started within three minutes in the test run.
+- **mbox motion** (C-c C-n / C-c C-p) costs the distance to the next message, not the file:
+  ~1 ms at the bottom of a 45 MB mailbox (was 55 / 135 ms). `tools/profile-mbox.blsp`
+  measures it.
+- **`format` → `formatter`, `term` → `terminal`.** brood ships modules by both names, and
+  a release resolves std's first, so every call into bedit's (format-buffer, format-on-save,
+  every terminal) landed in std's — dark in the v0.5.1 binary. brood 0.41.0's `nest
+  release` refuses such a bundle. `terminal` now loads with `main`.
+- **brood CI on `main` was red before 0.41.0** on the other session's json / browser-tab
+  work: `tests/temp_purge_coverage_test.blsp` and `process_wide_statics::every_process_wide_table_says_why`.
+  Not mail's; that session's to fix.
+- `issues.md` has no open items.
 
-## What landed today
+## Traps
 
-**Magit parity** — the git porcelain is section buffers (`src/sectionbuf.blsp`), every view
-(`src/gitview.blsp`), smerge, and every Magit menu; brood's half is ADR-388.
-
-**The git window painted slowly** — not git: every frame asked each visible row "is this a
-`file:line` link?", and *git-status* answered by running the error-pattern regex table over
-every commit and hunk line. It now reads its link map only (`results/line-links-only-loc`),
-and the view memoises link zones like it memoises rows (ADR-336). 25 → 3 ms a frame.
-
-**Native regex** (brood ADR-389) — `std/regex` keeps Brood's dialect (its parser, the
-forgiving rules for a stray metacharacter) and translates each pattern for `regex-automata`,
-which matches. `find` ~2 µs, `tokens` ~9 µs a line, the `file:line` table ~8 µs a line
-(was ~0.5 ms). `\w \s \b` are Unicode now, `\d` ASCII. bedit needed no change.
-
-## Traps — each cost a round today
-
-1. **A pre-push hook's `GIT_DIR` reaches every child.** Tests that shell out to git (brood's
-   `package_test`) wrote into the real repository — `core.bare = true`, a `Test` identity,
-   commits on the branch, junk tags. Fixed in the hook (`1054c7ba`); if a push ever fails
-   with "could not lock config file", check `.git/config` for `bare = true` and a `[user]`
-   before anything else.
-2. **`cargo test` is not how brood CI runs the lib tests.** Its threads share one process,
-   and `*features*` is shared by every interpreter in it, so `image_sigs`'s transitive-scan
-   test fails beside anything that loads its probe module. CI runs nextest (a process per
-   test) — judge by that.
-3. **The disk fills.** The 620 G disk hit 100% today (~230 G of it brood build targets) and
-   an edit failed with ENOSPC. `target/debug/incremental` and the `.claude/worktrees/agent-*/
-   target` directories are cache; they were cleared (~90 G).
-4. **The Bash hook blanks shell variables** — in a loop, and inside a heredoc that WRITES a
-   script. Write a script with the Write tool, pass arguments, run it.
-5. **Two sessions on one bug.** A brood session and this one both fixed KI-187 today. Before
-   starting on brood, check for a live `claude` process whose cwd is brood
-   (`readlink /proc/<pid>/cwd`), not just the transcript time.
+1. **The disk is ~99% full.** A GUI `make install` needs ~6 GB under `target/release-fast`.
+   Delete a worktree's `debug/` target once it is pushed; never build into the primary
+   brood checkout's `target/` while its session is live.
+2. **brood's pre-push hook looks for `./target/{release-fast,release,debug}/nest`.** A
+   worktree built with `CARGO_TARGET_DIR` elsewhere is invisible to it, and it falls back
+   to the installed nest — whose baked-in std is older, so the checker gate refuses.
+   Symlink `target` in the worktree to the build dir first. It also runs `cargo fmt --check`.
+3. **A mode's loading can only be checked in the built binary** (`make build` +
+   `BEDIT=./bedit tools/check-modes.sh`). `x.eml` and `x.mbox` are fixtures there now.
 
 ## Work queue
 
-1. **Land brood CI green** (see State) and confirm `gh run list -R broodlang/brood` goes
-   green, the downstream smoke included.
-2. **`issues.md`** — sixteen open or partly-done items; in progress this session.
-3. **The `regex` benchmark row** now measures the native engine and is no longer a dogfooding
-   signal for the interpreter (ADR-389 says to replace it). **Ask Wilhelm before starting.**
+1. Watch brood's `v0.41.0` release run and the next `ci.yml` on main
+   (`gh run list -R broodlang/brood`); bump brood's `BEDIT_REF` to the bedit commit that
+   requires 0.41.0, so the downstream smoke runs mail_test.
+2. Try `*lsp-log*` and the echo area live against Expert in an Elixir project.
+3. HTML-only mail shows its raw HTML in `*Message*` (with a note). An HTML→text in brood's
+   std (the prime directive) would let it render.
 
 ## How to verify a change here
 
-1. `nest check` clean; the suite per file (the bare `nest test` is blocked by a hook):
-   `for f in tests/*_test.blsp; do …; done` (2,426 tests); `nest test --failed` for the loop.
+1. `nest check` clean; the suite per file (the bare `nest test` is blocked by a hook), with
+   `BROOD_GUI_HEADLESS=1`; `nest test --failed` for the loop.
 2. `nest format --changed` before committing — CI checks it.
 3. `make check-modes` after a mode/service change; `make drive` for the live pty drivers.
 4. After a brood change: `make install` (GUI) from a brood **worktree** with the `target`
