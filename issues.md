@@ -140,7 +140,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **P10 Off-loop workers answered `:editor`, the first window.** A compile, a test run, a project run, a terminal or a shell started from a second frame (or a `--serve` client) painted its output into the first. — FIXED: `model/ed-loop-address` is captured on the loop when work is handed off; procstream handlers BUILD events and the worker delivers each run's to the address that run came with. Left on purpose: `frames` asks the primary; the LSP connection and the `*Messages*` log are shared by every frame.
 
 ### Live eval
-- [~] **L1 Tutor clears pending on ready** (`tutor.blsp:1179`) — FIXED (pending kept, test corrected). OPEN: the tutor is still a second copy of playground-core's launch/reply logic, not a client of it. Was: the bug playground-core
+- [x] **L1 Tutor clears pending on ready** (`tutor.blsp:1179`) — FIXED: pending kept, and the tutor is now playground-core's third client (a box is its form, the suffix rule is `:deps-of` answering nothing); its private launch/reply copy is gone, and what it needed became optional spec keys (`:form-data`, `[:answered note]`, `:note-line`, `:on-verdict`, `:after-launch`/`:after-reply`). Was: the bug playground-core
   fixed; a test asserts it. Tutor should be a client of playground-core.
 - [x] **L2 Spy pane cache keyed by form index shows the wrong form after a shift**
   (`playground-core.blsp:583`). — FIXED: `workings/rekey` moves each report through the same form pairing the notes use, before the stale ones are forgotten.

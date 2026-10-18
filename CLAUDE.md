@@ -263,7 +263,9 @@ src/sandbox-events.blsp     routes the shared sandbox's UiEvents to every client
 src/playground-core.blsp    the live-evaluating buffer as a MECHANISM, parameterised by a
                             language spec: form diffing, the marker-anchored notes, the
                             launch plan, the reply fold, the pane following the cursor —
-                            everything about a playground that is not about a language
+                            everything about a playground that is not about a language.
+                            Three clients: the two playgrounds and the tutorial (a box is
+                            its form, lesson data rides `:form-data`)
 src/playground.blsp         M-x brood-playground: a free-text Brood buffer that runs as you
                             type — results as ghost text, *Playground Spy* pane beside it
                             (the Brood half of playground-core: how Brood text splits into
@@ -294,7 +296,8 @@ elixir/bedit_agent.exs      bedit's agent ON the BEAM: a session (binding + modu
                             Needs Elixir 1.14+ (`dbg/2`'s `:dbg_callback`); below that it
                             still evaluates and says so once (`elixir-sandbox/version-notice`)
 src/tutor.blsp              the interactive Brood tutorial (C-h t): playground boxes that
-                            eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard
+                            eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard;
+                            the third client of playground-core
 src/aside.blsp              the ASIDE pane: a named buffer shown beside the page, refreshed in
                             place, latched closed once the reader closes it, reopened only by
                             asking — the discipline under every preview pane (workings, mdpreview)
