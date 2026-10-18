@@ -95,7 +95,11 @@ code units for ASCII. Document sync is INCREMENTAL when the server offers it
   ;; optional, because the server is blocked until we do.
   #{"client/registerCapability"
     "client/unregisterCapability" "workspace/semanticTokens/refresh" "workspace/codeLens/refresh"
-    "workspace/inlayHint/refresh" "workspace/diagnostic/refresh"})
+    "workspace/inlayHint/refresh" "workspace/diagnostic/refresh"
+    ;; we advertise `window.workDoneProgress`, so a server asks before it reports progress
+    ;; on a token of its own; the token needs no bookkeeping here — every `$/progress` is
+    ;; narrated by what it says, whatever token it carries
+    "window/workDoneProgress/create"})
 
 ;; ---- pure protocol: completion-result shapes --------------------------------
 
@@ -587,33 +591,86 @@ record — `lsp-request-shape`), shaping the raw `result` into what the waiting 
 wants. Completion is the fallback for an untagged (2-element) pending entry."
   (lsp-request-shape (or kind (lsp-completion)) result))
 
-(defn lsp-progress-text (msg)
-  "The one line a server's `window/logMessage` or `$/progress` notification is worth
-showing, or nil for one that says nothing.
+(def *lsp-message-levels*
+  ;; LSP's `MessageType`, the `type` of a `window/logMessage` or `window/showMessage`.
+  ;; A word rather than the number, because the word is what the log line says.
+  {1 "error" 2 "warning" 3 "info" 4 "log" 5 "debug"})
 
-Servers narrate their own startup and bedit dropped every word of it. That matters more
-than it sounds: Expert answers nothing until its engine node is up — it replies to
-`initialize` at once, advertises a full `completionProvider`, and then *ignores* requests
-with `Received request textDocument/completion before engine … was initialized`, never
-answering them at all. With the narration dropped, the first half-minute in an Elixir
-buffer is a server that looks installed, connected and broken. With it, you can watch
-`Starting engine node` → `Compiling …` → `Engine node started` go by."
+(def *lsp-echoed-show-levels*
+  ;; Which `window/showMessage` levels reach the echo area. `showMessage` is the server
+  ;; ASKING for the reader's attention, so every level that is a sentence for a person does;
+  ;; `log` and `debug` are the protocol's own name for "not for the reader".
+  #{"error" "warning" "info"})
+
+(defn lsp-notice-line (raw)
+  "The ONE line of a server's message `raw` worth an echo area, clipped to
+`*lsp-notice-width*` — or nil for one that says nothing.
+
+A server's log is written for a log file: Expert's startup includes the whole `PATH` and a
+fifteen-line list of ebin directories, and the echo area is one row. The first line is the
+sentence; the rest is the attachment, kept whole in `*lsp-log*`."
+  (when raw
+    (let (line (first (string/split (str raw) "\n")))
+      (when (not (= (string/trim line) ""))
+        (if (> (string/length line) *lsp-notice-width*)
+          (str (string/substring line 0 (- *lsp-notice-width* 1)) "…")
+          line)))))
+
+(defn lsp-notice (msg)
+  "What a server SAID, as `{:channel :level :text :line}` — or nil for a message that says
+nothing (a progress `end` with no message, any other notification).
+
+`:channel` is which of the protocol's three voices it came in, and it decides where the
+words go (see [[lsp-notice-echo?]]):
+
+- `:log` — `window/logMessage`, the server's LOG. Expert forwards its whole Logger here,
+  the indexer's `[error] Could not expand alias: {:%, [line: 36 …` included — internal
+  noise about the server's own work, at level error, many times a second while it indexes.
+- `:show` — `window/showMessage`, the server asking to tell the reader something.
+- `:progress` — `$/progress`, work the reader is waiting on. This is how Expert narrates
+  its startup (`Starting engine node`): it answers nothing until its engine node is up, and
+  with the narration dropped the first half-minute is a server that looks broken.
+
+`:text` is the whole message, for the log; `:line` the one line an echo area can hold."
   (let (params (or (:params msg) {})
         value (or (:value params) {})
-        raw (cond
-              (= (:method msg) "window/logMessage") (:message params)
-              ;; a progress `begin` carries :title, a `report` :message, an `end` either
-              (= (:method msg) "$/progress") (or (:title value) (:message value))
-              else nil))
-    ;; ONE line, clipped. A server's log is written for a log file: Expert's startup
-    ;; includes the whole `PATH` and a fifteen-line list of ebin directories, and the echo
-    ;; area is one row. The first line is the sentence; the rest is the attachment.
-    (when raw
-      (let (line (first (string/split (str raw) "\n")))
-        (when (not (= (string/trim line) ""))
-          (if (> (string/length line) *lsp-notice-width*)
-            (str (string/substring line 0 (- *lsp-notice-width* 1)) "…")
-            line))))))
+        method (:method msg)
+        channel (case method
+                  "window/logMessage" :log
+                  "window/showMessage" :show
+                  "$/progress" :progress
+                  nil)
+        ;; a progress `begin` carries :title, a `report` :message, an `end` either
+        raw (if (= channel :progress) (or (:title value) (:message value)) (:message params))
+        line (when channel (lsp-notice-line raw)))
+    (when line
+      {:channel channel
+       :level (if (= channel :progress) "info" (get *lsp-message-levels* (:type params) "info"))
+       :text (str raw)
+       :line line})))
+
+(defn lsp-notice-echo? (notice)
+  "Whether a server's `notice` ([[lsp-notice]]) belongs in the echo area, the way eglot
+and lsp-mode decide it: progress and a `showMessage` the reader is meant to see do; the
+LOG never does, at any level — it goes to `*lsp-log*` only.
+
+Echoing the log is what flooded the echo area while editing Elixir: Expert's indexer logs
+an error for every struct literal whose alias it cannot expand, and each one replaced
+whatever the reader was looking at — even in a dired buffer nowhere near the file."
+  (case (:channel notice)
+    :progress true
+    :show (contains? *lsp-echoed-show-levels* (:level notice))
+    false))
+
+(defn lsp-notice-log-line (notice)
+  "The `*lsp-log*` line for a server's `notice`: the channel and level, then the WHOLE
+message — the log is where the attachment the echo area clipped off is kept."
+  (str "["
+    (case (:channel notice) :log "log" :show "show" :progress "progress" "lsp")
+    " "
+    (:level notice)
+    "] "
+    (:text notice)))
 
 (def *lsp-severity-labels*
   ;; LSP severities are numbers; bedit's diagnostics carry no severity field, so the word
@@ -666,13 +723,29 @@ for a code-action request at point, which is how a server knows which quickfixes
   (assoc state
     :diags (append (or (:diags state) []) [(lsp-diagnostics-notice (or (:params msg) {}))])))
 
+(defn- lsp-queue-notice (state notice)
+  "Queue `notice` (a [[lsp-notice]] map) for the editor on the state's `:notices` (the
+shell sends it). Kept out of `:outbox`, which is frames for the SERVER — these go the
+other way."
+  (if (nil? notice) state (assoc state :notices (append (or (:notices state) []) [notice]))))
+
 (defn- lsp-narrate (state msg)
-  "Queue a server's narration for the editor, on the state's `:notices` (the shell sends
-it). Kept out of `:outbox`, which is frames for the SERVER — these go the other way."
-  (let (line (lsp-progress-text msg))
-    (if (or (nil? line) (= (string/trim (str line)) ""))
-      state
-      (assoc state :notices (append (or (:notices state) []) [(str line)])))))
+  "Queue what a server's notification SAID for the editor ([[lsp-notice]]); the editor
+decides whether it reaches the echo area or only the log ([[lsp-notice-echo?]])."
+  (lsp-queue-notice state (lsp-notice msg)))
+
+(defn lsp-error-notice (kind error)
+  "The `*lsp-log*` notice for a server's error RESPONSE to one of our requests of `kind`
+(an `LspRequest` record) — logged, never echoed.
+
+Most requests are not the reader's: the idle beat asks for signature help as point moves,
+and a server busy indexing refuses those by the dozen. The waiting command still gets its
+reply — an empty result, so a lookup the reader DID ask for says `no definition found` in
+its own voice — and the server's reason is kept here, where someone debugging it can read
+it, instead of nowhere."
+  (let (method (lsp-request-method (or kind (lsp-completion)))
+        text (str method " failed: " (or (:message error) "") " (code " (:code error) ")"))
+    {:channel :log :level "error" :text text :line (lsp-notice-line text)}))
 
 (defn- lsp-apply-edit-request (state msg)
   "A server's `workspace/applyEdit` — the edits a code action's command produced. Queued
@@ -732,7 +805,8 @@ server just as well as agreement would."
     (cond
       (and id (:method msg)) [(lsp-answer-server state msg) replies]
       ;; a notification: nothing to answer, but the server may be telling us where the
-      ;; errors are, or saying something the reader needs (see [[lsp-progress-text]])
+      ;; errors are, or saying something (see [[lsp-notice]] — and [[lsp-notice-echo?]] for
+      ;; why most of it is the server's log and never reaches the echo area)
       (= (:method msg) "textDocument/publishDiagnostics") [(lsp-publish state msg) replies]
       (nil? id) [(lsp-narrate state msg) replies]
       (nil? entry) [state replies]
@@ -740,7 +814,12 @@ server just as well as agreement would."
         (let (reply-to (first entry)
               corr (second entry)
               kind (when (>= (count entry) 3) (nth entry 2))
-              [tag value] (lsp-shape kind (:result msg)))
+              [tag value] (lsp-shape kind (:result msg))
+              ;; an error response still answers its waiter (as an empty result); the
+              ;; server's reason goes to the log, not the echo area ([[lsp-error-notice]])
+              state (if (:error msg)
+                      (lsp-queue-notice state (lsp-error-notice kind (:error msg)))
+                      state))
           [(assoc state :pending (dissoc (:pending state) id))
             (cons [reply-to [tag corr value]] replies)]))))
 
@@ -765,7 +844,7 @@ action's command, applied by the loop that owns the buffers). Here rather than i
 fold, so the fold stays pure."
   (doseq (r replies) (send (first r) (second r)))
   (lsp-send-all (:proc state) (or (:outbox state) []))
-  (doseq (line (or (:notices state) [])) (send :editor [:lsp-notice line]))
+  (doseq (notice (or (:notices state) [])) (send :editor [:lsp-notice notice]))
   (doseq (d (or (:diags state) []))
     (let ([path items raw] d)
       (send :editor [:lsp-diagnostics path items raw])))
@@ -845,7 +924,13 @@ server; `:shutdown` or the server dying stops it."
    ;; because it has no workspace to answer about.
    :workspaceFolders [{:uri root-uri :name (path/basename (lsp-uri->path root-uri))}]
    :clientInfo {:name "bedit"}
-   :capabilities {:workspace {:workspaceFolders true :configuration true}
+   ;; `window.workDoneProgress`: a server that may report progress says what it is doing
+   ;; in `$/progress` — the channel meant for the reader — rather than only in its log.
+   ;; Expert narrates `[proj] Starting engine node` there. Its log (`window/logMessage`)
+   ;; is its whole Logger, the indexer's errors included, and goes to `*lsp-log*` only
+   ;; ([[lsp-notice-echo?]]) — so progress is how its startup still reaches the reader.
+   :capabilities {:window {:workDoneProgress true}
+                  :workspace {:workspaceFolders true :configuration true}
                   :textDocument {:completion {:completionItem {:snippetSupport false}}
                                  :documentSymbol {:hierarchicalDocumentSymbolSupport true}}}})
 
