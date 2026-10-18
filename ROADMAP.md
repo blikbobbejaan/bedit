@@ -347,7 +347,7 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
   Makefile, INI/gitconfig, commit messages as tables over brood's `editor/lexer` (ADR-346).
   The pure-Brood regex capture engine cost ~1.4 ms per matched line until 2026-09-15, when
   the lexers moved onto the bitset DFA (brood ADR-352, `regex/tokens`); see §the open ends.
-- ⬜ **Browsable `*Kill Ring*`** view. (which-key ✅ — see §A.2.)
+- ✅ **Browsable `*Kill Ring*`** (M-x browse-kill-ring, 2026-10-18). (which-key ✅ — see §A.2.)
 - ⬜ **regex** ranges `[a-z]` / captures / `{m,n}` (`regex`, brood repo).
 - ⬜ **layers** extras (brood repo): `:commands` manifest, per-binding `when`-guards,
   cross-layer chord merging, a browsable command list.
@@ -444,13 +444,13 @@ formats. What it leaves, in the order to take it up:
    the window's close request included. Open: `nest check --strict` reads 58 findings under
    brood 0.28.0's checker (the ratchet's ceiling and comment name the classes) — a
    contract sweep, its own commit.
-2. ⬜ **The tree-sitter batch: TypeScript/JavaScript, Rust, Go, C** — and the way to get a
-   grammar: `deflanguage` gains `:grammar` (a git URL or a directory — "where it lives"),
-   `M-x grammar-install <lang>` runs brood's `editor/treesit/grammar-install` off the loop
-   (a `procstream` task into `*Grammars*`) then `grammar-reload`, and opening a file whose
-   mode declares a grammar that is not loaded says so with the command. The std half
-   (`grammar-fetch` / `grammar-build` / `grammar-install`) is in. Each language is a face
-   table + an indent spec, like python's; keywords come free from the anonymous tokens.
+2. ✅ **The tree-sitter batch** (2026-10-18): Rust, then JavaScript, TypeScript, TSX, Go and C
+   — a face table, `{}` brackets, definitions and a column-0 restart each, indented line for
+   line against prettier / gofmt / clang-format samples (Go with tabs: the `:indent-tabs`
+   facet). `deflanguage` gains `:grammar`, `M-x grammar-install` fetches and builds one off
+   the loop and loads it, and opening a file whose grammar is missing says so with the
+   command. Brood gained `editor/treesit/languages` (what parses now) and a `subdir` for a
+   repository holding several grammars.
 3. ⬜ **Org-mode** — parked by decision on 2026-09-13; a `std/editor/org` lexer (headings,
    TODO keywords, lists, links, `#+BEGIN_SRC` blocks) plus TAB visibility cycling and
    `C-c C-t`, on markdown-mode's shape. The one thing an Emacs person asks about first.
@@ -461,8 +461,9 @@ formats. What it leaves, in the order to take it up:
    comfortable row, as Emacs's `mwheel-scroll` does (`panes/ed-wheel-point`). On the way,
    `ed-scroll` counts the margin ABOVE point in rows too in a wrapped buffer — it counted
    lines, so a long wrapped line above point was one row of context instead of nine.
-6. ⬜ **Kill ring across frames** — per frame today (the OS clipboard makes yank cross
-   anyway); registers and bookmarks likewise.
+6. ✅ **Kill ring across frames** (2026-10-18): the ring lives in an agent every frame holds
+   (`model/ed-start-kill-agent`), so a kill in one window is C-y / M-y in all of them.
+   Registers are still per frame.
 7. ⬜ Two pre-existing red tests (`gitdiff_async_test`, `strict_ratchet_test` — the latter
    tracks the other session's checker work) and a new advisory finding in `tutor.blsp:1447`
    from brood's newer checker.
@@ -478,11 +479,11 @@ formats. What it leaves, in the order to take it up:
     `M-%`, `M-^`): the GUI frontend was stripping Shift from Alt/Ctrl chords
     (`key_without_modifiers`), so `Alt+Shift+.` arrived as `:alt-.` not `:alt->`.
     Fixed in Brood (`crates/lisp/src/gui.rs` `translate_key`/`shift_char`, 2026-06-02),
-    matching the crossterm frontend — no editor binding change. Still unverified: the
-    capital-letter chords (`M-O` vs `M-o`) collapse to one keyword (both frontends
-    lower-case letters), so `M-O` open-line-above is M-x-only for now — and the same
-    caveat applies to **`C-x F` (share-mirror)**: if the capital never arrives it's
-    `M-x share-mirror` until verified/rebound on a live window.
+    matching the crossterm frontend — no editor binding change. ✅ The capital-letter chords
+    are distinct too (checked 2026-10-18): the GUI keeps Alt+Shift+letter upper-case
+    (`:alt-O`, brood `host/gui/backend/input.rs`), which is what `M-O` open-line-above is
+    bound to, and a shifted letter after `C-x` arrives as the text `"F"` that `C-x F`
+    (share-mirror) binds.
 - Bindings live in `src/modes.blsp`; commands in `src/commands.blsp` (the
   `defcommand` macro + M-x registry in `src/interactive.blsp`); dispatch + minibuffer
   in `src/input.blsp`; model in `src/model.blsp`; pane geometry + mouse in
