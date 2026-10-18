@@ -172,9 +172,14 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             Ruby / Elixir / Python / Rust / JavaScript / TypeScript / TSX /
                             Go / C, each naming where its grammar lives (`:grammar`, for
                             M-x grammar-install), plus the lexer-only layers: env, shell,
-                            Dockerfile, JSON / YAML / TOML / Makefile / INI / commit, mbox
-                            (C-c C-n / C-c C-p between messages), and org-mode (std's
-                            `editor/org`, folding, TODO cycling, heading motion)
+                            Dockerfile, JSON / YAML / TOML / Makefile / INI / commit, and
+                            org-mode (std's `editor/org`, folding, TODO cycling, heading
+                            motion)
+src/mail.blsp               mail: mbox-mode (C-c C-n / C-c C-p between messages, on rope
+                            searches that cost the distance, not the offset), eml-mode, and
+                            C-c C-v — the message at point DECODED in *Message* (Gnus's
+                            article buffer) over std's `mime`: the headers that matter, the
+                            text part, the attachments, RET saves one
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
                             marks (● ✓ ✗ ⚠) read through one precedence table that both

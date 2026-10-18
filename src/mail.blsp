@@ -1,0 +1,292 @@
+(defmodule mail
+  "Mail: `mbox-mode` for a Unix mailbox, `eml-mode` for one saved message, and the
+decoded message VIEW behind C-c C-v in either — Gnus's article buffer. The raw file is
+what the sender's software wrote: encoded-word headers, quoted-printable or base64
+bodies, a part tree. `*Message*` shows what a reader means by the message — the headers
+that matter, decoded, the text body, the attachments — and RET on an attachment saves
+it. The decoding is std's `mime`; this module only lays it out."
+  (:use editor/buffer)
+  (:use model :only [ed-current-buf ed-set-buf message])
+  (:use pool :only [ed-display-buffer ed-path-prompt ed-default-dir])
+  (:use modes :only [register-language-mode register-special-type layer-commands])
+  (:use interactive :only [defcommand]))
+
+;; ---- colouring a message: mbox and eml share it -------------------------------------
+;; Messages one after another, each opened by a `From ` line, then headers up to the first
+;; blank line, then the body. Whether `Note: see below` is a header depends on which side
+;; of that blank line it sits, so unlike the lexers in `languages` this one carries STATE
+;; down the window — and its restart is the message boundary, the one line where that
+;; state is known. A window with no boundary in it starts in a body, which is where a
+;; viewport 200 lines from the nearest `From ` almost always is; an .eml has no boundary
+;; and starts in its headers.
+
+(def- *mail-header* "^([A-Za-z0-9-]+):")
+
+(defn- mail-line-spans (line from state faces)
+  ;; `[next-state spans]` for one line beginning at offset `from`
+  (let (end (+ from (string/length line))
+        whole (fn (face) [[from end (get faces face)]]))
+    (cond
+      (string/starts-with? line "From ") [:headers (whole :separator)]
+      (= state :headers)
+        (let (header (regex/find *mail-header* line))
+          (cond
+            (= (string/trim line) "") [:body []]
+            (nil? header) [:headers []] ; a folded continuation line
+            else
+              (let (colon (+ from (get header :end))
+                    name [from colon (get faces :header)])
+                (if (and (= (string/lower (get (first (get header :groups)) :text)) "subject")
+                      (< colon end))
+                  [:headers [name [colon end (get faces :subject)]]]
+                  [:headers [name]]))))
+      ;; the conventional signature separator: dim to the next message
+      (= line "-- ") [:signature (whole :quote)]
+      (= state :signature) [:signature (whole :quote)]
+      (string/starts-with? line ">") [state (whole :quote)]
+      else [state []])))
+
+(defn mail-spans (src state)
+  "Message colour spans for `src`, read from line state `state` (`:headers` or `:body`):
+the `From ` separator, header names (and the Subject), quoted `>` lines, and a `-- `
+signature."
+  (let (faces {:separator (editor/face/face :syntax/function)
+               :header (editor/face/face :syntax/keyword)
+               :subject (editor/face/face :syntax/doc)
+               :quote (editor/face/face :syntax/comment)}
+        [_ _ acc] (fold (string/split src "\n")
+                    [0 state '()]
+                    (fn ([from state acc] line)
+                      (let ([next-state spans] (mail-line-spans line from state faces))
+                        [(+ from (string/length line) 1)
+                          next-state
+                          (fold spans acc (fn (a s) (cons s a)))]))))
+    (reverse acc)))
+
+;; ---- mbox-mode: a Unix mailbox -------------------------------------------------------
+
+(defn mbox-spans (src)
+  "mbox's `:fontify`: `mail-spans` from a body, until a `From ` line opens a message."
+  (mail-spans src :body))
+
+(defn mbox-fontify-restart (src pos)
+  "mbox's `:fontify-restart`: the nearest message boundary at or before `pos`, else the
+line `pos` is on."
+  (let (line-start (inc (string/last-index-of src "\n" pos))
+        boundary (string/last-index-of src "\nFrom " pos))
+    (cond
+      (>= boundary 0) (inc boundary)
+      (string/starts-with? src "From ") 0
+      else line-start)))
+
+;; The message motions read the ROPE, never `buffer-text`: an mbox is the file that is tens
+;; of megabytes, and flattening it cost 50-120 ms per C-c C-n wherever point was. Both
+;; searches cost the distance to the message they find (brood's backward one read from
+;; offset 0 until it was made to walk back from `before`).
+
+(defn- mbox-message-after (buf point)
+  ;; the start of the first message beginning after `point`, or nil
+  (let (found (buffer-search-forward buf "\nFrom " point))
+    (when found (inc found))))
+
+(defn- mbox-message-before (buf point)
+  ;; the start of the last message beginning strictly before `point`, or nil — a `\nFrom `
+  ;; starting before `point - 1` opens a message before `point`
+  (let (found (buffer-search-backward buf "\nFrom " (dec point)))
+    (cond
+      found (inc found)
+      (and (> point 0)
+        (= (text/slice (buffer-rope buf) 0 (math/min 5 (buffer-length buf))) "From "))
+        0
+      else nil)))
+(sig mbox-message-before (any int -> (or int nil)))
+
+(defn- mbox-move (m find-target none)
+  (let (buf (ed-current-buf m)
+        target (find-target buf (buffer-point buf)))
+    (if (nil? target)
+      (message m none)
+      (ed-set-buf m (goto-char buf target)))))
+
+(defcommand cmd-mbox-next-message
+  (m key)
+  "Move to the start of the next message in an mbox (C-c C-n)."
+  (mbox-move m mbox-message-after "No next message"))
+
+(defcommand cmd-mbox-previous-message
+  (m key)
+  "Move to the start of the previous message in an mbox (C-c C-p)."
+  (mbox-move m mbox-message-before "No previous message"))
+
+(def mbox-keymap
+  (-> {}
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-n] 'mail/cmd-mbox-next-message)
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-p] 'mail/cmd-mbox-previous-message)
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-v] 'mail/cmd-mail-view)))
+
+(def mbox-mode-layer
+  {:name 'mbox
+   :file-pattern "\\.(mbox|mbx)$|(^|/)mbox$"
+   :fontify 'mail/mbox-spans
+   :fontify-restart 'mail/mbox-fontify-restart
+   :keymap mail/mbox-keymap
+   :commands (layer-commands mail/mbox-keymap)})
+
+(register-language-mode 'mail/mbox-mode-layer :mbox)
+
+;; ---- eml-mode: one message on its own ------------------------------------------------
+
+(defn eml-spans (src)
+  "eml's `:fontify`: `mail-spans` from the headers — the file IS one message, with no
+`From ` line to say where it starts."
+  (mail-spans src :headers))
+
+(def eml-keymap
+  (-> {}
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-v] 'mail/cmd-mail-view)))
+
+(def eml-mode-layer
+  {:name 'eml
+   :file-pattern "\\.eml$"
+   :fontify 'mail/eml-spans
+   :keymap mail/eml-keymap
+   :commands (layer-commands mail/eml-keymap)})
+
+(register-language-mode 'mail/eml-mode-layer :eml)
+
+;; ---- the message under point ----------------------------------------------------------
+
+(defn mail-message-bounds (buf point)
+  "`[start end]` of the message `point` is in: in an mbox, from its `From ` line to the
+next one; anywhere else, the whole buffer (a body line of an .eml may begin `From `)."
+  (let (total (buffer-length buf))
+    (if (= (editor/layers/buffer-type-for buf) :mbox)
+      (let (before (buffer-search-backward buf "\nFrom " (math/min total (inc point)))
+            after (buffer-search-forward buf "\nFrom " point))
+        [(if before (inc before) 0) (or after total)])
+      [0 total])))
+
+(defn mail-unescape-from (text)
+  "An mbox message's text with its `>From ` quoting undone: a body line that began with
+`From ` was written as `>From ` (and `>From ` as `>>From `, mboxrd), so the separator
+stays unambiguous; reading it back drops one `>`. (Never the first line: that is the
+separator itself, or a header.)"
+  (regex/replace "\n>(>*From )" text "\n$1"))
+
+;; ---- the view: a message laid out as text plus face spans -------------------------------
+
+(def mail-shown-headers ["From" "To" "Cc" "Reply-To" "Date" "Subject"])
+
+(defn- mail-header-text (value)
+  ;; decoded, and a folded address list on one line
+  (string/trim (regex/replace "\\s+" (or (mime/decode-header value) "") " ")))
+
+(defn mail-attachment-line (part)
+  "How an attachment shows in the view: its name, type and decoded size."
+  (str "["
+    (or (mime/filename part) "unnamed")
+    "]  "
+    (get part :type)
+    ", "
+    (humanize/byte-size (count (mime/body-bytes part)))))
+
+(defn- mail-body (message)
+  (let (text-part (mime/text-part message))
+    (cond
+      (nil? text-part) "(this message has no text part)"
+      (= (get text-part :type) "text/html")
+        (str "(HTML only — shown as written)\n\n" (mime/body-text text-part))
+      else (mime/body-text text-part))))
+
+(defn mail-render (message)
+  "`{:text :spans :attachments}` for `message` (a `mime/parse` tree): the shown headers
+decoded, a blank line, the text body, then one line per attachment. `:spans` colours
+header names, the Subject, quoted lines and attachments; `:attachments` maps each
+attachment's LINE to its part, for RET."
+  (let (faces {:header (editor/face/face :syntax/keyword)
+               :subject (editor/face/face :syntax/doc)
+               :quote (editor/face/face :syntax/comment)
+               :attachment (editor/face/face :syntax/function)}
+        headers (for (name mail-shown-headers :when (mime/header message name))
+                  [name (mail-header-text (mime/header message name))])
+        body (string/trimr (string/replace (mail-body message) "\r\n" "\n"))
+        attachments (vec (seq/filter (mime/leaves message) mime/attachment?))
+        header-lines (map headers
+                       (fn ([name value]) (str (string/pad-right (str name ":") 10) value)))
+        body-lines (string/split body "\n")
+        attachment-lines (map attachments mail-attachment-line)
+        lines (vec (append header-lines
+                     [""]
+                     body-lines
+                     (if (empty? attachments) [] (append [""] attachment-lines))))
+        header-count (count header-lines)
+        first-attachment (- (count lines) (count attachment-lines))
+        [_ spans] (fold (range (count lines))
+                    [0 '()]
+                    (fn ([offset spans] index)
+                      (let (line (nth lines index)
+                            end (+ offset (string/length line))
+                            spans (cond
+                                    (< index header-count)
+                                      (let (colon (+ offset (inc (index-of line ":")))
+                                            name-span [offset colon (:header faces)])
+                                        (if (string/starts-with? line "Subject:")
+                                          (cons [colon end (:subject faces)] (cons name-span spans))
+                                          (cons name-span spans)))
+                                    (>= index first-attachment)
+                                      (cons [offset end (:attachment faces)] spans)
+                                    (string/starts-with? line ">")
+                                      (cons [offset end (:quote faces)] spans)
+                                    else spans))
+                        [(inc end) spans]))))
+    {:text (str (string/join lines "\n") "\n")
+     :spans (reverse spans)
+     :attachments (into {}
+                    (map (range (count attachments))
+                      (fn (index) [(+ first-attachment index) (nth attachments index)])))}))
+
+(defcommand cmd-mail-view
+  (m key)
+  "Show the message at point decoded in `*Message*` (C-c C-v in an .eml or an mbox): the
+headers that matter, its text, its attachments — RET on one saves it."
+  (let (buf (ed-current-buf m)
+        [start end] (mail-message-bounds buf (buffer-point buf))
+        message (mime/parse (mail-unescape-from (text/slice (buffer-rope buf) start end)))
+        shown (mail-render message))
+    (assoc (ed-display-buffer m
+             "*Message*"
+             (:text shown)
+             :mail-message {:action :pop :spans (:spans shown)})
+      :mail-attachments (:attachments shown))))
+
+(defcommand cmd-mail-save-attachment
+  (m key)
+  "Save the attachment on this line of `*Message*` (RET): asks where, offering its own
+name in the buffer's directory."
+  (let (part (get (:mail-attachments m) (buffer-current-line (ed-current-buf m))))
+    (if (nil? part)
+      (message m "No attachment on this line")
+      (let (initial (str (ed-default-dir m) "/" (or (mime/filename part) "attachment")))
+        (assoc m
+          :minibuffer
+            (ed-path-prompt "Save attachment to: "
+              initial
+              []
+              (fn (model path)
+                (try
+                  (do
+                    (file/spit-bytes path (mime/body-bytes part))
+                    (message model (str "Saved " path)))
+                  (catch e (message model (str "Could not save: " (error-message e))))))))))))
+
+(def mail-message-keymap
+  (-> {}
+    (editor/keymap/keymap-bind [:enter] 'mail/cmd-mail-save-attachment)))
+
+(def mail-message-mode-layer
+  {:name 'mail-message
+   :doc "A mail message, decoded — RET on an attachment saves it."
+   :keymap mail/mail-message-keymap
+   :commands (layer-commands mail/mail-message-keymap)})
+
+(register-special-type :mail-message 'mail/mail-message-mode-layer)
