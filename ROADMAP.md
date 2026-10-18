@@ -451,9 +451,10 @@ formats. What it leaves, in the order to take it up:
    the loop and loads it, and opening a file whose grammar is missing says so with the
    command. Brood gained `editor/treesit/languages` (what parses now) and a `subdir` for a
    repository holding several grammars.
-3. ⬜ **Org-mode** — parked by decision on 2026-09-13; a `std/editor/org` lexer (headings,
-   TODO keywords, lists, links, `#+BEGIN_SRC` blocks) plus TAB visibility cycling and
-   `C-c C-t`, on markdown-mode's shape. The one thing an Emacs person asks about first.
+3. ✅ **Org-mode** (2026-10-18): brood's `std/editor/org` colours it and knows the outline
+   (heading level, subtree end, the TODO cycle); bedit's org-mode has TAB / S-TAB folding,
+   `C-c C-t`, `C-c C-n` / `C-c C-p`, M-<left> / M-<right> and M-RET. Folding is the
+   editor's own (`src/folds.blsp`): any mode that declares a `:fold-extent` gets it.
 4. ✅ **`C-n`/`C-p` by visual line** in a wrapped buffer (2026-10-18): one screen row per
    press, at a goal column kept across short rows and lines — which bedit had never had,
    wrapped or not (`commands/ed-line-move`).

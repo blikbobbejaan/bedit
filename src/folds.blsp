@@ -1,0 +1,150 @@
+(defmodule folds
+  "Outline folding in an editable buffer — Org's TAB. A fold is a buffer MARKER on the
+heading it folds, so it moves with the text above it like any other marker; what it hides
+is asked of the buffer's mode (`:fold-extent`, `(lines line) -> last line or nil` — Org's
+subtree end), so the fold always covers the subtree as it is NOW, not as it was when
+folded.
+
+The hidden lines reach the screen through ONE place: the row table (`wrap/rows-from`)
+gives a hidden line no rows, and `scroll/ed-row-extras` hands it the set beside the inlay
+rows. The view, the cursor, the scroll clamp and the mouse all read that table, so none of
+them knows folds exist. C-n / C-p step over hidden lines, and point landing in one some
+other way (a search, a jump) opens the fold around it (`reveal`), as Org does."
+  (:use editor/buffer) ; buffer markers, the rope, point
+  (:use model) ; ed-mode-service — the mode's `:fold-extent`
+  (:use memo)) ; defmemo — the hidden set is asked several times a frame
+
+(defn- fold-id? (id) (and (vector? id) (= (first id) :fold)))
+
+(sig folded-lines (buffer -> (list int)))
+(defn folded-lines (buf)
+  "The lines of `buf` that hold a fold, ascending."
+  (let (rope (buffer-rope buf))
+    (sort (seq/distinct (seq/keep (%map-pairs (buffer-markers buf))
+                          (fn ([id position]) (when (fold-id? id) (text/char->line rope position))))))))
+
+(defn- buffer-lines (rope)
+  (string/split (text/->string rope) "\n"))
+
+(sig extent-in (any any int -> (or nil int)))
+(defn- extent-in (extent-service lines line)
+  ;; the last line the heading at `line` folds, or nil when it folds nothing
+  (let (last (extent-service lines line))
+    (if (and (int? last) (> last line)) last nil)))
+
+;; Memoised on the text, the folded lines and the mode's service: asked by the row table,
+;; the scroll clamp and the cursor on every frame of a folded buffer, and it splits the text.
+(defmemo hidden-from 4 (rope extent-service folded)
+  "The set of lines the folds at `folded` hide in `rope`."
+  (let (lines (buffer-lines rope))
+    (fold folded
+      #{}
+      (fn (hidden line)
+        (let (last (extent-in extent-service lines line))
+          (if (or (nil? last) (not (int? line))) hidden (into hidden (range (inc line) (inc last)))))))))
+
+(defn hidden-lines (buf)
+  "The lines of `buf` its folds hide — `#{}` for a buffer with none, which is nearly all."
+  (let (folded (folded-lines buf)
+        extent-service (ed-mode-service buf :fold-extent))
+    (if (or (empty? folded) (nil? extent-service))
+      #{}
+      (hidden-from (buffer-rope buf) extent-service folded))))
+
+(sig extent (buffer int -> (or nil int)))
+(defn extent (buf line)
+  "The last line the heading at `line` would fold, or nil when it folds nothing."
+  (let (svc (ed-mode-service buf :fold-extent))
+    (when svc (extent-in svc (buffer-lines (buffer-rope buf)) line))))
+
+(defn folded? (buf line) (includes? (folded-lines buf) line))
+
+(defn fold-heading (buf line)
+  "`buf` with the heading at `line` folded — unchanged when it has nothing to fold."
+  (if (or (folded? buf line) (nil? (extent buf line)))
+    buf
+    (let (start (text/line->char (buffer-rope buf) line))
+      (buffer-marker-set buf [:fold start] start))))
+
+(defn unfold-heading (buf line)
+  "`buf` with the fold at `line` (if any) opened."
+  (let (rope (buffer-rope buf))
+    (fold (%map-pairs (buffer-markers buf))
+      buf
+      (fn (acc [id position])
+        (if (and (fold-id? id) (= (text/char->line rope position) line))
+          (buffer-marker-delete acc id)
+          acc)))))
+
+(defn unfold-all (buf)
+  "`buf` with every fold opened."
+  (fold (keys (buffer-markers buf))
+    buf
+    (fn (acc id) (if (fold-id? id) (buffer-marker-delete acc id) acc))))
+
+(sig headings-between (buffer int int -> list))
+(defn- headings-between (buf from to)
+  ;; the lines in [from, to] that fold something
+  (seq/filter (range from (inc to)) (fn (line) (not (nil? (extent buf line))))))
+
+(defn- children (buf line last)
+  ;; the headings directly under `line` (whose subtree ends at `last`): each one's own
+  ;; subtree is skipped, so a grandchild is not a child
+  (let (step (fn (at acc)
+               (if (> at last)
+                 (reverse acc)
+                 (let (child-last (extent buf at))
+                   (if (nil? child-last)
+                     (if (folds-something? buf at)
+                       (step (inc at) (cons at acc))
+                       (step (inc at) acc))
+                     (step (inc child-last) (cons at acc)))))))
+    (step (inc line) '())))
+
+(defn- folds-something? (buf line)
+  ;; a heading with an empty body still counts as a child heading
+  (let (svc (ed-mode-service buf :fold-extent))
+    (and svc (int? (svc (buffer-lines (buffer-rope buf)) line)))))
+
+(sig cycle-heading (buffer int -> (tuple buffer (or nil keyword))))
+(defn cycle-heading (buf line)
+  "Org's TAB on the heading at `line`: FOLDED → CHILDREN (the heading open, each child
+heading folded) → SUBTREE (everything under it open) → FOLDED. `[buf' state]`, the state
+it went to, or `[buf nil]` when the line folds nothing."
+  (let (last (extent buf line))
+    (cond
+      (nil? last) [buf nil]
+      (folded? buf line)
+        (let (opened (unfold-heading buf line))
+          [(fold (children opened line last) opened (fn (acc child) (fold-heading acc child)))
+            :children])
+      (any? (folded-lines buf) (fn (folded) (and (> folded line) (<= folded last))))
+        [(fold (headings-between buf (inc line) last)
+           buf
+           (fn (acc heading) (unfold-heading acc heading)))
+          :subtree]
+      else [(fold-heading buf line) :folded])))
+
+(sig cycle-buffer (buffer -> (tuple buffer keyword)))
+(defn cycle-buffer (buf)
+  "Org's S-TAB: every heading folded (the overview) when nothing is, else everything open.
+`[buf' state]`."
+  (if (empty? (folded-lines buf))
+    (let (last (dec (buffer-line-count buf)))
+      [(fold (headings-between buf 0 last) buf (fn (acc heading) (fold-heading acc heading)))
+        :overview])
+    [(unfold-all buf) :all]))
+
+(defn reveal (buf)
+  "`buf` with every fold that hides point's line opened — point reached it some way other
+than C-n / C-p (a search, a jump), and a cursor inside hidden text would be invisible."
+  (let (line (buffer-current-line buf))
+    (if (not (contains? (hidden-lines buf) line))
+      buf
+      (let (lines (buffer-lines (buffer-rope buf))
+            svc (ed-mode-service buf :fold-extent))
+        (fold (folded-lines buf)
+          buf
+          (fn (acc folded)
+            (let (last (extent-in svc lines folded))
+              (if (and last (> line folded) (<= line last)) (unfold-heading acc folded) acc))))))))

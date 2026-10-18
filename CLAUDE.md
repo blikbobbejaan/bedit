@@ -173,7 +173,8 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             Go / C, each naming where its grammar lives (`:grammar`, for
                             M-x grammar-install), plus the lexer-only layers: env, shell,
                             Dockerfile, JSON / YAML / TOML / Makefile / INI / commit, mbox
-                            (C-c C-n / C-c C-p between messages)
+                            (C-c C-n / C-c C-p between messages), and org-mode (std's
+                            `editor/org`, folding, TODO cycling, heading motion)
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
                             marks (● ✓ ✗ ⚠) read through one precedence table that both
@@ -245,6 +246,11 @@ src/wrap.blsp              visual-line-mode: the pure break rule (a line → `[f
                             segments, word-wrapped at the pane width) that the row↔line owner
                             (panes), the view and the scroll clamp all read — markdown wraps
                             by default (a `:visual-line` mode facet); M-x visual-line-mode toggles
+src/folds.blsp              outline FOLDING in an editable buffer (org's TAB): a fold is a
+                            marker on its heading, the mode's `:fold-extent` says what it
+                            covers, and the row table gives the hidden lines no rows — so the
+                            view, cursor, scroll and mouse never see them; point landing
+                            inside one opens it
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/eval-commands.blsp      the C-x C-e family as commands (eval-last-sexp / -region / -buffer):

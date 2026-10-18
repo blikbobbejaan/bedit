@@ -40,9 +40,10 @@ printf 'interface P {\n  x: number;\n}\n' > "$work/x.ts"
 printf 'export const A = () => <div>hi</div>;\n' > "$work/x.tsx"
 printf 'package main\n\nfunc main() {\n\tprintln(`raw`)\n}\n' > "$work/x.go"
 printf '#include <stdio.h>\nint main(void) {\n    return 0;\n}\n' > "$work/x.c"
+printf '#+TITLE: t\n* TODO Heading :tag:\n- [ ] item with *bold*\n' > "$work/x.org"
 
 fail=0
-for f in .bashrc .env Dockerfile x.json x.yaml x.toml Makefile x.ini COMMIT_EDITMSG x.md x.blsp x.mbox x.rs x.js x.ts x.tsx x.go x.c; do
+for f in .bashrc .env Dockerfile x.json x.yaml x.toml Makefile x.ini COMMIT_EDITMSG x.md x.blsp x.mbox x.rs x.js x.ts x.tsx x.go x.c x.org; do
   ( cd "$HOME" && timeout "$seconds" "$bedit" "$work/$f" > "$work/$f.log" 2>&1 )
   n=$(grep -c 'render error' "$work/$f.log")
   if [ "$n" -gt 0 ]; then
