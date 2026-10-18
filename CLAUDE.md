@@ -185,9 +185,11 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             installed (ABI, path), fetching and building a declared one off
                             the loop, and a live swap — drop a new .so in and reload, no
                             restart
-src/format.blsp             M-x format-buffer + format-on-save: the language's own
+src/formatter.blsp          M-x format-buffer + format-on-save: the language's own
                             formatter (mix format, black, rubocop), declared per language
                             and run over the FILE, so a failing formatter costs nothing
+                            (named to dodge std's `format`: a release resolves a std name
+                            first, so a project module called `format` never ran)
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
                             (named to dodge std's `tool/complete`, which shadows a bare `complete`)
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
@@ -344,7 +346,7 @@ src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a l
                             worker; owns the input-region vocabulary (`:input-start`, the
                             boundary guard, ↑/↓/C-r history) that a line-mode terminal
                             reuses
-src/term.blsp               a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u M-x term):
+src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u M-x term):
                             a program under a pty, its screen emulated by std/vt
                             (brood ADR-384) in the buffer's worker and painted into the
                             buffer's tail. CHAR mode (a full-screen program: claude,
@@ -357,6 +359,7 @@ src/term.blsp               a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             that asked for it; the program's cursor shape and visibility
                             are painted; history above the screen keeps its colour and
                             is capped; the mode line chip says which program and mode
+                            (named to dodge std's `term`, as formatter dodges `format`)
 src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is a
                             std/editor/section tree (brood ADR-388) — tree, rows and
                             visibility live ON THE BUFFER, faces come from the mode's
