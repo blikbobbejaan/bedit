@@ -169,18 +169,21 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             service set — checked against
                             editor/treesit/language-contract, so an incomplete language
                             fails at load rather than at the keypress that needed it.
-                            Ruby / Elixir / Python / Rust, plus the lexer-only layers: env,
-                            shell, Dockerfile, JSON / YAML / TOML / Makefile / INI / commit,
-                            mbox (C-c C-n / C-c C-p between messages)
+                            Ruby / Elixir / Python / Rust / JavaScript / TypeScript / TSX /
+                            Go / C, each naming where its grammar lives (`:grammar`, for
+                            M-x grammar-install), plus the lexer-only layers: env, shell,
+                            Dockerfile, JSON / YAML / TOML / Makefile / INI / commit, mbox
+                            (C-c C-n / C-c C-p between messages)
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
                             marks (● ✓ ✗ ⚠) read through one precedence table that both
                             paints and resolves a click
 src/grammars.blsp           tree-sitter grammars the runtime was not built with: where they
                             live (~/.config/bedit/grammars), loading them at startup, and
-                            M-x grammar-list / grammar-reload: what is installed (ABI,
-                            path), the recipe to build one, and a live swap — drop a new
-                            .so in and reload, no restart
+                            M-x grammar-list / grammar-reload / grammar-install: what is
+                            installed (ABI, path), fetching and building a declared one off
+                            the loop, and a live swap — drop a new .so in and reload, no
+                            restart
 src/format.blsp             M-x format-buffer + format-on-save: the language's own
                             formatter (mix format, black, rubocop), declared per language
                             and run over the FILE, so a failing formatter costs nothing

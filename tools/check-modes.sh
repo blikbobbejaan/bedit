@@ -35,9 +35,14 @@ printf '# Title\n\nSome *text* and `code`.\n' > "$work/x.md"
 printf '(defn f (x) (+ x 1))\n' > "$work/x.blsp"
 printf 'From a@b Mon Oct 12 10:00:00 2026\nSubject: hi\n\n> quoted\n' > "$work/x.mbox"
 printf '// c\nfn main() {\n    let s = r#"raw"#;\n}\n' > "$work/x.rs"
+printf '// c\nexport const s = `t ${1}`;\n' > "$work/x.js"
+printf 'interface P {\n  x: number;\n}\n' > "$work/x.ts"
+printf 'export const A = () => <div>hi</div>;\n' > "$work/x.tsx"
+printf 'package main\n\nfunc main() {\n\tprintln(`raw`)\n}\n' > "$work/x.go"
+printf '#include <stdio.h>\nint main(void) {\n    return 0;\n}\n' > "$work/x.c"
 
 fail=0
-for f in .bashrc .env Dockerfile x.json x.yaml x.toml Makefile x.ini COMMIT_EDITMSG x.md x.blsp x.mbox x.rs; do
+for f in .bashrc .env Dockerfile x.json x.yaml x.toml Makefile x.ini COMMIT_EDITMSG x.md x.blsp x.mbox x.rs x.js x.ts x.tsx x.go x.c; do
   ( cd "$HOME" && timeout "$seconds" "$bedit" "$work/$f" > "$work/$f.log" 2>&1 )
   n=$(grep -c 'render error' "$work/$f.log")
   if [ "$n" -gt 0 ]; then

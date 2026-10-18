@@ -12,12 +12,15 @@ grammar of the same name, and clears both the parser pool and the tree cache so 
 survives the swap holding pointers into the old library. So a reload is a real reload —
 drop in a new `.so`, run `M-x grammar-reload`, and the next keystroke is parsed by it.
 
-What is NOT here is a downloader. Fetching and compiling a grammar needs the network and
-a C toolchain, and an editor that quietly shells out to both is doing something the user
-should have asked for explicitly. `M-x grammar-list` prints the build recipe instead, so
-the command you need is in front of you rather than in a README."
+Getting a grammar is `M-x grammar-install`: a language declares where its grammar lives,
+and the command clones and compiles it. Fetching and compiling needs the network and a C
+toolchain, and an editor that quietly shells out to both is doing something the user
+should have asked for — so nothing fetches unasked. Opening a file whose grammar is
+missing only says so, naming the command; `M-x grammar-list` still prints the recipe for
+a language nobody declared."
   (:use model) ; message / ed-current-buf
   (:use pool) ; ed-show-named
+  (:use task) ; task — a grammar builds off the loop
   (:use interactive)) ; defcommand
 ;; ---- grammars the runtime was not built with --------------------------------
 ;; `%tree-sitter-load-grammar` is the mechanism; WHERE grammars live is policy, and this is
@@ -151,3 +154,116 @@ parse no longer uses."
       (if (empty? loaded)
         (str "no grammars in " (ts-grammar-dir))
         (str "reloaded " (string/join (map loaded ->string) ", "))))))
+
+;; ---- where a grammar lives, and fetching it when asked ---------------------------
+;; A language declares where its grammar lives (`deflanguage`'s `:grammar`), so getting one
+;; is a command rather than the recipe above: `M-x grammar-install go` clones and compiles it
+;; off the loop (std's `editor/treesit/grammar-install`), drops the library where the
+;; startup scan finds it, and loads it — the next frame colours. It needs git and a C
+;; compiler, and it only runs when asked; opening a file whose grammar is missing just SAYS
+;; so, with the command.
+
+(defn declare-grammar (lang source)
+  "Record that `lang`'s grammar lives at `source`: a git URL, or `{:url … :subdir …}` for a
+repository holding several grammars."
+  (registry/put! :grammars/sources lang source))
+
+(defn grammar-source (lang)
+  "Where `lang`'s grammar lives, as declared — nil for a language that declared none."
+  (registry/lookup :grammars/sources lang))
+
+(defn grammar-loaded? (lang)
+  "Whether the runtime can parse `lang` right now (loaded or built in)."
+  (includes? (editor/treesit/languages) lang))
+
+(defn missing-grammars ()
+  "The declared languages whose grammar is not loaded, sorted by name."
+  (let (loaded (editor/treesit/languages))
+    (sort-by (seq/filter (keys (registry/entries :grammars/sources))
+               (fn (lang) (not (includes? loaded lang))))
+      ->string)))
+
+(defn missing-note (buf)
+  "What to add to the message that opened `buf` when its mode is a tree-sitter language
+with no grammar loaded — how to get one — else \"\"."
+  (let (lang (ed-mode-service buf :ts-lang))
+    (if (or (nil? lang) (grammar-loaded? lang))
+      ""
+      (str " — no "
+        (->string lang)
+        " grammar, so no colours or structure: "
+        (if (nil? (grammar-source lang))
+          "M-x grammar-list says how to build one"
+          "M-x grammar-install")))))
+
+(defn- grammar-work-dir ()
+  "Where grammar checkouts are cloned: beside the libraries, which the startup scan ignores."
+  (path/join (ts-grammar-dir) "src"))
+
+(defn- grammar-install-run (lang source)
+  "Fetch and compile `lang`'s grammar into the grammar directory: `{:ok path}` or `{:error
+text}`. Runs off the loop — a clone and a compile take seconds."
+  (let (url (if (map? source) (get source :url) source)
+        subdir (if (map? source) (get source :subdir) nil))
+    (editor/treesit/grammar-install url lang (ts-grammar-dir) (grammar-work-dir) subdir)))
+
+(defn- grammar-install-land (m lang result)
+  "Load a freshly built grammar and say what happened."
+  (cond
+    (nil? result) (message m (str "grammar-install " (->string lang) ": failed or timed out"))
+    (contains? result :error)
+      (message m (str "grammar-install " (->string lang) ": " (get result :error)))
+    else
+      (let (abi (ts-load-grammar lang))
+        (message m
+          (if (nil? abi)
+            (str "built " (get result :ok) " but it did not load — see *Messages*")
+            (str "installed the " (->string lang) " grammar (ABI " abi ") — " (get result :ok)))))))
+
+(register-task-reply :grammar-proc 'grammars/grammar-install-apply nil "building a grammar")
+(defn grammar-install-apply (m result)
+  "The `:grammar-proc` task's reply, folded: the build's result, or nil when the task
+errored or timed out."
+  (let (lang (:grammar-pending m))
+    (grammar-install-land (dissoc m :grammar-proc :grammar-pending) lang result)))
+
+(defn grammar-install-start (m lang)
+  "Fetch, build and load `lang`'s declared grammar — off the loop, or inline when there is
+no loop to reply to (a test, a batch run)."
+  (let (source (grammar-source lang))
+    (cond
+      (nil? source)
+        (message m
+          (str "no known source for a "
+            (->string lang)
+            " grammar — M-x grammar-list says how to build one"))
+      (:grammar-proc m) (message m "a grammar is already being built")
+      (ed-headless?) (grammar-install-land m lang (grammar-install-run lang source))
+      else
+        (message (assoc m
+                   :grammar-proc (task (fn () (grammar-install-run lang source)) {:timeout 300000})
+                   :grammar-pending lang)
+          (str "fetching and building the " (->string lang) " grammar…")))))
+
+(defcommand cmd-grammar-install
+  (m key)
+  "Fetch, compile and load a language's tree-sitter grammar (M-x grammar-install): from
+where its mode declares it lives, into the grammar directory, with git and the C
+compiler. Offers the languages with no grammar loaded, the current buffer's first."
+  (let (missing (map (missing-grammars) ->string)
+        here (ed-mode-service (ed-current-buf m) :ts-lang)
+        names (if (and here (includes? missing (->string here)))
+                (cons (->string here)
+                  (seq/filter missing (fn (name) (not (= name (->string here))))))
+                missing))
+    (if (empty? names)
+      (message m "every declared language already has its grammar")
+      (assoc m
+        :minibuffer
+          (ed-name-prompt "Install grammar: "
+            names
+            (fn (m2 text)
+              (let (chosen (string/trim text))
+                (if (= chosen "")
+                  (message m2 "no language given")
+                  (grammar-install-start m2 (keyword chosen))))))))))
