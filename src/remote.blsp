@@ -65,13 +65,13 @@ background daemon). Without it, `--serve` also opens the host's own window (see 
 
 (defn remote-positional (args)
   "The first positional argument (a file path) in `args` — skipping flags (`--x`) AND the
-value token of a value-taking flag (`--name` / `--attach` / `--as` / `--listen`). So
-`--serve --shared` and `--serve --shared notes.txt` both parse correctly: nil and
-\"notes.txt\" respectively (a bare `--serve` never swallows the following `--shared` as a
+value token of a value-taking flag (`--name` / `--attach` / `--as` / `--listen` / `--cookie` /
+`--invite`). So `--serve --shared` and `--serve --shared notes.txt` both parse correctly: nil
+and \"notes.txt\" respectively (a bare `--serve` never swallows the following `--shared` as a
 filename). nil if none."
   (cond
     (empty? args) nil
-    (includes? ["--name" "--attach" "--as" "--listen"] (first args))
+    (includes? ["--name" "--attach" "--as" "--listen" "--cookie" "--invite"] (first args))
       (remote-positional (rest (rest args)))
     (string/starts-with? (first args) "--") (remote-positional (rest args))
     :else (first args)))
@@ -119,16 +119,53 @@ stay name-only. Idempotent for the node itself; the TCP listener is added even w
     (when (= (node/name) :nonode)
       (node/start (keyword name)))
     (let (addr (remote-listen-addr (argv)))
-      (when addr (node/also-listen addr)))))
+      (when addr
+        (node/also-listen addr)
+        (remote-grant-guests (argv))))))
 
-(defn- remote-attach-hint (name)
+;; ---- who may attach over TCP: guest grants, not the machine's cookie (ADR-415) -----------
+;; A node link authenticated with ~/.config/brood/cookie is every node on this machine, with
+;; code execution, for good. A TCP session hands out GUEST cookies instead (brood's
+;; `node/grant-guest`): fresh per session, reaching only the session server
+;; (`editor/serve/serve-name`) and the session it is given, and refusing any message that
+;; carries code. `--invite alice,bob` mints one per person with the name bound, so the
+;; server knows who attached rather than taking `--as` on trust.
+
+(defn- remote-fresh-cookie ()
+  "A new session cookie: 24 random bytes, hex."
+  (encoding/hex-encode-bytes (crypto/random-bytes 24)))
+
+(defn remote-invites (args)
+  "The names `--invite alice,bob` asks for, in order — `[]` without the flag."
+  (let (v (remote-arg-after args "--invite"))
+    (if (nil? v)
+      []
+      (into [] (seq/filter (map (string/split v ",") string/trim) (fn (name) (not (= name ""))))))))
+
+(defn- remote-grant-guests (args)
+  "Grant this session's guest cookies: one anyone you give it to can attach with (they say
+who they are), and one per `--invite` name (the name is bound). `{:session cookie :invites
+[[name cookie] …]}`, kept for the attach hint."
+  (let (names [editor/serve/serve-name]
+        session (node/grant-guest (remote-fresh-cookie) {:names names})
+        invites (map (remote-invites args)
+                  (fn (person)
+                    [person (node/grant-guest (remote-fresh-cookie) {:names names :as person})])))
+    {:session session :invites invites}))
+
+(defn- remote-attach-hint (name guests)
   "The attach command clients should run: plain NAME over the local Unix socket, or
-NAME@HOST:PORT when the daemon listens on TCP (`--listen`; a 0.0.0.0 bind means 'use
-this machine's reachable address' — substitute it on the other end)."
+NAME@HOST:PORT with this session's guest cookie when the daemon listens on TCP (`--listen`;
+a 0.0.0.0 bind means 'use this machine's reachable address' — substitute it on the other
+end), and one line per `--invite`d person with their own."
   (let (addr (remote-listen-addr (argv)))
     (if (nil? addr)
       (str "bedit --attach " name)
-      (str "bedit --attach " name "@" addr))))
+      (let (base (str "bedit --attach " name "@" addr " --cookie "))
+        (string/join (cons (str base (:session guests))
+                       (map (:invites guests)
+                         (fn ([person cookie]) (str "\n    for " person ":  " base cookie))))
+          "")))))
 
 (defn remote-main? (args)
   "True when `args` (the CLI tokens `main` received) requested daemon (`--serve`) or client
@@ -192,15 +229,15 @@ editor session over the link. By default the host also gets its **own local wind
 session (so serving isn't blind); `--headless` skips it (a pure background daemon). The runtime
 must already be a node — launch with `bedit --name NAME --serve [file]`. Blocks."
   (let (name (remote-node-name (argv)))
-    (remote-ensure-node name)
-    (serve (ed-serve-model file) ed-view ed-update)
-    (io/puts (str "bedit daemon '"
-               name
-               "' serving"
-               (if (nil? file) "" (str " " file))
-               " (private buffer per client)."))
-    (io/puts (str "  attach from another terminal:  " (remote-attach-hint name)))
-    (ed-serve-run name)))
+    (let (guests (remote-ensure-node name))
+      (serve (ed-serve-model file) ed-view ed-update)
+      (io/puts (str "bedit daemon '"
+                 name
+                 "' serving"
+                 (if (nil? file) "" (str " " file))
+                 " (private buffer per client)."))
+      (io/puts (str "  attach from another terminal:  " (remote-attach-hint name guests)))
+      (ed-serve-run name))))
 
 ;; ---- --serve --shared: shared content, a cursor per client (src/collab.blsp) -----
 ;; THE collaborative mode (`--collab` is an alias; the old fan-ONE-model/one-cursor
@@ -255,20 +292,20 @@ see `src/collab.blsp`). Blocks."
     ;; the node comes up FIRST, so the buffer process's pid carries the node's
     ;; stamp from birth — one less place for the pre-node-start `nonode` stamp
     ;; (now equality-normalized in the kernel, but why invite it) to appear
-    (remote-ensure-node name)
-    (let (reg (registry-start {:mirror true})
-          buf (ed-collab-buffer file)
-          proc (if (nil? (buffer-file buf))
-                 (spawn-buffer buf) ; the scratch welcome — not registry-tracked
-                 (collab-registry-share reg buf)))
-      (serve (ed-serve-collab-model file proc reg) ed-view ed-update)
-      (io/puts (str "bedit daemon '"
-                 name
-                 "' serving"
-                 (if (nil? file) "" (str " " file))
-                 " (SHARED — one document, everyone their own caret)."))
-      (io/puts (str "  attach:  " (remote-attach-hint name) " [--as NAME]"))
-      (ed-serve-run name))))
+    (let (guests (remote-ensure-node name))
+      (let (reg (registry-start {:mirror true})
+            buf (ed-collab-buffer file)
+            proc (if (nil? (buffer-file buf))
+                   (spawn-buffer buf) ; the scratch welcome — not registry-tracked
+                   (collab-registry-share reg buf)))
+        (serve (ed-serve-collab-model file proc reg) ed-view ed-update)
+        (io/puts (str "bedit daemon '"
+                   name
+                   "' serving"
+                   (if (nil? file) "" (str " " file))
+                   " (SHARED — one document, everyone their own caret)."))
+        (io/puts (str "  attach:  " (remote-attach-hint name guests) " [--as NAME]"))
+        (ed-serve-run name)))))
 
 (defn ed-attach (spec)
   "Open a native window and attach it to the bedit daemon named `spec` (\"name\" for a
@@ -282,6 +319,8 @@ make install`) — a clear error says so if it's missing."
   (if (bound? 'editor/serve/attach-display)
     (editor/serve/attach-display spec
       (gui-display {:app-id *app-id*})
-      nil
+      ;; the session's guest cookie (`--cookie`, from the daemon's attach hint), else the
+      ;; machine cookie — which only reaches a daemon on this machine's own nodes
+      (remote-arg-after (argv) "--cookie")
       {:name (remote-participant (argv))})
     (error "ed-attach: this nest's std lacks attach-display — rebuild Brood: (cd ../brood && ./configure --with-gui && make install)")))

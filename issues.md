@@ -55,12 +55,12 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   filename runs code.
   *Brood:* `os/shell-quote`. *bedit:* argv rows where possible; quote the rest.
 
-- [~] **S8 Web mirror / collab trust model.** FIXED: bare `--listen PORT` binds loopback; docs say attaching is full trust. OPEN (Brood): per-session cookies, a link that cannot ship code, trusted `--as`. `remote.blsp:92-117` — the machine-wide
+- [x] **S8 Web mirror / collab trust model.** FIXED: bare `--listen PORT` binds loopback. And brood ADR-415, guest links: a `--listen` session hands out a fresh guest cookie (and one per `--invite NAME`, the name bound — so `--as` is no longer taken on trust); a guest link reaches only the serve entry and the session it is given, and drops any message carrying code; and a guest's SESSION runs an allowlist (`model/ed-guest-allows?` — editing what it was given; no files, shells, eval, git, terminals). Was: `remote.blsp:92-117` — the machine-wide
   cookie is what the docs tell you to hand a collaborator (full code execution on every
   node); bare `--listen PORT` binds `0.0.0.0`; `--as NAME` is trusted.
   *Brood:* capability-scoped links. *bedit:* loopback default; docs say attach = full trust.
 
-- [~] **S9 Plugins: checksum only, no authenticity.** FIXED: install/update/startup share the `:enhances` check; refused packages stay off the load path (tested against a scratch config dir, `config/*config-base*`). OPEN (Brood std/package): signatures or trust-on-first-use for hosted packages. `packages.blsp:114-120`; the sha256
+- [x] **S9 Plugins: checksum only, no authenticity.** FIXED: install/update/startup share the `:enhances` check; refused packages stay off the load path. And brood's runtime install now checks the signature as the lock path does (ADR-212 TOFU, the key pinned in the install dir) and returns the verdict, which the install message shows (`packages/installed-note`). Found on the way and fixed in brood too: reinstalling or updating an installed package failed (its `%rm-rf` deletes only inside a `_deps/`). Was: `packages.blsp:114-120`; the sha256
   comes from the same registry response. `install!`/`update!` skip the `:enhances`
   version check startup applies; `load-installed!` adds refused packages to the load path.
 

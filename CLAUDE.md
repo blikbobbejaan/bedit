@@ -442,7 +442,10 @@ src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c 
                             discovered, cookie asked for not assumed, and the mode line
                             names the node the whole time, because the risk is forgetting
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
-src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model over node links
+src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model over node links.
+                            A TCP session hands out GUEST cookies (brood ADR-415; one per
+                            `--invite NAME`, the name bound), never the machine cookie, and a
+                            guest's session runs an allowlist (`model/ed-guest-allows?`)
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
