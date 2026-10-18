@@ -1,0 +1,153 @@
+(defmodule eldoc
+  "The idle beat's point-driven hints: the eldoc line (the buffer mode's `:eldoc` service,
+off the loop), when a language server's signature hint is due (`ed-signature-stale?` — the
+ask itself is `lsp-commands/ed-launch-signature`), and the inline completion preview.
+
+Each registers its idle-beat job (and eldoc its task-reply fold) when this module loads, so
+the model's timer reconciliation and the dispatcher's beat fold over a table instead of
+naming them."
+  (:use editor/buffer) ; buffer-text / buffer-point / buffer-rope
+  (:use model) ; ed-current-buf / ed-mode-service / ed-headless? / the registries
+  (:use task)) ; task — the eldoc service runs off the loop
+;; complete-at-point is deferred: referenced qualified, behind a `bound?` guard.
+
+;; ---- the post-event step: cached eldoc + debounced diagnostics --------------
+;; Both the eldoc hint and the advisory type-check are too costly to recompute on the
+;; render path (eldoc, every frame) or on every keystroke (the whole-buffer check).
+;; Emacs runs eldoc / flymake on an *idle timer*; we do the same with the editor's
+;; existing `:tick` beat. `input/ed-update` runs `ed-post-step` after each event folds
+;; in: it caches the eldoc string on the model (so `view` just paints it) and, instead
+;; of type-checking per key, arms a short debounce tick whose firing runs the check
+;; once typing settles. While a key auto-repeats, the typematic delay is the debounce.
+
+(sig ed-cache-eldoc (model -> model))
+(defn ed-cache-eldoc (m)
+  "Refresh the model's cached `:eldoc` hint — the current buffer mode's `:eldoc`
+service applied to point, or nil when the mode offers none. Also stamps `:eldoc-point`
+(the point it was computed at) so `ed-eldoc-stale?` can tell when point has moved and a
+refresh is due. Computed on the idle tick (`ed-post-step`), not per keystroke: the
+service parses around point (O(point) for brood-mode's `enclosing-call`), too costly to
+run on every key in a large buffer. A service error caches nil rather than disrupting
+the edit."
+  (let (buf (ed-current-buf m)
+        svc (ed-mode-service buf :eldoc)
+        pt (buffer-point buf))
+    (if (nil? svc)
+      (assoc m :eldoc nil :eldoc-point pt)
+      (assoc m
+        :eldoc
+          (try
+            (svc (buffer-text buf) pt)
+            (catch e (do (log/warn (str "eldoc service failed: " (error-message e))) nil)))
+        :eldoc-point pt))))
+
+(defn ed-eldoc-stale? (m)
+  "True if the current buffer offers an `:eldoc` service and point has moved since the
+cached `:eldoc` was computed (`:eldoc-point`) — a refresh is due. Buffers whose mode
+offers no eldoc never pay. (Point-move covers typing too, since inserting moves point.)"
+  (let (buf (ed-current-buf m))
+    (and (ed-mode-service buf :eldoc)
+      (not (= (buffer-point buf) (:eldoc-point m))))))
+
+(defn ed-signature-stale? (m)
+  "True when the LSP argument hint (`textDocument/signatureHelp`) is due a refresh — a
+server is connected, point or the text has moved since the last one was asked for
+(`:signature-at`), and the buffer's mode does not answer for itself.
+
+The mode's own `:eldoc` service wins where there is one, and not by seniority: it is
+local, instant and always right about the language it was written for, whereas this costs
+a round-trip. They share the `:eldoc` slot, so letting both write it would make the hint
+depend on which reply landed last."
+  (let (buf (ed-current-buf m))
+    (and (:lsp m)
+      (nil? (ed-mode-service buf :eldoc))
+      (not (= [(buffer-point buf) (buffer-rope buf)] (:signature-at m))))))
+
+(defn ed-preview-stale? (m)
+  "True when the inline completion preview needs recomputing — point moved, or the text
+did, since the cached one was made. Keyed on both because a preview is about the word
+before point and both of those change it."
+  (let (buf (ed-current-buf m))
+    (not (= [(buffer-point buf) (buffer-rope buf)] (:completion-preview-at m)))))
+
+(defn ed-refresh-preview (m)
+  "Recompute the inline completion preview (`:completion-preview`), stamped with the point
+and rope it was computed for so the view can tell a live one from a stale one.
+
+A no-op unless [[ed-preview-stale?]] — not (only) for the cost, but because the preview
+carries a CHOICE: M-n/M-p cycle which candidate it shows, and recomputing a preview the
+text has not changed under would silently walk it back to the first one while your hands
+were off the keys.
+
+Deferred-module guarded and late-bound like every other idle-beat client: a preview is a
+nicety, and a model that could not be built without it would be the wrong shape."
+  (if (or (not (bound? 'complete-at-point/completion-preview)) (not (ed-preview-stale? m)))
+    m
+    (let (buf (ed-current-buf m))
+      (assoc m
+        :completion-preview
+        ;; a source that raises must cost the reader a missing suggestion, never the frame
+          (check-allow :discarded-catch
+            (try ((reflect/eval 'complete-at-point/completion-preview) m) (catch _ nil)))
+        :completion-preview-at [(buffer-point buf) (buffer-rope buf)]))))
+
+(defn ed-launch-eldoc (m)
+  "Refresh the eldoc hint OFF the loop (the diagnostics pattern): with a live `:editor`
+process, run the mode's `:eldoc` service in a spawned task — recording its handle on
+`:eldoc-proc` and the point it is computed at on `:eldoc-checking`, so a stale reply
+can't clobber a newer hint — and fold the reply via `ed-apply-eldoc` on `[:task-done]`.
+Headless (no `:editor`) → synchronous (`ed-cache-eldoc`). A no-op when nothing is
+stale or a compute is already in flight."
+  (let (buf (ed-current-buf m)
+        svc (ed-mode-service buf :eldoc))
+    (cond
+      (or (nil? svc) (not (ed-eldoc-stale? m))) m
+      (:eldoc-proc m) m
+      (ed-headless?) (ed-cache-eldoc m)
+      :else
+        (let (text (buffer-text buf)
+              pt (buffer-point buf)
+              job (task (fn ()
+                          (try
+                            (svc text pt)
+                            (catch e
+                              (do (log/warn (str "eldoc service failed: " (error-message e))) nil))))))
+          ;; :eldoc-checking records the point AND the rope the hint is being
+          ;; computed for — the reply is dropped if the user switched buffers
+          ;; (or the text changed) while the task ran, else buffer A's signature
+          ;; would be cached (and shown) as buffer B's
+          (assoc m :eldoc-proc job :eldoc-checking {:pt pt :rope (buffer-rope buf)})))))
+
+(sig ed-apply-eldoc (model any -> model))
+(defn ed-apply-eldoc (m result)
+  "Fold a finished eldoc task's reply (nil on error/timeout): cache the hint against
+the point it was computed at (`:eldoc-checking` → `:eldoc-point`) and clear the
+in-flight handle — but only when the CURRENT buffer still holds the rope the hint
+was computed for; a reply landing after a buffer switch (or an edit) is dropped
+(the stale `:eldoc-point` mismatch then lets the next idle beat relaunch).
+`ed-eldoc-stale?` re-fires iff point moved on while the task ran."
+  (let (chk (:eldoc-checking m)
+        m1 (assoc m :eldoc-proc nil :eldoc-checking nil))
+    (if (= (buffer-rope (ed-current-buf m1)) (:rope chk))
+      (assoc m1 :eldoc result :eldoc-point (:pt chk))
+      m1)))
+
+(defn ed-quit-eldoc (m)
+  "C-g killed an eldoc lookup (`:on-quit`): forget the point it was computing for, so the
+next idle beat asks afresh."
+  (dissoc m :eldoc-checking))
+
+;; ---- registration ---------------------------------------------------------------
+
+(register-task-reply :eldoc-proc
+  'eldoc/ed-apply-eldoc
+  nil
+  nil
+  {:cancel-on-quit? true :on-quit 'eldoc/ed-quit-eldoc})
+
+;; the preview first: it is about the word before point as the beat finds it
+(register-idle-job :completion-preview
+  {:order 10 :run 'eldoc/ed-refresh-preview :stale? 'eldoc/ed-preview-stale? :held-key-gated? true})
+
+(register-idle-job :eldoc
+  {:order 40 :run 'eldoc/ed-launch-eldoc :stale? 'eldoc/ed-eldoc-stale? :held-key-gated? true})

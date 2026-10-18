@@ -13,7 +13,6 @@ between / open / kill buffers; `cmd-switch-buffer` / `cmd-find-file` open a
 minibuffer prompt (see `input`). This is editor *policy* — the reusable buffer
 model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use editor/buffer) ; the buffer ops the commands drive (incl. undo/redo, word motion)
-  (:use eval-command) ; last-sexp-source + eval-source — the async C-x C-e family
   (:use sexp) ; structural s-expression navigation (brood-mode commands)
   ;; NB: tree-sitter's structural motions (ruby/elixir-mode, ROADMAP §C) are deliberately
   ;; NOT `:use`d — see the `require` below.
@@ -21,17 +20,17 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use editor/pane) ; the pane-tree ops behind the split/other/delete commands
   (:use panes) ; ed-toggle-line-numbers — the line-number gutter toggle (C-x l)
   (:use complete-at-point) ; cmd-complete / complete-word-char? — TAB indent-or-complete
-  (:use completion) ; perms-string / rwx — the dired `ls -l` permission columns
   (:use isearch) ; incremental search + query-replace (the modal mini-loops)
   (:use mincomplete) ; ed-complete-name / ed-complete-path — minibuffer prompt completion
-  (:use collab) ; follow / participants / unfollow — the shared-session commands (C-x f)
   (:use projects) ; project-root / project-files — find-file-in-project (C-x p f)
-  (:use task) ; task / cancel-task — the off-loop, cancellable, timeout-bounded async eval
-  (:use io :exclude [inspect]) ; process-port — stream a spawned eval's output back to the editor
+  (:use task) ; task — off-loop jobs (the project file walk)
   ; web / lsp / proctree are deferred — required lazily inside their commands
-  (:use keymaps) ; ed-set-profile + vim-to-* — the emacs/vim keybinding profiles
-  (:use lsp-requests) ; the request-kind records + the LspRequest ability (fold impls below)
+  (:use keymaps) ; ed-set-profile + ed-vim-command-mode? — the emacs/vim keybinding profiles
   (:use results) ; the results-buffer abstraction — line-loc vocabulary + ed-append-follow
+  (:use pool) ; the buffer pool: open / select / kill, display-buffer, find-file, save
+  (:use keyhelp) ; key / command labels, where-is, docstrings
+  (:use scroll) ; ed-scroll / ed-max-top / ed-wrap? — keeping point on screen
+  (:use autosave) ; auto-save sidecars + auto-revert
   (:use model)) ; current-buffer accessors, the kill ring, message
 ;; Tree-sitter's structural motions (ruby/elixir-mode) are REQUIRED, not `:use`d. They
 ;; share several names with `sexp` — `point-defun-start`, `point-down`, … — and two `:use`s
@@ -43,20 +42,6 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
 ;; and config (init-config / apply-to-model) are referenced qualified below and auto-load.
 ;; `modes` (a project source module, loaded with the image) provides
 ;; welcome-link-at / *welcome-links* — the welcome scratch's clickable link lines.
-
-(defn ed-name-prompt (prompt names on-complete &optional (limit 20) (recent []))
-  "A Vertico minibuffer spec that completes input against a fixed `names` list — Tab to
-the common prefix, a fuzzy candidate list (top `limit`) — and runs `on-complete`
-(`(model text) -> model`) on the accepted entry. The shared shape behind M-x,
-switch-buffer, recentf, describe-function, and bookmark-jump. `recent` (a most-recent-first
-list, default none) floats its entries to the top on empty input via the shared
-`projects/float-recent` — the same recency any completion opts into (see `recent-commands`)."
-  {:edit (ed-mb-edit prompt "")
-   :on-complete on-complete
-   :complete-fn (fn (t) (ed-complete-name t names))
-   :rank-source (projects/float-recent names recent) ; recents first, then fuzzy-narrowed on typing
-   :rank-cap limit
-   :accept-selection true})
 
 ;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e/M-f/M-b + the arrow keys) -------
 
@@ -245,48 +230,55 @@ a tree-sitter node."
 ;; leading whitespace, preserving point. Emacs feel: TAB indents-or-completes, and
 ;; (in brood-mode) RET indents the new line.
 
-(defn- ed-ws-char? (c) "True for an indentation char (space or tab)." (or (= c " ") (= c "\t")))
+(sig ed-rope-leading-ws (any int -> int))
+(defn- ed-rope-leading-ws (rope bol)
+  "The count of leading spaces/tabs on the line starting at offset `bol` of `rope`."
+  ;; WHY the rope and not a string: every caller used to pass `(buffer-text buf)`, which
+  ;; copies the WHOLE buffer into a fresh string (~1 ms on a 2 MB file) and then pays that
+  ;; string's first char-index build on `string/char-at` (another ~2-3 ms, O(buffer)
+  ;; whatever the offset) — to count a few spaces. `text/skip-forward` reads only the run.
+  ;; Same answer as the char-at walk it replaced: both stop at the first char that is
+  ;; neither a space nor a tab, or at the end of the text.
+  (- (text/skip-forward rope bol " \t" true) bol))
 
-(defn- ed-leading-ws* (text i n)
-  (if (and (< i (string/length text)) (ed-ws-char? (string/char-at text i)))
-    (ed-leading-ws* text (inc i) (inc n))
-    n))
-(sig ed-leading-ws (string int -> int))
-(defn- ed-leading-ws (text bol)
-  "The count of leading spaces/tabs on the line starting at offset `bol`."
-  (ed-leading-ws* text bol 0))
-
-(sig ed-fallback-indent (string int -> int))
-(defn- ed-fallback-indent (text bol)
+(sig ed-fallback-indent (any int -> int))
+(defn- ed-fallback-indent (rope bol)
   "The simple, mode-less indent for the line at `bol`: the leading-whitespace width
 of the previous non-blank line, or 0 at the top. Tail-recursive over blank lines."
+  ;; Over the rope for the reason `ed-rope-leading-ws` is: this walks a line or two, and
+  ;; the string form paid O(buffer) to do it. The previous line's start is the rope's own
+  ;; line index (`text/line->char` of the line holding `bol - 1`) — the offset just past
+  ;; the previous newline that the backward char-at scan found.
   (if (<= bol 0)
     0
-    (let (prev-bol (ed-line-start-offset text (dec bol))
+    (let (prev-bol (text/line->char rope (text/char->line rope (dec bol)))
           content-len (- (dec bol) prev-bol)
-          ws (ed-leading-ws text prev-bol))
+          ws (ed-rope-leading-ws rope prev-bol))
       (if (>= ws content-len)
         ; previous line is empty / all whitespace — skip it
-        (ed-fallback-indent text prev-bol)
+        (ed-fallback-indent rope prev-bol)
         ws))))
 
 (defn ed-indent-target (buf)
   "The column the current line should indent to: the buffer mode's `:indent` service
 applied to the line start, else the previous-line fallback."
-  (let (text (buffer-text buf)
-        bol (buffer-point (beginning-of-line buf))
+  ;; The whole-buffer string is built only for a mode service, whose `(text bol)` contract
+  ;; needs it; the fallback reads the rope. (The service's own cost on a fresh string is
+  ;; brood's — see `brood-mode/brood-indent`.)
+  (let (bol (buffer-point (beginning-of-line buf))
         svc (ed-mode-service buf :indent))
-    (if (nil? svc) (ed-fallback-indent text bol) (svc text bol))))
+    (if (nil? svc) (ed-fallback-indent (buffer-rope buf) bol) (svc (buffer-text buf) bol))))
 
 (sig ed-reindent-line (buffer int -> buffer))
 (defn ed-reindent-line (buf target)
   "Reindent the current line of `buf` to `target` columns of leading spaces,
 preserving point: from inside the old indentation point moves to the first non-blank
 char; from the body it shifts by the indent delta."
-  (let (text (buffer-text buf)
-        p (buffer-point buf)
+  (let (p (buffer-point buf)
         bol (buffer-point (beginning-of-line buf))
-        cur (ed-leading-ws text bol)
+        ;; from the rope, not `(buffer-text buf)` — see `ed-rope-leading-ws`: RET and TAB
+        ;; both land here, and the string copy was a third of RET's cost on a large file
+        cur (ed-rope-leading-ws (buffer-rope buf) bol)
         within (<= (- p bol) cur)
         b1 (replace-region buf bol (+ bol cur) (string/repeat " " target))
         newp (if within (+ bol target) (+ p (- target cur))))
@@ -359,7 +351,7 @@ and a bulk reindent declines to put anything on a line with nothing on it."
   "Remove up to `width` leading spaces/tabs from line `ln`; a no-op on a line with none."
   (let (rope (buffer-rope buf)
         bol (text/line->char rope ln)
-        drop-n (math/min width (ed-leading-ws (buffer-text buf) bol)))
+        drop-n (math/min width (ed-rope-leading-ws rope bol)))
     (if (= drop-n 0) buf (replace-region buf bol (+ bol drop-n) ""))))
 
 (defcommand cmd-dedent
@@ -396,16 +388,6 @@ useful equivalent). A no-op when no form follows point."
             (let (nb (ed-fold-region-lines b first last ed-reindent-line-at))
               (back-to-indentation (goto-char nb (text/line->char (buffer-rope nb) first))))))))))
 
-(defn ed-vim-command-mode? (m)
-  "True while a modal profile holds the keyboard in a COMMAND state — vim `:normal`
-or `:visual`, where a plain key means a command and **nothing types**. The guard a
-mode-local EDITING binding needs: a buffer's mode layer outranks the model's
-profile (that's what makes modes work), so a mode that binds an editing key —
-brood-mode's RET-inserts-and-indents, the tutorial's — would otherwise fire it in
-normal mode and type behind the user's back. Emacs has no modal state, so this is
-false there and the binding behaves exactly as before."
-  (includes? [:normal :visual] (:edit-state m)))
-
 (defcommand cmd-newline-and-indent
   (m key)
   "Enter in a structured mode: insert a newline, then indent the new line to its
@@ -431,14 +413,16 @@ right indent and point sits on a symbol, complete instead (Emacs `tab-always-ind
     (if rl
       (let ([first last] rl)
         (ed-edit m (fn (b) (ed-map-region-lines b first last ed-reindent-line-at))))
-      (let (text (buffer-text buf)
-            bol (buffer-point (beginning-of-line buf))
-            cur (ed-leading-ws text bol)
+      ;; the indent and the char before point are read off the rope — a `buffer-text` copy
+      ;; here was a second whole-buffer string per TAB beside `ed-indent-target`'s; `p > 0`
+      ;; there (it exceeds `bol + cur`), so the one-char slice before it is that same char
+      (let (bol (buffer-point (beginning-of-line buf))
+            cur (ed-rope-leading-ws (buffer-rope buf) bol)
             p (buffer-point buf)
             target (ed-indent-target buf))
         (if (and (= cur target)
               (> p (+ bol cur))
-              (complete-word-char? (string/char-at text (dec p))))
+              (complete-word-char? (text/slice (buffer-rope buf) (dec p) p)))
           (cmd-complete m key)
           (ed-edit m (fn (b) (ed-reindent-line b target))))))))
 
@@ -560,7 +544,13 @@ top level a stray `)` closes nothing and is typed, `[1 2|)` is a mismatch and is
 inside a string or a comment a bracket is a character and is typed. Bound on brood-keymap
 only: the scan reads Brood syntax (`;` comments, `\"` strings), which is not Ruby's."
   (let (b (ed-current-buf m))
-    (if (and b (editor/highlight/closer-redundant? (buffer-text b) (buffer-point b) key))
+    ;; The char after point is asked of the rope FIRST: `closer-redundant?` answers false
+    ;; unless that char is this same closer (its own first test), and every other `)` typed —
+    ;; the usual case — then skips the whole-buffer `buffer-text` copy and the fresh string's
+    ;; char-index build (~4 ms per keystroke on a 2 MB file) for an answer it already has.
+    (if (and b
+          (= (buffer-char-after b) key)
+          (editor/highlight/closer-redundant? (buffer-text b) (buffer-point b) key))
       (ed-apply m (fn (bb) (goto-char bb (inc (buffer-point bb)))))
       (cmd-self-insert m key))))
 
@@ -726,52 +716,10 @@ block, closing the gap. Yank it back with C-x r y."
 ;; The model tracks `:last-command`/`:this-command` (set by the dispatch loop, see
 ;; `input`) so a kill knows whether the *previous* command was also a kill (then it
 ;; appends to the head entry rather than starting a new one), and so M-y
-;; (`cmd-yank-pop`) only fires right after a yank.
-;; Commands whose consecutive use coalesces into one kill-ring entry (like Emacs).
-;; Every command that kills, so consecutive kills coalesce into one entry (Emacs
-;; `kill-append`). `cmd-copy-region` is here on purpose: Emacs's copy-region-as-kill appends
-;; after a kill too. A kill command left off this list silently starts a new entry —
-;; `M-k M-k` used to leave two sentences on the ring instead of one.
-(def- ed-kill-commands
-  '(commands/cmd-kill-region commands/cmd-copy-region
-     commands/cmd-kill-line commands/cmd-kill-word commands/cmd-backward-kill-word
-     commands/cmd-kill-whole-line commands/cmd-sexp-kill commands/cmd-kill-sentence
-     commands/cmd-backward-kill-sentence commands/cmd-kill-sexp commands/cmd-backward-kill-sexp
-     commands/cmd-zap-to-char))
+;; (`cmd-yank-pop`) only fires right after a yank. The ring itself — `ed-push-kill`, the
+;; coalescing rule and `ed-drag-copy` — lives in `model`, beside the kill-ring state.
 (def- ed-yank-commands '(commands/cmd-yank commands/cmd-yank-pop))
-
-;; Cap the ring like Emacs's `kill-ring-max` (default 60) so it can't grow forever.
-
-(defn- ed-kill-command? (sym) (includes? ed-kill-commands sym))
 (defn- ed-yank-command? (sym) (includes? ed-yank-commands sym))
-
-(defn ed-push-kill (m text forward?)
-  "Push killed `text` onto the kill ring. If the previous command was also a kill,
-**append** to the current head entry instead of starting a new one — at the end for
-a forward kill, the front for a backward kill (Emacs's consecutive-kill coalescing).
-Otherwise cons a fresh entry. The new ring head is also mirrored to the OS clipboard
-(`os/clipboard-set`, itself a no-op without a clipboard) so every kill / copy is system-wide — Emacs's
-`interprogram-cut-function` / `select-enable-clipboard`; `cmd-yank` reads it back."
-  (let (ring (:kill-ring m)
-        coalesce? (and (ed-kill-command? (:last-command m)) (not (empty? ring)))
-        head (if coalesce?
-               (if forward? (str (first ring) text) (str text (first ring)))
-               text)
-        tail (if coalesce? (rest ring) ring))
-    ;; `os/clipboard-set` is itself a no-op without a clipboard, so nothing here is guarded:
-    ;; a stale name must raise, not leave every kill un-mirrored.
-    (when (:os-clipboard m) (os/clipboard-set head))
-    (assoc m :kill-ring (take (cons head tail) ed-kill-ring-max))))
-
-(defn ed-drag-copy (m)
-  "Emacs `mouse-drag-copy-region`: when a mouse drag-select ends with a real region,
-copy it to the kill ring — and thus the OS clipboard (`ed-push-kill`) — WITHOUT clearing
-it, so releasing a highlight makes it immediately paste-able in any buffer, read-only or
-not. Silent (no echo — a drag shouldn't spam the echo area). A plain click selects
-nothing, so it's a no-op. Coalescing is suppressed (`:last-command` cleared) so the
-selection is its own entry, never appended to a prior kill."
-  (let (text (buffer-region (ed-current-buf m)))
-    (if (nil? text) m (ed-push-kill (assoc m :last-command nil) text true))))
 
 (defn ed-kill-span (m move)
   "Kill from point to where `move` (a `buffer -> buffer` point move) lands: push
@@ -875,13 +823,15 @@ dragged the newline into the line."
         s1 (buffer-point (backward-word (goto-char b s2)))
         e1 (buffer-point (forward-word (goto-char b s1))))
     (if (and (>= s1 0) (< s1 e1) (<= e1 s2) (< s2 e2))
-      (let (txt (buffer-text b))
+      ;; the three pieces are sliced off the rope: each is a word or the gap between two, and
+      ;; a `buffer-text` copy of the whole buffer to cut them from cost O(buffer) per M-t
+      (let (rope (buffer-rope b))
         (goto-char (replace-region b
                      s1
                      e2
-                     (str (string/substring txt s2 e2)
-                       (string/substring txt e1 s2)
-                       (string/substring txt s1 e1)))
+                     (str (text/slice rope s2 e2)
+                       (text/slice rope e1 s2)
+                       (text/slice rope s1 e1)))
           e2))
       b)))
 
@@ -1016,7 +966,8 @@ on: nothing you cycle through is lost."
         ;; the run as it stood when the cycle began — captured on the first press,
         ;; carried unchanged after that (the buffer no longer holds it)
         orig (if (= phase :one-space)
-               {:text (string/substring (buffer-text b) lo hi) :offset (- (buffer-point b) lo)}
+               ;; the run off the rope — a whitespace run, not worth a whole-buffer copy
+               {:text (text/slice (buffer-rope b) lo hi) :offset (- (buffer-point b) lo)}
                (:orig st))
         stash {:phase phase :lo lo :orig orig})
     (assoc (if (= phase :restore)
@@ -1073,14 +1024,24 @@ separation after it. The paragraph's prefix — its indentation and a comment or
   (let (b (ed-current-buf m))
     (assoc (ed-set-buf m (set-read-only b (not (read-only? b))))
       :echo (if (read-only? b) "writable" "read-only")))) ; report the NEW state
+
+(defn ed-no-write-refusal (buf verb)
+  "Why `buf` must not be written to its file, as the echo-area line — or nil when it may be.
+Asks the buffer's MODE (its `:no-write` facet, `{:what :why}`), so a buffer whose text is a
+RENDERING of the file rather than the file — a hex view of a binary — refuses C-x C-s and
+C-x C-w alike without either command naming it. `verb` is the refused action (`saved` /
+`written`)."
+  (let (refusal (ed-mode-service buf :no-write))
+    (when refusal (str (:what refusal) " is not " verb " (" (:why refusal) ")"))))
+
 (defcommand cmd-write-file
   (m key)
   "Write the buffer to a path read in the minibuffer (C-x C-w); the buffer is then backed
 by that path (future C-x C-s saves there). Uses the same shared path prompt as find-file /
 dired (`ed-path-prompt`) — prefilled with the current file's path (else the current dir).
-A hex view is refused: its text renders the binary, it is not the binary."
-  (if (= (editor/layers/buffer-type-for (ed-current-buf m)) :hexl)
-    (message m "a hex view is not written (it renders the binary; edit the file itself)")
+A buffer whose mode refuses writing (`ed-no-write-refusal` — a hex view) is refused."
+  (if-let (refusal (ed-no-write-refusal (ed-current-buf m) "written"))
+    (message m refusal)
     (assoc m
       :minibuffer
         (ed-path-prompt "Write file: "
@@ -1098,20 +1059,12 @@ A hex view is refused: its text renders the binary, it is not the binary."
                   ;; new file's mtime (dropping it left a stale stamp -> a false
                   ;; "changed on disk" on the next save)
                   (let (b2 (save-buffer b)
-                        as-path (when old-file (ed-auto-save-path old-file))
                         ;; a shared buffer is now a different document: the registry
                         ;; entry (and every other frame's copy) follows it
                         m2 (hosted/hosted-rekey-slot (dissoc (ed-set-buf mm b2) :status)
                              (ed-current-index mm)
                              old-key))
-                    (when (and as-path (file/exists? as-path))
-                      (try
-                        (file/rm as-path)
-                        (catch e
-                          (log/warn (str "could not remove auto-save "
-                                      as-path
-                                      ": "
-                                      (error-message e))))))
+                    (ed-remove-auto-save old-file)
                     (message m2 (str "wrote " path))))
                 (catch e (message mm (str "write failed: " (error-message e)))))))))))
 
@@ -1174,116 +1127,14 @@ A hex view is refused: its text renders the binary, it is not the binary."
           (if (nil? found)
             (message mm (str "not found: " ch))
             (ed-kill-span mm (fn (b) (goto-char b (inc found)))))))))) ; kill [point, found] to ring
-;; ---- registers (C-x r SPC / j / s / i) --------------------------------------
-;; A register is a single-character slot in the model's `:registers` map holding a
-;; `Register` record — a saved point (`point-register`) or text (`text-register`).
-;; The ability keeps the jump/insert commands closed over WHAT a register holds:
-;; a new register kind (a rectangle, a window config, …) is a record + impl here,
-;; not another branch in the commands. Each command reads the register name with
-;; `ed-read-char`. Emacs C-x r SPC / j / s / i.
-
-(defrecord point-register ((position int))) ; C-x r SPC — a saved buffer position
-(defrecord text-register ((text string))) ; C-x r s — a saved region
-(defability Register
-  "What a register's held value can do: jump to it (C-x r j) or insert it (C-x r i).
-A kind that can't do one says so in the echo area (`c` is the register's name)."
-  (register-jump [self m c] :-> any)
-  (register-insert [self m c] :-> any))
-
-(impl Register
-  point-register
-  (register-jump [v m c]
-    (ed-apply m (fn (b) (goto-char b (math/min (point-register-position v) (buffer-length b))))))
-  (register-insert [v m c] (message m (str "register " c " holds no text"))))
-
-(impl Register
-  text-register
-  (register-jump [v m c] (message m (str "register " c " holds no point")))
-  (register-insert [v m c] (ed-edit m (fn (b) (insert b (text-register-text v))))))
-
-(defn ed-set-register (m c v) (assoc m :registers (assoc (or (:registers m) {}) c v)))
-(defn ed-get-register (m c) (get (or (:registers m) {}) c))
-
-(defcommand cmd-point-to-register
-  (m key)
-  "Save point in a register (C-x r SPC <r>); C-x r j <r> later jumps back to it."
-  (ed-read-char m
-    "Point to register: "
-    (fn (mm c)
-      (message (ed-set-register mm c (point-register (buffer-point (ed-current-buf mm))))
-        (str "Point saved in register " c)))))
-
-(defcommand cmd-jump-to-register
-  (m key)
-  "Jump to the point saved in a register (C-x r j <r>)."
-  (ed-read-char m
-    "Jump to register: "
-    (fn (mm c)
-      (let (v (ed-get-register mm c))
-        (if v
-          (register-jump v mm c)
-          (message mm (str "register " c " holds no point")))))))
-
-(defcommand cmd-copy-to-register
-  (m key)
-  "Copy the region into a register (C-x r s <r>); C-x r i <r> inserts it later."
-  (ed-read-char m
-    "Copy to register: "
-    (fn (mm c)
-      (let (txt (buffer-region (ed-current-buf mm)))
-        (if (nil? txt)
-          (message mm *no-region-message*)
-          (message (ed-set-register mm c (text-register txt))
-            (str "Region saved in register " c)))))))
-
-(defcommand cmd-insert-register
-  (m key)
-  "Insert a register's saved text at point (C-x r i <r>)."
-  (ed-read-char m
-    "Insert register: "
-    (fn (mm c)
-      (let (v (ed-get-register mm c))
-        (if v
-          (register-insert v mm c)
-          (message mm (str "register " c " holds no text")))))))
-
-;; ---- bookmarks (C-x r m set / C-x r b jump) ---------------------------------
-
-(defcommand cmd-bookmark-set
-  (m key)
-  "Set a named bookmark at point in the current file (C-x r m); persisted across sessions."
-  (let (b (ed-current-buf m) f (buffer-file b) p (buffer-point b))
-    (if (nil? f)
-      (message m "buffer has no file to bookmark")
-      (assoc m
-        :minibuffer
-          {:edit (ed-mb-edit "Set bookmark: " "")
-           :on-complete (fn (mm t)
-                          (do
-                            (bookmark-set! t f p)
-                            (message mm (str "Bookmark set: " t))))}))))
-
-(defcommand cmd-bookmark-jump
-  (m key)
-  "Jump to a bookmark (C-x r b): prompt with completion, open its file and go to point."
-  (let (names (into [] (bookmark-names)))
-    (if (empty? names)
-      (message m "no bookmarks yet (set one with C-x r m)")
-      (assoc m
-        :minibuffer
-          (ed-name-prompt "Jump to bookmark: "
-            names
-            (fn (mm t)
-              (let (bk (bookmark-get t))
-                (if (nil? bk)
-                  (message mm (str "no bookmark: " t))
-                  (ed-apply (ed-find-file mm (:file bk))
-                    (fn (bb) (goto-char bb (math/min (:pos bk) (buffer-length bb)))))))))))))
 
 ;; ---- occur (M-s o) ----------------------------------------------------------
 ;; List the current buffer's lines matching a string in a read-only *Occur* buffer;
-;; RET on a result jumps to that line in the source. Reuses the *Process List* report
-;; pattern (ed-show-named + a special read-only mode whose RET is bound — see modes).
+;; RET or a click on a result visits that line of the source, in another pane. A results
+;; buffer like *Diagnostics*: each row's location rides OFF-text in `:line-links`
+;; (`{:buffer :line}`, resolved by `results/line-links-only-loc`), and the jump is the
+;; shared `cmd-visit-location` (`results/location-jump-layer`) — so a second *Occur* over
+;; another buffer can never send the first one's rows to the wrong source.
 
 (defn- ed-occur-matches (buf needle)
   "`[line0 text]` for each 0-based line of `buf` whose text contains `needle`."
@@ -1294,7 +1145,7 @@ A kind that can't do one says so in the echo area (`c` is the register's name)."
 
 (defn ed-occur-text (matches needle)
   "The *Occur* buffer text for `matches` of `needle`: a header line then `N: <line>`
-rows (1-based source line numbers, which `cmd-occur-jump` parses back)."
+rows (1-based source line numbers)."
   (str (count matches)
     " matches for \""
     needle
@@ -1302,10 +1153,16 @@ rows (1-based source line numbers, which `cmd-occur-jump` parses back)."
     (string/join (map matches (fn (e) (str (inc (first e)) ": " (second e)))) "\n")
     "\n"))
 
+(defn- ed-occur-links (matches source)
+  "The *Occur* rows' `:line-links`: each row (0-based, after the header line) → the
+`{:buffer :line}` of the match it shows in buffer `source`."
+  (into {}
+    (map (seq/enumerate matches) (fn ([i e]) [(inc i) {:buffer source :line (inc (first e))}]))))
+
 (defcommand cmd-occur
   (m key)
   "List the current buffer's lines matching a string in a read-only *Occur* buffer
-(M-s o); RET on a result jumps to that line in the source buffer."
+(M-s o); RET on a result visits that line of the source buffer, in another pane."
   (let (src (buffer-name (ed-current-buf m)))
     (assoc m
       :minibuffer
@@ -1316,24 +1173,13 @@ rows (1-based source line numbers, which `cmd-occur-jump` parses back)."
                           (let (matches (ed-occur-matches (ed-current-buf mm) t))
                             (if (empty? matches)
                               (message mm (str "no matches for \"" t "\""))
-                              (ed-show-named (assoc mm :occur-source src)
-                                "*Occur*"
-                                (ed-occur-text matches t)
-                                :occur)))))})))
-
-(defcommand cmd-occur-jump
-  (m key)
-  "Jump to the source line named on the current *Occur* row (RET in *Occur*)."
-  (let (ln (ed-leading-int (buffer-line-at (ed-current-buf m)
-                             (buffer-current-line (ed-current-buf m))))
-        src (:occur-source m))
-    (cond
-      (nil? ln) (message m "not on a match line")
-      (nil? src) (message m "not on a match line")
-      (nil? (ed-buffer-index-by-name m src)) (message m (str "source buffer gone: " src))
-      else
-        (ed-apply (ed-select m (ed-buffer-index-by-name! m src))
-          (fn (b) (ed-goto-line b ln))))))
+                              (let (shown (ed-show-named mm
+                                            "*Occur*"
+                                            (ed-occur-text matches t)
+                                            :occur))
+                                (ed-set-buf shown
+                                  (assoc (ed-current-buf shown)
+                                    :line-links (ed-occur-links matches src))))))))})))
 
 ;; ---- reload the user config (M-x reload-config) -----------------------------
 ;; `~/.config/bedit/init.blsp` is read as DATA at startup (config/init-config),
@@ -1355,156 +1201,6 @@ so it can't be applied with eval-buffer."
     (message m1
       (if (empty? warns) "config reloaded" (str "config reloaded (" (first warns) ")")))))
 
-;; ---- hexl: a binary file as a hex view ---------------------------------------
-;; `find-file` on a file that is not UTF-8 (an ELF, a PNG, a .o) used to fail with
-;; "stream did not contain valid UTF-8" and open nothing. Emacs opens it in
-;; `hexl-mode`; so does this: a read-only `:hexl` buffer of xxd-style rows — offset,
-;; sixteen bytes as hex pairs, the printable ASCII beside — capped at `*hexl-cap*`
-;; bytes with a header saying so, because the rows are built in Brood and a
-;; multi-megabyte object file is not what anyone reads by eye.
-
-(defdyn *hexl-cap* 65536) ; bytes of a binary shown (4096 rows)
-(sig *hexl-cap* int)
-(def- hexl-row-bytes 16)
-
-(defn- hexl-ascii (b)
-  "The ASCII column's character for byte `b`: printable 7-bit as itself, else `.`."
-  (if (and (>= b 32) (< b 127)) (string/codepoints-> (list b)) "."))
-
-(defn hexl-row (b off n)
-  "One xxd row for the `n` bytes of `b` from `off`: `00000010: 7f45 4c46 … |.ELF…|`.
-Pure over the bytes value; the row is padded so the ASCII column lines up on a short
-last row."
-  (letrec (go (fn (j hex asc)
-                (if (>= j hexl-row-bytes)
-                  (str (string/format "%08x: " off) hex "  " (string/trimr asc))
-                  (let (sep (if (and (> j 0) (= 0 (math/rem j 2))) " " "")
-                        in? (< j n)
-                        v (if in? (nth b (+ off j) 0) 0))
-                    (go (inc j)
-                      (str hex sep (if in? (string/format "%02x" v) "  "))
-                      (str asc (if in? (hexl-ascii v) " ")))))))
-    (go 0 "" "")))
-
-(defn hexl-text (b)
-  "The hex view of bytes `b`: a header line, then a row per sixteen bytes up to
-`*hexl-cap*`."
-  (let (total (count b)
-        shown (math/min total *hexl-cap*)
-        rows (math/quot (+ shown (dec hexl-row-bytes)) hexl-row-bytes)
-        header (if (> total shown)
-                 (str ";; binary file: " total " bytes — the first " shown " shown (read-only)")
-                 (str ";; binary file: " total " bytes (read-only)")))
-    (string/join (cons header
-                   (map (range rows)
-                     (fn (r)
-                       (let (off (* r hexl-row-bytes))
-                         (hexl-row b off (math/min hexl-row-bytes (- shown off)))))))
-      "\n")))
-
-;; The hex view's `:fontify` service: a row is `<8 hex offset>: <hex pairs>  <ascii>` —
-;; the offset dim (a line number), the pairs in the text colour, a zero pair dimmer
-;; still (padding reads as structure at a glance), the ASCII column as a string; the
-;; header as a comment. Line-structural, so a windowed slice fontifies wherever it starts.
-
-(def- hexl-hex-col 10) ; the first hex pair's column: 8 offset digits, `:`, a space
-(def- hexl-ascii-col (+ hexl-hex-col 39 2)) ; 16 pairs + 7 group spaces, then two spaces
-(sig hexl-ascii-col int)
-
-(defn- hexl-pair-spans (lt off i n acc)
-  "The dim spans over the zero pairs (`00`) of row `lt` between hex columns `i`..`n`."
-  (if (>= i n)
-    acc
-    (let (pair (string/substring lt i (math/min n (+ i 2))))
-      (hexl-pair-spans lt
-        off
-        ;; pairs sit at +0 and +2 of each `xxxx ` group of five columns
-        (+ i (if (= 0 (math/rem (- i hexl-hex-col) 5)) 2 3))
-        n
-        (if (= pair "00") (cons [(+ off i) (+ off i 2) theme/face-dired-size] acc) acc)))))
-(sig hexl-pair-spans (string int int int list -> list))
-
-(defn- hexl-line-spans (lt off)
-  "The spans for one hex-view line at absolute offset `off`."
-  (let (n (string/length lt))
-    (cond
-      (string/starts-with? lt ";;") (list [off (+ off n) (editor/face/face :syntax/comment)])
-      (and (>= n hexl-hex-col) (= (string/substring lt 8 9) ":"))
-        (append (list [off (+ off 8) theme/face-dired-size])
-          (reverse (hexl-pair-spans lt off hexl-hex-col (math/min n (- hexl-ascii-col 2)) '()))
-          (if (> n hexl-ascii-col)
-            (list [(+ off hexl-ascii-col) (+ off n) (editor/face/face :syntax/string)])
-            '()))
-      else '())))
-
-(defn- hexl-spans-acc (lines off acc)
-  (if (empty? lines)
-    (reverse acc)
-    (hexl-spans-acc (rest lines)
-      (+ off (string/length (first lines)) 1)
-      (fold (hexl-line-spans (first lines) off) acc (fn (a s) (cons s a))))))
-
-(defn hexl-fontify (src)
-  "The hex view's `:fontify` service: `[start end face]` spans for a slice `src` of a
-`:hexl` buffer — offsets dim, zero bytes dimmer, the ASCII column as a string, the
-header as a comment."
-  (hexl-spans-acc (string/split src "\n") 0 '()))
-
-(defn- ed-open-binary (m path root)
-  "Open `path` (an existing file that is not UTF-8) as a `:hexl` buffer — Emacs
-`hexl-mode`, read-only. Its `:file` is kept so the mode line names it and `C-x C-j`
-lands in its directory, but there is no saving a hex view."
-  (let (b (file/slurp-bytes path)
-        m1 (ed-show-named m (file-display-name path root) (hexl-text b) :hexl))
-    (message (ed-set-buf m1 (assoc (ed-current-buf m1) :file path :dir (path/dirname path)))
-      (str "opened " path " as hex (binary, " (count b) " bytes)"))))
-
-(defn- utf8-file? (path)
-  "True when the bytes at `path` decode as UTF-8 — a text file `find-file-buffer` can read.
-The decode failing IS the answer (a binary), so the error is the verdict, not a fault."
-  (check-allow :discarded-catch
-    (try (do (string/bytes-> (file/slurp-bytes path)) true) (catch e false))))
-
-;; ---- dired lives in src/dired.blsp -----------------------------------------------
-;; Dired builds on this module (the find-file prompt, the default directory, the line
-;; motions), so this one reaches it at RUNTIME rather than through its header — a header
-;; each way would be a cycle, which does not fail loudly: it leaves one module
-;; half-initialised and breaks something unrelated.
-
-;; check-allow: the listing comes back through `reflect/eval`, which the checker reads as
-;; unknown; `dired/ed-show-dired` answers a model.
-(check-allow :trusted
-  (defn ed-open-dired (m dir)
-    "Show the dired listing of `dir` (`dired/ed-show-dired`) — what opening a directory from
-anywhere does. Loads `dired` on first use; by then this module has finished loading."
-    (do (require-one 'dired) ((reflect/eval 'dired/ed-show-dired) m dir))))
-(sig ed-open-dired (model string -> model))
-
-;; ---- describe-key (C-h k) ---------------------------------------------------
-
-(defcommand cmd-describe-key
-  (m key)
-  "Describe the next key sequence (C-h k): read a key (or chord) and report, in the echo
-area, the command it runs and the first line of its docstring. Handled by the describe-key
-transient (`input`); Esc/C-g aborts."
-  (assoc (message m "Describe key: ") :describe-key {:pending nil :keys []}))
-
-(defcommand cmd-describe-function
-  (m key)
-  "Describe a command by name (C-h f): prompt with completion over the M-x registry,
-then show the first line of its docstring in the echo area."
-  (let (names (command-names))
-    (assoc m
-      :minibuffer
-        (ed-name-prompt "Describe command: "
-          names
-          (fn (mm t)
-            (let (sym (command-sym t))
-              (if (nil? sym)
-                (message mm (str "no command: " t))
-                (let (d (ed-doc sym))
-                  (message mm (if d (str t " — " (ed-first-line d)) (str t " (no docstring)")))))))))))
-
 ;; ---- goto-line (M-g g) / recentf (C-x C-r) ----------------------------------
 
 (defn- ed-parse-int (s)
@@ -1512,21 +1208,6 @@ then show the first line of its docstring in the echo area."
   ;; `s` is what the user typed at the prompt — not reading as an integer is the answer
   (check-allow :discarded-catch
     (try (let (v (reflect/read-string s)) (if (int? v) v nil)) (catch e nil))))
-
-(sig ed-goto-line (buffer int -> buffer))
-(defn ed-goto-line (b n)
-  "Move point to the start of (1-based) line `n`, clamped to the buffer's line range."
-  (let (target (math/max 0 (math/min (dec n) (dec (buffer-line-count b)))))
-    (fold (range target) (beginning-of-buffer b) (fn (bb _) (forward-line bb)))))
-
-(sig ed-goto-line-col (buffer int int -> buffer))
-(defn ed-goto-line-col (b line0 col)
-  "Move point to 0-based `line0` / `col` (LSP coordinates), clamped to the buffer. Used by
-imenu/xref jumps, which land on a symbol's start position."
-  (let (rope (buffer-rope b)
-        ln (math/max 0 (math/min line0 (dec (buffer-line-count b))))
-        bol (text/line->char rope ln))
-    (goto-char b (math/min (+ bol (math/max 0 col)) (buffer-length b)))))
 
 (defcommand cmd-goto-line
   (m key)
@@ -1576,27 +1257,38 @@ first, fuzzy-narrowed). The list is the persisted ~/.cache/brood/recent-files ca
 
 (defn- ed-line-blank? (buf l) (string/blank? (buffer-line-at buf l)))
 
+;; Every per-line reader below works on the ROPE. They each took `(buffer-text buf)` — a
+;; copy of the whole buffer — per line, and the commented-test then copied the REST of the
+;; buffer again (`string/substring text at`) just to ask whether it starts with `;;`: M-; on
+;; one line of a 2 MB file was several whole-buffer copies, and a region was that per line.
+
+(defn- ed-indent-at (buf l)
+  "The offset of line `l`'s first non-indent character (its start plus its leading
+spaces/tabs)."
+  (let (rope (buffer-rope buf) bol (text/line->char rope l)) (+ bol (ed-rope-leading-ws rope bol))))
+
+(defn- ed-rope-starts-with? (buf at s)
+  "True if the text of `buf` from offset `at` begins with `s`."
+  ;; the slice is exactly as long as `s` (or what is left, when less is): equal to `s`
+  ;; precisely when the text from `at` starts with it — what `string/starts-with?` asked of
+  ;; the substring to the END of the buffer
+  (= (text/slice (buffer-rope buf) at (math/min (buffer-length buf) (+ at (string/length s)))) s))
+
 (defn- ed-line-commented? (buf l trimmed)
   "True if line `l` (after its indent) starts with the trimmed comment token."
-  (let (text (buffer-text buf)
-        bol (text/line->char (buffer-rope buf) l))
-    (string/starts-with? (string/substring text (+ bol (ed-leading-ws text bol))) trimmed)))
+  (ed-rope-starts-with? buf (ed-indent-at buf l) trimmed))
 
 (defn- ed-comment-line (buf l tok)
   "Insert comment token `tok` at the indent column of line `l`."
-  (let (bol (text/line->char (buffer-rope buf) l))
-    (insert (goto-char buf (+ bol (ed-leading-ws (buffer-text buf) bol))) tok)))
+  (insert (goto-char buf (ed-indent-at buf l)) tok))
 
 (defn- ed-uncomment-line (buf l tok trimmed)
   "Strip a leading comment token from line `l` — the full `tok` (with its space) when
 present, else the trimmed token; a no-op if the line isn't commented."
-  (let (text (buffer-text buf)
-        bol (text/line->char (buffer-rope buf) l)
-        at (+ bol (ed-leading-ws text bol))
-        rest (string/substring text at)
+  (let (at (ed-indent-at buf l)
         n (cond
-            (string/starts-with? rest tok) (string/length tok)
-            (string/starts-with? rest trimmed) (string/length trimmed)
+            (ed-rope-starts-with? buf at tok) (string/length tok)
+            (ed-rope-starts-with? buf at trimmed) (string/length trimmed)
             else 0))
     (if (= n 0) buf (replace-region buf at (+ at n) ""))))
 
@@ -1614,9 +1306,8 @@ is already commented, else comment. The per-line edit folds over `map-region-lin
                    (cond
                      (ed-line-blank? b l) b
                      all-commented? (ed-uncomment-line b l tok trimmed)
-                     else (ed-comment-line b l tok))))
-        sbol (text/line->char (buffer-rope edited) sl))
-    (goto-char edited (+ sbol (ed-leading-ws (buffer-text edited) sbol)))))
+                     else (ed-comment-line b l tok)))))
+    (goto-char edited (ed-indent-at edited sl))))
 
 (defcommand cmd-comment-dwim
   (m key)
@@ -1688,7 +1379,9 @@ outside your selection are simply not applied."
     (if (nil? (buffer-region-bounds b))
       (ed-undo-step m 'commands/cmd-undo "No further undo" "undo")
       (let (undone (editor/buffer/undo-in-region b))
-        (if (= (buffer-text undone) (buffer-text b))
+        ;; ropes compare by content, natively — the same test as the two whole-buffer
+        ;; string copies it replaces, without making them
+        (if (= (buffer-rope undone) (buffer-rope b))
           (message m "no change in the region to undo")
           (message (ed-set-buf m undone)
             "undid the region"))))))
@@ -1885,14 +1578,6 @@ motion (Emacs shift-select). Bound to every `:shift-*` key; `key` picks the moti
       (message m *no-region-message*)
       (ed-edit (ed-push-kill m text true) delete-region))))
 
-(defn- ed-link-at-point (m)
-  "The source location the current line of the current buffer links to (a results
-buffer's `:line-loc`, resolved for indented detail lines like the click does), or nil
-for an ordinary buffer / a non-link line."
-  (let (buf (ed-current-buf m))
-    (when (ed-mode-service buf :line-loc)
-      (line-link-loc buf (buffer-current-line buf)))))
-
 (defn- ed-link-abs-string (m loc)
   "Format `loc` as an absolute `path:line` — the paste-able jump target, the file made
 absolute against the project root (or cwd) when it isn't already."
@@ -1950,107 +1635,7 @@ one undo takes the whole M-y back."
         (if swapped?
           (assoc m2 :yank {:start (:start y) :end (buffer-point (ed-current-buf m2)) :index idx})
           m2)))))
-;; ---- right-click context menu (a standard dropdown) -------------------------
-;; A modal overlay on `:menu` listing actions that run the *same* commands as the
-;; keyboard (so Copy is exactly M-w, Cut C-w, Paste C-y, Select All C-x h — and thus the
-;; same OS-clipboard sync). Opened by a right-press (input/ed-ev-mouse), navigated by
-;; arrows + Enter (the `:menu` overlay handler in input), hovered + clicked by the mouse.
-;; Items are maps `{:label :key :run :enabled :sep}` — enabled/disabled computed when the
-;; menu opens so it reflects the current region / clipboard, like a native menu. The view
-;; renders from the item maps + the shared geometry (completion/context-menu-*); the `:run`
-;; command fn is only read back here.
-
-(defn ed-menu-items-for (m)
-  "The context-menu items for the current model — each with its keyboard shortcut and
-whether it applies now (`:enabled`; a disabled item renders dimmed and won't run). `:sep`
-marks a divider drawn above the item (the group break before Select All). Copy is enabled
-by a region OR a link under point; Cut by a region; Paste by a non-empty kill ring."
-  (let (has-region (not (nil? (buffer-region (ed-current-buf m))))
-        has-link (not (nil? (ed-link-at-point m)))
-        has-clip (not (empty? (:kill-ring m))))
-    (list {:label "Copy" :key "M-w" :run cmd-copy-region :enabled (or has-region has-link)}
-      {:label "Cut" :key "C-w" :run cmd-kill-region :enabled has-region}
-      {:label "Paste" :key "C-y" :run cmd-yank :enabled has-clip}
-      {:label "Select All" :key "C-x h" :run cmd-mark-whole-buffer :enabled true :sep true})))
-
-(defn- ed-menu-enabled (items)
-  "The indices of the enabled items — navigation and the initial selection land only on
-these (disabled items and the divider are skipped)."
-  (seq/filter (range (count items)) (fn (i) (:enabled (nth items i)))))
-
-(defn ed-open-menu (m row col)
-  "Open the context menu anchored at screen cell `[row col]` (point and the region are
-left untouched, so Copy/Cut act on the current selection). Selection starts on the first
-enabled item."
-  (let (items (ed-menu-items-for m)
-        enabled (ed-menu-enabled items))
-    (assoc m
-      :menu
-        {:row row
-         :col col
-         :items items
-         :sel (if (empty? enabled) 0 (first enabled))})))
-
-(defn ed-close-menu (m) "Dismiss the context menu." (dissoc m :menu))
-
-(sig ed-menu-move (model int -> model))
-(defn ed-menu-move (m d)
-  "Move the selection by `d` among the ENABLED items, wrapping — disabled items and the
-divider are skipped (arrow-key navigation)."
-  (let (menu (:menu m)
-        items (:items menu)
-        enabled (ed-menu-enabled items))
-    (if (empty? enabled)
-      m
-      ;; `index-of` answers -1 for "not found", never nil, so the `(or … 0)` this used to
-      ;; spell could not fire: a selection that is no longer enabled left `pos` at -1, and
-      ;; `M-<`'s `d` of -1 then wrapped to the second-from-last item instead of the first.
-      (let (cur (:sel menu)
-            at (index-of enabled cur)
-            pos (if (>= at 0) at 0)
-            nxt (nth enabled (math/mod (+ pos d) (count enabled))))
-        (assoc m :menu (assoc menu :sel nxt))))))
-
-(defn ed-menu-jump (m end)
-  "Select the FIRST or LAST enabled item — M-< / M->, meaning the same ends here as in a
-buffer, the minibuffer's candidate list and the completion popup."
-  (let (menu (:menu m)
-        enabled (ed-menu-enabled (:items menu)))
-    (if (empty? enabled)
-      m
-      (assoc m :menu (assoc menu :sel (if (= end :first) (first enabled) (last enabled)))))))
-
-(defn ed-menu-run (m)
-  "Run the selected item's command (`key` = nil) with the menu closed — so the command
-sees no `:menu` and its copy/cut/paste is the real edit. A disabled item is a no-op."
-  (let (menu (:menu m)
-        item (nth (:items menu) (:sel menu)))
-    (if (:enabled item)
-      ((:run item) (ed-close-menu m) nil)
-      m)))
-
-;; The click geometry + hit-test live in the view's ui-kit widget (view/ed-menu-hit reads
-;; the widget's zones), so a click can't disagree with what's drawn. These are the pure
-;; model ops the mouse dispatch (input/ed-menu-mouse-*) drives from that hit result.
-
-(defn ed-menu-activate (m i)
-  "Run item `i` — a click landed on it. Selects then runs; a disabled item is unreachable
-(the widget emits no zone for it), so this only ever runs an enabled command."
-  (ed-menu-run (assoc m :menu (assoc (:menu m) :sel i))))
-
-(defn ed-menu-select (m i)
-  "Hover-select item `i` (the pointer moved over it) without running it — the standard
-dropdown's hover-follows-pointer."
-  (assoc m :menu (assoc (:menu m) :sel i)))
-
 ;; ---- multiple buffers -------------------------------------------------------
-
-;; Switching shows buffer `i` in the SELECTED pane (other panes keep their
-;; buffers); `:status` is per-model, so reset it (else a stale "modified" from the
-;; previous buffer would describe the new one).
-(sig ed-select (model int -> model))
-(defn ed-select (m i)
-  (assoc (ed-show-index m i) :status ""))
 
 (defcommand cmd-next-buffer
   (m key)
@@ -2063,78 +1648,6 @@ dropdown's hover-follows-pointer."
   (ed-select m
     (math/mod (+ (dec (ed-current-index m)) (count (:buffers m)))
       (count (:buffers m)))))
-
-(defn ed-has-editable? (bufs)
-  "Whether the pool `bufs` holds a buffer other than `*Messages*`."
-  (any? bufs (fn (b) (not (= (buffer-name b) "*Messages*")))))
-
-(defn- ed-remap (m killed target)
-  "Re-point every pane after pool index `killed` was removed: a pane on
-`killed` now shows `target`; panes above `killed` shift down one; below are
-unchanged. (Routes through `ed-map-panes` over all leaf payloads.)"
-  (ed-map-panes m
-    (fn (w)
-      (let (b (:buffer w))
-        (assoc w :buffer (cond (< b killed) b (> b killed) (dec b) else target))))))
-
-(defn- ed-kill-at (m killed-idx follow-companions?)
-  "Kill pool buffer `killed-idx`: fire its mode layers' `:on-close`, unhost/unshare it,
-remove it, and re-point the panes that showed it (appending a fresh `*scratch*` if the pool
-would be left with nothing editable). The body of `cmd-kill-buffer`, factored out so the
-companion sweep below can reuse the whole path rather than half of it.
-
-With `follow-companions?` the buffers the closing mode NAMED (`layers/request-close`) are
-killed too — a mode's own second window, like the tutorial's *Workings* pane, which means
-nothing once the tutorial is gone. Their own `:on-close` fires (they may own workers), but
-their requests are NOT followed: one level, so a pair of modes naming each other cannot
-loop."
-  (let (buf (nth (:buffers m) killed-idx)
-        ;; The close hooks are effects (a mode kills the worker it spawned), but the closed
-        ;; context is also DATA — the companion names it left on itself. A hook cannot close
-        ;; them itself: it only ever sees its own buffer, and layers has no idea the app
-        ;; keeps a pool. So it names them and we act, here, where the pool is.
-        closed (try
-                 (editor/layers/close-context buf)
-                 (catch e (do (log/warn (str "close hook failed: " (error-message e))) nil)))
-        companions (if follow-companions?
-                     (try (editor/layers/close-requests closed) (catch _ (list)))
-                     (list))
-        ;; a collab-shared slot withdraws its presence first; a registry-hosted one (frames)
-        ;; is dropped by `hosted-drop-slot` itself, which also removes it from the registry
-        m0 (if (get-in m [:hosted killed-idx :collab?])
-             (collab/collab-unshare m killed-idx) ; presence withdraw + unsubscribe
-             m)
-        m0 (hosted/hosted-drop-slot m0 killed-idx) ; stop-if-local + index remap
-        removed (seq/remove-nth (:buffers m0) killed-idx)
-        label (str "killed " (buffer-name buf))
-        m1 (if (ed-has-editable? removed)
-             ;; another editable buffer remains: the killed pane shows the buffer
-             ;; that shifted into its slot (clamped to the last index).
-             (message (ed-remap (assoc m0 :buffers removed)
-                        killed-idx
-                        (math/min killed-idx (dec (count removed))))
-               label)
-             ;; none left → append a fresh *scratch* and point the killed pane at it.
-             (let (bufs (into removed [(ed-stamp (make-buffer ""))]))
-               (message (ed-remap (assoc m0 :buffers bufs) killed-idx (count removed)) label))))
-    ;; Then the companions, by NAME — indices have just shifted, so each is looked up
-    ;; afresh; one that is already gone (or never existed) is simply skipped.
-    ;;
-    ;; The echo is re-stated at the end, naming what the reader actually killed. Each
-    ;; companion kill echoes its own name as it goes, and the last one won: killing
-    ;; *Tutorial* reported "killed *Workings*", which is not the buffer anyone asked about.
-    (let ([m2 also] (fold companions
-                      [m1 (list)]
-                      (fn (acc nm)
-                        (let ([mm killed] acc
-                              i (ed-buffer-index-by-name mm nm))
-                          (cond
-                            (nil? i) acc
-                            (= nm "*Messages*") acc
-                            else [(ed-kill-at mm i false) (append killed (list nm))])))))
-      (if (empty? also)
-        m2
-        (message m2 (str label " (with " (string/join also ", ") ")"))))))
 
 (defcommand cmd-kill-buffer
   (m key)
@@ -2156,25 +1669,10 @@ that mode asked to take with it (`layers/request-close`) are killed as well."
         (ed-read-char m
           (str "Buffer " (buffer-name buf) " modified; kill anyway? (y or n)")
           (fn (mm k)
-            (if (or (= k "y") (= k "Y"))
+            (if (ed-yes-key? k)
               (ed-kill-at mm (ed-current-index mm) true)
               (message mm "kill canceled"))))
       else (ed-kill-at m (ed-current-index m) true))))
-
-(sig ed-kill-buffer-named (model string -> model))
-(defn ed-kill-buffer-named (m nm)
-  "Kill the pool buffer named `nm` — the full `ed-kill-at` path (its `:on-close`, the
-pane re-point), companions not followed — or `m` unchanged when there is none. For a mode
-closing a pane it owns (`aside/close`), which knows the pane by NAME and is not on it."
-  (let (idx (ed-buffer-index-by-name m nm))
-    (if (nil? idx) m (ed-kill-at m idx false))))
-
-(defn ed-kill-buffer-at (m idx)
-  "Kill pool buffer `idx` — the full `ed-kill-at` path, companions not followed. For a
-caller that knows the buffer by its SLOT because a name would be ambiguous: another
-frame's kill arrives keyed by document (`frames/ed-ev-registry-removed`), and two
-buffers may share a display name."
-  (ed-kill-at m idx false))
 
 ;; check-allow: the link's command is resolved late (`reflect/eval`), so its result is unknown
 ;; to the checker; every command answers a model
@@ -2194,186 +1692,12 @@ again rather than an unbound error."
         (bound? (second link)) ((reflect/eval (second link)) m key)
         :else (message m "that one is still loading — one second, then click again")))))
 
-(defn ed-open-buffer (m buf)
-  "Add `buf` to the pool (mode-stamped, and carrying a `:dir`) and show it in the selected
-pane. A buffer with no `:dir` of its own — a fileless one (scratch, *Occur*, …) — inherits
-the **current** buffer's `:dir`, so it opens 'in' the directory/project you were in (Emacs
-`default-directory` inheritance)."
-  (let (stamped (ed-stamp buf)
-        with-dir (if (nil? (:dir stamped))
-                   (assoc stamped :dir (:dir (ed-current-buf m)))
-                   stamped)
-        bufs (into (:buffers m) [with-dir]))
-    (ed-select (assoc m :buffers bufs) (dec (count bufs)))))
-
-(defn ed-upsert-named (m nm text &optional (type nil))
-  "Add or replace the pool buffer named `nm` holding `text` (stamped `type`, so a special mode
-and its read-only `:activate` hook apply) **without** touching the layout or selection. The
-pool-side half shared by `ed-show-named` (which then selects it) and `ed-show-named-aside`
-(which shows it in a side pane). Look the buffer's index up afterwards with
-`ed-buffer-index-by-name`. A fresh buffer inherits the current buffer's `:dir`; a re-show keeps
-the existing one's."
-  (let (idx (ed-buffer-index-by-name m nm)
-        raw (make-buffer text nm)
-        buf (if (nil? type) raw (editor/layers/set-buffer-type raw type)))
-    (if (nil? idx)
-      (assoc m
-        :buffers
-          (into (:buffers m)
-            [(assoc (ed-stamp buf) :dir (:dir (ed-current-buf m)))]))
-      (assoc m
-        :buffers
-          (assoc (:buffers m)
-            idx
-              (assoc (ed-stamp buf)
-                :dir
-                  (or (get (nth (:buffers m) idx) :dir)
-                    (:dir (ed-current-buf m)))))))))
-
-(defn- ed-other-pane-path (layout)
-  "The path of the pane `C-x o` would move to from the selected one (the next leaf in traversal
-order, wrapping) — where a side/preview buffer goes."
-  (let (paths (pane-leaf-paths layout)
-        i (index-of paths (pane-selected-path layout)))
-    (nth paths (math/mod (inc i) (count paths)))))
-
-(defn- ed-pane-showing (layout idx)
-  "The path of the first pane already showing pool buffer `idx`, or nil — the reuse probe
-behind `ed-display-buffer` (an existing window wins over a fresh split, like Emacs
-`display-buffer`). Reads each pane's payload by path (`pane-payload-at`, std editor/pane)."
-  (seq/find (pane-leaf-paths layout) (fn (p) (= idx (:buffer (pane-payload-at layout p))))))
-
-(defn- ed-place-aside (layout idx)
-  "Show buffer `idx` in a pane beside the selected one, returning `{:layout :path}`: split the
-lone pane off (new pane on the right at `:path`), else re-point the next pane in traversal order.
-Selection is left untouched — the caller decides whether to move onto `:path`."
-  (if (= (pane-count layout) 1)
-    {:layout (pane-split layout :col (ed-pane idx))
-     :path (append (pane-selected-path layout) (list :b))}
-    (let (p (ed-other-pane-path layout))
-      {:layout (pane-update-path layout
-                 p
-                 (fn (w) (assoc w :buffer idx :top 0 :point nil :mark nil)))
-       :path p})))
-
-(defn ed-display-buffer (m nm text &optional (type nil) (opts {}))
-  "The single place a command hands a report buffer to the window manager — an Emacs
-`display-buffer`/`pop-to-buffer` analog, so callers say WHAT to show and HOW, never WHERE.
-Upserts `nm`/`text`/`type` into the pool (stamping `type` so a special mode + its read-only
-`:activate` hook apply, and re-apply on every re-show), then places it by `(:action opts)`:
-  `:here`    — the selected pane, replacing it, and select it (the default).
-  `:pop`     — another pane, moving selection there (Emacs `pop-to-buffer`).
-  `:display` — another pane, selection left put — a preview (press-to-preview lists).
-Reuse first: if some pane already shows `nm`, that pane is used in place — no new split —
-matching `display-buffer`'s reuse rule. The reuse seam for generated/refreshable buffers
-(*Process List*, *git-log*, *git-diff*, …).
-
-Two more options shape a buffer that is RE-shown as it changes rather than regenerated:
-`:spans` stamps `[start end face]` faces onto the buffer as data (`:face-spans`, for text
-whose faces no lexer can recover — a rendered preview); `:keep-scroll` leaves a reused
-pane's scroll where it was instead of returning it to the top, so a refresh under a
-reader does not yank the view (the caller then places it — `mdpreview` follows the
-cursor)."
-  (let (action (:action opts :here)
-        m1 (ed-upsert-named m nm text type)
-        idx (ed-buffer-index-by-name! m1 nm) ; `ed-upsert-named` just put it there
-        m1 (if (contains? opts :spans)
-             (assoc m1
-               :buffers
-                 (assoc (:buffers m1) idx (assoc (ed-buf-at m1 idx) :face-spans (:spans opts))))
-             m1)
-        layout (:layout m1))
-    (if (= action :here)
-      (ed-select m1 idx)
-      (let (existing (ed-pane-showing layout idx)
-            placed (if (nil? existing) (ed-place-aside layout idx) {:layout layout :path existing})
-            ;; Reset the target pane to the top of the (freshly regenerated) report, clearing any
-            ;; stale scroll/point a reused pane carried from a previous, longer buffer — a shorter
-            ;; refresh would otherwise render a point past the new end (out-of-bounds). A
-            ;; `:keep-scroll` caller keeps the scroll (`ed-pane-top` clamps it into the buffer).
-            reset (pane-update-path (:layout placed)
-                    (:path placed)
-                    (fn (w)
-                      (if (:keep-scroll opts)
-                        (assoc w :point nil :mark nil)
-                        (assoc w :top 0 :point nil :mark nil))))
-            m2 (assoc m1 :layout reset))
-        (if (= action :pop)
-          (assoc m2 :layout (pane-select-path (:layout m2) (:path placed)))
-          m2)))))
-
-(defn ed-show-named (m nm text &optional (type nil))
-  "Show report buffer `nm`/`text`/`type` in the selected pane (replacing it) and select it —
-the thin `ed-display-buffer` `:here` wrapper kept for existing callers."
-  (ed-display-buffer m nm text type {:action :here}))
-
-(defn ed-show-named-aside (m nm text &optional (type nil))
-  "Show report buffer `nm`/`text`/`type` in a side / preview pane without moving selection —
-the thin `ed-display-buffer` `:display` wrapper. Splits a lone pane off, else reuses the next
-pane; if the buffer is already visible, that pane is refreshed in place (press-to-preview)."
-  (ed-display-buffer m nm text type {:action :display}))
-
-(defn ed-switch-to-named (m nm)
-  "Switch to the buffer named `nm`, or report there's no such buffer."
-  (let (idx (ed-buffer-index-by-name m nm))
-    (if (nil? idx) (message m (str "no buffer named " nm)) (ed-select m idx))))
-
 ;; ---- visit-location: the shared report-row jump ------------------------------
 ;; The location vocabulary (parse a row → `{:file :line :col}`) and the read-only
 ;; navigable layer now live in `src/results.blsp` (the results-buffer abstraction).
 ;; The *command* stays here: it resolves the current row's location through the layer's
 ;; `:line-loc` service (`results/line-loc-service`) and hands it to `ed-pop-to-file`,
-;; the pane/pool navigation below.
-
-;; ---- next-error: jump to a source location from a results buffer -------------
-;; The Emacs `next-error` / `display-buffer-other-window` discipline, as ONE
-;; primitive every results buffer shares (*Tests* / *Run* / *compilation* / *Occur*
-;; / *git-status*): a jump opens the source in a pane OTHER than the results pane —
-;; the results stay visible — and moves selection there. A buffer computes its own
-;; source location (the `:line-loc` mode service, or git's row→path) and hands it to
-;; `ed-pop-to-file`; WHERE/HOW lives here, once.
-
-(defn- ed-ensure-file-buffer (m path)
-  "Ensure the (absolute) `path` is in the pool WITHOUT changing selection — returns
-`[m idx]`. Reuses an open buffer for the file, else reads-or-news it (find-file
-semantics: an existing file is read, a missing one starts a fresh backed buffer)."
-  (let (idx (ed-buffer-index-by-file m path))
-    (if idx
-      [m idx]
-      (let (root (or (project-root (path/dirname path)) (:project-root m))
-            buf (ed-stamp (assoc (find-file-buffer path) :name (file-display-name path root)))
-            with-dir (if (nil? (:dir buf)) (assoc buf :dir (:dir (ed-current-buf m))) buf)
-            bufs (into (:buffers m) [with-dir]))
-        [(assoc m :buffers bufs) (dec (count bufs))]))))
-
-(defn ed-pop-to-index (m idx line)
-  "Show pool buffer `idx` at (1-based) `line` in a pane OTHER than the current one, select
-that pane and put point on the line — the placement half of [[ed-pop-to-file]], shared so a
-location naming a BUFFER lands exactly where one naming a file does."
-  (let (layout (:layout m)
-        existing (ed-pane-showing layout idx)
-        placed (if (nil? existing) (ed-place-aside layout idx) {:layout layout :path existing})
-        m1 (assoc m :layout (pane-select-path (:layout placed) (:path placed))))
-    ;; point moves; the loop's own scroll-clamp on the (now-selected) source pane
-    ;; brings it on screen this tick, as with `cmd-goto-definition`.
-    (ed-apply m1 (fn (b) (ed-goto-line b line)))))
-
-(defn ed-pop-to-buffer-named (m nm line)
-  "[[ed-pop-to-index]] for a buffer named rather than a file — what a location `{:buffer …}`
-visits. A buffer that is no longer in the pool says so instead of jumping somewhere else."
-  (let (idx (ed-buffer-index-by-name m nm))
-    (if (nil? idx) (message m (str nm " is no longer open")) (ed-pop-to-index m idx line))))
-
-(defn ed-pop-to-file (m path line)
-  "Emacs `next-error` / `display-buffer-other-window`: show `path` at (1-based)
-`line` in a pane OTHER than the current one — the results buffer stays visible —
-select that pane, and put point on the line. Reuses a pane already showing the file;
-splits a lone pane (the results buffer keeps the original). THE jump every
-results-buffer 'visit source' routes through, so the behaviour is uniform."
-  (if (string/blank? path)
-    (message m "(no file)")
-    (let ([m1 idx] (ed-ensure-file-buffer m (path/absolute path)))
-      (ed-pop-to-index m1 idx line))))
+;; the pane/pool navigation in `pool`.
 
 (defcommand cmd-visit-location
   (m key)
@@ -2400,54 +1724,6 @@ on RET."
                          (str (or (:project-root m) (file/cwd)) "/" path)))
           ;; next-error discipline: source opens in another pane, results stay put
           (ed-pop-to-file m resolved (:line loc))))))
-
-(defn ed-find-file (m path)
-  "Open `path`: switch to it if already open, read it if it exists, else start a
-fresh buffer backed by it (so Ctrl-S creates it). A relative or `~` path is resolved
-to absolute (`path-absolute`) first, so the prompt can stay short/relative while the
-buffer's `:file`, dedup, and project-relative name all key off a canonical path. A
-directory opens in dired (Emacs `find-file` on a directory), a file that is not UTF-8 as
-a hex view (`ed-open-binary`)."
-  (cond
-    (string/blank? path) (message m "(no file)")
-    (file/dir? (path/absolute path)) (ed-open-dired m (path/absolute path))
-    else
-      (let (path (path/normalize (path/absolute path)) ; `./` and `..` collapsed: one spelling per file
-            _ (when (:recent-files m) (remember-file! path)) ; recentf — live editor only
-            ;; The project follows the file you visit (Emacs `default-directory`): resolve
-            ;; the visited file's project root (`.git` / `project.blsp`) and make it the
-            ;; model's `:project-root`, so the mode line, find-file-in-project, and the
-            ;; project-relative name all track the buffer — not the dir the editor launched
-            ;; in. Falls back to the model's existing `:project-root` when the file isn't in
-            ;; a resolvable project (e.g. a virtual path). Record a freshly-resolved project
-            ;; as known too (best-effort, live editor only).
-            resolved (project-root (path/dirname path)) ; the visited file's real project, or nil
-            root (or resolved (:project-root m))
-            _ (when (and resolved (:recent-files m)) (remember-project! resolved))
-            ;; record the visit in the project's per-project recent list (the "last access"
-            ;; the default project-file sort orders by) — relative to the project root
-            _ (when (and resolved (:recent-files m) (string/starts-with? path (str resolved "/")))
-                (remember-project-file! resolved
-                  (string/substring path (string/length (str resolved "/")))))
-            m (if (nil? root) m (assoc m :project-root root))
-            idx (ed-buffer-index-by-file m path))
-        (if idx
-          (ed-select m idx)
-          ;; read-or-new (vim/emacs find-file) via the shared toolkit primitive; the
-          ;; try guards a read error (e.g. a permission denial on an existing file). The
-          ;; display name is project-relative inside a project, else the basename
-          ;; (`file-display-name`) — `:file` keeps the full path for saving / dedup.
-          ;; A file that exists but is not UTF-8 (an ELF, an image) opens as a hex view
-          ;; (`ed-open-binary`, Emacs hexl-mode) instead of failing on the decode.
-          (if (and (file/exists? path) (not (utf8-file? path)))
-            (ed-open-binary m path root)
-            (try
-              (let (buf (assoc (find-file-buffer path)
-                          :name (file-display-name path root)))
-                (message (ed-open-buffer m buf)
-                  (if (file/exists? path) (str "opened " path) (str "new file " path))))
-              (catch e (message m (str "open failed: " (error-message e))))))))))
-(sig ed-find-file (model string -> model))
 
 ;; ---- panes (tiled splits, Emacs C-x 2/3/0/1/o) ----------------------------
 ;; Operate on the model's `:layout` pane tree (std/pane). A split shows the
@@ -2649,48 +1925,6 @@ them."
           20
           names))))
 
-(defn ed-default-dir (m)
-  "The current buffer's directory (Emacs `default-directory`) — its **`:dir`**: every buffer
-carries one (a file's folder via `ed-stamp`, a Dired listing's dir, a shell's root, or
-inherited by a fileless buffer from the one it was created in). Falls back to a visited
-file's folder, then the working dir. The one place find-file, Dired, and `ed-project-root`
-read — so every path/project input starts from where you *are*, uniformly across buffers."
-  (let (b (ed-current-buf m))
-    (or (:dir b)
-      (let (f (buffer-file b)) (if (nil? f) (file/cwd) (path/dirname f))))))
-
-(defn ed-path-prompt (prompt initial recent on-complete)
-  "The shared path-completing minibuffer spec — the ONE shape every file/folder input uses
-(find-file, dired): prefilled with `initial` (an absolute dir; `:word-mode :path` so
-`C-w`/`M-DEL` walks **up** a component at a time, no `../`), a Plume candidate list of the
-entries completing the typed path (recentf floated to the top via `recent`, basename
-labels, perms/size/time marginalia), `Tab` to expand. `on-complete` is `(model text) ->
-model` — what to do with the chosen path. Consistent across the board."
-  {:edit (assoc (ed-mb-edit prompt initial) :word-mode :path)
-   :complete-fn (fn (t) (ed-complete-path t))
-   :candidates-fn (fn (t) (take (ed-sort-candidates (ed-path-candidates t) recent) 12))
-   :label-fn path-label ; show basenames in the list, not the full absolute path
-   :category :file ; marginalia: perms/size/mtime per row
-   :accept-selection true
-   :on-complete on-complete})
-
-(defn- ed-find-file-prompt (initial recent &optional (open nil) (prompt nil))
-  "The find-file prompt over `ed-path-prompt`: **selecting a directory re-opens the prompt
-inside it** (descend, carrying the same `recent`); a file (or a typed path with no
-candidate) is handed to `open` — `ed-find-file` by default, which opens it here.
-
-`open` is a parameter so `C-x 4 f` is this same prompt with a different destination
-(`ed-find-file-other-window`) rather than a second copy of the descend logic. WHERE a
-buffer goes is the only thing the two commands disagree about; Emacs splits them into two
-functions and bedit does not need to."
-  (ed-path-prompt (or prompt "Find file: ")
-    initial
-    recent
-    (fn (mm t)
-      (if (string/ends-with? t "/")
-        (assoc mm :minibuffer (ed-find-file-prompt t recent open prompt)) ; a directory → descend
-        ((or open ed-find-file) mm t)))))
-
 ;; ---- C-x 4: the other-window prefix -----------------------------------------
 ;; Emacs's second-most-used prefix after C-x itself, and it was entirely absent. Every
 ;; piece it needs already existed: `ed-pop-to-file` / `ed-pop-to-index` are the
@@ -2734,17 +1968,6 @@ another pane and selecting it."
               (message mm "no buffer")
               (ed-pop-to-buffer-named mm t 1)))))))
 
-(defcommand cmd-dired-other-window
-  (m key)
-  "Open Dired in the other window (C-x 4 d) — on the current buffer's directory."
-  (let (dir (ed-default-dir m)
-        ;; dired's buffer is generated, so it has to exist before it can be popped to:
-        ;; build it here (which selects it), then place it where `C-x 4` promised. The
-        ;; two-step is what keeps `dired/ed-show-dired` the single owner of the listing.
-        m1 (ed-open-dired m dir)
-        nm (buffer-name (ed-current-buf m1)))
-    (ed-pop-to-buffer-named (ed-show-index m1 (ed-current-index m)) nm 1)))
-
 (defcommand cmd-kill-buffer-and-window
   (m key)
   "Kill this buffer and delete its pane (C-x 4 0) — the pair you almost always want after
@@ -2776,17 +1999,6 @@ Emacs — no `../` needed. Last-used files (recentf) sort to the top, then by na
       (ed-find-file-prompt (str (ed-default-dir m) "/")
         ; the current buffer's dir, not the launch cwd
         (if (:recent-files m) (recent-files) [])))) ; recency only in the live editor
-(defn ed-project-root (m)
-  "The current project's root — resolved **live from the current buffer's directory**
-(Emacs `project-current`/`default-directory`): the nearest ancestor of the buffer's file
-holding a `*project-markers*` entry. So every project command (C-x p e/f/p/d) and Dired
-acts on the project you're *visiting*, not where the editor launched. Falls back to the
-model's cached `:project-root` (for a fileless buffer like *scratch*/*bshell*), then the
-working dir. Nil when there's no project anywhere."
-  (or (project-root (ed-default-dir m))
-    (:project-root m)
-    (project-root (file/cwd))))
-
 (defn- ed-project-prompt (root files)
   "The find-file-in-project minibuffer spec over `files` (root-relative paths). Separate from
 the command because the file list arrives LATE: the prompt opens over `()` and this same
@@ -2870,8 +2082,8 @@ file under the project you're in. Reports when not in a project."
   ;; its row is chosen rather than at startup. Adding an entry is a row.
   [["f" "Find file" 'commands/cmd-project-find-file]
     ["g" "Find regexp" 'project-search/cmd-project-find-regexp]
-    ["d" "Dired" 'commands/cmd-project-dired]
-    ["v" "VC status" 'git/cmd-git-status]
+    ["d" "Dired" 'dired/cmd-project-dired]
+    ["v" "VC status" 'gitstatus/cmd-git-status]
     ["e" "Shell" 'bshell/cmd-project-bshell]
     ["r" "REPL" 'term/cmd-project-repl]
     ["t" "Terminal" 'term/cmd-term]
@@ -2930,15 +2142,6 @@ compile. Projects are remembered as you open them."
          :rank-cap 20
          :category :file
          :accept-selection true})))
-
-(defcommand cmd-project-dired
-  (m key)
-  "Open Dired on the current project's root (C-x p d, Emacs `project-dired`). The project
-is the one the current buffer is in (`ed-project-root`), not where the editor launched."
-  (let (root (ed-project-root m))
-    (if (nil? root)
-      (message m "not in a project (no project.blsp found)")
-      (ed-open-dired m root))))
 
 ;; ---- C-x p k: close the project ----------------------------------------------
 ;; Emacs `project-kill-buffers`. Finishing with a project means closing everything it
@@ -3000,7 +2203,7 @@ how many are modified up front is the same consent, informed, in one key."
               (if (> dirty 0) (str " (" dirty " unsaved)") "")
               "? (y or n) ")
             (fn (mm k)
-              (if (or (= k "y") (= k "Y"))
+              (if (ed-yes-key? k)
                 (message (project-kill-named mm names)
                   (str "killed " (count names) " buffer" (if (= (count names) 1) "" "s")))
                 (message mm "kill canceled")))))))))
@@ -3193,20 +2396,25 @@ indentation is the part anyone wants converted."
   "Turn leading spaces into tabs over the region, or from point (M-x tabify)."
   (ed-retab m ed-tabify-text "tabify"))
 
+(defn ed-map-lines (text f)
+  "`text` with its lines replaced by `(f lines)` and joined back — the lines split WITHOUT
+the trailing newline, which is put back when there was one. The shape every line-wise
+rewrite of a region shares (sort, reverse, dedupe): splitting on `\\n` as-is would make a
+trailing newline an empty last line, which then sorts to the top or reverses to the front."
+  (let (nl? (string/ends-with? text "\n")
+        body (if nl? (string/substring text 0 (dec (string/length text))) text)
+        out (string/join (f (string/split body "\n")) "\n"))
+    (if nl? (str out "\n") out)))
+
 (defn ed-dedupe-lines (text)
   "`[text' dropped]` — `text` with CONSECUTIVE duplicate lines collapsed to one.
 
 Consecutive, like `uniq` and like Emacs's own `delete-duplicate-lines` on a sorted
 region. Global dedup would reorder nothing but would quietly delete a line far from the
 one it matched, which is not something you can eyeball afterwards."
-  (let (nl? (string/ends-with? text "\n")
-        body (if nl? (string/substring text 0 (dec (string/length text))) text)
-        lines (string/split body "\n")
-        kept (fold lines
-               []
-               (fn (acc l) (if (= (last acc) l) acc (conj acc l))))
-        out (string/join kept "\n"))
-    [(if (and nl? (not (empty? kept))) (str out "\n") out) (- (count lines) (count kept))]))
+  (let (out (ed-map-lines text
+              (fn (lines) (fold lines [] (fn (acc l) (if (= (last acc) l) acc (conj acc l)))))))
+    [out (- (count (string/split text "\n")) (count (string/split out "\n")))]))
 
 (defcommand cmd-delete-duplicate-lines
   (m key)
@@ -3222,10 +2430,7 @@ delete-duplicate-lines)."
 
 (defn ed-reverse-lines (text)
   "`text` with its lines in the opposite order, keeping a trailing newline if there was one."
-  (let (nl? (string/ends-with? text "\n")
-        body (if nl? (string/substring text 0 (dec (string/length text))) text)
-        out (string/join (reverse (string/split body "\n")) "\n"))
-    (if nl? (str out "\n") out)))
+  (ed-map-lines text reverse))
 
 (defcommand cmd-reverse-region
   (m key)
@@ -3342,6 +2547,24 @@ match is left alone."
                                     (str "aligned on `" p "`"))))))})))))
 ;; ---- M-x: run any interactive command by name -------------------------------
 
+;; Memoised because M-x opens far more often than anything registers: rejecting every
+;; command name against the layer-owned set and sorting the rest was most of an M-x open
+;; (~1-2 ms of it, with the set built afresh each time). Keyed on values that are the SAME
+;; objects while nothing changes, so `defmemo`'s `=` is immediate rather than a walk:
+;; `interactive/command-names` and `ed-all-layer-commands` are themselves memoised and
+;; answer their stored list, and the active layers' `:commands` lists are the ones stored on
+;; the layers. A registration, a redefined layer or a buffer in another mode is a new key.
+(memo/defmemo ed-mx-command-names
+  4
+  (command-names owned-names active-command-lists)
+  "The M-x candidates: `command-names` minus every layer-owned name in `owned-names`, plus
+the current buffer's own `active-command-lists`, sorted."
+  ;; a SET, not the list: `includes?` is O(n) and this rejects every command name against
+  ;; every layer-owned one, which is a few hundred against a few hundred
+  (let (owned (into #{} owned-names))
+    (sort (append (seq/reject command-names (fn (n) (contains? owned n)))
+            (apply append active-command-lists)))))
+
 (defcommand cmd-execute-extended-command
   (m key)
   "Prompt for an interactive command name and run it (M-x). Completes against the
@@ -3351,14 +2574,9 @@ commands appear first (most-recent at the top), then the alphabetical remainder 
 history is **persisted across restarts** via the same recentf mechanism (`recent-commands`
 / `remember-command!`), floated by the shared `projects/float-recent`."
   (let (buf (ed-current-buf m)
-        active-cmds (apply append (ed-active-mode-commands buf))
-        ;; a SET, not the list: `includes?` is O(n) and this rejects every command name
-        ;; against every layer-owned one, which is a few hundred against a few hundred —
-        ;; 26 ms to open M-x, all of it here
-        owned (into #{} (ed-all-layer-commands))
-        all-names (sort (append (seq/reject (interactive/command-names)
-                                  (fn (n) (contains? owned n)))
-                          active-cmds)))
+        all-names (ed-mx-command-names (interactive/command-names)
+                    (ed-all-layer-commands)
+                    (ed-active-mode-commands buf)))
     (assoc m
       :minibuffer
         (assoc (ed-name-prompt "M-x "
@@ -3381,20 +2599,6 @@ history is **persisted across restarts** via the same recentf mechanism (`recent
           ;; its declared contract, its docstring's first line (`plume/plume-command-annotation`)
           :category :command
           :anno-keys (ed-key-table (editor/layers/scope-keymap (list buf m)))))))
-
-(defn ed-leading-int (line)
-  "The leading integer of `line` (after trimming left whitespace), or nil when it doesn't
-start with a digit. The shared `\"<n> …\"`-row parser: a `*Process List*` row's process id,
-an `*Occur*` row's source line number, and a fuzzy line-search candidate's line number."
-  (let (t (string/triml line)
-        n (string/span t 0 "0123456789"))
-    (if (= n 0)
-      nil
-      ;; The span is all digits, so this parse cannot fail — but `string/->number`
-      ;; answers `number | failure`, and a failure is TRUTHY, so a caller's `(nil? ln)`
-      ;; guard would let one through into `dec`/`goto-line`. Say nil, as promised.
-      (let (v (string/->number (string/substring t 0 n)))
-        (when (int? v) v)))))
 
 ;; ---- fuzzy in-buffer line search (M-s) --------------------------------------
 ;; The same Vertico minibuffer the other completers use, ranking the buffer's own lines
@@ -3441,14 +2645,6 @@ M-x and find-file. Enter jumps point to the selected line; a bare number jumps t
 
 ;; ---- files + quit -----------------------------------------------------------
 
-(sig ed-modified-file-indices (model -> list))
-(defn ed-modified-file-indices (m)
-  "The pool indices of the buffers with unsaved changes to a FILE, in pool order — what a
-quit must ask about. A modified scratch or generated buffer has nowhere to be saved and is
-not asked about (Emacs asks only for file-visiting buffers)."
-  (seq/filter (range (count (:buffers m)))
-    (fn (i) (let (b (ed-buf-at m i)) (and (buffer-modified? b) (not (nil? (buffer-file b))))))))
-
 (defn- ed-quit-now (m)
   "End the loop — and, on the primary, every open frame with it (`frames/frames-close-all`;
 a frame's own quit is just its loop, see `frames/cmd-delete-frame`)."
@@ -3490,7 +2686,7 @@ it means and why they are not listed as answers."
         (str (label item) " (y, n, !, q)")
         (fn (mm k)
           (cond
-            (or (= k "y") (= k "Y") (= k " ")) (next (on-yes mm item) (inc accepted))
+            (or (ed-yes-key? k) (= k " ")) (next (on-yes mm item) (inc accepted))
             ;; `!` — this one and every one after, without asking again. Folded rather
             ;; than looped through the prompt, so it is one step however many remain.
             (= k "!")
@@ -3530,7 +2726,7 @@ anyway?`. `C-g` / Esc at any prompt cancels the quit.
                    (ed-read-char mm
                      "Modified buffers exist; exit anyway? (y or n)"
                      (fn (m2 k)
-                       (if (or (= k "y") (= k "Y"))
+                       (if (ed-yes-key? k)
                          (ed-quit-now m2)
                          (message m2 "quit canceled")))))))
     (if save-all?
@@ -3554,42 +2750,6 @@ way). ESC is *not* quit (it's `keyboard-escape-quit`; see `modes`)."
     (assoc m :done true)
     (ed-quit-ask m (ed-modified-file-indices m) false)))
 
-(sig ed-save-buf-at (model int -> model))
-(defn ed-save-buf-at (m i)
-  "Write pool buffer `i` to its file: the plain save every path shares — `C-x C-s` on the
-current buffer, and `save-some-buffers` on any other at quit. The buffer comes back unmodified
-(`save-buffer` sets its baseline) and its `#filename#` auto-save sidecar is deleted on success;
-reports the outcome in the echo area either way. The diff-hl gutter is NOT recomputed
-here: a save writes the working tree but touches neither the buffer text nor HEAD, so
-the buffer-vs-HEAD diff is unchanged (and any prior edit already refreshed it via the
-rope-keyed idle recompute). Leaving the cached `:git-line-status` in place keeps the bars
-steady — dropping it made them blink off and back on each save."
-  (let (buf (ed-buf-at m i))
-    (try
-      ;; `save-buffer` answers the buffer stamped with the file's new mtime, so the idle
-      ;; beat's change check (`ed-revert-changed-files`) knows text and file agree again
-      (let (saved (dissoc (save-buffer buf) :disk-warned)
-            f (buffer-file buf)
-            as-path (when f (ed-auto-save-path f))
-            m2 (dissoc (ed-set-buf-at m i saved) :status))
-        (do
-          (when (and as-path (file/exists? as-path))
-            (try
-              (file/rm as-path)
-              (catch e
-                (log/warn (str "could not remove auto-save " as-path ": " (error-message e))))))
-          ;; A HOSTED slot's buffer process owns the buffer's state, and it has to hear about
-          ;; the save too. Only the pool copy used to be marked saved: the process went on
-          ;; answering "modified", so another frame showed the buffer unsaved and the next
-          ;; push could carry the flag back. Sent after every splice this slot already sent
-          ;; (a mailbox is FIFO), so it marks exactly the text that was written; tagged as
-          ;; ours so it folds back as an echo, not a foreign change.
-          (let (proc (get-in m [:hosted i :proc]))
-            (when proc
-              (buffer-edit proc (fn (b) (mark-buffer-saved (buffer-stamp-file b))) (self))))
-          (message m2 (str "saved " f))))
-      (catch e (message m (str "save failed: " (error-message e)))))))
-
 (defcommand cmd-save
   (m key)
   "Write the current buffer to its file (C-x C-s); report the outcome in the echo
@@ -3602,12 +2762,13 @@ With format-on-save on (and a formatter for this language) the write is a format
 ours to write: the \"changed on disk\" question comes FIRST. It used to come after, so
 with format-on-save on, a save silently overwrote another writer's changes."
   (let (buf (ed-current-buf m)
-        write (fn (mm) (or (format/on-save mm) (ed-save-buf-at mm (ed-current-index mm)))))
+        write (fn (mm) (or (format/on-save mm) (ed-save-buf-at mm (ed-current-index mm))))
+        ;; a hex view names its file so the mode line and C-x C-j know it, but its TEXT
+        ;; is a rendering of the bytes: writing it would replace the binary with a dump.
+        ;; The mode says so (`:no-write`), so this command never names one.
+        refusal (ed-no-write-refusal buf "saved"))
     (cond
-      ;; a hex view names its file so the mode line and C-x C-j know it, but its TEXT
-      ;; is a rendering of the bytes: writing it would replace the binary with a dump
-      (= (editor/layers/buffer-type-for buf) :hexl)
-        (message m "a hex view is not saved (it renders the binary; edit the file itself)")
+      refusal (message m refusal)
       (nil? (buffer-file buf))
         (message m "no file to save (C-x C-f to open one, or run: nest run -- <path>)")
       ;; another writer changed the file since this buffer last agreed with it: saving
@@ -3616,132 +2777,34 @@ with format-on-save on, a save silently overwrote another writer's changes."
         (ed-read-char m
           (str (buffer-file buf) " has changed since visited or saved. Save anyway? (y or n)")
           (fn (mm k)
-            (if (or (= k "y") (= k "Y"))
+            (if (ed-yes-key? k)
               (write mm)
               (message mm "save canceled (M-x revert-buffer to reload the disk version)"))))
       else (write m))))
 
-;; ---- eval-in-buffer (the C-x C-e family, via std/eval-command) --------------
-;; Thin `(model key) -> model` wrappers over `std/eval-command.blsp`, which does
-;; the work (read + eval + value/output capture) as a pure `buffer -> message
-;; string` and is shared with any editor. We just route the result to `message`.
-
-(defdyn *eval-timeout-ms*
-  ;; Optional safeguard: auto-kill a spawned eval after this many ms (nil = no limit).
-  ;; Redefine to arm it — e.g. `(defdyn *eval-timeout-ms* 5000)` via C-x C-e.
-  nil)
-
-(defn ed-eval-async (m src timeout)
-  "Evaluate Brood source string `src` off the editor's loop via `std/task`, so a
-long-running or looping form never freezes the editor (`ui-run` is single-process —
-a synchronous eval would block the loop). A still-running prior eval is cancelled
-first; `task` returns a *handle* that tags its reply — `[:task-done <handle>
-<message>]`, or `[:task-timeout <handle>]` past `timeout` (ms; nil = no limit) — so a
-stale reply from a finished/cancelled eval can't clobber a newer one (`ed-update`
-shows it only when the handle matches `:eval-proc`). Manual interrupt is C-g
-(`cmd-keyboard-quit`). Returns the model with the handle on `:eval-proc` and an
-`evaluating…` note. (Async delivery relies on the GUI display's mailbox-`receive`
-poll; the eval runs in its own process while the editor stays live.)"
-  (let (prev (:eval-proc m)
-        ;; the loop this runs in — its output streams back here (nil in tests / headless)
-        sink (or *ui-loop* (proc/whereis :editor))
-        opts (if (and timeout (> timeout 0)) {:timeout timeout} {})
-        ;; With a live editor, bind the eval's *out*/*err* to a process-port back to it,
-        ;; so the form's output STREAMS into *Messages* as it's produced — a long or
-        ;; looping form's prints appear immediately, not trapped in a capture buffer
-        ;; until (if ever) it returns; the reply carries just the value. Without an
-        ;; editor (tests / headless) capture + bundle output into the reply as before.
-        thunk (if (nil? sink)
-                (fn () (eval-source src))
-                (fn ()
-                  (binding (*out* (io/process-port sink) *err* (io/process-port sink))
-                    (eval-source-value src))))
-        job (task/latest prev thunk opts))
-    ; supersede a still-running eval (std/task)
-    (message (assoc m :eval-proc job) "evaluating…")))
+;; ---- keyboard-quit (C-g / ESC): the universal cancel ------------------------
 
 (defcommand cmd-keyboard-quit
   (m key)
   "C-g / ESC (`keyboard-quit`): the universal cancel. Deactivates the region (clears the
 mark), drops a half-typed chord (`:pending`) and any numeric prefix argument, and
-**cancels every background worker in flight** — a running evaluation (C-x C-e), the
-advisory diagnostics check, and the diff-hl annotation. `cancel-task` hard-kills each
-worker process (`std/task`), so even a runaway loop or a pathologically slow diff dies;
-an already-finished task is a harmless no-op (its reply is dropped because the handle is
-cleared). This is the editor's guarantee that no background work can wedge it: slow work
-runs off the loop (never on the per-key path), and this key kills it.
+**cancels every background worker in flight** that its feature registered as cancellable
+(`model/register-task-reply`'s `:cancel-on-quit?` — a running evaluation, the advisory
+diagnostics check, the diff-hl annotation, eldoc). `task/cancel` hard-kills each worker
+process (`std/task`), so even a runaway loop or a pathologically slow diff dies; its reply
+is dropped because the slot is cleared. This is the editor's guarantee that no background
+work can wedge it: slow work runs off the loop (never on the per-key path), and this key
+kills it.
 
-A cancelled diff-hl annotation is re-stamped against the current text, so the
-idle beat treats the gutter as current and doesn't immediately relaunch the diff we just
-killed; it re-arms on the next edit. Diagnostics, by contrast, recompute once typing settles."
-  (let (eval-p (:eval-proc m)
-        diag-p (:diag-proc m)
-        gd-p (:gitdiff-proc m)
-        eldoc-p (:eldoc-proc m)
-        procs (seq/reject (list eval-p diag-p gd-p eldoc-p) nil?)
-        b (ed-current-buf m)
-        ;; a cancelled diff-hl recompute: re-stamp the bars annotation against the CURRENT
-        ;; text so the idle beat treats the gutter as current and won't relaunch the diff we
-        ;; just killed (keeping any existing bars; none if there were none). It re-arms on
-        ;; the next edit, because that is what makes the annotation stale again.
-        b1 (if gd-p
-             ;; `:value`, NOT `annotation-value`: the current-only accessor returns nil
-             ;; exactly when a line was inserted (which is why a diff was in flight), so
-             ;; it would DISCARD the bars this branch exists to keep.
-             (editor/buffer/annotate b
-               :git-line-status (or (:value (editor/buffer/annotation b :git-line-status)) {}))
-             b)
-        m1 (dissoc (ed-set-buf m (clear-mark b1))
-             :pending :prefix-arg :eval-proc :diag-proc :diag-checking :gitdiff-proc
-             :gitdiff-checking :eldoc-proc :eldoc-checking :lsp-pending) ; in-flight LSP lookups: replies drop as stale
-        _ (doseq (p procs) (cancel p)))
-    (message m1 (if (empty? procs) "quit" "quit — interrupted background work"))))
-
-(defn ed-eval-scope (buf)
-  "`[text point]` for the code around point — the buffer's own text and point unless
-its mode provides an `:eval-scope` service, which answers `[start end]` for a
-sub-region instead.
-
-Some buffers are only PARTLY code: a tutorial page is prose with playground boxes in
-it, a shell buffer is a transcript with one live input line. `last-sexp-source` reads
-from the start of whatever text it is given, so handed the whole buffer it throws on
-the first English sentence and C-x C-e reports \"no complete form before point\" while
-point sits inside a perfectly good form. The mode knows where its code lives; this asks
-it, rather than teaching every eval command about every buffer type."
-  (let (svc (ed-mode-service buf :eval-scope)
-        span (when svc (svc buf)))
-    (if (nil? span)
-      [(buffer-text buf) (buffer-point buf)]
-      (let ([start end] span
-            point (buffer-point buf))
-        [(string/substring (buffer-text buf) start end)
-          (math/max 0 (- (math/min point end) start))]))))
-
-(defcommand cmd-eval-last-sexp
-  (m key)
-  "C-x C-e — evaluate the last complete form ending at point (multi-line: reads every
-form up to point, evals the last) in a separate process; its value + output land in
-the echo area / *Messages* when it finishes, so a slow or looping form can't freeze
-the editor."
-  (let (buf (ed-current-buf m)
-        [text point] (ed-eval-scope buf)
-        src (last-sexp-source text point))
-    (if (nil? src)
-      (message m "no complete form before point")
-      (ed-eval-async m src *eval-timeout-ms*))))
-
-(defcommand cmd-eval-region
-  (m key)
-  "Evaluate the region (point↔mark) as Brood source in a separate process."
-  (let (region (buffer-region (ed-current-buf m)))
-    (if (nil? region)
-      (message m *no-region-message*)
-      (ed-eval-async m region *eval-timeout-ms*))))
-
-(defcommand cmd-eval-buffer
-  (m key)
-  "Evaluate the whole buffer as Brood source in a separate process."
-  (ed-eval-async m (buffer-text (ed-current-buf m)) *eval-timeout-ms*))
+What a job needs beyond that (diff-hl re-stamping its gutter so the idle beat does not
+relaunch the diff just killed) is the job's own `:on-quit` hook — this command names none
+of them ([[model/ed-cancel-quit-jobs]])."
+  (let ([cancelled cancelled?] (ed-cancel-quit-jobs m)
+        ;; in-flight LSP lookups are not tasks (nothing to kill — the server answers
+        ;; anyway), but forgetting them makes their replies drop as stale
+        m1 (dissoc (ed-set-buf cancelled (clear-mark (ed-current-buf cancelled)))
+             :pending :prefix-arg :lsp-pending))
+    (message m1 (if cancelled? "quit — interrupted background work" "quit"))))
 
 ;; ---- serve the selected buffer over HTTP (the live web mirror, C-x w) -------
 
@@ -3774,11 +2837,10 @@ M-x buffer-server-stop tears it down. (The push/render lives in `web`.)"
 syntax highlighting, eldoc, and completion for `.blsp` source."
   (ed-set-mode m :brood))
 
-;; ---- keybinding profiles + Vim modal commands (M-x emacs-mode / vim-mode) ---
+;; ---- keybinding profiles (M-x emacs-mode / vim-mode) ------------------------
 ;; The profile is a MODEL-scope keybinding layer (src/keymaps.blsp), orthogonal to the
-;; buffer's major mode above. `cmd-emacs-mode` / `cmd-vim-mode` swap it; the `cmd-vim-*`
-;; below are the Vim mode transitions and the modal grammar — each reuses the shared
-;; `(model key) -> model` command pool, so Vim is bindings + a little state machine.
+;; buffer's major mode above. `cmd-emacs-mode` / `cmd-vim-mode` swap it; the Vim mode
+;; transitions and the modal grammar live in `vim`.
 
 (defcommand cmd-emacs-mode
   (m key)
@@ -3790,62 +2852,6 @@ syntax highlighting, eldoc, and completion for `.blsp` source."
   "Switch to the Vim keybinding profile (modal: normal/insert/visual), starting in
 normal mode."
   (message (ed-set-profile m :vim) "vim mode (normal)"))
-
-(defcommand cmd-vim-normal
-  (m key)
-  "Return to Vim normal mode, clearing any visual selection (Esc)."
-  (vim-to-normal (ed-apply m clear-mark)))
-
-(defcommand cmd-vim-insert-bol
-  (m key)
-  "Enter Vim insert mode at the first column (I)."
-  (vim-to-insert (ed-apply m beginning-of-line)))
-
-(defcommand cmd-vim-append-eol
-  (m key)
-  "Enter Vim insert mode at end of line (A)."
-  (vim-to-insert (ed-apply m end-of-line)))
-
-(defcommand cmd-vim-open-below
-  (m key)
-  "Open a new line below and enter insert mode (o)."
-  (vim-to-insert (cmd-open-line-below m key)))
-
-(defcommand cmd-vim-open-above
-  (m key)
-  "Open a new line above and enter insert mode (O)."
-  (vim-to-insert (cmd-open-line-above m key)))
-
-(defcommand cmd-vim-visual
-  (m key)
-  "Enter Vim visual mode, anchoring the selection at point (v) — motions then extend
-the point↔mark region."
-  (vim-to-visual (ed-apply m set-mark)))
-
-(defn- ed-vim-visual-inclusive (m)
-  "The model with the visual selection widened to include the character UNDER the
-cursor — Vim's charwise selection is inclusive at both ends, Emacs's region is not.
-
-Without this every visual operation was one character short: `v` then `d` deleted
-nothing at all, and `v l l d` took two characters where Vim takes three. Only widen
-forward selections (point past mark); a backward one already covers the cursor's
-character, and never step over the end of the buffer."
-  (let (b (ed-current-buf m)
-        point (buffer-point b)
-        mark (get b :mark))
-    (if (and mark (>= point mark) (< point (buffer-length b)))
-      (ed-set-buf m (goto-char b (inc point)))
-      m)))
-
-(defcommand cmd-vim-visual-yank
-  (m key)
-  "Copy the visual selection to the kill ring and return to normal mode (y)."
-  (vim-to-normal (cmd-copy-region (ed-vim-visual-inclusive m) key)))
-
-(defcommand cmd-vim-visual-delete
-  (m key)
-  "Kill the visual selection (to the kill ring) and return to normal mode (d / x)."
-  (vim-to-normal (cmd-kill-region (ed-vim-visual-inclusive m) key)))
 
 (defcommand cmd-buffer-server-stop
   (m key)
@@ -3866,20 +2872,20 @@ one, so there is no stale-parser window to think about.
 
 Startup does the same scan, so this is only needed when the directory has changed since —
 which, while you are building a grammar, is every couple of minutes."
-  (let (loaded (modes/load-user-grammars))
+  (let (loaded (grammars/load-user-grammars))
     (message m
       (if (empty? loaded)
-        (str "no grammars in " (modes/ts-grammar-dir))
+        (str "no grammars in " (grammars/ts-grammar-dir))
         (str "loaded "
           (count loaded)
           " grammar(s): "
           (string/join (map loaded (fn (l) (->string l))) ", "))))))
 
-;; ---- the everyday Emacs tail: buffer list, dabbrev, shell commands, line utilities --
+;; ---- the everyday Emacs tail: buffer list, dabbrev, line utilities ----------------
 ;; The commands a user reaches for in the first hour that were not here: `C-x C-b`,
-;; `M-/`, `M-!` / `M-|`, `C-x C-o`, `M-x sort-lines`, `M-x delete-trailing-whitespace`,
-;; `M-=`, `C-x i`. Each is a `(model key) -> model` over the buffer primitives; the two
-;; that run a program go through `os/cmd` in the buffer's `default-directory`.
+;; `M-/`, `C-x C-o`, `M-x sort-lines`, `M-x delete-trailing-whitespace`, `M-=`, `C-x i`.
+;; Each is a `(model key) -> model` over the buffer primitives. (`M-!` / `M-|`, which run
+;; a program, live in `shell-command`.)
 
 (defn- ed-buffer-list-text (m)
   "The `*Buffer List*` rows: one per pool buffer — `*` when modified, `%` when read-only,
@@ -3994,138 +3000,6 @@ char before it is not a word char)."
                  i)))
     (step p)))
 
-;; shell commands: `M-!` runs one and shows its output; `M-|` pipes the region through
-;; one (`os/cmd` in the buffer's directory, off the loop), so a long-running command is
-;; what `C-c r` / the bshell are for — these are for `ls`, `date`, `sort -u`.
-(def *shell-command-timeout-ms* 120000)
-;; A shell command gets two minutes before the task is killed and reported as a timeout.
-;; `M-! sleep 600` is a typo, not an instruction to make the editor unusable for ten
-;; minutes, and an unbounded slot is one that never frees.
-
-(defn- ed-shell-command (dir cmd stdin)
-  "`{:exit :stdout :stderr}` of `sh -c cmd` in `dir`, fed `stdin` (nil for none), killed —
-with everything it started — after `*shell-command-timeout-ms*`. The one place M-! and M-|
-run a command, so the timeout reaches the OS process: a timeout on the TASK alone ended the
-green process and left `sleep 600` running."
-  (os/cmd "sh" ["-c" cmd] {:cwd dir :stdin stdin :timeout-ms *shell-command-timeout-ms*}))
-
-(defn ed-shell-run (m cmd stdin)
-  "`{:exit :stdout :stderr}` of `sh -c cmd` in the buffer's default directory, with
-`stdin` (nil for none). SYNCHRONOUS — the shared core, run inside a task by
-`ed-shell-launch` and inline only when headless."
-  (ed-shell-command (ed-default-dir m) cmd stdin))
-
-;; check-allow: `then` is a caller-supplied `(model result) -> model`, so the checker
-;; cannot see the last branch's result (ADR-341's `:trusted`, as `git/git-launch-op`).
-(check-allow :trusted
-  (sig ed-shell-launch (model string any any -> model))
-  (defn ed-shell-launch (m cmd stdin then)
-    "Run `sh -c cmd` OFF the loop and hand the result to `then` (`(model result) -> model`).
-
-`M-!` used to run on the dispatch path, which is fine for `date` and a freeze for anything
-else — and what counts as \"anything else\" is not knowable in advance: `M-! make`,
-`M-! grep -r` over a monorepo, a command that waits on a lock. The docstring said
-\"synchronous, so use `C-c r` for long ones\", which is a rule the editor was asking the
-reader to enforce on its behalf.
-
-One at a time, like every other off-loop job here: a second while one runs is refused
-rather than queued. Headless runs it inline, so tests and `--headless` are unchanged."
-    (cond
-      (:shell-proc m) (message m "a shell command is already running")
-      (ed-headless?) (then m (ed-shell-run m cmd stdin))
-      :else
-        (let (dir (ed-default-dir m)
-              job (task (fn () (ed-shell-command dir cmd stdin))
-                    {:timeout *shell-command-timeout-ms*}))
-          (assoc (message m (str "running: " cmd))
-            :shell-proc job
-            :shell-then then
-            :shell-cmd cmd)))))
-
-(check-allow :trusted
-  ;; M-! / M-| — a shell command is arbitrarily long, so it is a task like the rest
-  (register-task-reply :shell-proc 'commands/ed-apply-shell nil "shell")
-  (sig ed-apply-shell (model any -> model))
-  (defn ed-apply-shell (m r)
-    "Fold a finished `ed-shell-launch`. A nil `r` is the task having errored or timed out,
-said as such rather than reported as a command that succeeded with no output."
-    (let (then (:shell-then m)
-          cmd (:shell-cmd m "the command")
-          m1 (dissoc m :shell-proc :shell-then :shell-cmd))
-      (cond
-        (nil? r)
-          (message m1
-            (str cmd " failed or timed out after " *shell-command-timeout-ms* "ms"))
-        (nil? then) m1
-        :else (then m1 r)))))
-
-(defn- ed-shell-show (m cmd r)
-  "Show a shell command's result the Emacs way: one output line in the echo area, more in
-`*Shell Command Output*` beside the buffer; a failure's stderr joins the output."
-  (let (out (str (:stdout r) (if (= (:stderr r) "") "" (:stderr r)))
-        trimmed (string/trim out)
-        lines (string/split trimmed "\n"))
-    (cond
-      (= trimmed "")
-        (message m
-          (str "(shell command "
-            (if (= (:exit r) 0) "succeeded" (str "failed: " (:exit r)))
-            " with no output)"))
-      (= (count lines) 1) (message m trimmed)
-      else (ed-show-named-aside m "*Shell Command Output*" out :special))))
-
-(defcommand cmd-shell-command
-  (m key)
-  "Run a shell command and show its output (M-!, Emacs `shell-command`): one line of
-output goes to the echo area, more to `*Shell Command Output*` in a side pane. Runs
-`sh -c` in the buffer's directory, synchronously."
-  (assoc m
-    :minibuffer
-      {:edit (ed-mb-edit "Shell command: " "")
-       :on-complete (fn (mm t)
-                      (if (= (string/trim t) "")
-                        (message mm "no command")
-                        (ed-shell-launch mm t nil (fn (m2 r) (ed-shell-show m2 t r)))))}))
-
-(defcommand cmd-shell-command-on-region
-  (m key)
-  "Pipe the region through a shell command (M-|, Emacs `shell-command-on-region`): the
-region is the command's stdin; the output is shown like `M-!` — or, with a prefix
-argument (`C-u M-|`), REPLACES the region (the `sort`/`fmt`/`jq .` idiom)."
-  (let (buf (ed-current-buf m)
-        rb (buffer-region-bounds buf)
-        replace? (not (nil? (current-prefix-arg m))))
-    (if (nil? rb)
-      (message m "no region (set the mark first)")
-      (let ([lo hi] rb
-            input (text/slice (buffer-rope buf) lo hi))
-        (assoc m
-          :minibuffer
-            {:edit (ed-mb-edit (if replace?
-                                 "Shell command on region (replace): "
-                                 "Shell command on region: ")
-                     "")
-             :on-complete (fn (mm t)
-                            (if (= (string/trim t) "")
-                              (message mm "no command")
-                              (ed-shell-launch mm
-                                t
-                                input
-                                (fn (m2 r)
-                                  ;; the region's bounds were captured before the command
-                                  ;; ran; the reply can land after an edit moved them, so
-                                  ;; the replace is clamped to the text that is there now
-                                  (if (and replace? (= (:exit r) 0))
-                                    (message (ed-edit m2
-                                               (fn (b)
-                                                 (let (len (buffer-length b)
-                                                       a (math/min lo len)
-                                                       z (math/min hi len))
-                                                   (replace-region b a z (:stdout r)))))
-                                      (str "region replaced by `" t "`"))
-                                    (ed-shell-show m2 t r))))))})))))
-(register-prefix-consuming 'commands/cmd-shell-command-on-region)
-
 ;; line utilities
 (defn- ed-blank-line? (buf line)
   "Whether buffer `line` holds only whitespace."
@@ -4185,11 +3059,8 @@ whole buffer when there is no region) alphabetically, in place (M-x sort-lines).
             hi (if (< (inc el) (buffer-line-count b))
                  (text/line->char rope (inc el))
                  (buffer-length b))
-            block (text/slice rope lo hi)
-            trailing-nl (string/ends-with? block "\n")
-            body (if trailing-nl (string/substring block 0 (dec (string/length block))) block)
-            sorted (string/join (sort (string/split body "\n")) "\n"))
-        (goto-char (replace-region b lo hi (if trailing-nl (str sorted "\n") sorted)) lo)))))
+            block (text/slice rope lo hi))
+        (goto-char (replace-region b lo hi (ed-map-lines block sort)) lo)))))
 
 (defcommand cmd-delete-trailing-whitespace
   (m key)

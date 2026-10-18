@@ -1,0 +1,415 @@
+(defmodule languages
+  "The non-Lisp language modes. `deflanguage` declares a tree-sitter language from ONE spec
+(faces, indent, heredocs, formatter) and generates its whole service set — Ruby, Elixir and
+Python are its three clients, each a face table and an indent spec. Beside them, the
+fontify-only layers over std's lexers: env, shell, Dockerfile, and the configuration
+formats (JSON, YAML, TOML, Makefile, INI, git commit messages)."
+  (:use editor/layers) ; register-interpreter-type — shell-mode's shebang names
+  (:use modes :only [register-language-mode register-prog-mode]))
+;; editor/treesit, editor/highlight and the std lexers are referenced qualified below —
+;; each `mod/name` auto-loads its module.
+
+(defmacro deflanguage (name spec)
+  "Declare a tree-sitter language mode from ONE spec, and register it.
+
+    (deflanguage elixir
+      {:lang :elixir
+       :pattern \"[.](ex|exs)$\"
+       :faces elixir-face-table
+       :indent elixir-indent-spec
+       :heredocs *elixir-heredocs*
+       :comment \"# \"})
+
+Every language used to spell out the same five definitions — a `-fontify`, a
+`-fontify-restart`, an `-indent`, a layer naming all three, and the registration — of
+which only the tables differed. Three copies is where a language quietly gets less than
+the others: the mode was the place a service could be forgotten, and a forgotten service
+is invisible until someone presses the key. Here a language supplies DATA and gets the
+whole service set, or fails at load saying which part is missing.
+
+The services are generated as named globals rather than closures because
+`model/ed-mode-service` resolves a service SYMBOL late (`reflect/eval`) — which is what
+lets a redefined fontify take effect on the next frame without reloading the mode. A
+closure in the layer would be resolved once and frozen.
+
+`:format` is the language's formatter as a command vector — `[\"mix\" \"format\"]`, to which
+the file path is appended. It becomes the `:format-command` service that `M-x
+format-buffer` and format-on-save consult, so neither names a language.
+
+`:heredocs` is optional and produces the `:fontify-restart` a windowed fontify uses;
+`:restart` names one directly when the rule is more than counting paired markers (Ruby
+must also notice `=begin`). A language with neither declines to restart, which is a fact
+about the language — `editor/treesit/language-contract` says which services are required
+and which are optional.
+
+The generated one is `<name>-heredoc-restart`, not `<name>-fontify-restart`: the obvious
+name is the one a language with a CUSTOM restart has already used, and generating it
+silently replaced Ruby's — which then answered \"restart anywhere\" and coloured the prose
+inside its `=begin` blocks as code. A generated definition must not be able to take a
+hand-written name."
+  (let (base (->string name)
+        fontify (symbol (str base "-fontify"))
+        restart (symbol (str base "-heredoc-restart"))
+        indent (symbol (str base "-indent"))
+        layer (symbol (str base "-mode-layer"))
+        fontify-ref (symbol (str "languages/" base "-fontify"))
+        restart-ref (symbol (str "languages/" base "-heredoc-restart"))
+        indent-ref (symbol (str "languages/" base "-indent"))
+        layer-ref (symbol (str "languages/" base "-mode-layer")))
+    `(do
+       (defn ~fontify (text)
+         (editor/treesit/fontify text (get ~spec :lang) (get ~spec :faces)))
+       (defn ~indent (text bol)
+         (editor/treesit/indent-column text (get ~spec :lang) bol (get ~spec :indent)))
+       (defn ~restart (src pos)
+         (let (hd (get ~spec :heredocs))
+           (if (nil? hd) pos (editor/treesit/column0-restart src pos hd))))
+       (def ~layer
+         (languages/language-layer '~name ~spec '~fontify-ref '~indent-ref '~restart-ref))
+       (register-prog-mode '~layer-ref (get ~spec :lang)))))
+
+(defn language-layer (name spec fontify-ref indent-ref restart-ref)
+  "The mode layer for a `deflanguage`, checked against `editor/treesit/language-contract`.
+
+Raises on an incomplete language rather than registering one. A mode missing `:indent`
+would register happily and simply do nothing on RET — a failure that surfaces as a key
+which feels broken, in one language, much later."
+  (let (layer {:name name
+               :parser :tree-sitter
+               :ts-lang (get spec :lang)
+               :file-pattern (get spec :pattern)
+               :fontify fontify-ref
+               :indent indent-ref
+               ;; `:restart` names its own when the rule is more than counting paired
+               ;; markers (Ruby must also see `=begin`); `:heredocs` gets the derived
+               ;; one; a language with neither declines, which is a fact about the
+               ;; language rather than a hole in the mode.
+               :fontify-restart (or (get spec :restart)
+                                  (when (get spec :heredocs) restart-ref))
+               :comment-syntax (get spec :comment)
+               ;; The language's own formatter, as `[prog arg …]` with the file appended
+               ;; — `mix format <file>`. A service like any other, so `M-x format-buffer`
+               ;; and format-on-save ask the BUFFER what formats it and never name a
+               ;; language. Absent for a language with no formatter, which is a fact
+               ;; about the language.
+               :format-command (get spec :format)}
+        gaps (editor/treesit/missing-services layer))
+    (when (not (empty? gaps))
+      (error "deflanguage " name ": missing required service(s) " (->string gaps)))
+    layer))
+
+;; ---- env-mode / docker-mode: more fontify-only language layers --------------
+;; Two more language modes built the same way as markdown-mode — a layer whose only
+;; service is a `:fontify` span fn from a pure std module (editor/dotenv, editor/
+;; dockerfile). `.env` files and Dockerfiles keep every text-mode binding and gain
+;; syntax colouring. The `:file-pattern` is matched against the file's basename, so a
+;; bare `Dockerfile` / `.env` (no extension) triggers; both restart at the viewport's own
+;; line (`editor/highlight/line-restart`: line-oriented, no cross-line lexer state, so the
+;; 200-line backscan above the band is never lexed).
+
+(def env-mode-layer
+  {:name 'env
+   ;; .env and its variants (.env.local, .env.production, …); the leading-dot name
+   ;; carries no extension, so anchor on `.env` with an optional `.suffix`.
+   :file-pattern "(^|/)\\.env(\\.[^/]+)?$"
+   :fontify 'editor/dotenv/env-spans
+   :fontify-restart 'editor/highlight/line-restart})
+
+(register-language-mode 'languages/env-mode-layer :env)
+
+;; ---- shell-mode: sh / bash / zsh scripts -----------------------------------------
+;; `std/editor/shell` lexes per line (comments, strings, `$` expansions, keywords,
+;; builtins, function names). A script is recognised by its extension or its name
+;; (`.sh`, `.bashrc`, …) OR by its `#!` line (`register-interpreter-type`, the Emacs
+;; `interpreter-mode-alist`) — so `run`, `deploy`, `configure` with `#!/usr/bin/env bash`
+;; on top get the mode with no extension at all.
+
+(def shell-mode-layer
+  {:name 'shell
+   :file-pattern "[.](sh|bash|zsh|ksh|dash)$|(^|/)[.]?(bashrc|bash_profile|bash_aliases|bash_login|bash_logout|zshrc|zshenv|zprofile|zlogin|profile|xprofile|xinitrc)$|(^|/)PKGBUILD$"
+   :fontify 'editor/shell/shell-spans
+   :fontify-restart 'editor/highlight/line-restart
+   :comment "# "})
+
+(register-language-mode 'languages/shell-mode-layer :shell)
+(doseq (i ["sh" "bash" "zsh" "ksh" "dash" "ash" "busybox"])
+  (register-interpreter-type i :shell))
+
+(def docker-mode-layer
+  {:name 'docker
+   ;; `Dockerfile`, `Dockerfile.dev`, `*.dockerfile`, and Podman's `Containerfile`.
+   :file-pattern "(^|/)(Dockerfile|Containerfile)([.][^/]+)?$|[.]dockerfile$"
+   :fontify 'editor/dockerfile/dockerfile-spans
+   :fontify-restart 'editor/highlight/line-restart})
+
+(register-language-mode 'languages/docker-mode-layer :docker)
+
+;; ---- ruby-mode / elixir-mode: tree-sitter-backed language modes -------------
+;; The first modes whose parser is NOT Brood's reader: a `.rb`/`.ex` buffer gets
+;; syntax colouring AND structural navigation from a tree-sitter grammar
+;; (`tree-sitter-parse`), via `std/editor/treesit` — the foreign-language analogue
+;; of brood-mode's `highlight`+`sexp`. The proof of ROADMAP §C: because the
+;; builtin yields the SAME positioned-node shape Brood's reader does, the editor's
+;; `:fontify` service and the `C-M-f/b/u/d/a` structural commands run over a Ruby
+;; or Elixir tree unchanged — the modes are pure data (a face table + a `:ts-lang`
+;; + a layer), and now an indent spec: `editor/treesit/indent-column` walks the tree and each
+;; language names the node kinds that open a level (`languages/elixir-indent-spec`).
+;;
+;; `:fontify-restart` says where the windowed lead-in may be CUT. Without one the mode
+;; parses the whole lead-in every keystroke — 245 lines for a 44-row viewport, five times
+;; what is on screen, and 18 ms of a 25 ms keystroke on a 10k-line file. Elixir has one
+;; (`editor/treesit/column0-restart`, guarded on heredoc parity — see there); Ruby does NOT,
+;; deliberately: its heredoc terminator is arbitrary text (`<<~EOS`), so there is no paired
+;; marker to count and no way to tell a column-0 line inside one from a real top-level form.
+;; Guessing there would colour prose as code; Ruby keeps the lead-in until its own guard
+;; exists.
+
+;; (The `C-M-*` structural motions come from the shared `prog-mode-layer` above — ruby and
+;; elixir stack it via `register-prog-mode`, and the commands dispatch on `:ts-lang`.)
+
+;; Per-language kind→face tables name only the *named* nodes to colour; keywords
+;; (anonymous alphabetic tokens — `def`/`end`/`do`/`fn`/…) come free via
+;; passed straight to `editor/treesit/fontify`. Refine one by inspecting `(%tree-sitter-parse …)`.
+;; ---- indentation for the tree-sitter modes ----------------------------------
+;; `editor/treesit/indent-column` is the mechanism (walk the tree, count enclosing blocks);
+;; these four entries are the whole per-language policy. The kinds were read off real parses
+;; rather than guessed, and each spec is checked line-for-line against hand-written source —
+;; every line of a sample module must re-indent to the column it already has.
+;;
+;; `:dedent-levels` differs because the grammars do: Elixir's `do_block` spans its own `end`,
+;; so a closing line measured at the line start is still inside the block and backs out one;
+;; Ruby's `body_statement` stops before `end`, so the closer is already outside and backs out
+;; none.
+
+(def elixir-indent-spec
+  {:width 2
+   :blocks #{:do_block :body} ; `do … end`, and a `->` clause's body
+   ;; The bracketed openers — a multi-line list/map/tuple/binary/`fn` indents its
+   ;; contents exactly as a block does, but must NOT indent its own opening line, which
+   ;; is what `:brackets` means. `:arguments` is deliberately absent: Elixir does not add
+   ;; a level for a call's argument list when the last argument is an `fn`, which is the
+   ;; common shape (`Enum.reduce(xs, %{}, fn … end)`), and counting it put every such
+   ;; clause one level too deep.
+   :brackets #{:anonymous_function :list :map :tuple :bitstring}
+   ;; keywords only; the closing delimiters decide for themselves
+   :dedent #{"end" "else" "catch" "rescue" "after"}
+   :dedent-levels 1})
+
+(def ruby-indent-spec
+  {:width 2
+   ;; a method/class body, an if/else arm, and a BRACE block's body — `{ |x| … }` spanning
+   ;; lines indents its contents like any block, and `:block_body` is the kind the grammar
+   ;; gives it. Without it every multi-line `{ |t| … }` body sat a level too shallow, which
+   ;; is 44 of the 46 lines the Ruby stdlib disagreed with.
+   :blocks #{:body_statement :then :else :block_body}
+   ;; the bracketed openers, which must not indent their own opening line
+   :brackets #{:array :hash :argument_list}
+   ;; Per token, because the grammar disagrees per token: a `body_statement` stops before
+   ;; its `end`, so `end` is already outside it and backs out nothing — but it SPANS its
+   ;; own `ensure`/`rescue`/`else`, so those must back out one. A single `:dedent-levels`
+   ;; cannot say both, and with one number Ruby's `ensure` sat a level too deep in every
+   ;; method that had one.
+   ;; Keywords only — a closing delimiter decides for itself (see `ts-dedent-levels`),
+   ;; because the same `}` closes a hash whose node encloses the closing line AND a
+   ;; `{ |x| … }` block whose body ended before it. Read off the grammar, one token at a
+   ;; time, against the Ruby stdlib:
+   ;;   `end`                  a `body_statement` stops before it — already outside
+   ;;   `else` `elsif` `when`  the arm ends before the keyword — already outside
+   ;;   `rescue` `ensure`      children of the `body_statement`, which SPANS them
+   :dedent {"end" 0 "else" 0 "elsif" 0 "when" 0 "rescue" 1 "ensure" 1}})
+
+(def ruby-face-table
+  {:comment :syntax/comment
+   :string :syntax/string
+   :heredoc_body :syntax/string
+   :regex :syntax/string
+   :simple_symbol :syntax/special
+   :hash_key_symbol :syntax/special
+   :delimited_symbol :syntax/special
+   :integer :syntax/number
+   :float :syntax/number
+   :constant :syntax/special
+   :instance_variable :syntax/function
+   :global_variable :syntax/function
+   :class_variable :syntax/function})
+
+;; ---- ruby's fontify restart ---------------------------------------------------
+;; Elixir decides restart safety by counting PAIRED heredoc markers; Ruby has no pair to
+;; count — `<<~EOS` ends at a line holding whatever identifier the opener named. So Ruby
+;; asks a weaker question with a safe answer: is there any heredoc opener, or any `=begin`
+;; block comment, above the candidate at all? If so it declines and keeps the full lead-in,
+;; which is exactly today's behaviour. Over-declining costs speed in files that open a
+;; heredoc near the viewport and nothing else; guessing would colour heredoc prose as code.
+;;
+;; Bare `<<EOS` is recognised by the uppercase/underscore that conventionally follows,
+;; because `<<` alone is `Array#<<` and left-shift — searching for it would decline
+;; everywhere and buy nothing.
+
+(defn- ruby-upper? (c)
+  ;; an uppercase ASCII letter, tested by case-folding (Brood's `<` is numeric-only)
+  (and (not (= (string/upper c) (string/lower c))) (= c (string/upper c))))
+
+(sig ruby-heredoc-open-at? (string int -> bool))
+(defn- ruby-heredoc-open-at? (src i)
+  ;; `i` is the offset of a `<<` — does it open a heredoc rather than shift or append?
+  (let (j (+ i 2))
+    (and (< j (string/length src))
+      (let (c (string/char-at src j))
+        (or (= c "~") (= c "-") (= c "'") (= c "\"") (= c "_") (ruby-upper? c))))))
+
+(defn- ruby-heredoc-above? (src upto from)
+  ;; any heredoc opener in `src` before `upto`
+  (let (i (index-of src "<<" from))
+    (cond
+      (or (< i 0) (>= i upto)) false
+      (ruby-heredoc-open-at? src i) true
+      else (ruby-heredoc-above? src upto (+ i 2)))))
+
+(defn- ruby-block-comment-above? (src upto)
+  ;; `=begin` / `=end` are column-0 only, so a newline-prefixed match (or offset 0) is one
+  (or (string/starts-with? src "=begin")
+    (let (i (index-of src "\n=begin")) (and (>= i 0) (< i upto)))))
+
+(defn ruby-fontify-restart (src pos)
+  "Ruby's `:fontify-restart`: the previous column-0 line, unless a heredoc or `=begin` block
+opens above it in this window — in which case keep the whole lead-in, as before."
+  (let (candidate (editor/treesit/column0-before src pos))
+    (if (or (ruby-heredoc-above? src candidate 0) (ruby-block-comment-above? src candidate))
+      0
+      candidate)))
+
+(deflanguage ruby
+  {:lang :ruby
+   :pattern "\\.rb$"
+   :faces languages/ruby-face-table
+   :indent languages/ruby-indent-spec
+   ;; its own: a heredoc terminator is arbitrary text, and `=begin` blocks count too
+   :restart 'languages/ruby-fontify-restart
+   ;; the community standard, and what a Ruby project has if it has anything
+   :format ["rubocop" "-a" "--stderr" "--format" "quiet"]
+   :comment "# "})
+
+;; Elixir: def/defmodule are macros (parsed as calls, not keywords), so they
+;; aren't keyword-coloured — `do`/`end`/`fn`/`when`/… are. Atoms and module
+;; aliases read as `:special`.
+(def elixir-face-table
+  {:comment :syntax/comment
+   :string :syntax/string
+   :charlist :syntax/string
+   :sigil :syntax/string
+   :integer :syntax/number
+   :float :syntax/number
+   :atom :syntax/special
+   :alias :syntax/special
+   :keyword :syntax/special})
+
+;; Elixir's paired multi-line string markers — what the restart counts to decide whether a
+;; column-0 line is real code or prose inside an `@moduledoc`.
+(def *elixir-heredocs* ["\"\"\"" "'''"])
+
+(deflanguage elixir
+  {:lang :elixir
+   :pattern "\\.(ex|exs)$"
+   :faces languages/elixir-face-table
+   :indent languages/elixir-indent-spec
+   :heredocs languages/*elixir-heredocs*
+   :format ["mix" "format"]
+   :comment "# "})
+
+;; ---- python-mode: a language the runtime was never built with ---------------
+;; The proof that a language is a data entry rather than a build: nothing in Brood knows
+;; Python. Drop `libtree-sitter-python.so` into `~/.config/bedit/grammars/` and everything
+;; below — colouring, the `C-M-*` structural motions, indentation — comes from these three
+;; definitions. Without the grammar the mode still registers and simply cannot parse.
+;;
+;; Python indents by four, and every level is the same `:block` node, so it needs no dedent
+;; set at all: `else:` sits in the `if`'s own block chain, not inside the arm it follows.
+(def python-face-table
+  {:comment :syntax/comment
+   :string :syntax/string
+   :string_content :syntax/string
+   :integer :syntax/number
+   :float :syntax/number
+   :true :syntax/special
+   :false :syntax/special
+   :none :syntax/special})
+
+(def python-indent-spec
+  {:width 4
+   :blocks #{:block} ; every suite is a `block`; `else:` sits in the `if`'s own chain
+   ;; the bracketed literals and call arguments — a multi-line one indents (or aligns)
+   ;; its contents, and must not indent its own opening line
+   :brackets #{:list :dictionary :set :tuple :argument_list :parameters :parenthesized_expression}
+   ;; Nothing to declare: `else:`/`elif:`/`except:` are children of the statement rather
+   ;; than of its block, so they already measure at the outer level, and the closing
+   ;; delimiters decide for themselves.
+   :dedent #{}})
+
+(deflanguage python
+  {:lang :python
+   :pattern "\\.py$"
+   :faces languages/python-face-table
+   :indent languages/python-indent-spec
+   ;; paired triple quotes, exactly Elixir's case
+   :heredocs languages/*elixir-heredocs*
+   :format ["black" "-q"]
+   :comment "# "})
+
+;; ---- the configuration formats: tables over std's `editor/lexer` ---------------------
+;; Fontify-only layers like env-mode and docker-mode; the lexing is `editor/configs`'.
+;; The `:file-pattern` matches the file's basename, so the extensionless names
+;; (`Makefile`, `COMMIT_EDITMSG`, `.gitconfig`) trigger too. Line-oriented: each restarts at
+;; the viewport's own line (`editor/highlight/line-restart`), so a keystroke lexes the band alone.
+
+(def json-mode-layer
+  {:name 'json
+   :file-pattern "\\.(json|jsonc|json5|jsonl|webmanifest)$|(^|/)\\.(babelrc|eslintrc|prettierrc)$"
+   :fontify 'editor/configs/json-spans
+   :fontify-restart 'editor/highlight/line-restart
+   :comment-syntax "// "})
+
+(register-language-mode 'languages/json-mode-layer :json)
+
+(def yaml-mode-layer
+  {:name 'yaml
+   :file-pattern "\\.(ya?ml)$|(^|/)\\.(clang-format|yamllint)$"
+   :fontify 'editor/configs/yaml-spans
+   :fontify-restart 'editor/highlight/line-restart
+   :comment-syntax "# "})
+
+(register-language-mode 'languages/yaml-mode-layer :yaml)
+
+(def toml-mode-layer
+  {:name 'toml
+   :file-pattern "\\.toml$|(^|/)(Cargo|Pipfile|poetry)\\.lock$"
+   :fontify 'editor/configs/toml-spans
+   :fontify-restart 'editor/highlight/line-restart
+   :comment-syntax "# "})
+
+(register-language-mode 'languages/toml-mode-layer :toml)
+
+(def makefile-mode-layer
+  {:name 'makefile
+   :file-pattern "(^|/)(GNUmakefile|Makefile|makefile)$|\\.(mk|make)$"
+   :fontify 'editor/configs/makefile-spans
+   :fontify-restart 'editor/highlight/line-restart
+   :comment-syntax "# "})
+
+(register-language-mode 'languages/makefile-mode-layer :makefile)
+
+(def ini-mode-layer
+  {:name 'ini
+   :file-pattern "\\.(ini|cfg|conf|properties|gitconfig|gitmodules|editorconfig|npmrc|service|desktop)$|(^|/)\\.(gitconfig|gitmodules|editorconfig|npmrc|hgrc)$"
+   :fontify 'editor/configs/ini-spans
+   :fontify-restart 'editor/highlight/line-restart
+   :comment-syntax "# "})
+
+(register-language-mode 'languages/ini-mode-layer :ini)
+
+(def gitcommit-mode-layer
+  {:name 'gitcommit
+   :file-pattern "(^|/)(COMMIT_EDITMSG|MERGE_MSG|TAG_EDITMSG|SQUASH_MSG|NOTES_EDITMSG)$"
+   :fontify 'editor/configs/gitcommit-spans
+   :fontify-restart 'editor/highlight/line-restart})
+
+(register-language-mode 'languages/gitcommit-mode-layer :gitcommit)

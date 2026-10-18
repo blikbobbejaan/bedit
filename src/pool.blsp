@@ -1,0 +1,502 @@
+(defmodule pool
+  "The buffer pool and where its buffers are shown — the API most of the editor needs
+from `commands` without needing a single command: open / select / kill a pool buffer,
+upsert a named report buffer and hand it to the window manager (`ed-display-buffer`, the
+Emacs `display-buffer` analog), pop to a file or buffer at a line in another pane
+(`ed-pop-to-file`, the `next-error` discipline), find-file and its path prompt, the
+default directory and project root, and saving a pool buffer.
+
+It used to live inside `commands`, so every module that showed a report buffer `:use`d
+four thousand lines of commands to reach six hundred of these. Splitting it out is what
+lets a feature module (git, the BEAM views, the test runner, …) depend on the pool
+without depending on every keystroke's command. `commands` builds on this module, never
+the reverse: the two things find-file needs from above it — the hex view of a binary
+(`hexl`) and a directory listing (`dired`) — are reached late-bound."
+  (:use editor/buffer) ; make-buffer / find-file-buffer / save-buffer / point motion
+  (:use editor/pane) ; pane-leaf-paths / pane-split / pane-update-path — where a buffer goes
+  (:use mincomplete) ; ed-complete-name / ed-complete-path / path candidates — the prompts
+  (:use projects) ; project-root / file-display-name / remember-* — the project a file is in
+  (:use autosave) ; auto-save sidecars + auto-revert
+  (:use model)) ; the pool + layout accessors, ed-stamp, message, ed-mb-edit
+;; collab (unshare a killed slot), hosted (drop / rekey a slot), editor/layers (close hooks,
+;; buffer types) and text (line->char) are referenced qualified below and auto-load.
+
+(defn ed-name-prompt (prompt names on-complete &optional (limit 20) (recent []))
+  "A Vertico minibuffer spec that completes input against a fixed `names` list — Tab to
+the common prefix, a fuzzy candidate list (top `limit`) — and runs `on-complete`
+(`(model text) -> model`) on the accepted entry. The shared shape behind M-x,
+switch-buffer, recentf, describe-function, and bookmark-jump. `recent` (a most-recent-first
+list, default none) floats its entries to the top on empty input via the shared
+`projects/float-recent` — the same recency any completion opts into (see `recent-commands`)."
+  {:edit (ed-mb-edit prompt "")
+   :on-complete on-complete
+   :complete-fn (fn (t) (ed-complete-name t names))
+   :rank-source (projects/float-recent names recent) ; recents first, then fuzzy-narrowed on typing
+   :rank-cap limit
+   :accept-selection true})
+
+(defn- utf8-file? (path)
+  "True when the bytes at `path` decode as UTF-8 — a text file `find-file-buffer` can read.
+The decode failing IS the answer (a binary), so the error is the verdict, not a fault."
+  (check-allow :discarded-catch
+    (try (do (string/bytes-> (file/slurp-bytes path)) true) (catch e false))))
+
+;; ---- dired lives in src/dired.blsp, the hex view in src/hexl.blsp -----------------
+;; Both build on this module (the find-file prompt, the default directory, the line
+;; motions, `ed-show-named`), so this one reaches them at RUNTIME rather than through its
+;; header — a header each way would be a cycle, which does not fail loudly: it leaves one
+;; module half-initialised and breaks something unrelated.
+
+;; check-allow: the listing comes back through `reflect/eval`, which the checker reads as
+;; unknown; `dired/ed-show-dired` answers a model.
+(check-allow :trusted
+  (defn ed-open-dired (m dir)
+    "Show the dired listing of `dir` (`dired/ed-show-dired`) — what opening a directory from
+anywhere does. Loads `dired` on first use; by then this module has finished loading."
+    (do (require-one 'dired) ((reflect/eval 'dired/ed-show-dired) m dir))))
+(sig ed-open-dired (model string -> model))
+
+;; check-allow: as above — `hexl/ed-open-binary` is resolved late and answers a model.
+(check-allow :trusted
+  (defn- ed-open-binary (m path root)
+    "Open `path`, a file that is not UTF-8, as a read-only hex view
+(`hexl/ed-open-binary`, Emacs `hexl-mode`). Loads `hexl` on first use; by then this module
+has finished loading."
+    (do (require-one 'hexl) ((reflect/eval 'hexl/ed-open-binary) m path root))))
+(sig ed-open-binary (model string any -> model))
+
+(sig ed-goto-line (buffer int -> buffer))
+(defn ed-goto-line (b n)
+  "Move point to the start of (1-based) line `n`, clamped to the buffer's line range."
+  (ed-goto-line-col b (dec n) 0))
+
+(sig ed-goto-line-col (buffer int int -> buffer))
+(defn ed-goto-line-col (b line0 col)
+  "Move point to 0-based `line0` / `col` (LSP coordinates), clamped to the buffer. Used by
+imenu/xref jumps, which land on a symbol's start position."
+  (let (rope (buffer-rope b)
+        ln (math/max 0 (math/min line0 (dec (buffer-line-count b))))
+        bol (text/line->char rope ln))
+    (goto-char b (math/min (+ bol (math/max 0 col)) (buffer-length b)))))
+
+;; Switching shows buffer `i` in the SELECTED pane (other panes keep their
+;; buffers); `:status` is per-model, so reset it (else a stale "modified" from the
+;; previous buffer would describe the new one).
+(sig ed-select (model int -> model))
+(defn ed-select (m i)
+  (assoc (ed-show-index m i) :status ""))
+
+(defn ed-has-editable? (bufs)
+  "Whether the pool `bufs` holds a buffer other than `*Messages*`."
+  (any? bufs (fn (b) (not (= (buffer-name b) "*Messages*")))))
+
+(defn- ed-remap (m killed target)
+  "Re-point every pane after pool index `killed` was removed: a pane on
+`killed` now shows `target`; panes above `killed` shift down one; below are
+unchanged. (Routes through `ed-map-panes` over all leaf payloads.)"
+  (ed-map-panes m
+    (fn (w)
+      (let (b (:buffer w))
+        (assoc w :buffer (cond (< b killed) b (> b killed) (dec b) else target))))))
+
+(defn ed-kill-at (m killed-idx follow-companions?)
+  "Kill pool buffer `killed-idx`: fire its mode layers' `:on-close`, unhost/unshare it,
+remove it, and re-point the panes that showed it (appending a fresh `*scratch*` if the pool
+would be left with nothing editable). The body of `cmd-kill-buffer`, factored out so the
+companion sweep below can reuse the whole path rather than half of it.
+
+With `follow-companions?` the buffers the closing mode NAMED (`layers/request-close`) are
+killed too — a mode's own second window, like the tutorial's *Workings* pane, which means
+nothing once the tutorial is gone. Their own `:on-close` fires (they may own workers), but
+their requests are NOT followed: one level, so a pair of modes naming each other cannot
+loop."
+  (let (buf (nth (:buffers m) killed-idx)
+        ;; The close hooks are effects (a mode kills the worker it spawned), but the closed
+        ;; context is also DATA — the companion names it left on itself. A hook cannot close
+        ;; them itself: it only ever sees its own buffer, and layers has no idea the app
+        ;; keeps a pool. So it names them and we act, here, where the pool is.
+        closed (try
+                 (editor/layers/close-context buf)
+                 (catch e (do (log/warn (str "close hook failed: " (error-message e))) nil)))
+        companions (if follow-companions?
+                     (try (editor/layers/close-requests closed) (catch _ (list)))
+                     (list))
+        ;; a collab-shared slot withdraws its presence first; a registry-hosted one (frames)
+        ;; is dropped by `hosted-drop-slot` itself, which also removes it from the registry
+        m0 (if (get-in m [:hosted killed-idx :collab?])
+             (collab/collab-unshare m killed-idx) ; presence withdraw + unsubscribe
+             m)
+        m0 (hosted/hosted-drop-slot m0 killed-idx) ; stop-if-local + index remap
+        removed (seq/remove-nth (:buffers m0) killed-idx)
+        label (str "killed " (buffer-name buf))
+        m1 (if (ed-has-editable? removed)
+             ;; another editable buffer remains: the killed pane shows the buffer
+             ;; that shifted into its slot (clamped to the last index).
+             (message (ed-remap (assoc m0 :buffers removed)
+                        killed-idx
+                        (math/min killed-idx (dec (count removed))))
+               label)
+             ;; none left → append a fresh *scratch* and point the killed pane at it.
+             (let (bufs (into removed [(ed-stamp (make-buffer ""))]))
+               (message (ed-remap (assoc m0 :buffers bufs) killed-idx (count removed)) label))))
+    ;; Then the companions, by NAME — indices have just shifted, so each is looked up
+    ;; afresh; one that is already gone (or never existed) is simply skipped.
+    ;;
+    ;; The echo is re-stated at the end, naming what the reader actually killed. Each
+    ;; companion kill echoes its own name as it goes, and the last one won: killing
+    ;; *Tutorial* reported "killed *Workings*", which is not the buffer anyone asked about.
+    (let ([m2 also] (fold companions
+                      [m1 (list)]
+                      (fn (acc nm)
+                        (let ([mm killed] acc
+                              i (ed-buffer-index-by-name mm nm))
+                          (cond
+                            (nil? i) acc
+                            (= nm "*Messages*") acc
+                            else [(ed-kill-at mm i false) (append killed (list nm))])))))
+      (if (empty? also)
+        m2
+        (message m2 (str label " (with " (string/join also ", ") ")"))))))
+
+(sig ed-kill-buffer-named (model string -> model))
+(defn ed-kill-buffer-named (m nm)
+  "Kill the pool buffer named `nm` — the full `ed-kill-at` path (its `:on-close`, the
+pane re-point), companions not followed — or `m` unchanged when there is none. For a mode
+closing a pane it owns (`aside/close`), which knows the pane by NAME and is not on it."
+  (let (idx (ed-buffer-index-by-name m nm))
+    (if (nil? idx) m (ed-kill-at m idx false))))
+
+(defn ed-kill-buffer-at (m idx)
+  "Kill pool buffer `idx` — the full `ed-kill-at` path, companions not followed. For a
+caller that knows the buffer by its SLOT because a name would be ambiguous: another
+frame's kill arrives keyed by document (`frames/ed-ev-registry-removed`), and two
+buffers may share a display name."
+  (ed-kill-at m idx false))
+
+(defn- ed-inherit-dir (m buf)
+  "`buf` carrying a `:dir`: its own when it has one (a file's folder, given by `ed-stamp`),
+else the **current** buffer's — Emacs `default-directory` inheritance, so a fileless buffer
+(scratch, *Occur*, a report) opens 'in' the directory/project you were in. The one rule
+every way a buffer enters the pool follows."
+  (if (nil? (:dir buf)) (assoc buf :dir (:dir (ed-current-buf m))) buf))
+
+(defn ed-open-buffer (m buf)
+  "Add `buf` to the pool (mode-stamped, and carrying a `:dir` — `ed-inherit-dir`) and show
+it in the selected pane."
+  (let (bufs (into (:buffers m) [(ed-inherit-dir m (ed-stamp buf))]))
+    (ed-select (assoc m :buffers bufs) (dec (count bufs)))))
+
+(defn ed-upsert-named (m nm text &optional (type nil))
+  "Add or replace the pool buffer named `nm` holding `text` (stamped `type`, so a special mode
+and its read-only `:activate` hook apply) **without** touching the layout or selection. The
+pool-side half shared by `ed-show-named` (which then selects it) and `ed-show-named-aside`
+(which shows it in a side pane). Look the buffer's index up afterwards with
+`ed-buffer-index-by-name`. A fresh buffer inherits the current buffer's `:dir`; a re-show keeps
+the existing one's."
+  (let (idx (ed-buffer-index-by-name m nm)
+        raw (make-buffer text nm)
+        buf (if (nil? type) raw (editor/layers/set-buffer-type raw type)))
+    (if (nil? idx)
+      (assoc m :buffers (into (:buffers m) [(ed-inherit-dir m (ed-stamp buf))]))
+      (assoc m
+        :buffers
+          (assoc (:buffers m)
+            idx
+              (ed-inherit-dir m
+                (assoc (ed-stamp buf) :dir (get (nth (:buffers m) idx) :dir))))))))
+
+(defn- ed-other-pane-path (layout)
+  "The path of the pane `C-x o` would move to from the selected one (the next leaf in traversal
+order, wrapping) — where a side/preview buffer goes."
+  (let (paths (pane-leaf-paths layout)
+        i (index-of paths (pane-selected-path layout)))
+    (nth paths (math/mod (inc i) (count paths)))))
+
+(defn- ed-pane-showing (layout idx)
+  "The path of the first pane already showing pool buffer `idx`, or nil — the reuse probe
+behind `ed-display-buffer` (an existing window wins over a fresh split, like Emacs
+`display-buffer`). Reads each pane's payload by path (`pane-payload-at`, std editor/pane)."
+  (seq/find (pane-leaf-paths layout) (fn (p) (= idx (:buffer (pane-payload-at layout p))))))
+
+(defn- ed-place-aside (layout idx)
+  "Show buffer `idx` in a pane beside the selected one, returning `{:layout :path}`: split the
+lone pane off (new pane on the right at `:path`), else re-point the next pane in traversal order.
+Selection is left untouched — the caller decides whether to move onto `:path`."
+  (if (= (pane-count layout) 1)
+    {:layout (pane-split layout :col (ed-pane idx))
+     :path (append (pane-selected-path layout) (list :b))}
+    (let (p (ed-other-pane-path layout))
+      {:layout (pane-update-path layout
+                 p
+                 (fn (w) (assoc w :buffer idx :top 0 :point nil :mark nil)))
+       :path p})))
+
+(sig ed-place-other (map int -> (record &open :layout map :path list)))
+(defn- ed-place-other (layout idx)
+  "Where buffer `idx` goes when it is shown in a pane OTHER than the selected one,
+`{:layout :path}`: the pane already showing it when there is one (`ed-pane-showing` — reuse
+wins, as in Emacs `display-buffer`), else a pane beside the selected one (`ed-place-aside`).
+Selection is left untouched."
+  (let (existing (ed-pane-showing layout idx))
+    (if (nil? existing) (ed-place-aside layout idx) {:layout layout :path existing})))
+
+(defn ed-display-buffer (m nm text &optional (type nil) (opts {}))
+  "The single place a command hands a report buffer to the window manager — an Emacs
+`display-buffer`/`pop-to-buffer` analog, so callers say WHAT to show and HOW, never WHERE.
+Upserts `nm`/`text`/`type` into the pool (stamping `type` so a special mode + its read-only
+`:activate` hook apply, and re-apply on every re-show), then places it by `(:action opts)`:
+  `:here`    — the selected pane, replacing it, and select it (the default).
+  `:pop`     — another pane, moving selection there (Emacs `pop-to-buffer`).
+  `:display` — another pane, selection left put — a preview (press-to-preview lists).
+Reuse first: if some pane already shows `nm`, that pane is used in place — no new split —
+matching `display-buffer`'s reuse rule. The reuse seam for generated/refreshable buffers
+(*Process List*, *git-log*, *git-diff*, …).
+
+Two more options shape a buffer that is RE-shown as it changes rather than regenerated:
+`:spans` stamps `[start end face]` faces onto the buffer as data (`:face-spans`, for text
+whose faces no lexer can recover — a rendered preview); `:keep-scroll` leaves a reused
+pane's scroll where it was instead of returning it to the top, so a refresh under a
+reader does not yank the view (the caller then places it — `mdpreview` follows the
+cursor)."
+  (let (action (:action opts :here)
+        m1 (ed-upsert-named m nm text type)
+        idx (ed-buffer-index-by-name! m1 nm) ; `ed-upsert-named` just put it there
+        m1 (if (contains? opts :spans)
+             (assoc m1
+               :buffers
+                 (assoc (:buffers m1) idx (assoc (ed-buf-at m1 idx) :face-spans (:spans opts))))
+             m1)
+        layout (:layout m1))
+    (if (= action :here)
+      (ed-select m1 idx)
+      (let (placed (ed-place-other layout idx)
+            ;; Reset the target pane to the top of the (freshly regenerated) report, clearing any
+            ;; stale scroll/point a reused pane carried from a previous, longer buffer — a shorter
+            ;; refresh would otherwise render a point past the new end (out-of-bounds). A
+            ;; `:keep-scroll` caller keeps the scroll (`ed-pane-top` clamps it into the buffer).
+            reset (pane-update-path (:layout placed)
+                    (:path placed)
+                    (fn (w)
+                      (if (:keep-scroll opts)
+                        (assoc w :point nil :mark nil)
+                        (assoc w :top 0 :point nil :mark nil))))
+            m2 (assoc m1 :layout reset))
+        (if (= action :pop)
+          (assoc m2 :layout (pane-select-path (:layout m2) (:path placed)))
+          m2)))))
+
+(defn ed-show-named (m nm text &optional (type nil))
+  "Show report buffer `nm`/`text`/`type` in the selected pane (replacing it) and select it —
+the thin `ed-display-buffer` `:here` wrapper kept for existing callers."
+  (ed-display-buffer m nm text type {:action :here}))
+
+(defn ed-show-named-aside (m nm text &optional (type nil))
+  "Show report buffer `nm`/`text`/`type` in a side / preview pane without moving selection —
+the thin `ed-display-buffer` `:display` wrapper. Splits a lone pane off, else reuses the next
+pane; if the buffer is already visible, that pane is refreshed in place (press-to-preview)."
+  (ed-display-buffer m nm text type {:action :display}))
+
+(defn ed-switch-to-named (m nm)
+  "Switch to the buffer named `nm`, or report there's no such buffer."
+  (let (idx (ed-buffer-index-by-name m nm))
+    (if (nil? idx) (message m (str "no buffer named " nm)) (ed-select m idx))))
+
+;; ---- next-error: jump to a source location from a results buffer -------------
+;; The Emacs `next-error` / `display-buffer-other-window` discipline, as ONE
+;; primitive every results buffer shares (*Tests* / *Run* / *compilation* / *Occur*
+;; / *git-status*): a jump opens the source in a pane OTHER than the results pane —
+;; the results stay visible — and moves selection there. A buffer computes its own
+;; source location (the `:line-loc` mode service, or git's row→path) and hands it to
+;; `ed-pop-to-file`; WHERE/HOW lives here, once.
+
+(defn- ed-ensure-file-buffer (m path)
+  "Ensure the (absolute) `path` is in the pool WITHOUT changing selection — returns
+`[m idx]`. Reuses an open buffer for the file, else reads-or-news it (find-file
+semantics: an existing file is read, a missing one starts a fresh backed buffer)."
+  (let (idx (ed-buffer-index-by-file m path))
+    (if idx
+      [m idx]
+      (let (root (or (project-root (path/dirname path)) (:project-root m))
+            buf (ed-stamp (assoc (find-file-buffer path) :name (file-display-name path root)))
+            bufs (into (:buffers m) [(ed-inherit-dir m buf)]))
+        [(assoc m :buffers bufs) (dec (count bufs))]))))
+
+(defn ed-pop-to-index (m idx line)
+  "Show pool buffer `idx` at (1-based) `line` in a pane OTHER than the current one, select
+that pane and put point on the line — the placement half of [[ed-pop-to-file]], shared so a
+location naming a BUFFER lands exactly where one naming a file does."
+  (let (placed (ed-place-other (:layout m) idx)
+        m1 (assoc m :layout (pane-select-path (:layout placed) (:path placed))))
+    ;; point moves; the loop's own scroll-clamp on the (now-selected) source pane
+    ;; brings it on screen this tick, as with `cmd-goto-definition`.
+    (ed-apply m1 (fn (b) (ed-goto-line b line)))))
+
+(defn ed-pop-to-buffer-named (m nm line)
+  "[[ed-pop-to-index]] for a buffer named rather than a file — what a location `{:buffer …}`
+visits. A buffer that is no longer in the pool says so instead of jumping somewhere else."
+  (let (idx (ed-buffer-index-by-name m nm))
+    (if (nil? idx) (message m (str nm " is no longer open")) (ed-pop-to-index m idx line))))
+
+(defn ed-pop-to-file (m path line)
+  "Emacs `next-error` / `display-buffer-other-window`: show `path` at (1-based)
+`line` in a pane OTHER than the current one — the results buffer stays visible —
+select that pane, and put point on the line. Reuses a pane already showing the file;
+splits a lone pane (the results buffer keeps the original). THE jump every
+results-buffer 'visit source' routes through, so the behaviour is uniform."
+  (if (string/blank? path)
+    (message m "(no file)")
+    (let ([m1 idx] (ed-ensure-file-buffer m (path/absolute path)))
+      (ed-pop-to-index m1 idx line))))
+
+(defn ed-find-file (m path)
+  "Open `path`: switch to it if already open, read it if it exists, else start a
+fresh buffer backed by it (so Ctrl-S creates it). A relative or `~` path is resolved
+to absolute (`path-absolute`) first, so the prompt can stay short/relative while the
+buffer's `:file`, dedup, and project-relative name all key off a canonical path. A
+directory opens in dired (Emacs `find-file` on a directory), a file that is not UTF-8 as
+a hex view (`ed-open-binary`)."
+  (cond
+    (string/blank? path) (message m "(no file)")
+    (file/dir? (path/absolute path)) (ed-open-dired m (path/absolute path))
+    else
+      (let (path (path/normalize (path/absolute path)) ; `./` and `..` collapsed: one spelling per file
+            _ (when (:recent-files m) (remember-file! path)) ; recentf — live editor only
+            ;; The project follows the file you visit (Emacs `default-directory`): resolve
+            ;; the visited file's project root (`.git` / `project.blsp`) and make it the
+            ;; model's `:project-root`, so the mode line, find-file-in-project, and the
+            ;; project-relative name all track the buffer — not the dir the editor launched
+            ;; in. Falls back to the model's existing `:project-root` when the file isn't in
+            ;; a resolvable project (e.g. a virtual path). Record a freshly-resolved project
+            ;; as known too (best-effort, live editor only).
+            resolved (project-root (path/dirname path)) ; the visited file's real project, or nil
+            root (or resolved (:project-root m))
+            _ (when (and resolved (:recent-files m)) (remember-project! resolved))
+            ;; record the visit in the project's per-project recent list (the "last access"
+            ;; the default project-file sort orders by) — relative to the project root
+            _ (when (and resolved (:recent-files m) (string/starts-with? path (str resolved "/")))
+                (remember-project-file! resolved
+                  (string/substring path (string/length (str resolved "/")))))
+            m (if (nil? root) m (assoc m :project-root root))
+            idx (ed-buffer-index-by-file m path))
+        (if idx
+          (ed-select m idx)
+          ;; read-or-new (vim/emacs find-file) via the shared toolkit primitive; the
+          ;; try guards a read error (e.g. a permission denial on an existing file). The
+          ;; display name is project-relative inside a project, else the basename
+          ;; (`file-display-name`) — `:file` keeps the full path for saving / dedup.
+          ;; A file that exists but is not UTF-8 (an ELF, an image) opens as a hex view
+          ;; (`ed-open-binary`, Emacs hexl-mode) instead of failing on the decode.
+          (if (and (file/exists? path) (not (utf8-file? path)))
+            (ed-open-binary m path root)
+            (try
+              (let (buf (assoc (find-file-buffer path)
+                          :name (file-display-name path root)))
+                (message (ed-open-buffer m buf)
+                  (if (file/exists? path) (str "opened " path) (str "new file " path))))
+              (catch e (message m (str "open failed: " (error-message e))))))))))
+(sig ed-find-file (model string -> model))
+
+(defn ed-default-dir (m)
+  "The current buffer's directory (Emacs `default-directory`) — its **`:dir`**: every buffer
+carries one (a file's folder via `ed-stamp`, a Dired listing's dir, a shell's root, or
+inherited by a fileless buffer from the one it was created in). Falls back to a visited
+file's folder, then the working dir. The one place find-file, Dired, and `ed-project-root`
+read — so every path/project input starts from where you *are*, uniformly across buffers."
+  (ed-buffer-dir (ed-current-buf m)))
+
+(defn ed-path-prompt (prompt initial recent on-complete)
+  "The shared path-completing minibuffer spec — the ONE shape every file/folder input uses
+(find-file, dired): prefilled with `initial` (an absolute dir; `:word-mode :path` so
+`C-w`/`M-DEL` walks **up** a component at a time, no `../`), a Plume candidate list of the
+entries completing the typed path (recentf floated to the top via `recent`, basename
+labels, perms/size/time marginalia), `Tab` to expand. `on-complete` is `(model text) ->
+model` — what to do with the chosen path. Consistent across the board."
+  {:edit (assoc (ed-mb-edit prompt initial) :word-mode :path)
+   :complete-fn (fn (t) (ed-complete-path t))
+   ;; only the twelve shown are built (`ed-path-candidates-top`): /tmp has 10k entries
+   :candidates-fn (fn (t) (ed-path-candidates-top t recent 12))
+   :label-fn path-label ; show basenames in the list, not the full absolute path
+   :category :file ; marginalia: perms/size/mtime per row
+   :accept-selection true
+   :on-complete on-complete})
+
+(defn ed-find-file-prompt (initial recent &optional (open nil) (prompt nil))
+  "The find-file prompt over `ed-path-prompt`: **selecting a directory re-opens the prompt
+inside it** (descend, carrying the same `recent`); a file (or a typed path with no
+candidate) is handed to `open` — `ed-find-file` by default, which opens it here.
+
+`open` is a parameter so `C-x 4 f` is this same prompt with a different destination
+(`ed-find-file-other-window`) rather than a second copy of the descend logic. WHERE a
+buffer goes is the only thing the two commands disagree about; Emacs splits them into two
+functions and bedit does not need to."
+  (ed-path-prompt (or prompt "Find file: ")
+    initial
+    recent
+    (fn (mm t)
+      (if (string/ends-with? t "/")
+        (assoc mm :minibuffer (ed-find-file-prompt t recent open prompt)) ; a directory → descend
+        ((or open ed-find-file) mm t)))))
+
+(defn ed-project-root (m)
+  "The current project's root — resolved **live from the current buffer's directory**
+(Emacs `project-current`/`default-directory`): the nearest ancestor of the buffer's file
+holding a `*project-markers*` entry. So every project command (C-x p e/f/p/d) and Dired
+acts on the project you're *visiting*, not where the editor launched. Falls back to the
+model's cached `:project-root` (for a fileless buffer like *scratch*/*bshell*), then the
+working dir. Nil when there's no project anywhere."
+  (or (project-root (ed-default-dir m))
+    (:project-root m)
+    (project-root (file/cwd))))
+
+(defn ed-leading-int (line)
+  "The leading integer of `line` (after trimming left whitespace), or nil when it doesn't
+start with a digit. The shared `\"<n> …\"`-row parser: a `*Process List*` row's process id,
+an `*Occur*` row's source line number, and a fuzzy line-search candidate's line number."
+  (let (t (string/triml line)
+        n (string/span t 0 "0123456789"))
+    (if (= n 0)
+      nil
+      ;; The span is all digits, so this parse cannot fail — but `string/->number`
+      ;; answers `number | failure`, and a failure is TRUTHY, so a caller's `(nil? ln)`
+      ;; guard would let one through into `dec`/`goto-line`. Say nil, as promised.
+      (let (v (string/->number (string/substring t 0 n)))
+        (when (int? v) v)))))
+
+(sig ed-modified-file-indices (model -> list))
+(defn ed-modified-file-indices (m)
+  "The pool indices of the buffers with unsaved changes to a FILE, in pool order — what a
+quit must ask about. A modified scratch or generated buffer has nowhere to be saved and is
+not asked about (Emacs asks only for file-visiting buffers)."
+  (seq/filter (range (count (:buffers m)))
+    (fn (i) (let (b (ed-buf-at m i)) (and (buffer-modified? b) (not (nil? (buffer-file b))))))))
+
+(sig ed-save-buf-at (model int -> model))
+(defn ed-save-buf-at (m i)
+  "Write pool buffer `i` to its file: the plain save every path shares — `C-x C-s` on the
+current buffer, and `save-some-buffers` on any other at quit. The buffer comes back unmodified
+(`save-buffer` sets its baseline) and its `#filename#` auto-save sidecar is deleted on success;
+reports the outcome in the echo area either way. The diff-hl gutter is NOT recomputed
+here: a save writes the working tree but touches neither the buffer text nor HEAD, so
+the buffer-vs-HEAD diff is unchanged (and any prior edit already refreshed it via the
+rope-keyed idle recompute). Leaving the cached `:git-line-status` in place keeps the bars
+steady — dropping it made them blink off and back on each save."
+  (let (buf (ed-buf-at m i))
+    (try
+      ;; `save-buffer` answers the buffer stamped with the file's new mtime, so the idle
+      ;; beat's change check (`ed-revert-changed-files`) knows text and file agree again
+      (let (saved (dissoc (save-buffer buf) :disk-warned)
+            f (buffer-file buf)
+            m2 (dissoc (ed-set-buf-at m i saved) :status))
+        (do
+          (ed-remove-auto-save f)
+          ;; A HOSTED slot's buffer process owns the buffer's state, and it has to hear about
+          ;; the save too. Only the pool copy used to be marked saved: the process went on
+          ;; answering "modified", so another frame showed the buffer unsaved and the next
+          ;; push could carry the flag back. Sent after every splice this slot already sent
+          ;; (a mailbox is FIFO), so it marks exactly the text that was written; tagged as
+          ;; ours so it folds back as an echo, not a foreign change.
+          (let (proc (get-in m [:hosted i :proc]))
+            (when proc
+              (buffer-edit proc (fn (b) (mark-buffer-saved (buffer-stamp-file b))) (self))))
+          (message m2 (str "saved " f))))
+      (catch e (message m (str "save failed: " (error-message e)))))))

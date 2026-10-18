@@ -6,7 +6,7 @@ Whatever you type in a box evaluates as you settle (the `:tutor-eval` idle timer
 ~250ms) in the persistent OS-process sandbox (`sandbox` → std's `eval-server`,
 ADR-198), never in the editor's own image — so a lesson can `def` freely, loop
 forever, or throw, and the editor only ever learns the reply. Feedback lands as
-margin marks (· result, ✓ exercise passed, ✗ not yet — `modes/gutter-mark-for`),
+margin marks (· result, ✓ exercise passed, ✗ not yet — `gutter/gutter-mark-for`),
 ghost text at the end of the box's last form, and the echo line for the full
 story.
 
@@ -23,8 +23,11 @@ in lesson DATA keyed by box order — never in the buffer, so they can't be edit
 away. Headless (tests, no `:editor` process) the eval falls back to std's
 `eval-capturing` in-image, synchronously — the diag-fallback discipline."
   (:use editor/buffer)
+  (:use keyhelp) ; key / command labels, where-is, docstrings
   (:use model)
-  (:use commands) ; ed-show-named / ed-apply / ed-edit / ed-switch-to-named
+  (:use pool) ; ed-show-named / ed-switch-to-named — the tutorial buffer and its return
+  (:use commands) ; cmd-newline-and-indent / cmd-indent-or-complete / ed-reindent-line — the box keys
+  (:use keymaps :only [ed-vim-command-mode?]) ; nothing types in vim normal mode — the box keys
   (:use interactive) ; defcommand — the M-x registry
   (:use editor/keymap)
   (:use editor/layers)
@@ -39,7 +42,7 @@ away. Headless (tests, no `:editor` process) the eval falls back to std's
 ;; ---- the key vocabulary: ASKED, not hardcoded ---------------------------------
 ;; Lesson prose/titles/hints are TEMPLATES ({{kf}}, {{kill-line}} … — std/template)
 ;; rendered against a vocabulary. The KEY entries are derived from the live keymaps
-;; (`model/ed-command-keys` over `keymaps/profile-keymap` → std's `keymap-where-is`),
+;; (`keyhelp/ed-command-keys` over `keymaps/profile-keymap` → std's `keymap-where-is`),
 ;; so the tutorial teaches what the user's editor actually does — including their own
 ;; rebindings from `init.blsp`, not just emacs-vs-vim. Each spec carries a fallback
 ;; for a key a profile expresses as *grammar* rather than a binding: vim routes
@@ -414,7 +417,7 @@ e.g. a group-complete message) and park point on the first ▸ entry."
         m1 (tutor-install-page m text true {:pending {}})
         first-line (seq/find (range (buffer-line-count (ed-current-buf m1)))
                      (fn (i) (tutor-contents-section-at (ed-current-buf m1) i))))
-    (ed-apply m1 (fn (b) (if first-line (commands/ed-goto-line b (inc first-line)) b)))))
+    (ed-apply m1 (fn (b) (if first-line (pool/ed-goto-line b (inc first-line)) b)))))
 
 (defn tutor-contents? (m)
   (:tutor-contents? (ed-current-buf m)))
@@ -464,6 +467,10 @@ boundary that keeps the pane module from needing anything back."
 ;; ---- buffer plumbing ----------------------------------------------------------
 
 (defn tutor-buffer? (b) (= (buffer-name b) tutor/*tutor-buffer-name*))
+
+(defn- tutor-buf (m)
+  "The *Tutorial* pool buffer wherever it lives, or nil when it is not open."
+  (let (i (ed-buffer-index-by-name m tutor/*tutor-buffer-name*)) (when i (ed-buf-at m i))))
 
 (defn- tutor-bufset-buf (m f)
   "Apply `f` to the *Tutorial* pool buffer (wherever it lives) — the buffer-shaped
@@ -562,24 +569,19 @@ running says so — the two things a value alone can't tell you."
   "Store `note` (`:kind`/`:text`) for playground `region-idx` on the *Tutorial*
 buffer, anchored (`:line`, always recomputed from the current text) on the box's
 last form; stamps the rope/count it belongs to."
-  (let (i (ed-buffer-index-by-name m tutor/*tutor-buffer-name*))
-    (if (nil? i)
+  (let (b (tutor-buf m)
+        text (if (nil? b) "" (buffer-text b))
+        r (nth (tutor-regions text) region-idx nil))
+    (if (or (nil? b) (nil? r))
       m
-      (let (b (nth (:buffers m) i)
-            text (buffer-text b)
-            rope (buffer-rope b)
-            regions (tutor-regions text)
-            r (nth regions region-idx nil))
-        (if (nil? r)
-          m
-          ;; ONE generic annotation (std `annotate` stamps the rope + line count it
-          ;; describes): `:eol-notes` is owner-keyed with `:line` inside, and the
-          ;; gutter / ghost text / echo all read it through `results/eol-notes`
-          (tutor-bufset-buf m
-            (fn (bb)
-              (editor/buffer/annotate bb
-                :eol-notes (assoc (or (results/eol-notes-any bb) {})
-                  region-idx (assoc note :line (tutor-note-anchor rope text r)))))))))))
+      ;; ONE generic annotation (std `annotate` stamps the rope + line count it
+      ;; describes): `:eol-notes` is owner-keyed with `:line` inside, and the
+      ;; gutter / ghost text / echo all read it through `results/eol-notes`
+      (let (placed (assoc note :line (tutor-note-anchor (buffer-rope b) text r)))
+        (tutor-bufset-buf m
+          (fn (bb)
+            (editor/buffer/annotate bb
+              :eol-notes (assoc (or (results/eol-notes-any bb) {}) region-idx placed))))))))
 
 ;; ---- eval-on-type: the stale? / launch / apply triple ---------------------------
 
@@ -599,7 +601,8 @@ buffer then comes back to what the launch parsed (type a newline, delete it agai
 test says there is nothing to do while `results/eol-notes` — anchored to the line count of
 that other moment — hands the renderer nothing. Every verdict on the page disappears and
 nothing re-arms. Asking `results/eol-notes-hidden?` too is what brings them back: the launch
-that follows re-anchors them (its `nil? from` branch sends nothing)."
+that follows re-anchors them (with no box changed, every box carries its note and nothing is
+sent)."
   (let (b (ed-current-buf m))
     (and (tutor-buffer? b)
       (or (not (= (buffer-rope b) (:tutor-eval-rope b))) (results/eol-notes-hidden? b)))))
@@ -638,13 +641,15 @@ Not worth a resolver here: only the sandbox knows its own global table."
           inner (fold (rest form) '() (fn (acc f) (append acc (tutor-call-heads f)))))
       (if (symbol? head) (cons head inner) inner))))
 
-(defn- tutor-defined-names (form)
-  "The name a top-level definition binds — `(defn f …)` / `(def f …)` → `f`, else nil.
-A box's own function is the one thing it is guaranteed to be worth tracing."
-  (when (and (pair? form)
-          (includes? ['def 'defn 'defmacro 'defdyn] (first form))
-          (symbol? (second form)))
-    (second form)))
+(defn- tutor-defined-names (src)
+  "The names `src`'s top-level definitions bind — `(defn f …)` / `(def f …)` → `\"f\"` — as
+the reader's own `reflect/source-deps` `:defines` says, rather than a list of heads kept
+here that drifts from it. A box's own function is the one thing it is guaranteed to be
+worth tracing."
+  (check-allow :discarded-catch
+    (try
+      (mapcat (reflect/source-deps src) (fn (deps) (or (:defines deps) '())))
+      (catch _ '()))))
 
 (defn- tutor-trace-names (pg src)
   "The fn-name strings to boundary-trace for one box: what `src` defines, what it
@@ -652,7 +657,8 @@ calls, and the lesson's explicit `:trace` — deduped, special forms dropped (th
 syntax, never functions). `src` that doesn't parse contributes nothing; the box is
 mid-typing and has no verdict yet either."
   (let (forms (try (reflect/read-all src) (catch _ '()))
-        defined (seq/filter (map forms tutor-defined-names) (fn (s) (not (nil? s))))
+        ;; nothing when `src` does not read: a box mid-typing has no verdict yet either
+        defined (if (empty? forms) '() (tutor-defined-names src))
         called (fold forms '() (fn (acc f) (append acc (tutor-call-heads f))))
         specials (reflect/special-forms)
         names (seq/filter (map (append defined called) ->string)
@@ -876,29 +882,28 @@ debounce beat). A line with no note at all gets a standalone warning."
       (tutor-warning-echoes? (second hit) w) notes ; …or already said this exact thing
       else (let ([k note] hit) (assoc notes k (assoc note :warn (:text w)))))))
 
+(defn- tutor-without-warnings (notes)
+  ;; Last round's warnings dropped — both the standalone ones and the `:warn` fields
+  ;; attached to results — since they are recomputed from the current text.
+  (fold notes
+    {}
+    (fn (acc kv)
+      (let ([k v] kv) (if (and (vector? k) (= (first k) :warn)) acc (assoc acc k (dissoc v :warn)))))))
+
 (defn- tutor-with-warnings (m)
   "Add the checker's warnings for every box to the buffer's notes — beside a result on
 the same line, on their own line otherwise."
-  (let (i (ed-buffer-index-by-name m tutor/*tutor-buffer-name*))
-    (if (nil? i)
+  (let (b (tutor-buf m))
+    (if (nil? b)
       m
-      (let (b (nth (:buffers m) i)
-            text (buffer-text b)
-            ;; drop last round's warnings — both the standalone ones and the `:warn`
-            ;; fields attached to results — since they are recomputed from the current text
-            notes (fold (or (results/eol-notes-any b) {})
-                    {}
-                    (fn (acc kv)
-                      (let ([k v] kv)
-                        (if (and (vector? k) (= (first k) :warn))
-                          acc
-                          (assoc acc k (dissoc v :warn))))))
+      (let (text (buffer-text b)
             warns (tutor-session-warnings (buffer-rope b)
                     text
                     (seq/filter (tutor-regions text) (fn (r) (= (:kind r) :code))))
-            merged (fold warns notes (fn (acc kv) (tutor-merge-warning acc (second kv)))))
-        (tutor-bufset-buf m
-          (fn (bb) (editor/buffer/annotate bb :eol-notes merged)))))))
+            merged (fold warns
+                     (tutor-without-warnings (or (results/eol-notes-any b) {}))
+                     (fn (acc kv) (tutor-merge-warning acc (second kv)))))
+        (tutor-bufset-buf m (fn (bb) (editor/buffer/annotate bb :eol-notes merged)))))))
 
 (defn ed-tutor-reanchor (m)
   "Re-anchor the tutorial's verdicts to the text as it is NOW — on the edit itself, not the
@@ -920,8 +925,7 @@ briefly absent.
 
 Guarded on the notes' own currency rather than on a remembered rope, for the reason
 [[ed-tutor-stale?]] gives."
-  (let (i (ed-buffer-index-by-name m tutor/*tutor-buffer-name*)
-        b (when i (nth (:buffers m) i)))
+  (let (b (tutor-buf m))
     (if (or (nil? b) (not (results/eol-notes-stale? b)))
       m
       (fold (or (results/eol-notes-any b) {})
@@ -930,6 +934,134 @@ Guarded on the notes' own currency rather than on a remembered rope, for the rea
           (let ([k note] kv)
             ;; region keys only — see the note on warnings above
             (if (int? k) (tutor-set-note mm k (dissoc note :line)) mm)))))))
+
+(defn- tutor-known (b pending)
+  ;; What each box was last evaluated with (`:tutor-srcs`), plus the boxes whose identical
+  ;; request is already IN FLIGHT: their answer is coming, so they are not "never evaluated"
+  ;; and must not drag the first change (and with it the whole tail below them) into a
+  ;; re-send on every settled keystroke. Counted for the plan only — never written to
+  ;; `:tutor-srcs`, since only a reply landing may say that ([[tutor-evaluated]]).
+  ;; `liveeval/in-flight` is the playground's reader too, so "which regions are waiting?" is
+  ;; answered the same way — newest request per region — on both sides.
+  (merge (or (:tutor-srcs b) {})
+    (into {} (map (liveeval/in-flight pending) (fn (kv) [(first kv) (:src (second kv))])))))
+
+(defn- tutor-launch-reset (m b from)
+  ;; Stamp the rope this launch read (the timer disarms until the text moves), clear the
+  ;; notes, and forget what the session evaluated for every box from `from` down: a box
+  ;; being re-derived is no longer one the session has evaluated — the launch puts back the
+  ;; ones it answers locally, a reply puts back the rest ([[tutor-evaluated]]).
+  ;;
+  ;; The cached workings of those boxes go too, BEFORE anything is evaluated: their old
+  ;; cascades describe code that no longer exists, and a headless (synchronous) launch
+  ;; applies its verdicts inside the launch's fold — forgetting afterwards would erase the
+  ;; very entries it just produced.
+  (tutor-workings/forget (tutor-bufset-buf (tutor-bufset m
+                                             {:tutor-eval-rope (buffer-rope b)
+                                              :tutor-srcs (into {}
+                                                            (seq/filter (or (:tutor-srcs b) {})
+                                                              (fn (kv) (< (first kv) from))))})
+                           (fn (bb) (editor/buffer/annotate bb :eol-notes {})))
+    from))
+
+(defn- tutor-launch-client (pgs)
+  ;; The tutorial's half of `liveeval/form-step` — how a box is sent, booked and, headless,
+  ;; answered in this image.
+  {:note-at tutor-set-note
+   ;; a box that would write, delete or run something outside the sandbox is not run as
+   ;; you type — an electric pair closes `(file/spit "f" "")` before the text is in
+   ;; (issues.md S5). No lesson needs one.
+   :held-reason liveeval/held-reason
+   :held-how "the tutorial does not run it — try it in M-x brood-playground"
+   :live? (tutor-live?)
+   ;; Sent, it shows as in flight straight away: with a `receive` in the box a reply can be
+   ;; hundreds of ms away, and a stale verdict sitting there looking current is the wrong
+   ;; thing to show. Keyed by what was SENT, not by the rope of the whole page — see
+   ;; `tutor-apply-reply`.
+   :send (fn (id i src)
+           (sandbox-eval id
+             src
+             tutor/*tutor-eval-timeout-ms*
+             (tutor-trace-names (nth pgs i {}) src)))
+   :request (fn (i src) {:region i :src src})
+   :no-session "no sandbox — C-c C-k restarts it"
+   ;; HEADLESS (tests, batch): the eval runs IN THIS IMAGE, and it installs NO traces — not
+   ;; the derived list, not even the lesson's own `:trace`. Instrumentation rebinds globals,
+   ;; and here the globals are the running editor's, shared by every test process in the
+   ;; run: a `trace-fn` here shows up as `[reload] arity changed` churn, and two tests
+   ;; evaluating the same lesson concurrently are the "concurrent writers" case wholesale
+   ;; global rebinding is documented not to survive (ADR-017). Tracing belongs to the
+   ;; sandbox, a throwaway image built for it. So the headless path yields verdicts (values,
+   ;; ✓/✗) but no cascade — the pane's own behaviour is tested from synthetic replies, and
+   ;; end to end by the pty drive.
+   :headless (fn (m i src)
+               (tutor-apply-verdict m i (nth pgs i {}) (eval-server/eval-capturing src nil)))})
+
+(defn- tutor-prose-step (acc i pg src)
+  ;; A PROSE box: never parsed, never sent to the sandbox — it answers locally and
+  ;; instantly, or says nothing. A solved prose exercise counts on the contents page exactly
+  ;; like an evaluated one — same bookkeeping, just no round trip to get there.
+  (let ([m next-id pending] acc
+        note (tutor-text-verdict pg src))
+    (if (nil? note)
+      acc
+      [(tutor-remember-pass (tutor-set-note m i note) i pg note) next-id pending])))
+
+(defn- tutor-code-state (src)
+  ;; a code box's `liveeval/form-step` state: its parse — except that an emptied box keeps
+  ;; its last verdict, where the playground's says nothing
+  (let (parsed (liveeval/parse-state src)) (if (= parsed :blank) :carry parsed)))
+
+(defn- tutor-record-answered (acc i src)
+  ;; A box with no request in flight has been ANSWERED, right here and now — locally (prose,
+  ;; blank, a syntax error, headless) or, for a carried box, in an earlier round. Remember
+  ;; what it was answered for. The one case that must not record is the box just SENT:
+  ;; only its reply landing may say the session has it.
+  (let ([m next-id pending] acc)
+    (if (liveeval/awaiting? pending i) acc [(tutor-evaluated m i src) next-id pending])))
+
+(defn- tutor-box-step (pgs srcs old-notes from)
+  ;; The launch's fold step, `(acc i) -> acc`: each box takes its turn through the step the
+  ;; playground shares (`liveeval/form-step`) — carry, note, hold, send or answer in-image.
+  ;; A box above the edit is unaffected, so it keeps its verdict as it is; a prose box is
+  ;; the tutorial's own ([[tutor-prose-step]]).
+  (let (client (tutor-launch-client pgs))
+    (fn (acc i)
+      (let (src (get srcs i "")
+            pg (nth pgs i {})
+            old (get old-notes i))
+        (tutor-record-answered (cond
+                                 (< i from) (liveeval/form-step acc i src :carry old client)
+                                 (= (:kind pg) :text) (tutor-prose-step acc i pg src)
+                                 else
+                                   (liveeval/form-step acc i src (tutor-code-state src) old client))
+          i src)))))
+
+(defn- tutor-launch-finish (m)
+  ;; The checker's warnings, then the pane re-rendered for the box at point (the stale
+  ;; cascades of the re-sent boxes are already gone — see [[tutor-launch-reset]]), so it
+  ;; says `⋯ has not run yet` until the reply lands rather than showing the version you
+  ;; just edited away.
+  ;;
+  ;; A lesson where ANY box has workings gets the pane opened, even when the box you happen
+  ;; to be in has none: on a lesson built around watching code run, the pane has to be
+  ;; there to be noticed. It still shows the box at point — the reader moves and it
+  ;; follows — rather than whichever box traced last.
+  ;;
+  ;; Only ONCE per page, though: `:workings-region` unset means the pane has not been shown
+  ;; on this page yet (`tutor-install-page` clears it), so a pane the reader closed is not
+  ;; dragged back by the next thing they type. C-c C-w is the way back after that, which
+  ;; is the point of having the command.
+  (let (m1 (tutor-with-warnings m))
+    (tutor-workings/refresh m1
+      (tutor-box-at-point m1)
+      (and (nil? (get-in m1 [:tutor :workings-region])) (tutor-workings/on-page? m1)))))
+
+(defn- tutor-pending-above (pending from)
+  ;; The launch's request book is seeded with the in-flight requests of the boxes NOT being
+  ;; re-sent (those above the edit): their replies are still coming, and dropping them from
+  ;; `:pending` would strand the `⋯ evaluating…` note the carry re-stamps.
+  (into {} (seq/filter pending (fn (kv) (< (:region (second kv)) from)))))
 
 (defn ed-tutor-launch (m)
   "Debounce landed: re-evaluate the current lesson's playgrounds FROM THE EDITED BOX
@@ -943,7 +1075,9 @@ every box instead re-ran work that provably can't have changed: lesson 12's try-
 is `(countdown 1000000)`, so typing in the exercise beneath it re-ran a million tail
 calls every beat, and the process lessons spawn a process per box per round. Boxes
 ABOVE the edit cannot depend on text below them, so they keep their notes
-(re-anchored, since lines may have shifted).
+(re-anchored, since lines may have shifted). When nothing in any box changed (an edit
+the guard reverted, whitespace the parser ignores) every box is above the edit: every
+note is re-anchored and nothing is sent.
 
 Incomplete boxes (reader E0002: mid-form) say nothing and carry their previous note;
 a real syntax error fails locally without a round-trip. A box with lesson `:trace`
@@ -959,204 +1093,43 @@ Reading order is dependency order here, which is what a tutorial should teach."
     (if (not (tutor-buffer? b))
       m
       (let (text (buffer-text b)
-            rope (buffer-rope b)
             regions (tutor-regions text)
-            pgs (tutor-playgrounds m)
-            live (tutor-live?)
-            old-notes (or (results/eol-notes-any b) {})
-            old-srcs (or (:tutor-srcs b) {})
+            total (count regions)
             srcs (tutor-region-srcs text regions)
-            ;; …plus the boxes whose identical request is already IN FLIGHT: their answer is
-            ;; coming, so they are not "never evaluated" and must not drag `from` (and with
-            ;; it the whole tail below them) into a re-send on every settled keystroke.
-            ;; Counted for the plan only — never written to `:tutor-srcs`, since only a reply
-            ;; landing may say that ([[tutor-evaluated]]). `liveeval/in-flight` is the
-            ;; playground's reader too, so "which regions are waiting?" is answered the same
-            ;; way — newest request per region — on both sides.
-            in-flight (into {}
-                        (map (liveeval/in-flight (or (get-in m [:tutor :pending]) {}))
-                          (fn (kv) [(first kv) (:src (second kv))])))
-            from (tutor-first-changed srcs (merge old-srcs in-flight) (count regions))
-            ;; one counter for the whole sandbox, not one per client — see `sandbox-next-id`
-            start-id (sandbox-next-id m)
-            ;; Drop the cached workings of every box being re-sent BEFORE anything is
-            ;; evaluated: their old cascades describe code that no longer exists, and a
-            ;; headless (synchronous) launch applies its verdicts inside the fold below —
-            ;; forgetting afterwards would erase the very entries it just produced.
-            m0 (tutor-workings/forget
-                 (tutor-bufset-buf
-                   (tutor-bufset m
-                     {:tutor-eval-rope rope
-                      ;; A box being re-derived is no
-                      ;; longer one the session has
-                      ;; evaluated — the fold below puts
-                      ;; back the ones it answers
-                      ;; locally, a reply puts back the
-                      ;; rest ([[tutor-evaluated]]).
-                      :tutor-srcs (if (nil? from)
-                                    old-srcs
-                                    (into {}
-                                      (seq/filter old-srcs
-                                        (fn (kv) (< (first kv) from)))))})
-                   (fn (bb) (editor/buffer/annotate bb :eol-notes {})))
-                 from)
-            ;; nothing in any box changed (an edit the guard reverted, whitespace the
-            ;; parser ignores): re-anchor every note and send nothing
-            result (if (nil? from)
-                     [(fold old-notes
-                        m0
-                        (fn (mm kv)
-                          (let ([i note] kv) (tutor-set-note mm i (dissoc note :line)))))
-                       start-id
-                       {}]
-                     (fold (seq/enumerate regions)
-                       ;; Seed with the in-flight entries of the boxes we are NOT
-                       ;; re-sending (those above the edit): their replies are still
-                       ;; coming, and dropping them from `:pending` would strand the
-                       ;; `⋯ evaluating…` note the carry branch re-stamps.
-                       [m0
-                         start-id
-                         (into {}
-                           (seq/filter (or (get-in m [:tutor :pending]) {})
-                             (fn (kv) (< (:region (second kv)) from))))]
-                       (fn (acc ir)
-                         (let ([m1 next-id pending] acc
-                               [i r] ir
-                               src (get srcs i "")
-                               pg (nth pgs i {})
-                               old (get old-notes i)
-                               state (cond
-                                       (< i from) :carry
-                                       ;; prose: never parsed, never sent to the sandbox
-                                       (= (:kind pg) :text) :text
-                                       else
-                                         (let (parsed (liveeval/parse-state src)
-                                               ;; ready, but it would reach outside the
-                                               ;; sandbox — see the `[:held …]` clause
-                                               held (when (= parsed :ok) (liveeval/held-reason src)))
-                                           (if held [:held held] parsed)))
-                               out (match state
-                                     ;; a prose box answers locally and instantly, or says nothing
-                                     (:text
-                                       (let (note (tutor-text-verdict pg src))
-                                         (if (nil? note)
-                                           acc
-                                           ;; a solved prose exercise counts on the contents
-                                           ;; page exactly like an evaluated one — same
-                                           ;; bookkeeping, just no round trip to get there
-                                           [(tutor-remember-pass (tutor-set-note m1 i note)
-                                              i pg note)
-                                             next-id pending])))
-                                     ;; above the edit: unaffected, so keep the verdict as it is
-                                     (:carry (if old
-                                               [(tutor-set-note m1 i (dissoc old :line))
-                                                 next-id pending]
-                                               acc))
-                                     (:blank (if old
-                                               [(tutor-set-note m1 i (dissoc old :line))
-                                                 next-id pending]
-                                               acc))
-                                     ;; Mid-form. Two things must NOT happen here: re-stamping the
-                                     ;; previous verdict (which left a confident `=> "hi"` beside
-                                     ;; a `(str "hi` that can no longer produce it — the same
-                                     ;; "stale verdict looking current" the `:ok` branch refuses
-                                     ;; to show), and showing nothing at all (indistinguishable
-                                     ;; from "no feedback yet"). Say what the reader is waiting
-                                     ;; for, in the pending voice — dim, never a verdict colour,
-                                     ;; because a form you are still typing is not a mistake.
-                                     ([:incomplete reason] [(tutor-set-note m1
-                                                              i
-                                                              (liveeval/incomplete-note reason))
-                                                             next-id pending])
-                                     ([:err msg] [(tutor-set-note m1
-                                                    i
-                                                    (liveeval/syntax-error-note msg))
-                                                   next-id pending])
-                                     ;; a box that would write, delete or run something outside
-                                     ;; the sandbox is not run as you type — an electric pair
-                                     ;; closes `(file/spit "f" "")` before the text is in
-                                     ;; (issues.md S5). No lesson needs one.
-                                     ([:held reason] [(tutor-set-note m1
-                                                        i
-                                                        (liveeval/held-note reason
-                                                          "the tutorial does not run it — try it in M-x brood-playground"))
-                                                       next-id pending])
-                                     (:ok
-                                       (if live
-                                         (if (sandbox-eval next-id
-                                               src
-                                               tutor/*tutor-eval-timeout-ms*
-                                               (tutor-trace-names pg src))
-                                           ;; show it as in flight straight away: with a
-                                           ;; `receive` in the box a reply can be hundreds of
-                                           ;; ms away, and a stale verdict sitting there
-                                           ;; looking current is the wrong thing to show.
-                                           ;; Keyed by what was SENT, not by the rope of the
-                                           ;; whole page — see `tutor-apply-reply`.
-                                           [(tutor-set-note m1 i (liveeval/running-note))
-                                             (inc next-id)
-                                             (assoc pending next-id {:region i :src src})]
-                                           ;; The worker is gone (it gave up, or never started).
-                                           ;; Nothing is coming, so pending it would wedge this box
-                                           ;; on its running indicator forever — a box whose answer
-                                           ;; is already in flight is never re-sent.
-                                           [(tutor-set-note m1
-                                              i
-                                              (liveeval/syntax-error-note "no sandbox — C-c C-k restarts it"))
-                                             next-id pending])
-                                         ;; HEADLESS (tests, batch): the eval runs IN THIS IMAGE, and
-                                         ;; it installs NO traces — not the derived list, not even
-                                         ;; the lesson's own `:trace`. Instrumentation rebinds
-                                         ;; globals, and here the globals are the running editor's,
-                                         ;; shared by every test process in the run: a `trace-fn`
-                                         ;; here shows up as `[reload] arity changed` churn, and two
-                                         ;; tests evaluating the same lesson concurrently are the
-                                         ;; "concurrent writers" case wholesale global rebinding is
-                                         ;; documented not to survive (ADR-017). Tracing belongs to
-                                         ;; the sandbox, a throwaway image built for it. So the
-                                         ;; headless path yields verdicts (values, ✓/✗) but no
-                                         ;; cascade — the pane's own behaviour is tested from
-                                         ;; synthetic replies, and end to end by the pty drive.
-                                         [(tutor-apply-verdict m1
-                                            i
-                                            pg
-                                            (eval-server/eval-capturing src nil))
-                                           next-id pending])))
-                               [m2 nid pend] out)
-                           ;; A box with no request in flight has been ANSWERED, right here
-                           ;; and now — locally (prose, blank, a syntax error, headless) or,
-                           ;; for a carried box, in an earlier round. Remember what it was
-                           ;; answered for. The one case that must not record is the box we
-                           ;; just SENT: only its reply landing may say the session has it.
-                           (if (seq/find pend (fn (kv) (= (:region (second kv)) i)))
-                             out
-                             [(tutor-evaluated m2 i src) nid pend])))))
-            [m2 next-id pending] result)
-        ;; Re-render the pane for the box at point (the stale cascades of the re-sent
-        ;; boxes are already gone — see `m0`), so it says `⋯ has not run yet` until the
-        ;; reply lands rather than showing the version you just edited away.
-        ;;
-        ;; A lesson where ANY box has workings gets the pane opened, even when the box
-        ;; you happen to be in has none: on a lesson built around watching code run, the
-        ;; pane has to be there to be noticed. It still shows the box at point — the
-        ;; reader moves and it follows — rather than whichever box traced last.
-        ;;
-        ;; Only ONCE per page, though: `:workings-region` unset means the pane has not
-        ;; been shown on this page yet (`tutor-install-page` clears it), so a pane the
-        ;; reader closed is not dragged back by the next thing they type. C-c C-w is the
-        ;; way back after that, which is the point of having the command.
-        (let (m4 (tutor-with-warnings (update (sandbox-ids-used m2 next-id)
-                                        :tutor merge
-                                        {:pending pending})))
-          (tutor-workings/refresh m4
-            (tutor-box-at-point m4)
-            (and (nil? (get-in m4 [:tutor :workings-region])) (tutor-workings/on-page? m4))))))))
+            pending (or (get-in m [:tutor :pending]) {})
+            from (or (tutor-first-changed srcs (tutor-known b pending) total) total)
+            [m1 next-id sent] (fold (range total)
+                                [(tutor-launch-reset m b from)
+                                  (session/next-id m)
+                                  (tutor-pending-above pending from)]
+                                (tutor-box-step (tutor-playgrounds m)
+                                  srcs
+                                  (or (results/eol-notes-any b) {})
+                                  from)))
+        (tutor-launch-finish (session/client-sent m1 :tutor next-id sent))))))
+
+(defn- tutor-land-reply (m request reply)
+  ;; The `session/client-reply` landing: accepted when the BOX still holds the text the
+  ;; request was sent for — boxes cannot move, so it is that region or nothing.
+  (let (b (tutor-buf m)
+        region (:region request)
+        src (when b
+              (let (text (buffer-text b))
+                (get (tutor-region-srcs text (tutor-regions text)) region))))
+    (if (or (nil? b) (not (= src (:src request))))
+      m
+      (tutor-with-warnings (tutor-evaluated (tutor-apply-verdict m
+                                              region
+                                              (nth (tutor-playgrounds m) region {})
+                                              reply)
+                             region src)))))
 
 (defn tutor-apply-reply (m reply)
   "Fold one sandbox reply into the model: an unknown id, or a BOX that no longer holds the
 text the request was sent for → dropped (the next idle beat re-evaluates); else the verdict
 lands as the box's note (and its trace, if any, as the workings pane), and the box is
-recorded as evaluated with that source.
+recorded as evaluated with that source. A reply under the session's own generation — the
+generation check is [[tutor-sandbox-reply]]'s.
 
 The acceptance test used to be the whole page's rope, which discarded every reply the moment
 you typed anywhere — including in a different box, whose text cannot change what this one
@@ -1165,24 +1138,7 @@ results: the launch had already recorded the send as evaluated, so nothing re-se
 the `⋯ evaluating…` stayed until that box's own text changed. The playground learned this
 first; the pairing is now the same on both sides — [[tutor-evaluated]] records only what
 landed, and the request carries the source it was sent for."
-  (let (id (get reply :id)
-        pend (get-in m [:tutor :pending id]))
-    (if (nil? pend)
-      m
-      (let (m1 (update m :tutor update :pending dissoc id)
-            i (ed-buffer-index-by-name m1 tutor/*tutor-buffer-name*)
-            b (when i (ed-buf-at m1 i))
-            region (:region pend)
-            src (when b
-                  (let (text (buffer-text b))
-                    (get (tutor-region-srcs text (tutor-regions text)) region))))
-        (if (or (nil? b) (not (= src (:src pend))))
-          m1
-          (tutor-with-warnings (tutor-evaluated (tutor-apply-verdict m1
-                                                  region
-                                                  (nth (tutor-playgrounds m1) region {})
-                                                  reply)
-                                 region src)))))))
+  (tutor-sandbox-reply m reply (get-in m [:tutor :sandbox-gen])))
 
 ;; ---- the sandbox events fold in here (the records live consumer-blind in sandbox) --
 
@@ -1194,12 +1150,10 @@ whole lesson against the fresh session. `:tutor-srcs` matters as much as
 it behind made a restart re-send *nothing*: the session was empty but every box
 looked evaluated, and the next keystroke hit `unbound symbol` for a def that was
 never replayed."
-  (update (tutor-bufset m {:tutor-eval-rope nil :tutor-srcs {}})
-    :tutor merge
-    ;; `:pending` is KEPT, as in playground-core's `sandbox-ready`: requests sent before
-    ;; the banner were queued and flushed to this child, so their replies are coming; the
-    ;; launch counts those boxes as in flight and does not send them again
-    {:sandbox-gen gen :sandbox-ready true}))
+  ;; `:pending` is KEPT, as in playground-core's `sandbox-ready`: requests sent before
+  ;; the banner were queued and flushed to this child, so their replies are coming; the
+  ;; launch counts those boxes as in flight and does not send them again
+  (session/client-ready (tutor-bufset m {:tutor-eval-rope nil :tutor-srcs {}}) :tutor gen))
 
 ;; The three sandbox hooks. They used to be `impl UiEvent` blocks right here, which made the
 ;; tutorial the router for a resource it shares — and an `impl` is per record type, so no
@@ -1207,6 +1161,14 @@ never replayed."
 ;; each event to every client; these are what it calls for this one. Behaviour is unchanged:
 ;; the id check that ignores a foreign reply was always there (`tutor-apply-reply`), and it is
 ;; what makes a fan-out safe.
+;;
+;; Registering is also what loads `sandbox-events`, so its impls are in place before the
+;; tutorial can have started a sandbox.
+(sandbox-events/register-client {:session :sandbox
+                                 :live? 'tutor/tutor-live-buffer?
+                                 :ready 'tutor/tutor-sandbox-ready
+                                 :reply 'tutor/tutor-sandbox-reply
+                                 :down 'tutor/tutor-sandbox-down})
 
 (defn tutor-live-buffer? (m)
   "Is the *Tutorial* buffer still on screen — i.e. does the tutorial still want a sandbox?
@@ -1214,26 +1176,23 @@ never replayed."
   (not (nil? (ed-buffer-index-by-name m tutor/*tutor-buffer-name*))))
 
 (defn tutor-sandbox-reply (m reply gen)
-  "Fold one sandbox reply for the tutorial. Replies stamped by a superseded child (pre-reset
-stragglers) are dropped; the worker answers its own inflight ids `{:timeout true}` BEFORE
-bumping gen, so those arrive with the current gen and land as ✗ timed out. A reply the
-tutorial never sent falls out of `tutor-apply-reply` untouched."
-  (if (= gen (get-in m [:tutor :sandbox-gen])) (tutor-apply-reply m reply) m))
+  "Fold one sandbox reply for the tutorial, through the rule every live-evaluating client
+shares (`session/client-reply`): a reply the tutorial never sent is not its own; one stamped
+by a superseded child (a pre-reset straggler) is dropped and unpended; anything else lands
+through [[tutor-land-reply]]. The worker answers its own inflight ids `{:timeout true}`
+BEFORE bumping gen, so those arrive with the current gen and land as ✗ timed out."
+  (session/client-reply m :tutor reply gen tutor/*tutor-buffer-name* tutor-land-reply))
 
 (defn tutor-sandbox-down (m code)
-  "The child (or the whole worker) went away, and somebody still wants a sandbox (the
-shut-it-down-for-good case belongs to `sandbox-events`, which is the only place that can see
-whether EVERY client is gone). Policy by code:
-  `:gave-up` / `:spawn-failed` → the worker already stopped itself — say so once, and how to
-                                 retry; anything else is an ordinary restart."
-  (let (m1 (update m :tutor merge {:sandbox-ready false}))
-    (cond
-      (not (tutor-live-buffer? m1)) m1 ; not ours to narrate — the playground may have caused it
-      (= code :gave-up)
-        (message m1 "tutorial sandbox keeps dying — C-c C-k retries, *Messages* may say why")
-      (= code :spawn-failed)
-        (message m1 "could not start the tutorial sandbox (is `nest` on PATH?) — C-c C-k retries")
-      else (message m1 "tutorial sandbox restarting…"))))
+  "The child (or the whole worker) went away, and somebody still wants a sandbox
+([[session/client-down]]). Narrated only while the tutorial is on screen — otherwise it is
+not ours to narrate; the playground may have caused it."
+  (session/client-down m
+    :tutor tutor-live-buffer?
+    code
+    {:gave-up "tutorial sandbox keeps dying — C-c C-k retries, *Messages* may say why"
+     :spawn-failed "could not start the tutorial sandbox (is `nest` on PATH?) — C-c C-k retries"
+     :restarting "tutorial sandbox restarting…"}))
 
 ;; ---- the :post-key hook (profile re-render) and the :on-move follower (workings) ---
 ;; (the prose is protected at the edit primitive now — the buffer is narrowed to its boxes,
@@ -1356,7 +1315,7 @@ anything is on screen asks you to decide with no context, and the lesson can *sh
 both profiles and let you switch in place (every page re-renders for the keys you
 pick). The eval sandbox starts spawning here, so its boot hides behind reading."
   (do
-    (when (tutor-live?) (do (sandbox-events/ensure) (sandbox-start)))
+    (when (tutor-live?) (sandbox-start))
     (if (ed-buffer-index-by-name m tutor/*tutor-buffer-name*)
       (ed-switch-to-named m tutor/*tutor-buffer-name*)
       ;; Read the saved solves back in on the way in, so the contents page shows what
@@ -1441,7 +1400,7 @@ The contents page is the top; there is nowhere above it."
           buf (ed-current-buf hub)
           line (seq/find (range (buffer-line-count buf))
                  (fn (i) (= (tutor-contents-section-at buf i) group))))
-      (if (nil? line) hub (ed-apply hub (fn (b) (commands/ed-goto-line b (inc line))))))))
+      (if (nil? line) hub (ed-apply hub (fn (b) (pool/ed-goto-line b (inc line))))))))
 
 (defcommand cmd-tutorial-contents
   (m key)
@@ -1470,7 +1429,7 @@ lesson. A line that names no section is left alone."
   (m key)
   "RET in the tutorial: on the contents page it enters the section at point; inside
 a lesson it's an ordinary auto-indenting newline (a motion under a modal profile's
-command state — `vim/ed-vim-command-mode?`)."
+command state — `keymaps/ed-vim-command-mode?`)."
   (if (tutor-contents? m)
     (cmd-tutorial-enter-section m key)
     (cmd-newline-and-indent m key)))
@@ -1554,7 +1513,7 @@ isn't code). Extends the selection like any motion when a mark is set."
 like every other Brood buffer — deterministic, because navigation lives on M-n / M-p /
 S-TAB. Inside a PROSE box it only indents. Outside any box there is nothing to indent,
 so it points you at the keys that move. Under a modal profile's command state it hops
-boxes instead — nothing types in vim normal mode (`vim/ed-vim-command-mode?`).
+boxes instead — nothing types in vim normal mode (`keymaps/ed-vim-command-mode?`).
 
 Why prose must not complete: `cmd-indent-or-complete` finishes the symbol at point when
 the line is already indented, and in an English box EVERY word is a symbol to that code.
@@ -1650,10 +1609,7 @@ the whole lesson re-evaluates against it once it announces ready. Also the retry
 path when the worker itself gave up or failed to spawn: a dead worker is started
 anew, not reset (reset on a dead worker was a silent no-op)."
   (do
-    (when (tutor-live?)
-      (do
-        (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
-        (if (sandbox-running?) (sandbox-reset) (sandbox-start))))
+    (when (tutor-live?) (if (sandbox-running?) (sandbox-reset) (sandbox-start)))
     (message m "restarting the tutorial sandbox…")))
 
 (defn tutor-on-close (buf)
@@ -1684,7 +1640,7 @@ apostrophe would drift."
   (let (region (tutor-region-at (tutor-regions text) bol)
         margin (string/length tutor/*tutor-box-margin*))
     (cond
-      (nil? region) (modes/brood-indent text bol)
+      (nil? region) (brood-mode/brood-indent text bol)
       (= (:kind region) :text) margin
       ;; Scope the sexp indenter to the BOX's own slice: the page around it is prose,
       ;; and prose brackets (an aside like "(try it)", an unmatched quote) would
@@ -1692,7 +1648,7 @@ apostrophe would drift."
       ;; at a line start, so columns in the slice equal columns in the buffer.
       else
         (math/max margin
-          (modes/brood-indent (string/substring text (:start region) (:end region))
+          (brood-mode/brood-indent (string/substring text (:start region) (:end region))
             (- bol (:start region)))))))
 
 ;; ---- fontify ---------------------------------------------------------------------

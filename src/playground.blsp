@@ -35,14 +35,11 @@ reply's note says, and where to send one. Nine functions and a map.
 **Nothing persists.** A fresh buffer every time the editor starts: the point is a surface
 with no stakes, and a playground that accumulates is a file you end up tidying. `C-x C-w`
 if a session turns out to be worth keeping."
-  (:use model) ; message / ed-current-buf
-  (:use commands) ; ed-show-named / ed-select
+  (:use model) ; register-live-eval-client — the eval-on-type hooks
   (:use interactive) ; defcommand — M-x brood-playground
-  (:use editor/buffer) ; buffer-text
   (:use editor/layers) ; register-type-layers / request-close
-  (:use theme) ; *subtext* / *teal* — the spy pane's two faces
   (:use sandbox)) ; sandbox-start / sandbox-eval / the session
-;; liveeval, playground-core, workings, sandbox-events, sexp and modes are referenced
+;; liveeval, playground-core, sandbox-events, attach, sexp and eval-server are referenced
 ;; qualified below — each `mod/name` auto-loads its module.
 
 (def *buffer-name* "*Playground*")
@@ -120,6 +117,12 @@ It yields values but no cascade: `:trace :all` resolves against the SANDBOX's se
 the editor's own image is not it."
   (eval-server/eval-capturing src nil))
 
+(defn start-session (m)
+  "Start the sandbox for the playground. Any root will do (nil): the playground is
+projectless, so a sandbox already running elsewhere is left where it is rather than
+respawned under you."
+  (sandbox-start))
+
 (def *spec*
   {:key :playground
    :buffer playground/*buffer-name*
@@ -136,7 +139,18 @@ the editor's own image is not it."
    :namespace-form? 'playground/namespace-form?
    :note-of 'playground/note-of
    :eval 'playground/send-eval
-   :in-image 'playground/eval-in-image})
+   :in-image 'playground/eval-in-image
+   :start 'playground/start-session
+   :running? 'sandbox/sandbox-running?
+   :reset 'sandbox/sandbox-reset
+   :welcome playground/*welcome*
+   :open-message "playground — type Brood; it runs as you stop typing"
+   :restart-message "restarting the playground sandbox…"
+   ;; the untraced note is an aside about the tracer, not about your code — dimmest,
+   ;; italic, so the eye passes over it on the way back to the value
+   :spy-faces [[:prefix "What ran" :dim]
+                [:prefix liveeval/*untraced-note* :aside]
+                [:trimmed-prefix "= " :value]]})
 
 ;; ---- the buffer -------------------------------------------------------------------
 
@@ -151,11 +165,6 @@ so it is a Brood file first and a playground second."
 `sandbox-events` client hooks."
   (playground-core/live-buffer? *spec* m))
 
-(defn- playground-live? ()
-  ;; Is there a running editor to deliver a sandbox event to? Without the `ui-run` loop
-  ;; there is nothing to receive a reply, so a headless open starts no child runtime.
-  (not (ed-headless?)))
-
 ;; ---- the eval-on-type triple (the model's timers call these) -------------------------
 
 ;; the playground evaluates as you type — its three hooks, on the model's idle debounce
@@ -167,7 +176,14 @@ so it is a Brood file first and a playground second."
 (defn ed-playground-reanchor (m) (playground-core/ed-reanchor *spec* m))
 (defn ed-playground-launch (m) (playground-core/ed-launch *spec* m))
 
-;; ---- the sandbox client hooks (registered in `sandbox-events/*clients*`) --------------
+;; ---- the sandbox client hooks ---------------------------------------------------------
+;; Registering is also what loads `sandbox-events`, so its impls are in place before the
+;; playground can have started a sandbox.
+(sandbox-events/register-client {:session :sandbox
+                                 :live? 'playground/playground-live-buffer?
+                                 :ready 'playground/playground-sandbox-ready
+                                 :reply 'playground/playground-sandbox-reply
+                                 :down 'playground/playground-sandbox-down})
 
 (defn playground-sandbox-ready (m gen banner) (playground-core/sandbox-ready *spec* m gen))
 (defn playground-sandbox-reply (m reply gen)
@@ -215,21 +231,11 @@ with no re-evaluation."
 
 (register-type-layers :playground
   (list 'playground/playground-mode-layer
-    'modes/brood-mode-layer 'modes/prog-mode-layer 'modes/text-mode-layer))
-
-(defn- spy-line-face (line)
-  (cond
-    (string/starts-with? line "What ran") {:fg *subtext*}
-    ;; the untraced note is an aside about the tracer, not about your code — dimmest,
-    ;; italic, so the eye passes over it on the way back to the value
-    (string/starts-with? line liveeval/*untraced-note*) {:fg *overlay0* :italic true}
-    (string/starts-with? (string/triml line) "= ") {:fg *teal*}
-    else nil))
+    'brood-mode/brood-mode-layer 'modes/prog-mode-layer 'modes/text-mode-layer))
 
 (defn spy-fontify (src)
-  "The spy pane's colouring: the heading dim, every `= value` return in the accent — so a
-cascade reads as calls going in and values coming back rather than as a wall of text."
-  (modes/fontify-line-faces src playground/spy-line-face))
+  "The spy pane's colouring — the spec's `:spy-faces`, painted by `playground-core`."
+  (playground-core/spy-fontify *spec* src))
 
 (def playground-spy-layer
   {:name 'playground-spy :no-line-numbers true :fontify 'playground/spy-fontify})
@@ -260,39 +266,11 @@ brings the pane back if you closed it, on the form the cursor is in. A separate
 `playground-spy` command was a second thing to know for what is really the same intent
 (\"show me the playground\"), and a second entry cluttering `M-x` for a reader who has no
 idea the pane can be dismissed. Closing the pane still latches, so a later result does not
-reopen it behind you; asking for the playground again does, because that is you asking."
-  (do
-    ;; The sandbox is a child runtime, and only a running editor can receive its replies —
-    ;; so a headless open (a test, a `--headless` daemon) starts nothing.
-    (when (playground-live?)
-      (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
-      (sandbox-start))
-    (let (existing (playground-core/pg-index *spec* m))
-      (if existing
-        ;; already open: select it, and un-latch the pane onto the form at point
-        (let (m1 (ed-select m existing)
-              b (playground-core/pg-buf *spec* m1))
-          (if (nil? b)
-            m1
-            (let (text (buffer-text b))
-              (workings/reopen *spy-spec*
-                m1
-                (or (playground-core/form-index-in (playground-core/form-spans-in text
-                                                     (forms-of text))
-                      (:point b 0))
-                  0)))))
-        ;; `:playground` stacks a two-hook layer over the real brood-mode, so the buffer is
-        ;; a Brood file first — highlighting, indent, eldoc and paredit all come for free.
-        ;;
-        ;; The pane opens HERE, with `force`, rather than waiting to earn its split from the
-        ;; first traced reply the way the tutorial's does. The rules differ because the
-        ;; features do: a lesson is prose you are reading and the pane is an aside; a
-        ;; playground IS the pane's subject — you opened it to watch code run.
-        (message (workings/refresh *spy-spec*
-                   (ed-show-named m *buffer-name* *welcome* :playground)
-                   0
-                   true)
-          "playground — type Brood; it runs as you stop typing")))))
+reopen it behind you; asking for the playground again does, because that is you asking.
+
+`:playground` stacks a two-hook layer over the real brood-mode, so the buffer is a Brood
+file first — highlighting, indent, eldoc and paredit all come for free."
+  (playground-core/open *spec* m))
 
 (defcommand cmd-playground-run-held
   (m key)
@@ -312,12 +290,7 @@ Also the retry path when the worker itself gave up or never spawned, which is wh
 a dead one rather than resetting it: `sandbox-reset` on a worker that is not running is a
 silent no-op, and a silent no-op is the wrong answer to \"please try again\". The tutorial
 has the same command on `C-c C-k`; both drive the same shared child."
-  (do
-    (when (playground-live?)
-      (do
-        (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
-        (if (sandbox-running?) (sandbox-reset) (sandbox-start))))
-    (message m "restarting the playground sandbox…")))
+  (playground-core/restart *spec* m))
 
 ;; ---- attaching the Brood session to a node that is already running ------------------------
 ;; The mirror of `beam-attach`, and for the same reason: the session is an ordinary Brood
@@ -350,37 +323,11 @@ mode line says so for as long as it lasts. `M-x brood-detach` goes back.
 
 The node is typed rather than picked from a list on purpose: a menu of reachable nodes is
 one keystroke away from evaluating on production. `\"name\"` dials a local node over its
-Unix socket; `\"name@host:port\"` dials one over TCP."
-  (if (not (sandbox-running?))
-    (message m "no Brood session to attach — open a playground or evaluate something first")
-    (assoc m
-      :minibuffer
-        {:edit (ed-mb-edit "Attach to node: " "")
-         :on-complete (fn (m1 spec)
-                        (if (= (string/trim spec) "")
-                          (message m1 "no node named")
-                          (assoc m1
-                            :minibuffer
-                              {:edit (ed-mb-edit (str "Cookie for " (string/trim spec) ": ") "")
-                               :on-complete (fn (m2 cookie)
-                                              (let (id (sandbox-next-id m2)
-                                                    sent (sandbox-attach id
-                                                           (string/trim spec)
-                                                           (string/trim cookie)))
-                                                (if (not sent)
-                                                  (message m2 "the session is not running")
-                                                  (message (assoc-in (sandbox-ids-used m2 (inc id))
-                                                             [:sandbox :attaching]
-                                                             id)
-                                                    (str "connecting to " (string/trim spec) "…")))))})))})))
+Unix socket; `\"name@host:port\"` dials one over TCP. The prompt is `attach`'s, shared with
+`beam-attach` — this command is its `:brood` row."
+  (attach/prompt m :brood))
 
 (defcommand cmd-brood-detach
   (m key)
   "Route the Brood session back to bedit's own runtime (M-x brood-detach)."
-  (if (nil? (attached-node m))
-    (message m "not attached to anything")
-    (let (id (sandbox-next-id m)
-          sent (sandbox-detach id))
-      (if (not sent)
-        (message m "the session is not running")
-        (message (assoc-in (sandbox-ids-used m (inc id)) [:sandbox :attaching] id) "detaching…")))))
+  (attach/detach m :brood))

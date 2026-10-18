@@ -11,11 +11,12 @@ completion requests. `lsp-complete-source` plugs into `*completion-sources*`: on
 it does **one bounded synchronous round-trip** to the connection (completion is an
 explicit trigger, never a per-keystroke auto-popup, so a short blocking request is
 fine), and the returned labels are merged + fuzzy-ranked with the mode and
-buffer-word sources by `complete` like any other source.
+buffer-word sources by `complete` like any other source. Narrowing the popup filters that
+answer rather than asking again, unless the server said it was incomplete.
 
 The bug-prone logic — frame encode/decode across chunk boundaries, request/response
 correlation, completion-result shapes — is **pure** (`lsp-ingest`,
-`lsp-request-complete`, `lsp-decode`, `lsp-completion-labels`), so it's unit-tested
+`lsp-issue`, `lsp-decode`, `lsp-completion-labels`), so it's unit-tested
 without a server (tests/lsp_test.blsp); the connection process is a thin IO shell
 around it.
 
@@ -30,11 +31,13 @@ character split across two stdout reads is reassembled by the subprocess reader 
 reaches us, so a large frame no longer desyncs.)
 
 Caveats: document positions use 0-based **character** columns, which equal LSP's UTF-16
-code units for ASCII. Full-text document sync (no incremental edits)."
+code units for ASCII. Document sync is INCREMENTAL when the server offers it
+(`textDocumentSync` change kind 2): the editor sends the splices its buffer recorded
+([[lsp-content-changes]]), not the document — see [[lsp-sync-document]]."
   (:use model) ; ed-current-buf — the source reads the current buffer
   (:use editor/buffer) ; buffer-file / buffer-text / buffer-point / line+column
   (:use editor/highlight) ; symbol-prefix-at — the shared completion word boundary
-  (:use lsp-requests)) ; the request-kind records + the LspRequest ability (shape impls below)
+  (:use lsp-requests)) ; the request-kind records + the LspRequest ability (wire + shape impls below)
 ;; ---- tunables (redefine live) -----------------------------------------------
 
 (def *lsp-timeout-ms* 1000) ; how long a Tab waits for the server before giving up
@@ -105,6 +108,15 @@ either a `CompletionItem[]` (a vector) or a `{:items [...] :isIncomplete b}` obj
                 (vector? result) result
                 :else (:items result '())))
     (seq/keep items :label)))
+
+(defn lsp-completion-answer (result)
+  "`{:labels :incomplete}` for a `textDocument/completion` `result`: the labels
+([[lsp-completion-labels]]) and whether the server said the list is NOT the whole answer
+(`isIncomplete`) — in which case typing more must ask it again, where a complete list can
+be narrowed by filtering it (`complete-at-point`'s cache). A bare `CompletionItem[]` is
+complete by the protocol's definition."
+  {:labels (lsp-completion-labels result)
+   :incomplete (and (map? result) (= true (:isIncomplete result)))})
 
 ;; ---- pure protocol: documentSymbol shapes (imenu, M-g i) --------------------
 ;; `textDocument/documentSymbol` returns either a flat `SymbolInformation[]` (each with a
@@ -362,7 +374,7 @@ shapes; `{}` when nil."
 ;; The connection process's state:
 ;;   {:proc handle :buf "" :next-id N :pending {jsonrpc-id -> [reply-to corr]}
 ;;    :opened {uri -> true} :version V}
-;; `lsp-ingest` and `lsp-request-complete` are pure transitions returning the new
+;; `lsp-ingest` and `lsp-issue` are pure transitions returning the new
 ;; state plus the IO the shell must perform (messages to send / frames to write), so
 ;; correlation and framing are testable without a process or a server.
 
@@ -370,132 +382,203 @@ shapes; `{}` when nil."
   (jsonrpc/notification "textDocument/didOpen"
     {:textDocument {:uri uri :languageId lang :version 1 :text text}}))
 
-(defn- lsp-did-change (uri version text)
+(defn- lsp-did-change (uri version changes)
+  ;; `changes` is the `contentChanges` vector: one `{:text}` for the whole document, or
+  ;; ranged `{:range :text}` edits applied in order
   (jsonrpc/notification "textDocument/didChange"
-    {:textDocument {:uri uri :version version}
-     :contentChanges [{:text text}]}))
+    {:textDocument {:uri uri :version version} :contentChanges changes}))
 
-;; Each request is `{:textDocument {:uri …}}` plus a method-specific body. `lsp-pos`
-;; adds the `:position` every cursor-located request (completion/definition/references/
-;; hover/rename) carries.
+;; ---- the document sync: whole text, or the edits since the last one ---------------
+;; Sending the document is what made a Tab cost a second on a big file: the connection
+;; JSON-encodes all of it (341 ms for a 44k-line buffer, measured) and the server re-reads
+;; all of it, on every completion request and every idle beat after an edit. The buffer
+;; already logs what each edit DID (`buffer-splices-since`), so the editor can send that
+;; instead — a keystroke is a one-character change, whatever the file's size.
+;;
+;; Changes only make sense against the text the server HAS, and only the connection knows
+;; what that is. So every sync carries a TOKEN (a fresh ref) naming the text it leaves the
+;; server holding, and an incremental one names its BASE; the connection applies it only
+;; when the base is the token it holds for that uri. Anything else — a reconnected server,
+;; a full sync a lookup made meanwhile, a model the editor threw away after syncing — is
+;; refused, and the editor is told (`[:lsp-resync uri]`) to send the whole text next time.
+;; A refused change costs one full sync; an applied wrong one would corrupt the server's
+;; copy of the file until it was reopened.
+
+(defn lsp-incremental-sync? (caps)
+  "Does a server with capabilities `caps` accept ranged `didChange` edits — a
+`textDocumentSync` of 2 (Incremental), as a number or as `{:change 2}`?"
+  (let (sync (get (or caps {}) :textDocumentSync))
+    (= 2 (if (map? sync) (get sync :change) sync))))
+
+(defn- lsp-utf16-length (s)
+  "`s`'s length in UTF-16 code units — LSP's column unit: a character beyond the Basic
+Multilingual Plane (an emoji) is two."
+  (fold (string/->codepoints s) 0 (fn (acc code) (+ acc (if (> code 65535) 2 1)))))
+
+(defn- lsp-rope-position (rope offset)
+  "The LSP `{:line :character}` of char `offset` in `rope`."
+  (let (line (text/char->line rope offset)
+        line-start (text/line->char rope line))
+    (lsp-pos line (lsp-utf16-length (text/slice rope line-start offset)))))
+
+(defn lsp-content-changes (before after)
+  "The ranged `contentChanges` that turn buffer `before`'s text into `after`'s — one
+`{:range {:start :end} :text}` per edit the buffer logged, in order, each positioned
+against the text the previous one left (which is how LSP applies them) — or nil when the
+log cannot account for the change (an undo snapshot, a wholesale replace, more edits than
+it keeps: `buffer-splices-since`), for the caller to send the whole text instead."
+  (let (splices (buffer-splices-since before after))
+    (when (not (empty? splices))
+      (second (fold splices
+                [(buffer-rope before) []]
+                (fn (acc splice)
+                  (let ([rope changes] acc
+                        [lo hi replacement] splice)
+                    [(text/insert (text/delete rope lo hi) lo replacement)
+                      (conj changes
+                        {:range {:start (lsp-rope-position rope lo)
+                                 :end (lsp-rope-position rope hi)}
+                         :text replacement})])))))))
+
+(defn- lsp-sync-document (state uri lang sync)
+  "Pure: bring the server's copy of `uri` up to date. `sync` is `{:text :token}` — the whole
+document: `didOpen` the first time a uri is seen (tagged with `lang`, the LSP languageId),
+else a full-text `didChange` — or `{:changes :base :token}`, ranged edits against the text
+that `:base` names ([[lsp-content-changes]]), applied only when that is the text the server
+holds and refused otherwise (no frame; the uri is queued under `:resyncs` for the shell to
+report). Either way the uri then holds `:token` (nil for a sync nobody will build on).
+Returns `[state' frames]`. The one sync behind both a bare `:sync` and every request about a
+document."
+  (let (opened (:opened state)
+        version (:version state)
+        tokens (or (:tokens state) {})
+        changes (:changes sync))
+    (cond
+      (nil? changes)
+        [(assoc state
+           :version (+ version 1)
+           :opened (assoc opened uri true)
+           :tokens (assoc tokens uri (:token sync)))
+          [(if (get opened uri)
+             (lsp-did-change uri version [{:text (:text sync)}])
+             (lsp-did-open uri lang (:text sync)))]]
+      (and (get opened uri) (not (nil? (:base sync))) (= (get tokens uri) (:base sync)))
+        [(assoc state :version (+ version 1) :tokens (assoc tokens uri (:token sync)))
+          [(lsp-did-change uri version changes)]]
+      :else
+        [(assoc state
+           :tokens (dissoc tokens uri)
+           :resyncs (conj (or (:resyncs state) []) uri))
+          []])))
+
+;; ---- what each request kind puts on the wire ------------------------------------
+;; The `LspRequest` method/params halves (see `lsp-requests`). A REQUEST is the map the
+;; editor sent — `{:uri :lang :text :line :char}` for a question about the text at point,
+;; plus whatever one kind needs (`:diags`, `:new-name`), or `{:command :arguments}` for one
+;; that is about no document at all.
+
 (defn- lsp-pos (line char) {:line line :character char})
 
-(defn- lsp-completion-request (id uri line char)
-  (jsonrpc/request id
-    "textDocument/completion"
-    {:textDocument {:uri uri} :position (lsp-pos line char)}))
-(defn- lsp-document-symbol-request (id uri)
-  (jsonrpc/request id "textDocument/documentSymbol" {:textDocument {:uri uri}}))
-(defn- lsp-definition-request (id uri line char)
-  (jsonrpc/request id
-    "textDocument/definition"
-    {:textDocument {:uri uri} :position (lsp-pos line char)}))
-(defn- lsp-references-request (id uri line char)
-  (jsonrpc/request id
-    "textDocument/references"
-    {:textDocument {:uri uri} :position (lsp-pos line char) :context {:includeDeclaration true}}))
-(defn- lsp-hover-request (id uri line char)
-  (jsonrpc/request id "textDocument/hover" {:textDocument {:uri uri} :position (lsp-pos line char)}))
-(defn- lsp-code-action-request (id uri line char diags)
-  (jsonrpc/request id
-    "textDocument/codeAction"
-    {:textDocument {:uri uri}
-     ;; an empty range AT point: the actions offered for where the cursor is. (A region
-     ;; would widen it to "extract this" territory — a later feature, not a wider range
-     ;; smuggled in here.)
-     :range {:start (lsp-pos line char) :end (lsp-pos line char)}
-     :context {:diagnostics (or diags [])}}))
-(defn- lsp-execute-command-request (id command arguments)
-  (jsonrpc/request id "workspace/executeCommand" {:command command :arguments (or arguments [])}))
-(defn- lsp-signature-request (id uri line char)
-  (jsonrpc/request id
-    "textDocument/signatureHelp"
-    {:textDocument {:uri uri} :position (lsp-pos line char)}))
-(defn- lsp-formatting-request (id uri)
-  (jsonrpc/request id
-    "textDocument/formatting"
-    {:textDocument {:uri uri} :options {:tabSize 2 :insertSpaces true}}))
-(defn- lsp-rename-request (id uri line char new-name)
-  (jsonrpc/request id
-    "textDocument/rename"
-    {:textDocument {:uri uri} :position (lsp-pos line char) :newName new-name}))
+(defn- lsp-doc (request) {:textDocument {:uri (:uri request)}})
 
-(defn- lsp-issue (state corr reply-to uri lang text kind make-request)
-  "Pure: the frames + next state for one request. Syncs the document first (`didOpen` the
-first time a uri is seen — tagged with `lang`, the LSP languageId — else a full-text
-`didChange`), then `(make-request id)` (a framed request), recording `[reply-to corr kind]`
-under its jsonrpc id so the response is routed back and shaped per `kind` (`lsp-shape`).
-The one transition behind every request — completion, symbols, definition, references,
-hover, formatting, rename. Returns `[state' frames]`."
-  (let (id (:next-id state)
-        opened (:opened state)
-        version (:version state)
-        seen? (get opened uri)
-        sync-frame (if seen? (lsp-did-change uri version text) (lsp-did-open uri lang text))
-        state2 (assoc state
+(defn- lsp-doc-at (request)
+  ;; `{:textDocument {:uri …}}` plus the `:position` every cursor-located request carries
+  (assoc (lsp-doc request) :position (lsp-pos (:line request) (:char request))))
+
+(defn- lsp-request-frame (id kind request)
+  "The framed JSON-RPC request for `kind` (an `LspRequest` record) built from `request`."
+  (jsonrpc/request id (lsp-request-method kind) (lsp-request-params kind request)))
+
+(defn- lsp-issue (state corr reply-to kind request)
+  "Pure: the frames + next state for one request of `kind` (an `LspRequest` record). A
+request carrying the document's `:text` syncs it first ([[lsp-sync-document]]) — the
+editor's own requests carry none, having synced incrementally just before asking
+(`lsp-commands/ed-lsp-push-text`), so asking costs the request and not the document;
+then the request itself ([[lsp-request-frame]]), recording `[reply-to corr kind]` under
+its jsonrpc id so the response is routed back and shaped per `kind` (`lsp-shape`). The one
+transition behind every request — completion, symbols, definition, references, hover,
+signature, code actions, commands, formatting, rename. Returns `[state' frames]`."
+  (let ([synced sync-frames] (if (and (contains? request :uri) (contains? request :text))
+                               (lsp-sync-document state
+                                 (:uri request)
+                                 (:lang request)
+                                 {:text (:text request) :token nil})
+                               [state []])
+        id (:next-id synced)
+        state2 (assoc synced
                  :next-id (+ id 1)
-                 :version (+ version 1)
-                 :opened (assoc opened uri true)
-                 :pending (assoc (:pending state) id [reply-to corr kind])))
-    [state2 [sync-frame (make-request id)]]))
+                 :pending (assoc (:pending synced) id [reply-to corr kind])))
+    [state2 (conj sync-frames (lsp-request-frame id kind request))]))
 
-(defn- lsp-request-complete (state corr reply-to uri lang text line char)
-  "Completion at `(uri, line, char)` — see `lsp-issue`. `[state' frames]`."
-  (lsp-issue state
-    corr
-    reply-to
-    uri
-    lang
-    text
-    (lsp-completion)
-    (fn (id) (lsp-completion-request id uri line char))))
-
-(defn- lsp-request-symbols (state corr reply-to uri lang text)
-  "documentSymbol on `uri` — see `lsp-issue`. `[state' frames]`."
-  (lsp-issue state
-    corr
-    reply-to
-    uri
-    lang
-    text
-    (lsp-symbols)
-    (fn (id) (lsp-document-symbol-request id uri))))
-
-;; The shape half of the `LspRequest` ability (see `lsp-requests`): raw server
-;; result -> `[reply-tag value]`, one impl per kind, beside the shaping helpers.
-;; The ids are written qualified — a bare id would qualify to THIS module.
+;; The connection's half of the `LspRequest` ability (see `lsp-requests`), one impl per
+;; kind, beside the shaping helpers: what goes on the wire, and the raw server result ->
+;; `[reply-tag value]`. The ids are written qualified — a bare id would qualify to THIS
+;; module.
 (impl LspRequest
   lsp-requests/lsp-completion
-  (lsp-request-shape [_ result] [:lsp-completion (lsp-completion-labels result)]))
+  (lsp-request-method [_] "textDocument/completion")
+  (lsp-request-params [_ request] (lsp-doc-at request))
+  (lsp-request-shape [_ result] [:lsp-completion (lsp-completion-answer result)]))
 (impl LspRequest
   lsp-requests/lsp-symbols
+  (lsp-request-method [_] "textDocument/documentSymbol")
+  (lsp-request-params [_ request] (lsp-doc request))
   (lsp-request-shape [_ result] [:lsp-symbols (lsp-document-symbols result)]))
 (impl LspRequest
   lsp-requests/lsp-definition
+  (lsp-request-method [_] "textDocument/definition")
+  (lsp-request-params [_ request] (lsp-doc-at request))
   (lsp-request-shape [_ result] [:lsp-definition (lsp-locations result)]))
 (impl LspRequest
   lsp-requests/lsp-references
+  (lsp-request-method [_] "textDocument/references")
+  (lsp-request-params [_ request]
+    (assoc (lsp-doc-at request) :context {:includeDeclaration true}))
   (lsp-request-shape [_ result] [:lsp-references (lsp-locations result)]))
 (impl LspRequest
   lsp-requests/lsp-hover
+  (lsp-request-method [_] "textDocument/hover")
+  (lsp-request-params [_ request] (lsp-doc-at request))
   (lsp-request-shape [_ result] [:lsp-hover (lsp-hover-text result)]))
 (impl LspRequest
   lsp-requests/lsp-signature
+  (lsp-request-method [_] "textDocument/signatureHelp")
+  (lsp-request-params [_ request] (lsp-doc-at request))
   (lsp-request-shape [_ result] [:lsp-signature (lsp-signature-text result)]))
 (impl LspRequest
   lsp-requests/lsp-code-actions
+  (lsp-request-method [_] "textDocument/codeAction")
+  (lsp-request-params [_ request]
+    (let (at (lsp-pos (:line request) (:char request)))
+      (assoc (lsp-doc request)
+        ;; an empty range AT point: the actions offered for where the cursor is. (A region
+        ;; would widen it to "extract this" territory — a later feature, not a wider range
+        ;; smuggled in here.)
+        :range {:start at :end at}
+        ;; the diagnostics on the line go WITH it — how a server knows which quickfix
+        :context {:diagnostics (or (:diags request) [])})))
   (lsp-request-shape [_ result] [:lsp-code-actions (lsp-code-action-list result)]))
 (impl LspRequest
   lsp-requests/lsp-execute-command
+  ;; no document: the server is being asked to run something it already offered, not to
+  ;; look at text — so the request carries no `:uri` and `lsp-issue` syncs nothing
+  (lsp-request-method [_] "workspace/executeCommand")
+  (lsp-request-params [_ request]
+    {:command (:command request) :arguments (or (:arguments request) [])})
   ;; `workspace/executeCommand` answers with whatever the command returns, usually null:
   ;; the EDITS come separately, as a `workspace/applyEdit` request from the server
   ;; ([[lsp-answer-server]]). So this reply is only ever "it ran".
   (lsp-request-shape [_ result] [:lsp-command-done result]))
 (impl LspRequest
   lsp-requests/lsp-formatting
+  (lsp-request-method [_] "textDocument/formatting")
+  (lsp-request-params [_ request]
+    (assoc (lsp-doc request) :options {:tabSize 2 :insertSpaces true}))
   (lsp-request-shape [_ result] [:lsp-text-edits (lsp-text-edits result)]))
 (impl LspRequest
   lsp-requests/lsp-rename
+  (lsp-request-method [_] "textDocument/rename")
+  (lsp-request-params [_ request] (assoc (lsp-doc-at request) :newName (:new-name request)))
   (lsp-request-shape [_ result] [:lsp-workspace-edit (lsp-workspace-edit result)]))
 
 (defn- lsp-shape (kind result)
@@ -687,7 +770,10 @@ fold, so the fold stays pure."
     (let ([path items raw] d)
       (send :editor [:lsp-diagnostics path items raw])))
   (doseq (e (or (:edits state) [])) (send :editor [:lsp-apply-edit e]))
-  (dissoc state :outbox :notices :diags :edits))
+  ;; …and any document whose incremental sync it had to refuse: the editor sends the whole
+  ;; text next time ([[lsp-sync-document]])
+  (doseq (uri (or (:resyncs state) [])) (send :editor [:lsp-resync uri]))
+  (dissoc state :outbox :notices :diags :edits :resyncs))
 
 (defn- lsp-await-init (state id)
   "Read frames until the `initialize` response (jsonrpc `id`) arrives, returning the
@@ -722,138 +808,32 @@ late first completion rather than a frozen editor."
 
 (defn- lsp-loop (state)
   "The connection's main receive loop: server output folds in via `lsp-ingest` (replies
-routed to waiters); a `[:complete …]` request is turned into frames and written to the
+routed to waiters); an `[:ask …]` request is turned into frames and written to the
 server; `:shutdown` or the server dying stops it."
   (receive
     ([:proc p chunk] (lsp-loop (apply lsp-drain (lsp-ingest state chunk))))
     ([:proc-err p chunk] (lsp-loop state))
     ([:proc-closed p code] :lsp-stopped)
-    ([:complete corr reply-to uri lang text line char] (let ([st2 frames] (lsp-request-complete state
-                                                                            corr reply-to uri lang
-                                                                            text line char))
-                                                         (lsp-send-all (:proc st2) frames)
-                                                         (lsp-loop st2)))
-    ;; A SYNC with no question attached. Every other arm here syncs the document as a side
-    ;; effect of asking the server something (`lsp-issue`), which is the whole reason
-    ;; diagnostics never appeared: a server PUSHES `publishDiagnostics` after a
-    ;; `didChange`, and nothing sent one while you typed. The symptom was exact — imenu
-    ;; worked, because asking for symbols synced the text on the way past, and then the
-    ;; findings arrived for that one version and never again.
-    ([:sync uri lang text] (let (opened (:opened state)
-                                 version (:version state)
-                                 frame (if (get opened uri)
-                                         (lsp-did-change uri version text)
-                                         (lsp-did-open uri lang text)))
-                             (lsp-send-all (:proc state) [frame])
-                             (lsp-loop (assoc state
-                                         :version (+ version 1)
-                                         :opened (assoc opened uri true)))))
-    ([:document-symbols corr reply-to uri lang text] (let ([st2 frames] (lsp-request-symbols state
-                                                                          corr reply-to uri lang
-                                                                          text))
-                                                       (lsp-send-all (:proc st2) frames)
-                                                       (lsp-loop st2)))
-    ([:definition corr reply-to uri lang text line char] (let ([st2 frames] (lsp-issue state
-                                                                              corr
-                                                                              reply-to
-                                                                              uri
-                                                                              lang
-                                                                              text
-                                                                              (lsp-definition)
-                                                                              (fn (id)
-                                                                                (lsp-definition-request id
-                                                                                  uri line char))))
-                                                           (lsp-send-all (:proc st2) frames)
-                                                           (lsp-loop st2)))
-    ([:references corr reply-to uri lang text line char] (let ([st2 frames] (lsp-issue state
-                                                                              corr
-                                                                              reply-to
-                                                                              uri
-                                                                              lang
-                                                                              text
-                                                                              (lsp-references)
-                                                                              (fn (id)
-                                                                                (lsp-references-request id
-                                                                                  uri line char))))
-                                                           (lsp-send-all (:proc st2) frames)
-                                                           (lsp-loop st2)))
-    ([:hover corr reply-to uri lang text line char] (let ([st2 frames] (lsp-issue state
-                                                                         corr
-                                                                         reply-to
-                                                                         uri
-                                                                         lang
-                                                                         text
-                                                                         (lsp-hover)
-                                                                         (fn (id)
-                                                                           (lsp-hover-request id
-                                                                             uri line char))))
-                                                      (lsp-send-all (:proc st2) frames)
-                                                      (lsp-loop st2)))
-    ([:code-actions corr reply-to uri lang text line char diags] (let ([st2 frames] (lsp-issue state
-                                                                                      corr
-                                                                                      reply-to
-                                                                                      uri
-                                                                                      lang
-                                                                                      text
-                                                                                      (lsp-code-actions)
-                                                                                      (fn (id)
-                                                                                        (lsp-code-action-request id
-                                                                                          uri line
-                                                                                          char diags))))
-                                                                   (lsp-send-all (:proc st2) frames)
-                                                                   (lsp-loop st2)))
-    ;; no document to sync: the server is being asked to run something it already offered,
-    ;; not to look at text, so this bypasses `lsp-issue` and its didOpen/didChange
-    ([:execute-command corr reply-to command args] (let (id (:next-id state)
-                                                         st2 (assoc state
-                                                               :next-id (+ id 1)
-                                                               :pending
-                                                                 (assoc (:pending state)
-                                                                   id
-                                                                     [reply-to
-                                                                       corr
-                                                                       (lsp-execute-command)])))
-                                                     (lsp-send-all (:proc st2)
-                                                       [(lsp-execute-command-request id
-                                                          command args)])
-                                                     (lsp-loop st2)))
-    ([:signature corr reply-to uri lang text line char] (let ([st2 frames] (lsp-issue state
-                                                                             corr
-                                                                             reply-to
-                                                                             uri
-                                                                             lang
-                                                                             text
-                                                                             (lsp-signature)
-                                                                             (fn (id)
-                                                                               (lsp-signature-request id
-                                                                                 uri line char))))
-                                                          (lsp-send-all (:proc st2) frames)
-                                                          (lsp-loop st2)))
-    ([:formatting corr reply-to uri lang text] (let ([st2 frames] (lsp-issue state
-                                                                    corr
-                                                                    reply-to
-                                                                    uri
-                                                                    lang
-                                                                    text
-                                                                    (lsp-formatting)
-                                                                    (fn (id)
-                                                                      (lsp-formatting-request id
-                                                                        uri))))
-                                                 (lsp-send-all (:proc st2) frames)
-                                                 (lsp-loop st2)))
-    ([:rename corr reply-to uri lang text line char new-name] (let ([st2 frames] (lsp-issue state
-                                                                                   corr
-                                                                                   reply-to
-                                                                                   uri
-                                                                                   lang
-                                                                                   text
-                                                                                   (lsp-rename)
-                                                                                   (fn (id)
-                                                                                     (lsp-rename-request id
-                                                                                       uri line char
-                                                                                       new-name))))
-                                                                (lsp-send-all (:proc st2) frames)
-                                                                (lsp-loop st2)))
+    ;; Every question, whatever its kind: the kind (an `LspRequest` record) says what goes
+    ;; on the wire and how the answer is shaped, so a new request is an impl, not an arm.
+    ([:ask kind corr reply-to request] (let ([st2 frames] (lsp-issue state
+                                                            corr reply-to kind request))
+                                         (lsp-send-all (:proc st2) frames)
+                                         (lsp-loop st2)))
+    ;; A SYNC with no question attached. Every `:ask` syncs the document as a side effect
+    ;; of asking the server something (`lsp-issue`), which is the whole reason diagnostics
+    ;; never appeared: a server PUSHES `publishDiagnostics` after a `didChange`, and nothing
+    ;; sent one while you typed. The symptom was exact — imenu worked, because asking for
+    ;; symbols synced the text on the way past, and then the findings arrived for that one
+    ;; version and never again.
+    ;; `sync` is a bare string (the whole text, from a caller that tracks no tokens) or the
+    ;; `{:text|:changes …}` map [[lsp-sync-document]] takes
+    ([:sync uri lang sync] (let ([st2 frames] (lsp-sync-document state
+                                                uri
+                                                lang
+                                                (if (string? sync) {:text sync :token nil} sync)))
+                             (lsp-send-all (:proc st2) frames)
+                             (lsp-loop (lsp-drain st2 (list)))))
     ([:shutdown] (do (os/close (:proc state)) :lsp-stopped))))
 
 (defn- lsp-init-params (root-uri)
@@ -922,80 +902,64 @@ its behalf would be worse than letting it say no itself."
   "Stop a connection: kill the server and end the connection process."
   (send conn [:shutdown]))
 
-(defn lsp-complete-sync (conn uri lang text line char timeout)
-  "Ask `conn` for completions at `(uri, line, char)` with the buffer `text` (LSP
-languageId `lang`), blocking up to `timeout` ms for the reply (then `()`). Safe to call
-only on an explicit trigger, not per keystroke."
+(defn lsp-complete-sync (conn request timeout)
+  "Ask `conn` for completions at `request`'s `{:uri :lang :line :char}` — with `:text` when
+the server's copy has to be brought up to date on the way — blocking up to `timeout` ms for
+the reply. Answers `{:labels :incomplete}` ([[lsp-completion-answer]]); a timeout answers
+no labels, marked incomplete so nothing caches it. Safe to call only on an explicit
+trigger, not per keystroke."
   (let (corr (ref))
-    (send conn [:complete corr (self) uri lang text line char])
+    (lsp-ask-async conn (lsp-completion) corr (self) request)
     (receive
-      ([:lsp-completion ^corr labels] labels)
-      (after timeout '()))))
+      ([:lsp-completion ^corr answer] answer)
+      (after timeout {:labels '() :incomplete true}))))
 
-;; ---- the async counterparts: fire the request; the reply lands on `reply-to` ----
-;; Each sends the same wire message as its -sync twin but returns at once: the conn's
-;; tagged, corr-carrying reply (`[:lsp-definition corr locs]`, `[:lsp-hover corr s]`, …)
-;; lands on `reply-to`'s mailbox — the editor registers event handlers for those tags
-;; and folds by corr against `:lsp-pending` (lsp-commands/ed-ev-lsp-reply), so a lookup
-;; never blocks the loop: jump/show/apply happen when the answer ARRIVES. Completion
-;; keeps its bounded sync wait (the popup is modal UX — see `lsp-complete-sync`).
+;; ---- the async requests: fire the request; the reply lands on `reply-to` ----------
+;; Returns at once: the conn's tagged, corr-carrying reply (`[:lsp-definition corr locs]`,
+;; `[:lsp-hover corr s]`, …) lands on `reply-to`'s mailbox — the editor registers event
+;; handlers for those tags and folds by corr against `:lsp-pending`
+;; (lsp-commands/ed-ev-lsp-reply), so a lookup never blocks the loop: jump/show/apply
+;; happen when the answer ARRIVES. Completion keeps its bounded sync wait (the popup is
+;; modal UX — see `lsp-complete-sync`).
 
-(defn lsp-sync (conn uri lang text)
-  "Tell the server the document's current text, asking nothing in return — `didOpen` the
-first time it sees the uri, a full-text `didChange` after.
+(defn lsp-sync (conn uri lang sync)
+  "Tell the server the document changed, asking nothing in return. `sync` is the whole
+text (a string), or the `{:text|:changes :base :token}` map [[lsp-sync-document]] takes —
+the editor sends the edits since its last sync when the server accepts them
+(`lsp-commands/ed-lsp-push-text`).
 
 This is what makes DIAGNOSTICS work. A server does not answer a question with them; it
-pushes `publishDiagnostics` when it learns the text changed. Every other call here syncs
-the document on its way to asking something, so before this existed the findings arrived
+pushes `publishDiagnostics` when it learns the text changed. Requests used to sync the
+document only on their way to asking something, so before this existed the findings arrived
 only for whatever version you happened to invoke a lookup on — and never while typing,
 which is the only time they are worth having."
-  (send conn [:sync uri lang text]))
+  (send conn [:sync uri lang sync]))
 
-(defn lsp-definition-async (conn corr reply-to uri lang text line char)
-  "Fire a definition lookup; `[:lsp-definition corr locs]` lands on `reply-to`."
-  (send conn [:definition corr reply-to uri lang text line char]))
+(defn lsp-ask-async (conn kind corr reply-to request)
+  "Fire one request of `kind` (an `LspRequest` record — `lsp-definition`, `lsp-hover`, …)
+built from `request`: `{:uri :lang :line :char}` for a question about the text at
+point (with `:text` only to sync the whole document on the way — see [[lsp-issue]]),
+plus `:diags` (code actions) or `:new-name` (rename); `{:command :arguments}` for
+`lsp-execute-command`, which is about no document. The kind's reply —
+`[:lsp-definition corr locs]`, `[:lsp-workspace-edit corr wsedit]`, … (see its
+`lsp-request-shape`) — lands on `reply-to`.
 
-(defn lsp-references-async (conn corr reply-to uri lang text line char)
-  "Fire a references lookup; `[:lsp-references corr locs]` lands on `reply-to`."
-  (send conn [:references corr reply-to uri lang text line char]))
-
-(defn lsp-hover-async (conn corr reply-to uri lang text line char)
-  "Fire a hover lookup; `[:lsp-hover corr text]` lands on `reply-to`."
-  (send conn [:hover corr reply-to uri lang text line char]))
-
-(defn lsp-code-actions-async (conn corr reply-to uri lang text line char diags)
-  "Fire a codeAction lookup at point; `[:lsp-code-actions corr actions]` lands on
-`reply-to`. `diags` are the raw diagnostics on that line — the context a server matches
-its quickfixes against."
-  (send conn [:code-actions corr reply-to uri lang text line char diags]))
-
-(defn lsp-execute-command-async (conn corr reply-to command arguments)
-  "Ask the server to run `command`; `[:lsp-command-done corr result]` lands on `reply-to`.
-Any EDITS it produces arrive separately, as `[:lsp-apply-edit wsedit]` on the editor."
-  (send conn [:execute-command corr reply-to command arguments]))
-
-(defn lsp-signature-async (conn corr reply-to uri lang text line char)
-  "Fire a signatureHelp lookup; `[:lsp-signature corr line]` lands on `reply-to`."
-  (send conn [:signature corr reply-to uri lang text line char]))
-
-(defn lsp-document-symbols-async (conn corr reply-to uri lang text)
-  "Fire a documentSymbol request; `[:lsp-symbols corr syms]` lands on `reply-to`."
-  (send conn [:document-symbols corr reply-to uri lang text]))
-
-(defn lsp-format-async (conn corr reply-to uri lang text)
-  "Fire a whole-document format; `[:lsp-text-edits corr edits]` lands on `reply-to`."
-  (send conn [:formatting corr reply-to uri lang text]))
-
-(defn lsp-rename-async (conn corr reply-to uri lang text line char new-name)
-  "Fire a workspace rename; `[:lsp-workspace-edit corr wsedit]` lands on `reply-to`."
-  (send conn [:rename corr reply-to uri lang text line char new-name]))
+ONE sender rather than one per kind: each used to be a function, a `lsp-loop` arm and a
+request builder, three copies of the same plumbing that differed only in the method name
+and the params, which are now the kind's own `lsp-request-method` / `lsp-request-params`."
+  (send conn [:ask kind corr reply-to request]))
 
 ;; ---- the completion source --------------------------------------------------
 
-(defn- lsp-prefix-start (text p)
-  "The start of the symbol before `p` — the completion region's left edge, by the same
-boundary rule the other sources use (`symbol-prefix-at`), so the merge keeps this source."
-  (first (symbol-prefix-at text p)))
+(defn- lsp-symbol-at-point (buf)
+  "`[start prefix]` — the symbol before point, the completion region, by the same boundary
+rule the other sources use (`symbol-prefix-at`), so the merge keeps this source. Read from
+the current line up to point: a symbol never crosses a line, and flattening the buffer to
+find it was a measurable part of every Tab on a big file."
+  (let (line-start (buffer-point (beginning-of-line buf))
+        line (text/slice (buffer-rope buf) line-start (buffer-point buf))
+        [start prefix] (symbol-prefix-at line (string/length line)))
+    [(+ line-start start) prefix]))
 
 (defn lsp-path->uri (path)
   "The `file://` URI of `path`, each segment percent-encoded: a server compares URIs as
@@ -1041,9 +1005,19 @@ or `nil` if none."
 
 (defn lsp-complete-source (m)
   "The LSP completion source (a `complete-at-point/*completion-sources*` entry): `[start prefix
-labels]` from the server stored on the model under `:lsp`, or `nil` when LSP is off, the
-buffer has no file, or the server returns nothing. `complete` merges these with the mode
-and buffer-word sources.
+labels opts]` from the server stored on the model under `:lsp`, or `nil` when LSP is off,
+the buffer has no file, or the server timed out. `complete` merges these with the mode and
+buffer-word sources.
+
+`opts` is `{:cache true}` unless the server said its list was incomplete: the popup then
+narrows by filtering these labels as you type, and asks the server again only when the
+prefix stops extending this one (`complete-at-point/complete-at`). An EMPTY complete answer
+is an answer too — nothing for `foo` means nothing for `foob` — so it is returned, not nil,
+or every narrowing key would ask again.
+
+The request carries no text when the server already has this buffer's: completion's
+prepare step (`*completion-prepare*`, the LSP layer's incremental push) synced it just
+before. Only a model that skipped that step sends the whole document along.
 
 A connection whose process has died counts as off: this source runs on every Tab, and a
 pid nothing answers would spend `*lsp-timeout-ms*` per press waiting for a reply that
@@ -1055,15 +1029,20 @@ cannot come."
             file (buffer-file buf))
         (if (nil? file)
           nil
-          (let (text (buffer-text buf)
-                p (buffer-point buf)
-                start (lsp-prefix-start text p)
-                prefix (string/substring text start p)
-                labels (lsp-complete-sync conn
-                         (lsp-path->uri file)
-                         (lsp-language-id file)
-                         text
-                         (buffer-current-line buf)
-                         (buffer-column buf)
-                         *lsp-timeout-ms*))
-            (if (empty? labels) nil [start prefix labels])))))))
+          (let (uri (lsp-path->uri file)
+                [start prefix] (lsp-symbol-at-point buf)
+                synced (get-in m [:lsp-synced uri :buf])
+                request {:uri uri
+                         :lang (lsp-language-id file)
+                         :line (buffer-current-line buf)
+                         :char (buffer-column buf)}
+                answer (lsp-complete-sync conn
+                         (if (and synced (= (buffer-rope synced) (buffer-rope buf)))
+                           request
+                           (assoc request :text (buffer-text buf)))
+                         *lsp-timeout-ms*)
+                labels (:labels answer))
+            (cond
+              (not (:incomplete answer)) [start prefix labels {:cache true}]
+              (empty? labels) nil
+              :else [start prefix labels])))))))

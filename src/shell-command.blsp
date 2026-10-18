@@ -1,0 +1,150 @@
+(defmodule shell-command
+  "Emacs `shell-command` and `shell-command-on-region` (M-! / M-|): one `sh -c` in the
+buffer's default directory, run off the loop as a `std/task`, its output in the echo area
+(one line) or `*Shell Command Output*` beside the buffer; `C-u M-|` replaces the region
+with it. Not a shell BUFFER — that is `bshell`.
+
+Loaded with the image (`main`): `C-u M-|` must find the command registered as
+prefix-consuming before its module has ever run, or the prefix would repeat it instead.
+Split out of `commands.blsp`."
+  (:use editor/buffer) ; buffer-region-bounds / buffer-rope / replace-region — the piped region
+  (:use model) ; message / ed-edit / ed-mb-edit / ed-headless? / register-task-reply
+  (:use pool) ; ed-default-dir / ed-show-named-aside — where it runs and where output goes
+  (:use interactive) ; defcommand / current-prefix-arg / register-prefix-consuming
+  (:use task :only [task])) ; task — the command runs off the loop
+
+;; ---- one-off shell commands (M-! / M-|) --------------------------------------
+;; `M-!` runs one and shows its output; `M-|` pipes the region through one (`os/cmd` in the
+;; buffer's directory, off the loop), so a long-running command is what `C-c r` / the
+;; bshell are for — these are for `ls`, `date`, `sort -u`.
+(def *shell-command-timeout-ms* 120000)
+;; A shell command gets two minutes before the task is killed and reported as a timeout.
+;; `M-! sleep 600` is a typo, not an instruction to make the editor unusable for ten
+;; minutes, and an unbounded slot is one that never frees.
+
+(defn- ed-shell-command (dir cmd stdin)
+  "`{:exit :stdout :stderr}` of `sh -c cmd` in `dir`, fed `stdin` (nil for none), killed —
+with everything it started — after `*shell-command-timeout-ms*`. The one place M-! and M-|
+run a command, so the timeout reaches the OS process: a timeout on the TASK alone ended the
+green process and left `sleep 600` running."
+  (os/cmd "sh" ["-c" cmd] {:cwd dir :stdin stdin :timeout-ms *shell-command-timeout-ms*}))
+
+(defn ed-shell-run (m cmd stdin)
+  "`{:exit :stdout :stderr}` of `sh -c cmd` in the buffer's default directory, with
+`stdin` (nil for none). SYNCHRONOUS — the shared core, run inside a task by
+`ed-shell-launch` and inline only when headless."
+  (ed-shell-command (ed-default-dir m) cmd stdin))
+
+;; check-allow: `then` is a caller-supplied `(model result) -> model`, so the checker
+;; cannot see the last branch's result (ADR-341's `:trusted`, as `gitcore/git-launch-op`).
+(check-allow :trusted
+  (sig ed-shell-launch (model string any any -> model))
+  (defn ed-shell-launch (m cmd stdin then)
+    "Run `sh -c cmd` OFF the loop and hand the result to `then` (`(model result) -> model`).
+
+`M-!` used to run on the dispatch path, which is fine for `date` and a freeze for anything
+else — and what counts as \"anything else\" is not knowable in advance: `M-! make`,
+`M-! grep -r` over a monorepo, a command that waits on a lock. The docstring said
+\"synchronous, so use `C-c r` for long ones\", which is a rule the editor was asking the
+reader to enforce on its behalf.
+
+One at a time, like every other off-loop job here: a second while one runs is refused
+rather than queued. Headless runs it inline, so tests and `--headless` are unchanged."
+    (cond
+      (:shell-proc m) (message m "a shell command is already running")
+      (ed-headless?) (then m (ed-shell-run m cmd stdin))
+      :else
+        (let (dir (ed-default-dir m)
+              job (task (fn () (ed-shell-command dir cmd stdin))
+                    {:timeout *shell-command-timeout-ms*}))
+          (assoc (message m (str "running: " cmd))
+            :shell-proc job
+            :shell-then then
+            :shell-cmd cmd)))))
+
+(check-allow :trusted
+  ;; M-! / M-| — a shell command is arbitrarily long, so it is a task like the rest
+  ;; Not `:cancel-on-quit?`: `task/cancel` ends the green process, but `os/cmd` blocks in
+  ;; the runtime until the OS command exits or hits its own timeout — so C-g would free
+  ;; the slot and say "interrupted" while the command kept running. Opting in wants an
+  ;; `os/cmd` the caller can kill (a brood gap), not a quit that only looks like one.
+  (register-task-reply :shell-proc 'shell-command/ed-apply-shell nil "shell")
+  (sig ed-apply-shell (model any -> model))
+  (defn ed-apply-shell (m r)
+    "Fold a finished `ed-shell-launch`. A nil `r` is the task having errored or timed out,
+said as such rather than reported as a command that succeeded with no output."
+    (let (then (:shell-then m)
+          cmd (:shell-cmd m "the command")
+          m1 (dissoc m :shell-proc :shell-then :shell-cmd))
+      (cond
+        (nil? r)
+          (message m1
+            (str cmd " failed or timed out after " *shell-command-timeout-ms* "ms"))
+        (nil? then) m1
+        :else (then m1 r)))))
+
+(defn- ed-shell-show (m cmd r)
+  "Show a shell command's result the Emacs way: one output line in the echo area, more in
+`*Shell Command Output*` beside the buffer; a failure's stderr joins the output."
+  (let (out (str (:stdout r) (if (= (:stderr r) "") "" (:stderr r)))
+        trimmed (string/trim out)
+        lines (string/split trimmed "\n"))
+    (cond
+      (= trimmed "")
+        (message m
+          (str "(shell command "
+            (if (= (:exit r) 0) "succeeded" (str "failed: " (:exit r)))
+            " with no output)"))
+      (= (count lines) 1) (message m trimmed)
+      else (ed-show-named-aside m "*Shell Command Output*" out :special))))
+
+(defn- read-shell-command (m prompt run)
+  "Ask for a shell command at `prompt`, then `(run model command)` — or say there was none."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit prompt "")
+       :on-complete (fn (mm command)
+                      (if (= (string/trim command) "") (message mm "no command") (run mm command)))}))
+
+(defcommand cmd-shell-command
+  (m key)
+  "Run a shell command and show its output (M-!, Emacs `shell-command`): one line of
+output goes to the echo area, more to `*Shell Command Output*` in a side pane. Runs
+`sh -c` in the buffer's directory, synchronously."
+  (read-shell-command m
+    "Shell command: "
+    (fn (mm command) (ed-shell-launch mm command nil (fn (m2 r) (ed-shell-show m2 command r))))))
+
+(defn- replace-region-clamped (b lo hi text)
+  ;; The region's bounds were captured before the command ran; the reply can land after an
+  ;; edit moved them, so the replace is clamped to the text that is there now.
+  (let (size (buffer-length b)) (replace-region b (math/min lo size) (math/min hi size) text)))
+
+(defn- shell-region-result (m command r lo hi replace?)
+  ;; What M-| does with a finished command: a successful `C-u M-|` REPLACES the region with
+  ;; its output; anything else is shown like `M-!`.
+  (if (and replace? (= (:exit r) 0))
+    (message (ed-edit m (fn (b) (replace-region-clamped b lo hi (:stdout r))))
+      (str "region replaced by `" command "`"))
+    (ed-shell-show m command r)))
+
+(defcommand cmd-shell-command-on-region
+  (m key)
+  "Pipe the region through a shell command (M-|, Emacs `shell-command-on-region`): the
+region is the command's stdin; the output is shown like `M-!` — or, with a prefix
+argument (`C-u M-|`), REPLACES the region (the `sort`/`fmt`/`jq .` idiom)."
+  (let (buf (ed-current-buf m)
+        bounds (buffer-region-bounds buf)
+        replace? (not (nil? (current-prefix-arg m))))
+    (if (nil? bounds)
+      (message m "no region (set the mark first)")
+      (let ([lo hi] bounds
+            input (text/slice (buffer-rope buf) lo hi))
+        (read-shell-command m
+          (if replace? "Shell command on region (replace): " "Shell command on region: ")
+          (fn (mm command)
+            (ed-shell-launch mm
+              command
+              input
+              (fn (m2 r) (shell-region-result m2 command r lo hi replace?)))))))))
+(register-prefix-consuming 'shell-command/cmd-shell-command-on-region)

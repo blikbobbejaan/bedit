@@ -22,13 +22,14 @@ navigation — that stays in the editor's command layer, which *consumes* this):
 
 Consumers (`testrun`/`apprun`/`compile`/`modes`' occur+git) stack the layer, override
 `:line-loc` if needed, and stream through `ed-append-follow`. The navigation *command*
-(`cmd-visit-location` → `ed-pop-to-file`, pane/pool-coupled) lives in `commands` and uses
+(`cmd-visit-location` in `commands` → `pool/ed-pop-to-file`, pane/pool-coupled) uses
 this layer's vocabulary — the app-specific half, kept out of the abstraction."
   (:use model) ; ed-mode-service / ed-append-named / ed-buf-at / ed-buffer-index-by-name
   (:use editor/buffer) ; buffer-line-at / buffer-line-count — read a row's text / length
   (:use editor/keymap) ; keymap-bind — the RET binding on the jump keymap
   (:use panes) ; ed-body-layout / ed-pane-vrows / ed-pane-top — find + measure the panes
-  (:use editor/pane)) ; pane-update-path — scroll the pane that follows the tail
+  (:use editor/pane) ; pane-update-path — scroll the pane that follows the tail
+  (:use memo)) ; defmemo — the findings chip's counts, asked every frame while nothing changes
 ;; ---- location vocabulary: parse a row → a source location -------------------
 
 ;; ONE parser for "where in which file", used by every results buffer (RET / click) AND by
@@ -154,6 +155,15 @@ to the test row above them. Drives BOTH the jump and the hover/cursor affordance
                         (if (nil? loc) (go (dec i) (dec limit)) loc)))))
       (go line0 40))))
 
+(defn ed-link-at-point (m)
+  "The source location the current line of the current buffer links to (a results
+buffer's `:line-loc`, resolved for indented detail lines like the click does), or nil
+for an ordinary buffer / a non-link line. What M-w copies with no region, and what
+enables the context menu's Copy."
+  (let (buf (ed-current-buf m))
+    (when (ed-mode-service buf :line-loc)
+      (line-link-loc buf (buffer-current-line buf)))))
+
 ;; ---- the layer: read-only + navigable location rows -------------------------
 ;; Any report buffer whose rows name source locations stacks this: RET and a mouse click
 ;; both visit the row's location (`commands/cmd-visit-location`, resolved late by symbol),
@@ -212,7 +222,7 @@ Falls back to a plain append when no pane shows the buffer."
 ;; A note is `{owner-key -> {:line n :kind :info|:pass|:fail|:running|:hint :text str}}`
 ;; stored as ONE buffer annotation (`std/editor/buffer`'s `annotate`, so currency and
 ;; staleness come for free) under `:eol-notes`. Three renderers share it: the margin
-;; glyph (`modes/gutter-mark-for`), the ghost text past the line's end
+;; glyph (`gutter/gutter-mark-for`), the ghost text past the line's end
 ;; (`view/ed-eol-note-ops`), and the echo row when point is on the line
 ;; (`view/ed-eol-note-on-line`).
 ;;
@@ -454,10 +464,16 @@ whose answer had nowhere below it to go — and every reader of this annotation 
 that. A reader that takes only the first silently drops the rest; a renderer that draws them
 all at the same column paints them on top of each other. A buffer holds a handful of notes,
 so this scans."
-  (let (here (by-owner (seq/filter (or (eol-notes buf) {}) (fn (kv) (= (:line (second kv)) line))))
-        notes (map here second))
-    (append (seq/filter notes (fn (n) (= (:kind n) :hint)))
-      (seq/filter notes (fn (n) (not (= (:kind n) :hint)))))))
+  ;; a buffer with no notes — nearly every one — answers before the filters: this is asked
+  ;; for the cursor's line on every frame (the echo row) and per line by the ghost text, and
+  ;; the walk of an empty map through four sequence ops cost more than the rest of the row
+  (let (all (eol-notes buf))
+    (if (or (nil? all) (empty? all))
+      '()
+      (let (here (by-owner (seq/filter all (fn (kv) (= (:line (second kv)) line))))
+            notes (map here second))
+        (append (seq/filter notes (fn (n) (= (:kind n) :hint)))
+          (seq/filter notes (fn (n) (not (= (:kind n) :hint)))))))))
 
 (defn note-lines (buf)
   "The distinct lines carrying a current note, ascending — what a renderer iterates so it
@@ -466,8 +482,12 @@ visits each line once and can lay that line's notes out side by side.
 A note with no line (one stored without `set-note`, which stamps it) is skipped rather than
 handed on: the renderer compares lines, and one malformed note threw out of the whole
 frame, blanking the editor behind a `render error`."
-  (sort (seq/distinct (seq/keep (or (eol-notes buf) {})
-                        (fn (kv) (let (line (:line (second kv))) (when (int? line) line)))))))
+  ;; no notes is the common case and the view asks every frame: skip the sort/distinct/keep
+  (let (all (eol-notes buf))
+    (if (or (nil? all) (empty? all))
+      '()
+      (sort (seq/distinct (seq/keep all
+                            (fn (kv) (let (line (:line (second kv))) (when (int? line) line)))))))))
 
 (defn note-text (note)
   "One note's full text, its `:warn` advisory included — what a reader with room for the
@@ -568,3 +588,83 @@ the first one's work."
       :eol-notes (fold (if share? '() (hint-entries buf key note at hint-at))
         notes
         (fn (acc entry) (let ([k v] entry) (assoc acc k v)))))))
+
+;; ---- the findings chip on the mode line ---------------------------------------
+;; FINDINGS: `✗ 2 ⚠ 5`, clickable. The margin can only mark lines that are on screen, so a
+;; file with one error forty lines down looks exactly like a clean one; the count is the
+;; part of the answer that does not fit in a margin. Read through `diagnostic-lines` — the
+;; same annotation the margin reads, so the bar and the marks cannot disagree. It lives
+;; here, off the buffer's own annotation, rather than in `diagnostics`: the bar is drawn
+;; every frame and must not load a deferred module to do it (the same rule the
+;; attached-node chip follows). `diagnostics` owns the PANE; only the click loads it.
+
+(defn ed-diagnostics-counts (buf)
+  "`[errors warnings]` for `buf` — what its findings are, by severity."
+  (diagnostic-counts-of (diagnostic-lines buf)))
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; the store only ever holds what the body below built, an `[errors warnings]` pair.
+(check-allow :trusted
+  (defmemo diagnostic-counts-of 4 (by-line)
+    "`[errors warnings]` over a `{line -> findings}` index. Remembered on the index itself —
+the annotation's own value, the same map every frame until a recheck replaces it — because
+the mode line's chip asks for the counts twice a frame (its label and its face) and each
+ask walked every finding in the file."
+    (let (ds (mapcat (%map-pairs by-line) (fn ([_ v]) v)))
+      [(count (seq/filter ds diagnostic-error?)) (count (seq/reject ds diagnostic-error?))])))
+
+(defn ed-diagnostics-checked? (m buf)
+  "Is anything actually CHECKING this buffer — a mode's own `:diagnostics` service (the
+Brood checker) or a connected language server?"
+  (or (not (nil? (ed-mode-service buf :diagnostics))) (not (nil? (:lsp m)))))
+
+(defn ed-diagnostics-label (m buf)
+  "The findings chip — `✗ 2 ⚠ 5`, `✓` for a buffer something checked and found clean, and
+`\"\"` when nothing is checking it.
+
+The `✓` is the whole point of the three states. A clean file and a file nobody is looking
+at showed the same empty bar, so a language server that had not started, or had started
+and never been told the text changed, was indistinguishable from good news — which is
+exactly how a broken document sync went unnoticed: `|asfd` in an Elixir buffer, and a bar
+with nothing on it. An empty chip now means one thing only: no checker here."
+  (let ([errors warnings] (ed-diagnostics-counts buf))
+    (cond
+      (or (> errors 0) (> warnings 0))
+        (string/trim (str (if (> errors 0) (str "✗ " errors " ") "")
+                       (if (> warnings 0) (str "⚠ " warnings) "")))
+      (ed-diagnostics-checked? m buf) "✓"
+      else "")))
+
+(defn ed-diagnostics-face (m buf)
+  "Red when something will not compile, amber when it is only advice, and the quiet
+green of a passing verdict when a checker found nothing — the margin's colours."
+  (let ([errors warnings] (ed-diagnostics-counts buf))
+    (cond
+      (> errors 0) {:fg *red* :bold true}
+      (> warnings 0) {:fg *yellow*}
+      else {:fg *green*})))
+
+(defn ed-diagnostics-tooltip (m buf)
+  "The chip's hover: the counts spelled out, and what a click does."
+  (let ([errors warnings] (ed-diagnostics-counts buf))
+    (if (and (= errors 0) (= warnings 0))
+      ["no errors or warnings" "click for the list (C-c !)"]
+      [(str errors
+         " "
+         (if (= errors 1) "error" "errors")
+         ", "
+         warnings
+         " "
+         (if (= warnings 1) "warning" "warnings"))
+        "click for the list (C-c !)"])))
+
+(defn diagnostics-segment (m pane buf)
+  "The findings chip as a segment; the click loads `diagnostics` and opens its list."
+  (statusbar/seg :diagnostics
+    (ed-diagnostics-label m buf)
+    {:sep "  —  "
+     :face (ed-diagnostics-face m buf)
+     :on-click 'diagnostics/cmd-diagnostics
+     :tooltip (fn (mm) (ed-diagnostics-tooltip mm buf))}))
+
+(statusbar/register-modeline-segment :diagnostics 60 'results/diagnostics-segment)

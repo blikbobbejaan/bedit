@@ -15,8 +15,8 @@ Every hard part of that is language-neutral and lives here:
   [[sandbox-reply]]      one reply → this form's note and this form's cascade
 
 What a LANGUAGE supplies is a spec (see below): how to split text into top-level forms,
-how to tell mid-typing from broken, what a reply's note says, and how to send one. Nine
-symbols, resolved late, and nothing else.
+how to tell mid-typing from broken, what a reply's note says, how to send one, and which
+session to start. Symbols and sentences, resolved late, and nothing else.
 
 The alternative was a second copy of nine hundred lines, which is how the two would have
 drifted: the reply path alone carries four separate corrections — the generation check,
@@ -64,14 +64,22 @@ that would re-derive it never runs; the text is already what it last parsed.
      :namespace-form? 'sym           ; (src) -> does this change what names mean below it?
      :note-of 'sym                   ; (reply src) -> the ghost-text note
      :eval 'sym                      ; (id src timeout-ms) -> was it accepted?
-     :in-image 'sym}                 ; (src) -> a reply map, or nil — the headless path
+     :in-image 'sym                  ; (src) -> a reply map, or nil — the headless path
+     :start 'sym                     ; (m) -> start (or re-root) the session
+     :running? 'sym                  ; () -> is the session's worker alive?
+     :reset 'sym                     ; () -> a fresh child
+     :welcome \"…\"                    ; a new buffer's text
+     :open-message \"…\"               ; or 'sym, (m booting?) -> what [[open]] says
+     :restart-message \"…\"            ; what [[restart]] says
+     :spy-faces [[test text role] …]} ; the pane's colouring — see [[spy-fontify]]
 
 Symbols, resolved at call time, for the same reason a keymap names a command symbol: a
 service redefined at runtime takes effect on the next keystroke."
   (:use model) ; ed-buffer-index-by-name / ed-buf-at / ed-update-named / ed-current-buf
-  (:use editor/buffer) ; buffer-text / buffer-rope / annotate / buffer-marker
-  (:use sandbox)) ; sandbox-next-id / sandbox-ids-used — ONE id space for every session
-;; liveeval, workings and results are referenced qualified below — each `mod/name`
+  (:use pool) ; ed-select / ed-show-named — open / reselect the playground's buffer
+  (:use editor/buffer)) ; buffer-text / buffer-rope / annotate / buffer-marker
+;; liveeval, workings, results, modes, theme and session (the ONE request-id
+;; space every session mints from) are referenced qualified below — each `mod/name`
 ;; auto-loads its module.
 
 ;; ---- reading the spec ------------------------------------------------------------
@@ -98,21 +106,12 @@ module docstring."
   ;; playground is the selected buffer — it usually is not when a reply lands.
   (ed-update-named m (buffer-name spec) f))
 
-(defn- pg-merge-state (spec m kvs)
-  "Merge `kvs` into this playground's own slot of the model."
-  (update m (get spec :key) merge kvs))
-(sig pg-merge-state (any model map -> model))
-
-(defn- pg-unpend (spec m id)
-  "Forget request `id` — it has been answered, or it never will be."
-  (update m (get spec :key) update :pending dissoc id))
-(sig pg-unpend (any model int -> model))
-
-;; Both of the above exist for their `sig` as much as for their body. `(update m :playground
-;; merge …)` with a LITERAL key is read by the checker as a model in and a model out; with
-;; the spec's key it cannot know which collection it was handed, so it answers `vector | map`
-;; — and that union then flows into every `model`-taking call downstream, which is seven
-;; `--strict` findings for what is one fact stated twice here.
+;; The request book (`[key :pending]`) is written and read only through `session`'s
+;; `client-sent` / `client-unpend` / `client-reply`, whose `sig`s matter as much as their
+;; bodies: `(update m :playground merge …)` with a LITERAL key is read by the checker as a
+;; model in and a model out; with the spec's key it cannot know which collection it was
+;; handed, so it answers `vector | map` — and that union then flows into every
+;; `model`-taking call downstream, which was seven `--strict` findings for one fact.
 
 (defn live-buffer? (spec m)
   "Is this playground on screen — i.e. does it still want a session? One of the
@@ -259,6 +258,30 @@ up to date. `evaluated` is compared slot-for-slot, so pass it through
       (any? defines
         (fn (d) (or (= r d) (string/ends-with? r (str "/" d)) (string/ends-with? r (str "." d))))))))
 
+(defn- dropped-defines (dropped)
+  ;; `{index -> names}`: what each of [[realign-evaluated]]'s `:dropped` records defined,
+  ;; provided from where its form stood (its `:before`), in record order.
+  (fold dropped
+    {}
+    (fn (acc record)
+      (let (at (:before record))
+        (assoc acc at (append (get acc at '()) (get (:deps record) :defines '())))))))
+
+(defn- stale-step (spec srcs deps changed vanished)
+  ;; [[stale-forms]]' fold step over the forms in order, `[provided stale tail?] -> …`:
+  ;; `provided` is every name a re-run form above (or a vanished one, from where it stood)
+  ;; defines. A form is stale when it changed, reaches one of those, or sits in the tail
+  ;; below a form that changes what names mean.
+  (fn (acc i)
+    (let ([provided-above stale tail?] acc
+          provided (append provided-above (get vanished i '()))
+          form-deps (nth deps i {}))
+      (if (or tail? (contains? changed i) (reaches? (get form-deps :references '()) provided))
+        [(append provided (get form-deps :defines '()))
+          (cons i stale)
+          (or tail? (svc spec :namespace-form? (list (get srcs i ""))))]
+        [provided stale tail?]))))
+
 (defn stale-forms (spec srcs evaluated deps total)
   "Which forms a launch must re-send: every one whose own source changed, plus every LATER
 form that reaches one of them — directly, or through another form that is being re-run.
@@ -281,24 +304,8 @@ it (the spec's `:namespace-form?`) takes the whole tail, and a `deps` that does 
 with the forms one-for-one falls back to the suffix rule."
   (let ({:aligned aligned :dropped dropped} evaluated
         changed (index-set (changed-forms srcs aligned total))
-        defines-at (fn (i) (get (nth deps i {}) :defines '()))
-        ;; what a dropped record defined, provided from where its form stood (`:before`)
-        dropped-at (fn (i)
-                     (mapcat (seq/filter dropped (fn (rec) (= (:before rec) i)))
-                       (fn (rec) (get (:deps rec) :defines '()))))
-        r (fold (range total)
-            ['() '() false]
-            (fn (acc i)
-              (let ([provided0 stale tail?] acc
-                    provided (append provided0 (dropped-at i))
-                    mine? (or tail?
-                            (contains? changed i)
-                            (reaches? (get (nth deps i {}) :references '()) provided)))
-                (if mine?
-                  [(append provided (defines-at i))
-                    (cons i stale)
-                    (or tail? (svc spec :namespace-form? (list (get srcs i ""))))]
-                  [provided stale tail?])))))
+        vanished (dropped-defines dropped)
+        r (fold (range total) ['() '() false] (stale-step spec srcs deps changed vanished)))
     (reverse (second r))))
 
 (defn launch-plan (spec srcs realigned deps total)
@@ -348,57 +355,54 @@ on the KEYSTROKE path."
 ;; note still applies — its length gives the start exactly.
 (defn- pg-note-marker (bb key hi) (buffer-marker-set bb [:pg-end key] hi))
 
-(defn- pg-note-region (bb key src)
-  ;; `[lo hi]` for `key`'s form as the text stands now, or nil when it has no marker.
+(defn- pg-intact-region (bb rope key src)
+  ;; `[lo hi]` for `key`'s form as the text stands now — when it still has its marker AND
+  ;; still holds `src`, the source its note was stamped for — else nil.
   (let (hi (buffer-marker bb [:pg-end key]))
-    (when hi (let (lo (- hi (string/length src))) (when (>= lo 0) [lo hi])))))
+    (when hi
+      (let (lo (- hi (string/length src)))
+        (when (and (>= lo 0) (= (text/slice rope lo hi) src)) [lo hi])))))
 
-(defn- pg-place-inlays (note first-line)
-  ;; The note's INLAY rows, offsets resolved to buffer lines the same way its hints are.
-  ;; Separate from the hints because they are painted somewhere else entirely — a row above
-  ;; the line rather than the end of it — and a producer chooses per entry which a piece of
-  ;; derived text deserves: a signature belongs above the definition it describes, a `dbg`
-  ;; step's value belongs at the step.
-  (let (rows (:inlays note))
+(defn- pg-place-rows (note field first-line)
+  ;; A note's `:hints` and `:inlays` arrive with `:offset` — the line WITHIN the form each
+  ;; one describes, because the child only ever saw that form's text and counts from its
+  ;; first line. The buffer line is the form's first line plus that offset, and this is the
+  ;; one place that knows where the form sits, so it is the one place that converts.
+  ;; Everything downstream deals in buffer lines like every other note.
+  ;;
+  ;; The two fields are separate because they are painted somewhere else entirely — an
+  ;; inlay is a row above the line rather than the end of it — and a producer chooses per
+  ;; entry which a piece of derived text deserves: a signature belongs above the definition
+  ;; it describes, a `dbg` step's value belongs at the step.
+  (let (rows (get note field))
     (if (empty? rows)
       note
-      (assoc note
-        :inlays (map rows (fn (r) (assoc r :line (+ first-line (or (:offset r) 0)))))))))
+      (assoc note field (map rows (fn (r) (assoc r :line (+ first-line (or (:offset r) 0)))))))))
 
-(defn- pg-place-hints (note first-line)
-  ;; A note's `:hints` arrive with `:offset` — the line WITHIN the form each one describes,
-  ;; because the child only ever saw that form's text and counts from its first line. The
-  ;; buffer line is the form's first line plus that offset, and this is the one place that
-  ;; knows where the form sits, so it is the one place that converts. Everything downstream
-  ;; deals in buffer lines like every other note.
-  (let (hints (:hints note))
-    (if (empty? hints)
-      note
-      (assoc note
-        :hints (map hints (fn (h) (assoc h :line (+ first-line (or (:offset h) 0)))))))))
+(defn- pg-anchor-note (bb key note rope lo hi)
+  ;; Paint `note` under `key` for the form at `[lo hi)` through the shared anchored-note
+  ;; channel: its answer on the line below the form's last, its `:hint` at the form's
+  ;; opening line. `results/set-note` owns everything else — the owner-keying, the hint key,
+  ;; and the one-line collapse when a form at EOF has no line below it.
+  (let (first-line (results/line-of rope lo))
+    (results/set-note bb
+      key
+      (pg-place-rows (pg-place-rows note :hints first-line) :inlays first-line)
+      (results/answer-line rope (dec hi)) ; the extent's end is exclusive
+      first-line)))
 
 (defn- pg-note-into (bb key note span place)
-  ;; Stamp `note` under `key` on buffer `bb`, anchored to the form at `span`, through the
-  ;; shared anchored-note channel: its answer on the line below the form's last, its
-  ;; `:hint` at the form's opening line. `results/set-note` owns everything else — the
-  ;; owner-keying, the hint key, and the one-line collapse when a form at EOF has no line
-  ;; below it. `key` and `span` are passed apart because a note keeps the index its launch
-  ;; gave it while its form may since have moved to another slot.
+  ;; Stamp `note` under `key` on buffer `bb`, anchored to the form at `span`: what it says
+  ;; and the source it says it of go to `:playground-notes`, the form's end gets its marker,
+  ;; and the note is painted. `key` and `span` are passed apart because a note keeps the
+  ;; index its launch gave it while its form may since have moved to another slot.
   (if (nil? span)
     bb
     (let ([lo hi] span
-          {:rope rope :text text} place)
-      (results/set-note (pg-note-marker (assoc bb
-                                          :playground-notes
-                                            (assoc (or (:playground-notes bb) {})
-                                              key
-                                                {:src (string/substring text lo hi)
-                                                 :note (dissoc note :line)}))
-                          key hi)
-        key
-        (pg-place-inlays (pg-place-hints note (results/line-of rope lo)) (results/line-of rope lo))
-        (results/answer-line rope (dec hi)) ; the extent's end is exclusive
-        (results/line-of rope lo)))))
+          {:rope rope :text text} place
+          said {:src (string/substring text lo hi) :note (dissoc note :line)})
+      (pg-anchor-note (pg-note-marker (assoc-in bb [:playground-notes key] said) key hi)
+        key note rope lo hi))))
 
 (defn pg-set-note (spec m key note place &optional (at nil))
   "[[pg-note-into]] on this playground's buffer: `note` under `key`, anchored to the form
@@ -454,18 +458,10 @@ or a fresh session asked for a replay (`:playground-replay`) — which arms the 
     (pg-clear-anchors bb)
     (fn (acc kv)
       (let ([key entry] kv
-            region (pg-note-region acc key (:src entry)))
+            region (pg-intact-region acc rope key (:src entry)))
         (if (nil? region)
           acc
-          (let ([lo hi] region)
-            (if (not (= (text/slice rope lo hi) (:src entry)))
-              acc
-              (results/set-note acc
-                key
-                (pg-place-inlays (pg-place-hints (:note entry) (results/line-of rope lo))
-                  (results/line-of rope lo))
-                (results/answer-line rope (dec hi))
-                (results/line-of rope lo)))))))))
+          (let ([lo hi] region) (pg-anchor-note acc key (:note entry) rope lo hi)))))))
 
 (defn- pg-reanchor-by-text (spec bb rope stash)
   ;; The slow path, for when a note has lost its marker: find each form by TEXT instead.
@@ -486,13 +482,8 @@ or a fresh session asked for a replay (`:playground-replay`) — which arms the 
           (if (or (nil? entry) (nil? span))
             acc
             (let ([lo hi] span)
-              (results/set-note (pg-note-marker acc key hi)
-                ; re-mark it, so the next edit is fast again
-                key
-                (pg-place-inlays (pg-place-hints (:note entry) (results/line-of rope lo))
-                  (results/line-of rope lo))
-                (results/answer-line rope (dec hi))
-                (results/line-of rope lo)))))))))
+              ;; re-mark it, so the next edit is fast again
+              (pg-anchor-note (pg-note-marker acc key hi) key (:note entry) rope lo hi))))))))
 
 (defn ed-reanchor (spec m)
   "Re-anchor this playground's notes to the text as it is NOW — on the edit itself, not the
@@ -547,35 +538,79 @@ the language holds nothing, or this exact text was released."
   (when (and (has? spec :held?) (not (contains? (or (:playground-released b) #{}) src)))
     (svc spec :held? (list src))))
 
+(defn- pg-release (bb i src)
+  ;; Release form `i`, whose source is `src`: not evaluated, so the launch sends it; replay,
+  ;; so a launch happens although the text has not moved.
+  (assoc bb
+    :playground-released (conj (or (:playground-released bb) #{}) src)
+    :playground-evaluated (pg-unevaluate (or (:playground-evaluated bb) {}) (list i))
+    :playground-replay true))
+
 (defn pg-release-at-point (spec m)
   "C-c C-c in a playground: run the held form at point, once — the next launch sends it.
 Says so when point is not on a form, or the buffer has moved on since the last launch
 parsed it (the form's extent is not known yet; a moment later it is)."
-  (let (b (pg-buf spec m))
+  (let (b (pg-buf spec m)
+        spans (when b (or (:playground-spans b) []))
+        i (when b (form-index-in spans (buffer-point b))))
     (cond
       (nil? b) m
       (not (= (buffer-rope b) (:playground-rope b)))
         (message m "still reading the buffer — try again")
+      (nil? i) (message m "no form at point")
       :else
-        (let (spans (or (:playground-spans b) [])
-              i (form-index-in spans (buffer-point b)))
-          (if (nil? i)
-            (message m "no form at point")
-            (let ([lo hi] (nth spans i)
-                  src (text/slice (buffer-rope b) lo hi))
-              (message
-                (pg-update-buf spec
-                  m
-                  (fn (bb)
-                    (assoc bb
-                      :playground-released (conj (or (:playground-released bb) #{}) src)
-                      ;; not evaluated, so the launch sends it; replay, so a launch
-                      ;; happens although the text has not moved
-                      :playground-evaluated
-                        (pg-unevaluate (or (:playground-evaluated bb) {})
-                          (list i))
-                      :playground-replay true)))
-                "running the held form")))))))
+        (let ([lo hi] (nth spans i)
+              src (text/slice (buffer-rope b) lo hi))
+          (message (pg-update-buf spec m (fn (bb) (pg-release bb i src))) "running the held form")))))
+
+(defn- pg-known (spec m b)
+  ;; What the session knows about each form: what it has actually EVALUATED, plus the forms
+  ;; whose identical text is already IN FLIGHT — those need no second request, their answer
+  ;; is coming. A request carries the `:deps` it was sent with, so the two kinds are the
+  ;; same shape and this map is homogeneous: a form displaced by an in-flight record still
+  ;; contributes what it defines to `stale-forms`, which a record without deps would
+  ;; silently have dropped.
+  (merge (or (:playground-evaluated b) {}) (liveeval/in-flight (pending-of spec m))))
+
+(defn- pg-launch-reset (spec m pairs stale launched)
+  ;; Before anything runs: move the pane's cached reports with their forms (`pairs`) and
+  ;; drop the cascades of everything being re-sent — they describe code that no longer
+  ;; exists; a form nobody re-ran keeps a report that is still true — then stamp the
+  ;; buffer with what this launch parsed (`launched`) and clear its notes.
+  (let (spy (get spec :spy))
+    (pg-update-buf spec
+      (workings/forget spy (workings/rekey spy m pairs) (fn (i) (contains? stale i)))
+      (fn (bb) (pg-clear-notes (merge (dissoc bb :playground-replay) launched))))))
+
+(defn- pg-in-image (spec m i src deps note-at)
+  ;; Headless, there is no loop to deliver a reply to: the language's `:in-image` answer,
+  ;; noted and recorded as evaluated, or nil. A language whose session IS a child process
+  ;; has no in-image answer to give, so headless it answers nothing.
+  (let (reply (when (has? spec :in-image) (svc spec :in-image (list src))))
+    (when reply (pg-evaluated spec (note-at m i (svc spec :note-of (list reply src))) i src deps))))
+
+(defn- pg-launch-client (spec b deps note-at)
+  ;; This playground's half of `liveeval/form-step`: how it sends, what a request records
+  ;; (its `:deps`, which `in-flight` hands back to the plan), and the in-image path.
+  {:note-at note-at
+   ;; ready, but it reaches outside the session and nobody asked — C-c C-c releases it
+   ;; ([[pg-release-at-point]])
+   :held-reason (fn (src) (pg-held-reason spec b src))
+   :live? (live?)
+   :send (fn (id i src) (svc spec :eval (list id src (get spec :timeout-ms))))
+   :request (fn (i src) {:region i :src src :deps (nth deps i {})})
+   :no-session (str "no session — " (get spec :restart))
+   :headless (fn (m i src) (pg-in-image spec m i src (nth deps i {}) note-at))})
+
+(defn- pg-form-step (spec b srcs deps stale old-notes place)
+  ;; The launch's fold step, `(acc i) -> acc`: each form takes its turn through the step
+  ;; the tutorial shares (`liveeval/form-step`) — carry, note, hold, send or answer
+  ;; in-image. A form the plan did not reach is carried with its last note.
+  (let (client (pg-launch-client spec b deps (fn (m i note) (pg-set-note spec m i note place))))
+    (fn (acc i)
+      (let (src (get srcs i "")
+            state (if (contains? stale i) (svc spec :parse-state (list src)) :carry))
+        (liveeval/form-step acc i src state (get old-notes i) client)))))
 
 (defn ed-launch (spec m)
   "The debounce landed: re-evaluate the forms this edit could have changed the answer of —
@@ -586,134 +621,44 @@ genuinely broken fails locally with no round trip; a blank one says nothing.
 
 Notes are rebuilt, not patched — see the module docstring. A form whose reply is still in
 flight wears `⋯ evaluating…` rather than nothing, so a rebuild never flashes the buffer
-blank on its way to the same answer."
+blank on its way to the same answer. A form nothing could reach (all of them, when the edit
+was whitespace the parser ignores or an edit undone) is re-stamped with its last note where
+it now sits — a form that moved takes its note with it."
   (let (b (pg-buf spec m))
     (if (nil? b)
       m
       (let (text (buffer-text b)
             rope (buffer-rope b)
             forms (svc spec :forms-of (list text))
+            total (count forms)
             srcs (form-srcs-in text forms)
             spans (form-spans-in text forms)
-            ;; What the session knows about each form: what it has actually EVALUATED, plus
-            ;; the forms whose identical text is already IN FLIGHT — those need no second
-            ;; request, their answer is coming. A request carries the `:deps` it was sent
-            ;; with, so the two kinds are the same shape and this map is homogeneous: a form
-            ;; displaced by an in-flight record still contributes what it defines to
-            ;; `stale-forms`, which a record without deps would silently have dropped.
-            known (merge (or (:playground-evaluated b) {}) (liveeval/in-flight (pending-of spec m)))
+            deps (svc spec :deps-of (list text))
             ;; ONE alignment, for the plan and for the write-back both — a form that moved
             ;; keeps its record. What goes back to `:playground-evaluated` is this minus the
-            ;; promises (`:in-flight?`), because only a reply landing may say the session
-            ;; holds a form (see the module docstring).
-            realigned (realign-evaluated srcs known (count forms))
-            evaluated (into {}
-                        (seq/filter (:aligned realigned) (fn (kv) (not (:in-flight? (second kv))))))
-            deps (svc spec :deps-of (list text))
-            ;; last launch's notes, keyed by the forms as they are now (a form that moved
-            ;; takes its note with it; a hint is re-derived from its result note)
+            ;; promises, because only a reply landing may say the session holds a form
+            ;; (see the module docstring).
+            realigned (realign-evaluated srcs (pg-known spec m b) total)
+            stale (index-set (launch-plan spec srcs realigned deps total))
             ;; each form of the last launch matched to where it is now — the notes AND the
             ;; pane's cached reports are keyed by the old indices, and both move with it
-            pairs (pg-form-pairs spec b srcs (count forms))
+            pairs (pg-form-pairs spec b srcs total)
             old-notes (pg-rekey-notes (or (:playground-notes b) {}) pairs)
-            running (live?)
-            stale (launch-plan spec srcs realigned deps (count forms))
-            ;; one counter for every session, not one per client — see `sandbox-next-id`
-            start-id (sandbox-next-id m)
-            ;; Drop the cached cascades of everything being re-sent (they describe code that
-            ;; no longer exists) and clear the notes, before anything runs. Only the re-sent
-            ;; ones: a form nobody re-ran keeps a report that is still true.
-            stale? (index-set stale)
-            m0 (pg-update-buf spec
-                 (workings/forget (get spec :spy)
-                   (workings/rekey (get spec :spy) m pairs)
-                   (fn (i) (contains? stale? i)))
-                 (fn (bb)
-                   (pg-clear-notes
-                     (assoc (dissoc bb :playground-replay)
-                       :playground-rope rope
-                       :playground-spans spans
-                       :playground-deps deps
-                       ;; A form being SENT is no longer one the session has evaluated —
-                       ;; only its reply landing puts it back. A launch that recorded what
-                       ;; it asked for would leave a lost reply invisible forever.
-                       :playground-evaluated (pg-unevaluate evaluated stale)))))
-            place (pg-placement rope text spans)
-            note-at (fn (mm i note) (pg-set-note spec mm i note place))
-            result (if (empty? stale)
-                     ;; nothing changed (whitespace the parser ignores, an edit undone):
-                     ;; re-anchor every note where it now sits and send nothing. Form keys
-                     ;; only, which `:playground-notes` already is: a hint is derived from
-                     ;; its result note, so re-stamping the results re-anchors the hints too.
-                     [(fold old-notes m0 (fn (mm kv) (let ([i note] kv) (note-at mm i note))))
-                       start-id
-                       {}]
-                     (fold (range (count forms))
-                       [m0 start-id {}]
-                       (fn (acc i)
-                         (let ([m1 next-id pending] acc
-                               src (get srcs i "")
-                               old (get old-notes i)
-                               parsed (if (contains? stale? i)
-                                        (svc spec :parse-state (list src))
-                                        :carry)
-                               ;; ready, but it reaches outside the session and nobody asked
-                               held (when (= parsed :ok) (pg-held-reason spec b src))
-                               state (if held [:held held] parsed))
-                           (match state
-                             ;; nothing this edit could reach: keep the verdict as it is
-                             (:carry (if old [(note-at m1 i old) next-id pending] acc))
-                             (:blank acc)
-                             ;; Mid-form. Neither re-stamp the old verdict (a confident
-                             ;; `=> 6` beside a form that can no longer produce it) nor show
-                             ;; nothing (indistinguishable from "no feedback yet"): say what
-                             ;; it is waiting for, dim.
-                             ([:incomplete reason] [(note-at m1 i (liveeval/incomplete-note reason))
-                                                     next-id pending])
-                             ([:err msg] [(note-at m1 i (liveeval/syntax-error-note msg))
-                                           next-id pending])
-                             ;; Ready, but running it would reach outside the session — a
-                             ;; file written, a program run — and nobody asked yet: say so,
-                             ;; send nothing. C-c C-c releases it ([[pg-release-at-point]]).
-                             ([:held reason] [(note-at m1 i (liveeval/held-note reason))
-                                               next-id pending])
-                             ;; Live (an `:editor` process exists): fire the request at the
-                             ;; session and let the reply land through `sandbox-events`.
-                             ;; Headless (tests, no loop to deliver an event to): the
-                             ;; language's `:in-image` path when it has one, and nothing
-                             ;; when it does not — a language whose session IS a child
-                             ;; process has no in-image answer to give.
-                             (:ok
-                               (if running
-                                 (if (svc spec :eval (list next-id src (get spec :timeout-ms)))
-                                   [(note-at m1 i (liveeval/running-note))
-                                     (inc next-id)
-                                     (assoc pending
-                                       next-id {:region i :src src :deps (nth deps i {})})]
-                                   ;; The worker is gone (it gave up, or never started).
-                                   ;; Nothing is coming, so pending it would wedge this form
-                                   ;; on `⋯ evaluating…` forever: a form whose answer is
-                                   ;; already in flight is never re-sent.
-                                   [(note-at m1
-                                      i
-                                      (liveeval/syntax-error-note (str "no session — "
-                                                                    (get spec :restart))))
-                                     next-id pending])
-                                 (let (reply (when (has? spec :in-image)
-                                               (svc spec :in-image (list src))))
-                                   (if (nil? reply)
-                                     acc
-                                     [(pg-evaluated spec
-                                        (note-at m1 i (svc spec :note-of (list reply src)))
-                                        i
-                                        src
-                                        (nth deps i {}))
-                                       next-id pending])))))))))
-            [m2 next-id pending] result)
-        (update (sandbox-ids-used m2 next-id)
-          (get spec :key)
-          merge
-          {:pending (merge (pending-of spec m2) pending)})))))
+            ;; A form being SENT is no longer one the session has evaluated — only its
+            ;; reply landing puts it back. A launch that recorded what it asked for would
+            ;; leave a lost reply invisible forever.
+            evaluated (pg-unevaluate (liveeval/settled (:aligned realigned)) stale)
+            m0 (pg-launch-reset spec
+                 m
+                 pairs
+                 stale
+                 {:playground-rope rope
+                  :playground-spans spans
+                  :playground-deps deps
+                  :playground-evaluated evaluated})
+            step (pg-form-step spec b srcs deps stale old-notes (pg-placement rope text spans))
+            [m1 next-id sent] (fold (range total) [m0 (session/next-id m) {}] step))
+        (session/client-sent m1 (get spec :key) next-id (merge (pending-of spec m1) sent))))))
 
 ;; ---- the session client hooks ---------------------------------------------------------
 
@@ -732,7 +677,7 @@ entry, the form stayed un-evaluated, and every later launch — every settled ke
 sent it again. A request that was IN FLIGHT when a reset killed the child was answered
 `{:timeout true}` by the worker before the respawn, so nothing is left dangling."
   (pg-update-buf spec
-    (pg-merge-state spec m {:sandbox-gen gen :sandbox-ready true})
+    (session/client-ready m (get spec :key) gen)
     (fn (bb)
       ;; `:playground-replay` is what makes the next idle beat launch: the buffer has not
       ;; moved, so [[ed-stale?]]'s rope comparison alone would not. The rope and extents of
@@ -741,112 +686,102 @@ sent it again. A request that was IN FLIGHT when a reset killed the child was an
       ;; came up.
       (assoc bb :playground-replay true :playground-evaluated {}))))
 
+(defn- pg-reply-view (spec b)
+  ;; `{:text :spans :deps}` of the buffer as a reply finds it. The extents and deps cached
+  ;; by the last launch are exact while the buffer still holds the text it parsed, which is
+  ;; the ordinary case and costs no parse. When it does not — an edit landed while the
+  ;; request was in flight — the answer may still be good, so both are re-derived rather
+  ;; than thrown away.
+  (let (text (buffer-text b))
+    (if (= (buffer-rope b) (:playground-rope b))
+      {:text text
+       :spans (or (:playground-spans b) [])
+       :deps (or (:playground-deps b) (svc spec :deps-of (list text)))}
+      {:text text
+       :spans (form-spans-in text (svc spec :forms-of (list text)))
+       :deps (svc spec :deps-of (list text))})))
+
+(defn answering-form (src-at total i0 sent)
+  "Which of `total` forms a reply answers: the one whose source (`(src-at k)`) is still
+`sent` — at the index `i0` it was sent from, or, when a line typed above it moved it while
+the request was in flight, the NEAREST slot holding that text (nearest, so twin forms take
+their own reply and not each other's). Nil when no form holds it any more."
+  (if (= (src-at i0) sent)
+    i0
+    (seq/min-by (seq/filter (range total) (fn (k) (= (src-at k) sent)))
+      (fn (k) (math/abs (- k i0))))))
+
+(defn- pg-land-reply (spec m request reply)
+  ;; Accepted when THE FORM's source is still the one that was sent. The test used to be
+  ;; the whole buffer's rope, which dropped every reply the moment you typed anywhere — and
+  ;; the launch had already recorded the send as evaluated, so nothing re-sent it and the
+  ;; session kept a definition the buffer no longer showed. A form's answer does not go
+  ;; stale because a different form moved.
+  (let (b (pg-buf spec m))
+    (if (nil? b)
+      m
+      (let ({:text text :spans spans :deps deps} (pg-reply-view spec b)
+            src-at (fn (k)
+                     (let (span (nth spans k nil))
+                       (when span (string/substring text (first span) (second span)))))
+            i0 (:region request)
+            i (answering-form src-at (count spans) i0 (:src request))
+            src (when i (src-at i)))
+        (if (nil? i)
+          (do
+            (log/warn (str (get spec :buffer)
+                        ": reply "
+                        (get reply :id)
+                        " dropped — form "
+                        i0
+                        " no longer holds the text that was sent; it re-evaluates on the next idle beat"))
+            m)
+          ;; Stamped under the key its own REQUEST was made with (`i0`) and anchored at the
+          ;; slot the form now occupies (`i`). Under `i` alone it would land on whatever key
+          ;; the launch gave a different form — because `i0` and `i` differ exactly when the
+          ;; forms have shifted, so the slot this one moved into is somebody else's — and
+          ;; quietly replace that form's note.
+          ;;
+          ;; `workings/show` caches this form's cascade and opens the pane only if the
+          ;; cascade is real AND belongs to the form the cursor is in — so a background
+          ;; re-eval never yanks the pane off what you are reading.
+          (workings/show (get spec :spy)
+            (pg-evaluated spec
+              (pg-set-note spec
+                m
+                i0
+                (svc spec :note-of (list reply src))
+                (pg-placement (buffer-rope b) text spans)
+                i)
+              i
+              src
+              (nth deps i {}))
+            i
+            (form-index-in spans (:point b 0))
+            reply
+            src))))))
+
 (defn sandbox-reply (spec m reply gen)
   "Fold one reply into the model. A reply this playground never sent, one from a superseded
-child, or one whose form has been edited since the send is dropped — the next idle beat
-re-evaluates. Otherwise the result lands as the form's note and its trace as the pane's
-cascade."
-  (let (key (get spec :key)
-        id (get reply :id)
-        pend (get-in m [key :pending id]))
-    (cond
-      (nil? pend) m ; not ours (another client's, or a straggler) — the fan-out's no-op
-      (not (= gen (get-in m [key :sandbox-gen])))
-      ;; Logged, never silent: a dropped reply leaves its form blank, and "the note never
-      ;; came" is indistinguishable from "nothing was sent" without this line.
-      ;;
-      ;; UNPENDED, too. A straggler is the last thing that will ever be said about that
-      ;; request — its child is gone — so leaving the entry behind leaves the form
-      ;; permanently IN FLIGHT as far as [[ed-launch]] is concerned, and a form whose answer
-      ;; is already coming is not re-sent. It never came, and the `⋯ evaluating…` note sat
-      ;; there until that form's own text changed.
-        (do
-          (log/warn (str (get spec :buffer)
-                      ": reply "
-                      id
-                      " dropped — generation "
-                      gen
-                      " is not the session's "
-                      (get-in m [key :sandbox-gen])))
-          (pg-unpend spec m id))
-      else
-        (let (m1 (pg-unpend spec m id)
-              b (pg-buf spec m1)
-              i0 (:region pend))
-          (if (nil? b)
-            m1
-            ;; The extents and deps cached by the last launch are exact while the buffer
-            ;; still holds the text it parsed, which is the ordinary case and costs no
-            ;; parse. When it does not — an edit landed while this was in flight — the
-            ;; answer may still be good, so both are re-derived rather than thrown away.
-            (let (text (buffer-text b)
-                  fresh? (= (buffer-rope b) (:playground-rope b))
-                  spans (if fresh?
-                          (or (:playground-spans b) [])
-                          (form-spans-in text (svc spec :forms-of (list text))))
-                  deps (if fresh?
-                         (or (:playground-deps b) (svc spec :deps-of (list text)))
-                         (svc spec :deps-of (list text)))
-                  src-at (fn (k)
-                           (let (span (nth spans k nil))
-                             (when span (string/substring text (first span) (second span)))))
-                  ;; The form this answers is the one whose source is still what was sent —
-                  ;; at the index it had, or, when a line typed above it moved it down a slot
-                  ;; while this was in flight, the nearest slot holding that text (nearest,
-                  ;; so twin forms take their own reply and not each other's).
-                  i (if (= (src-at i0) (:src pend))
-                      i0
-                      (first (sort-by (seq/filter (range (count spans))
-                                        (fn (k) (= (src-at k) (:src pend))))
-                               (fn (k) (math/abs (- k i0))))))
-                  src (when i (src-at i)))
-              ;; Accepted when THE FORM's source is still the one that was sent. The test
-              ;; used to be the whole buffer's rope, which dropped every reply the moment you
-              ;; typed anywhere — and the launch had already recorded the send as evaluated,
-              ;; so nothing re-sent it and the session kept a definition the buffer no longer
-              ;; showed. A form's answer does not go stale because a different form moved.
-              (if (nil? i)
-                (do
-                  (log/warn (str (get spec :buffer)
-                              ": reply " id " dropped — form " i0
-                              " no longer holds the text that was sent; it re-evaluates on the next idle beat"))
-                  m1)
-                ;; Stamped under the key its own REQUEST was made with (`i0`) and anchored at
-                ;; the slot the form now occupies (`i`). Under `i` alone it would land on
-                ;; whatever key the launch gave a different form — because `i0` and `i` differ
-                ;; exactly when the forms have shifted, so the slot this one moved into is
-                ;; somebody else's — and quietly replace that form's note.
-                (let (m2 (pg-evaluated spec
-                           (pg-set-note spec
-                             m1
-                             i0
-                             (svc spec :note-of (list reply src))
-                             (pg-placement (buffer-rope b) text spans)
-                             i)
-                           i
-                           src
-                           (nth deps i {})))
-                  ;; `workings/show` caches this form's cascade and opens the pane only if the
-                  ;; cascade is real AND belongs to the form the cursor is in — so a
-                  ;; background re-eval never yanks the pane off what you are reading.
-                  (workings/show (get spec :spy)
-                    m2
-                    i
-                    (form-index-in spans (:point b 0))
-                    reply
-                    src)))))))))
+child (`session/client-reply`, the rule the tutorial shares), or one whose form has been
+edited since the send is dropped — the next idle beat re-evaluates. Otherwise the result
+lands as the form's note and its trace as the pane's cascade."
+  (session/client-reply m
+    (get spec :key)
+    reply
+    gen
+    (get spec :buffer)
+    (fn (m1 request answer) (pg-land-reply spec m1 request answer))))
 
 (defn sandbox-down (spec m code)
-  "The child went away and somebody still wants a session (letting it go for good is
-`sandbox-events`' call — only it can see whether every client is gone)."
-  (let (m1 (pg-merge-state spec m {:sandbox-ready false}))
-    (cond
-      (not (live-buffer? spec m1)) m1 ; not ours to narrate
-      (= code :gave-up)
-        (message m1 (str (get spec :buffer) " session keeps dying — *Messages* may say why"))
-      (= code :spawn-failed)
-        (message m1 (get spec :spawn-failed-message "could not start the session"))
-      else (message m1 (str (get spec :buffer) " session restarting…")))))
+  "The child went away and somebody still wants a session ([[session/client-down]])."
+  (session/client-down m
+    (get spec :key)
+    (fn (mm) (live-buffer? spec mm))
+    code
+    {:gave-up (str (get spec :buffer) " session keeps dying — *Messages* may say why")
+     :spawn-failed (get spec :spawn-failed-message "could not start the session")
+     :restarting (str (get spec :buffer) " session restarting…")}))
 
 ;; ---- the pane follows the cursor --------------------------------------------------------
 
@@ -903,6 +838,98 @@ image lookup — which is the half you want while typing a call."
           ;; same form, new docs: re-render what is already open, never open one for a hover
           (and moved? (not (nil? (or i here)))) (workings/refresh spy m1 (or i here) false)
           else m1)))))
+
+;; ---- the pane's colouring -----------------------------------------------------------
+;; A spec's `:spy-faces` is the pane's colouring as DATA — `[test text role]` rows, the
+;; first matching row wins — because the two languages' panes differ by a heading and an
+;; arrow, and were two copies of the same `cond` for it. Roles rather than faces: a face
+;; built when the spec is `def`'d would keep the colours of the theme that was current then.
+
+(defn- spy-role-face (role)
+  ;; Read at paint time, so a theme switch recolours the pane.
+  (case role
+    :dim {:fg *subtext*}
+    :aside {:fg *overlay0* :italic true}
+    :value {:fg *teal*}
+    nil))
+
+(defn- spy-rule-matches? (rule line)
+  (let ([test text _] rule)
+    (case test
+      :prefix (string/starts-with? line text)
+      :trimmed-prefix (string/starts-with? (string/triml line) text)
+      :includes (includes? line text)
+      false)))
+
+(defn spy-fontify (spec src)
+  "The pane's colouring from the spec's `:spy-faces`: the heading dim, every returned value
+in the accent — so a cascade reads as calls going in and values coming back rather than as
+a wall of text."
+  (let (rules (get spec :spy-faces []))
+    (modes/fontify-line-faces src
+      (fn (line)
+        (let (rule (seq/find rules (fn (r) (spy-rule-matches? r line))))
+          (when rule (spy-role-face (nth rule 2))))))))
+
+;; ---- opening and restarting ---------------------------------------------------------
+;; The two commands every playground has, written once. What differs per language is
+;; which session to start and what to say, and both are on the spec.
+
+(defn- open-message (spec m booting?)
+  ;; `:open-message` is a sentence, or a symbol `(m booting?) -> sentence` for a language
+  ;; whose session takes long enough to boot that the wait needs explaining.
+  (let (said (get spec :open-message))
+    (if (string? said) said (svc spec :open-message (list m booting?)))))
+
+(defn- pg-reselect (spec m)
+  ;; The playground was already open and is now selected: bring the pane back onto the form
+  ;; at point. The buffer may have moved on since the last launch, so this parses rather
+  ;; than trusting the cached extents.
+  (let (b (pg-buf spec m))
+    (if (nil? b)
+      m
+      (let (text (buffer-text b)
+            spans (form-spans-in text (svc spec :forms-of (list text))))
+        (workings/reopen (get spec :spy) m (or (form-index-in spans (:point b 0)) 0))))))
+
+(defn open (spec m)
+  "Open this playground, or switch to it: the session starts (only a running editor can
+receive its replies, so a headless open starts nothing), and the buffer is created with the
+pane beside it — or, already open, selected, with the pane brought back onto the form at
+point.
+
+**One command, not two.** Asking again switches to the buffer you already have and reopens
+a pane you closed: a separate command for the pane was a second thing to know for what is
+the same intent (\"show me the playground\"). Closing the pane still latches, so a later
+result does not reopen it behind you; asking for the playground again does, because that is
+you asking.
+
+The pane opens with `force` on a fresh buffer, rather than waiting to earn its split from
+the first traced reply the way the tutorial's does: a lesson is prose you are reading and
+the pane an aside, but a playground IS the pane's subject — you opened it to watch code run."
+  (let (booting? (and (live?) (not (svc spec :running? '())))
+        spy (get spec :spy))
+    (do
+      (when (live?) (svc spec :start (list m)))
+      (let (existing (pg-index spec m))
+        (if existing
+          (pg-reselect spec (ed-select m existing))
+          (message (workings/refresh spy
+                     (ed-show-named m (buffer-name spec) (get spec :welcome) (get spec :type))
+                     0
+                     true)
+            (open-message spec m booting?)))))))
+
+(defn restart (spec m)
+  "Restart this playground's session: a fresh child — everything the buffer defined is
+gone — and the whole buffer re-evaluates against it once the child announces ready.
+
+Also the retry path when the session gave up or never started, which is why it STARTS a dead
+one rather than resetting it: a reset on a worker that is not running is a silent no-op, and
+a silent no-op is the wrong answer to \"please try again\"."
+  (do
+    (when (live?) (if (svc spec :running? '()) (svc spec :reset '()) (svc spec :start (list m))))
+    (message m (get spec :restart-message))))
 
 ;; ---- the mode line's count ---------------------------------------------------------
 

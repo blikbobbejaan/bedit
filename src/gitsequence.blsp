@@ -1,0 +1,616 @@
+(defmodule gitsequence
+  "Rewriting history: merge (`m`), rebase (`r`, including the interactive todo list edited
+in a buffer and rewording, editing or dropping ONE commit), cherry-pick (`A`), revert (`V`)
+and bisect (`B`). They share the SEQUENCER: git records in `.git` which of them is
+part-way through, so one continue / skip / abort dispatches on it."
+  (:use editor/keymap :only [keymap-bind]) ; the *git-rebase-todo* keymap below
+  (:use editor/layers :only [register-type-layers]) ; its buffer type
+  (:use model) ; message / ed-current-buf / ed-set-buf
+  (:use pool) ; ed-show-named
+  (:use commands) ; cmd-kill-buffer
+  (:use interactive) ; defcommand
+  (:use transient) ; ed-transient-open / ed-transient-args
+  (:use editor/buffer) ; buffer-text / buffer-current-line
+  (:use gitcore)
+  (:use gitsection) ; git-log-commits
+  (:use gitpick) ; git-pick-commit / git-with-ref / git-on-commit
+  (:use gitview)) ; git-show-diff — the merge preview
+
+;; ============================================================================
+;; REWRITING HISTORY: merge, rebase, cherry-pick, revert and bisect — and the two rules
+;; every command past staging, committing and pushing shares.
+;; ============================================================================
+;;
+;; Every one of these is "run a git subcommand with some flags, then refresh", and the
+;; flags are what a keymap could never hold — which is why this arrives now and not
+;; before: a transient (brood ADR-387) is the place a flag can live.
+;;
+;; Two rules run through the lot.
+;;
+;; **Nothing here guesses.** A command that could lose work asks first — `git-confirm`
+;; is a y/n the dangerous ones go through, and it names what it is about to do rather
+;; than asking "are you sure?". `reset --hard` and `clean` are the two that can destroy
+;; uncommitted work, and both are behind it.
+;;
+;; **The SEQUENCER is one idea, not five.** A rebase, a merge, a cherry-pick and a revert
+;; can all stop half-way and leave the repo waiting for you, and each has its own
+;; `--continue` / `--abort` / `--skip`. Magit has a key per verb; it does not need to be
+;; that way, because git itself records which one is in flight — in `.git`. So
+;; `git-sequencer` reads the state and `cmd-git-sequence-continue` / `-abort` / `-skip`
+;; dispatch on it: one key that means "carry on with whatever we are in the middle of".
+
+(defn- git-sequence-argv (seq step)
+  "The argv that performs `step` (continue / abort / skip) on the operation `seq`, or nil
+when that operation has no such step.
+
+Almost every verb spells these `--continue` / `--abort` / `--skip`, which is what made one
+set of keys possible at all. **Bisect does not**: it is `git bisect reset` to stop and
+`git bisect skip` to move on, with no `--` and no continue at all — `git bisect --abort`
+is simply an error. A table, so the exception is data rather than a special case that gets
+forgotten."
+  (let (verb (:verb seq))
+    (if (= (:kind seq) :bisect)
+      (case step
+        "abort" ["bisect" "reset"]
+        "skip" ["bisect" "skip"]
+        nil) ; there is nothing to "continue" in a bisect — you answer good or bad
+      [verb (str "--" step)])))
+
+(defn- git-sequence-step (m step)
+  "Run `step` on whatever operation is in flight. The one command behind three keys,
+because git already knows which verb it is."
+  (let (root (git-resolve-root m))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      :else
+        (let (seq (git-sequencer root)
+              argv (if (nil? seq) nil (git-sequence-argv seq step)))
+          (cond
+            (nil? seq) (message m "nothing in progress")
+            (nil? argv) (message m (str "a " (:verb seq) " has no " step " — answer good or bad"))
+            :else (git-do m (string/join argv " ") (append git-no-editor argv)))))))
+
+(defcommand cmd-git-sequence-continue
+  (m key)
+  "Carry on with the rebase / merge / cherry-pick / revert that is part-way through (r c)."
+  (git-sequence-step m "continue"))
+
+(defcommand cmd-git-sequence-abort
+  (m key)
+  "Abandon the operation in progress and put the repo back (r a)."
+  (git-sequence-step m "abort"))
+
+(defcommand cmd-git-sequence-skip
+  (m key)
+  "Skip the commit the operation is stuck on and carry on (r s)."
+  (git-sequence-step m "skip"))
+
+(defn- git-in-progress-group (&optional (skip-label nil) (abort-key "a"))
+  "The menu group for an operation stopped part-way: continue, skip (labelled `skip-label`,
+for the verbs that can skip) and abort. One group in every menu that can stop, because the
+sequencer is one idea (`git-sequence-step`); cherry-pick moves abort to `k`, its `a` being
+apply."
+  {:title "In progress"
+   :suffixes (into []
+               (seq/reject [["c" 'gitsequence/cmd-git-sequence-continue "continue"]
+                             (if (nil? skip-label)
+                               nil
+                               ["s" 'gitsequence/cmd-git-sequence-skip skip-label])
+                             [abort-key 'gitsequence/cmd-git-sequence-abort "abort"]]
+                 nil?))})
+
+;; ---- merge (m) ---------------------------------------------------------------
+
+(def git-merge-transient
+  {:name 'git-merge
+   :title "Merge"
+   :groups [{:title "Arguments"
+             :suffixes [["-n" :switch "--no-ff" "always make a merge commit"]
+                         ["-f" :switch "--ff-only" "fast-forward only"]
+                         ["-s" :switch "--squash" "squash to a single change"]
+                         ["-S" :switch "--no-commit" "stop before committing"]]}
+             {:title "Merge"
+              :suffixes [["m" 'gitsequence/cmd-git-merge "a branch into HEAD"]
+                          ["p" 'gitsequence/cmd-git-merge-preview "preview what it would bring in"]]}
+             (git-in-progress-group)]})
+
+(defcommand cmd-git-merge-menu
+  (m key)
+  "The merge menu (m)."
+  (transient/ed-transient-open m git-merge-transient))
+
+(defcommand cmd-git-merge
+  (m key)
+  "Merge a branch into HEAD, with the merge menu's flags."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m
+      "Merge branch: "
+      :branches (fn (mm ref)
+        (git-do mm "merge" (append git-no-editor ["merge"] args [ref]))))))
+
+(defcommand cmd-git-merge-preview
+  (m key)
+  "What merging a branch would bring in (m p): its changes since it left HEAD's history."
+  (git-with-ref m
+    "Preview merging: "
+    :branches (fn (mm ref) (git-show-diff mm (git-resolve-root mm) [(str "HEAD..." ref)] nil))))
+
+;; ---- rebase (r) --------------------------------------------------------------
+
+(def git-rebase-transient
+  {:name 'git-rebase
+   :title "Rebase"
+   :groups [{:title "Arguments"
+             :suffixes [["-a" :switch "--autostash" "stash local changes and put them back"]
+                         ["-k" :switch "--keep-empty" "keep commits that become empty"]
+                         ["-u" :switch "--update-refs" "move branches on the way too"]]}
+             {:title "Rebase the current branch onto"
+              :suffixes [["u" 'gitsequence/cmd-git-rebase-upstream "its upstream"]
+                          ["e" 'gitsequence/cmd-git-rebase "elsewhere"]]}
+             {:title "Rewrite history"
+              :suffixes [["i"
+                           'gitsequence/cmd-git-rebase-interactive
+                           "interactively — edit the plan first"]
+                          ["w" 'gitcommit/cmd-git-rebase-reword-commit "reword a commit"]
+                          ["m" 'gitsequence/cmd-git-rebase-edit-commit "modify a commit"]
+                          ["k" 'gitsequence/cmd-git-rebase-remove-commit "remove a commit"]
+                          ["f" 'gitsequence/cmd-git-rebase-autosquash "autosquash fixups"]]}
+             (git-in-progress-group "skip this commit")]})
+
+(defcommand cmd-git-rebase-menu
+  (m key)
+  "The rebase menu (r): the arguments, where to rebase onto, and the three ways out of one
+that has stopped part-way."
+  (transient/ed-transient-open m git-rebase-transient))
+
+(defcommand cmd-git-rebase
+  (m key)
+  "Rebase the current branch onto a branch you pick, with the menu's flags."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m
+      "Rebase onto: "
+      :branches (fn (mm ref)
+        (git-do mm "rebase" (append git-no-editor ["rebase"] args [ref]))))))
+
+(defcommand cmd-git-rebase-upstream
+  (m key)
+  "Rebase the current branch onto its upstream — the common case, with no prompt."
+  (let (root (git-resolve-root m))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (nil? (git-upstream root)) (message m "this branch has no upstream to rebase onto")
+      :else
+        (git-do m
+          "rebase"
+          (append git-no-editor
+            ["rebase"]
+            (transient/ed-transient-args m)
+            [(git-upstream root)])))))
+
+;; ---- cherry-pick (A) and revert (V) ------------------------------------------
+;; Both take a commit and both can stop on a conflict, so both lead into the sequencer.
+;; In *git-status* the commit under point is the obvious subject — the log sections are
+;; right there — so the commit row's hash is offered as the default.
+
+(def git-cherry-pick-transient
+  {:name 'git-cherry-pick
+   :title "Cherry-pick"
+   :groups [{:title "Arguments"
+             :suffixes [["-x" :switch "-x" "record which commit it came from"]
+                         ["-s" :switch "--signoff" "add a Signed-off-by line"]]}
+             {:title "Cherry-pick"
+              :suffixes [["A" 'gitsequence/cmd-git-cherry-pick "a commit onto HEAD"]
+                          ["a"
+                            'gitsequence/cmd-git-cherry-apply "apply a commit's change, uncommitted"]]}
+             (git-in-progress-group "skip" "k")]})
+
+(def git-revert-transient
+  {:name 'git-revert
+   :title "Revert"
+   :groups [{:title "Arguments"
+             :suffixes [["-s" :switch "--signoff" "add a Signed-off-by line"]]}
+             {:title "Revert"
+              :suffixes [["V" 'gitsequence/cmd-git-revert "a commit"]
+                          ["v"
+                            'gitsequence/cmd-git-revert-no-commit "a commit's change, uncommitted"]]}
+             (git-in-progress-group)]})
+
+(defcommand cmd-git-cherry-pick-menu
+  (m key)
+  "The cherry-pick menu (A)."
+  (transient/ed-transient-open m git-cherry-pick-transient))
+
+(defcommand cmd-git-revert-menu
+  (m key)
+  "The revert menu (V)."
+  (transient/ed-transient-open m git-revert-transient))
+
+(defcommand cmd-git-cherry-pick
+  (m key)
+  "Cherry-pick a commit onto HEAD — the one under point by default."
+  (let (args (transient/ed-transient-args m))
+    (git-on-commit m
+      "Cherry-pick commit: "
+      "cherry-pick"
+      (fn (commit) (append git-no-editor ["cherry-pick"] args [commit])))))
+
+(defcommand cmd-git-revert
+  (m key)
+  "Revert a commit — the one under point by default."
+  (let (args (transient/ed-transient-args m))
+    (git-on-commit m
+      "Revert commit: "
+      "revert"
+      (fn (commit) (append git-no-editor ["revert"] args [commit])))))
+
+(defcommand cmd-git-cherry-apply
+  (m key)
+  "Apply a commit's change to the work tree and index without committing (A a)."
+  (git-on-commit m
+    "Apply commit: "
+    "cherry-pick --no-commit"
+    (fn (commit) ["cherry-pick" "--no-commit" commit])))
+
+(defcommand cmd-git-revert-no-commit
+  (m key)
+  "Reverse a commit's change in the work tree and index without committing (V v)."
+  (git-on-commit m
+    "Revert (uncommitted) commit: "
+    "revert --no-commit"
+    (fn (commit) ["revert" "--no-commit" commit])))
+
+;; ============================================================================
+;; INTERACTIVE REBASE — the todo list, edited in a buffer
+;; ============================================================================
+;;
+;; `git rebase -i` works by writing a TODO list to `.git/rebase-merge/git-rebase-todo` and
+;; opening your editor on it. That is a problem from inside an editor: git runs as a
+;; subprocess and blocks, and there is no terminal on the far side, so the editor it opens
+;; is one nobody can see. Everywhere else in the porcelain that is solved by
+;; `core.editor=true` — accept whatever git prepared — which for `-i` means "pick
+;; everything", i.e. `--interactive` that is not interactive.
+;;
+;; The way round it is to compose the todo FIRST and hand git a sequence editor that
+;; installs it. `sequence.editor` is run as `<value> <path-to-todo>`, so
+;; `sequence.editor=cp <our file>` becomes `cp <our file> <the todo>` — git then proceeds
+;; with exactly the plan you wrote, and never opens anything.
+;;
+;; So the flow is: press `r i`, get a buffer of `pick <hash> <subject>` lines, edit it (by
+;; key or by hand — it is a text buffer), `C-c C-c` to run it. Which is Magit's flow, and
+;; it reads the same way, but it is doing something quite different underneath.
+
+(def- git-rebase-actions
+  ;; The todo verbs, and what each does. Shown in the buffer's help block, because nobody
+  ;; remembers the difference between squash and fixup under pressure.
+  [["pick" "p" "use the commit as it is"]
+    ["reword" "r" "use it, but edit its message"]
+    ["edit" "e" "use it, then stop so you can amend it"]
+    ["squash" "s" "meld into the previous commit, editing the combined message"]
+    ["fixup" "f" "meld into the previous commit, discarding this message"]
+    ["drop" "d" "remove the commit entirely"]])
+
+(defn- git-rebase-help ()
+  "The comment block under the todo — the verbs, and the keys."
+  (str "\n# Commits are applied TOP DOWN — the oldest is first, the opposite of a log.\n#\n"
+    (string/join (map git-rebase-actions
+                   (fn (row)
+                     (let ([verb key doc] row)
+                       (str "#   " (string/pad-right verb 8) key "   " doc))))
+      "\n")
+    "\n#\n# M-<up> / M-<down> reorder · C-c C-c run it · C-c C-k cancel\n"
+    "# Edit the lines by hand if you prefer; this is an ordinary buffer.\n"))
+
+(defn git-rebase-todo-text (commits)
+  "The todo buffer's text for `commits` (newest first, as git reports them): a `pick` line
+each in OLDEST-FIRST order, then the help block.
+
+Oldest first is not a presentation choice — it is the order a rebase applies them in, and
+it is the reverse of every log you have ever read. A todo shown newest-first would have
+`squash` meld the wrong way round, and nothing would tell you until it had."
+  (str (string/join (map (reverse commits) (fn (c) (str "pick " (:hash c) " " (:subject c ""))))
+         "\n")
+    "\n"
+    (git-rebase-help)))
+
+(defn git-rebase-todo-lines (text)
+  "The instruction lines of a todo buffer — comments and blanks dropped. What gets written
+to git's todo file."
+  (seq/reject (string/split text "\n")
+    (fn (l) (or (string/blank? l) (string/starts-with? (string/triml l) "#")))))
+
+(defcommand cmd-git-rebase-interactive
+  (m key)
+  "Interactive rebase (r i): pick the first commit to rewrite — the one at point in a log
+or the status buffer — then edit the plan in a buffer."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (git-pick-commit m
+        "Rebase interactively from commit: "
+        (fn (mm c)
+          (let (onto (str c "^")
+                commits (git-log-commits root [(str onto "..HEAD")]))
+            (if (empty? commits)
+              (message mm (str "nothing to rebase from " c))
+              (ed-show-named (assoc mm :git-root root :git-rebase-onto onto)
+                "*git-rebase-todo*"
+                (git-rebase-todo-text commits)
+                :git-rebase))))))))
+
+(defn- git-rebase-todo-file (root)
+  "Where the composed todo is written for git to copy in. Under `.git`, so it shares the
+repo's lifetime and permissions rather than living in a world-readable temp dir — a todo
+names every commit subject you are about to rewrite."
+  (path/join (git-output root ["rev-parse" "--absolute-git-dir"])
+    "bedit-rebase-todo"))
+
+(defn- git-rebase-plan (m root onto lines)
+  "Run an interactive rebase of `root` onto `onto` following the plan `lines`, with no
+editor opened by anything. `sequence.editor` is run as `<value> <todo path>`, so `cp <our
+plan>` puts it in place of git's; `core.editor` covers the message editor a `squash` would
+otherwise open."
+  (let (file (git-rebase-todo-file root))
+    (do
+      (file/spit file (str (string/join lines "\n") "\n"))
+      (git-do (assoc m :git-root root)
+        "rebase -i"
+        ["-c"
+          (str "sequence.editor=cp " (os/shell-quote file))
+          "-c"
+          "core.editor=true"
+          "rebase"
+          "-i"
+          "--autostash"
+          onto]))))
+
+(defcommand cmd-git-rebase-todo-run
+  (m key)
+  "Run the rebase with the plan in this buffer (C-c C-c)."
+  (let (root (:git-root m)
+        onto (:git-rebase-onto m)
+        lines (git-rebase-todo-lines (buffer-text (ed-current-buf m))))
+    (cond
+      (or (nil? root) (nil? onto)) (message m "no rebase in progress")
+      (empty? lines) (message m "the plan is empty — C-c C-k to cancel")
+      :else (git-rebase-plan (cmd-kill-buffer (assoc m :git-rebase-onto nil) key) root onto lines))))
+
+(defcommand cmd-git-rebase-todo-abort
+  (m key)
+  "Abandon the plan without starting a rebase (C-c C-k)."
+  (message (cmd-kill-buffer (assoc m :git-rebase-onto nil) key) "rebase cancelled"))
+
+;; ---- rewriting ONE commit: r w / r m / r k / r f ---------------------------------
+;; The interactive rebase with the plan already written: every commit from the target on is
+;; picked, and the target gets its verb. Magit's `magit-rebase-reword-commit` and friends —
+;; the edits you make most, without a plan to compose.
+
+(defn- git-plan-for (root target verb &optional (after nil))
+  "The plan rewriting `target` with `verb` (every later commit picked), and `after` — extra
+plan lines — straight after it. Returns `[onto lines]`, or nil when `target` is not an
+ancestor of HEAD."
+  (let (onto (str target "^")
+        commits (reverse (git-log-commits root [(str onto "..HEAD")]))
+        full (git-output root ["rev-parse" target]))
+    (if (empty? commits)
+      nil
+      [onto
+        (mapcat commits
+          (fn (c)
+            (let (mine? (string/starts-with? full (str (:hash c))))
+              (append [(str (if mine? verb "pick") " " (:hash c) " " (:subject c ""))]
+                (if (and mine? after) after [])))))])))
+
+(defn- git-rewrite-one (m prompt verb &optional (confirm nil))
+  "Pick a commit (the one at point first) and rebase with `verb` on it."
+  (let (root (git-resolve-root m))
+    (git-pick-commit m
+      prompt
+      (fn (mm c)
+        (let (plan (git-plan-for root c verb))
+          (cond
+            (nil? plan) (message mm (str c " is not in HEAD's history"))
+            (nil? confirm) (git-rebase-plan mm root (first plan) (second plan))
+            :else
+              (git-confirm mm
+                (str confirm " " c "?")
+                (fn (m2) (git-rebase-plan m2 root (first plan) (second plan))))))))))
+
+(defcommand cmd-git-rebase-edit-commit
+  (m key)
+  "Stop at a commit so you can change it (r m): the rebase halts there; amend it, then r c."
+  (git-rewrite-one m "Modify commit: " "edit"))
+
+(defcommand cmd-git-rebase-remove-commit
+  (m key)
+  "Remove a commit from history (r k), after a question."
+  (git-rewrite-one m "Remove commit: " "drop" "Remove"))
+
+(defn git-reword-at (m root target msg)
+  "Rewrite `target`'s message to `msg`: pick it, then amend it with an `exec` line, and pick
+everything after — the whole of `r w`, as one plan."
+  (let (plan (git-plan-for root
+               target
+               "pick"
+               [(str "exec git commit --amend --only --allow-empty -m " (os/shell-quote msg))]))
+    (if (nil? plan)
+      (message m (str target " is not in HEAD's history"))
+      (git-rebase-plan m root (first plan) (second plan)))))
+
+;; ---- fixup and squash: commits aimed at an earlier commit --------------------------
+;; `c f` makes a `fixup! <subject>` commit of what is staged, aimed at the commit you pick;
+;; `c F` does that and then folds it in straight away (an autosquash rebase that opens no
+;; editor). `c s` / `c S` are the same with the message kept for editing into the target's.
+
+(defn git-autosquash (m target)
+  "Rebase from `target`'s parent with `--autosquash`, accepting the plan git prepares — the
+fixup lands on its target — and stashing any other changes around it."
+  (git-do m
+    "rebase --autosquash"
+    (append ["-c" "sequence.editor=true" "-c" "core.editor=true"]
+      ["rebase" "-i" "--autosquash" "--autostash" (str target "^")])))
+
+(defcommand cmd-git-rebase-autosquash
+  (m key)
+  "Fold every `fixup!` / `squash!` commit into its target (r f), from a commit you pick."
+  (git-pick-commit m "Autosquash from commit: " git-autosquash))
+
+(defn- git-rebase-set-action (m verb)
+  "Replace the verb on the current todo line, leaving the hash and subject alone."
+  (let (b (ed-current-buf m)
+        line (buffer-current-line b)
+        text (buffer-text b)
+        lines (string/split text "\n")
+        current (nth lines line ""))
+    (if (or (string/blank? current) (string/starts-with? (string/triml current) "#"))
+      (message m "not on a commit line")
+      (let (rest-of (let (sp (index-of current " "))
+                      (if (< sp 0) "" (string/substring current sp (string/length current))))
+            updated (string/join (assoc (into [] lines) line (str verb rest-of)) "\n"))
+        (ed-set-buf m (replace-region (ed-current-buf m) 0 (buffer-length b) updated))))))
+
+(defcommand cmd-git-rebase-pick
+  (m key)
+  "Use this commit as it is (p)."
+  (git-rebase-set-action m "pick"))
+(defcommand cmd-git-rebase-reword
+  (m key)
+  "Use it, but edit its message (r)."
+  (git-rebase-set-action m "reword"))
+(defcommand cmd-git-rebase-edit
+  (m key)
+  "Stop at it so you can amend (e)."
+  (git-rebase-set-action m "edit"))
+(defcommand cmd-git-rebase-squash
+  (m key)
+  "Meld into the previous commit, editing the combined message (s)."
+  (git-rebase-set-action m "squash"))
+(defcommand cmd-git-rebase-fixup
+  (m key)
+  "Meld into the previous commit, discarding this message (f)."
+  (git-rebase-set-action m "fixup"))
+(defcommand cmd-git-rebase-drop
+  (m key)
+  "Remove the commit entirely (d)."
+  (git-rebase-set-action m "drop"))
+
+(defn- git-rebase-move (m delta)
+  "Move the current todo line up or down, taking point with it — reordering commits is half
+of what an interactive rebase is for, and doing it by kill-and-yank in a list of hashes is
+how you end up rebasing the wrong plan."
+  (let (b (ed-current-buf m)
+        line (buffer-current-line b)
+        lines (into [] (string/split (buffer-text b) "\n"))
+        target (+ line delta)
+        movable? (fn (i)
+                   (and (>= i 0)
+                     (< i (count lines))
+                     (not (string/blank? (nth lines i "")))
+                     (not (string/starts-with? (string/triml (nth lines i "")) "#")))))
+    (if (not (and (movable? line) (movable? target)))
+      (message m "cannot move past the end of the plan")
+      (let (swapped (assoc (assoc lines line (nth lines target)) target (nth lines line))
+            text (string/join swapped "\n")
+            b2 (replace-region (set-read-only b false) 0 (buffer-length b) text))
+        (ed-set-buf m (pool/ed-goto-line b2 (inc target)))))))
+
+(defcommand cmd-git-rebase-move-up
+  (m key)
+  "Move this commit earlier (M-<up>)."
+  (git-rebase-move m -1))
+(defcommand cmd-git-rebase-move-down
+  (m key)
+  "Move this commit later (M-<down>)."
+  (git-rebase-move m 1))
+
+;; ---- bisect (B) --------------------------------------------------------------
+;; Binary search for the commit that broke something. Rarely reached for, and painful
+;; without tooling precisely because it is rare: nobody remembers the four verbs, and the
+;; state lives in the repo rather than in your head, so coming back to it after lunch means
+;; working out where you were.
+;;
+;; The status buffer already says a bisect is in progress (`git-sequencer` reads
+;; `BISECT_LOG`), so the "where was I" half is answered by opening it.
+
+(defcommand cmd-git-bisect-start
+  (m key)
+  "Start a bisect (B s): prompts for a KNOWN-BAD commit, then a known-good one. git then
+checks out a commit half way between them and asks you about it."
+  (git-pick-commit m
+    "Bisect — a commit that is BAD: "
+    (fn (mm bad)
+      (git-with-ref mm
+        "…and one that was GOOD: "
+        :branches (fn (m2 good) (git-do m2 "bisect start" ["bisect" "start" bad good]))))))
+
+(defcommand cmd-git-bisect-good
+  (m key)
+  "This commit is good (B g) — the fault is later."
+  (git-do m "bisect good" ["bisect" "good"]))
+
+(defcommand cmd-git-bisect-bad
+  (m key)
+  "This commit is bad (B b) — the fault is here or earlier."
+  (git-do m "bisect bad" ["bisect" "bad"]))
+
+(defcommand cmd-git-bisect-skip
+  (m key)
+  "Can't tell from this commit — it doesn't build, or the test can't run (B k)."
+  (git-do m "bisect skip" ["bisect" "skip"]))
+
+(defcommand cmd-git-bisect-reset
+  (m key)
+  "Stop bisecting and go back to where you were (B r)."
+  (git-do m "bisect reset" ["bisect" "reset"]))
+
+(defcommand cmd-git-bisect-log
+  (m key)
+  "What the bisect has established so far (B l) — the answers you have given and what they
+ruled out."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run (assoc m :git-root root) ["bisect" "log"]))
+        (git-show-report m1 "*git-bisect*" (:stdout r "") :git-text {:action :pop})))))
+
+(def git-bisect-transient
+  {:name 'git-bisect
+   :title "Bisect"
+   :groups [{:title "Start"
+             :suffixes [["s" 'gitsequence/cmd-git-bisect-start "start a bisect"]]}
+             {:title "Answer for the commit you are on"
+              :suffixes [["g" 'gitsequence/cmd-git-bisect-good "good — the fault is later"]
+                          ["b" 'gitsequence/cmd-git-bisect-bad "bad — the fault is here or earlier"]
+                          ["k" 'gitsequence/cmd-git-bisect-skip "can't tell — skip this one"]]}
+             {:title "Finish"
+              :suffixes [["l" 'gitsequence/cmd-git-bisect-log "what it has established"]
+                          ["r" 'gitsequence/cmd-git-bisect-reset "stop and go back"]]}]})
+
+(defcommand cmd-git-bisect-menu
+  (m key)
+  "The bisect menu (B)."
+  (transient/ed-transient-open m git-bisect-transient))
+
+;; *git-rebase-todo* — the interactive-rebase plan. A read/WRITE buffer (you may edit the
+;; lines by hand) with a key per verb over the top, because `f` is quicker than selecting
+;; `pick` and typing `fixup`, and the verbs are the whole vocabulary.
+(def git-rebase-keymap
+  (-> {}
+    (keymap-bind [:ctrl-c :ctrl-c] 'gitsequence/cmd-git-rebase-todo-run)
+    (keymap-bind [:ctrl-c :ctrl-k] 'gitsequence/cmd-git-rebase-todo-abort)
+    (keymap-bind ["p"] 'gitsequence/cmd-git-rebase-pick)
+    (keymap-bind ["r"] 'gitsequence/cmd-git-rebase-reword)
+    (keymap-bind ["e"] 'gitsequence/cmd-git-rebase-edit)
+    (keymap-bind ["s"] 'gitsequence/cmd-git-rebase-squash)
+    (keymap-bind ["f"] 'gitsequence/cmd-git-rebase-fixup)
+    (keymap-bind ["d"] 'gitsequence/cmd-git-rebase-drop)
+    (keymap-bind [:alt-up] 'gitsequence/cmd-git-rebase-move-up)
+    (keymap-bind [:alt-down] 'gitsequence/cmd-git-rebase-move-down)))
+
+(def git-rebase-mode-layer
+  {:name 'git-rebase
+   :doc "An interactive rebase plan: p pick · r reword · e edit · s squash · f fixup · d drop · M-up/M-down reorder · C-c C-c run"
+   :keymap gitsequence/git-rebase-keymap
+   :no-line-numbers true
+   :commands '("git-rebase-todo-run" "git-rebase-todo-abort")})
+
+(register-type-layers :git-rebase (list 'gitsequence/git-rebase-mode-layer 'modes/text-mode-layer))

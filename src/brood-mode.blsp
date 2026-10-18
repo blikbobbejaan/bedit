@@ -1,0 +1,328 @@
+(defmodule brood-mode
+  "brood-mode — the `.blsp` source mode: its keymap (paredit edits, the sexp-aware C-k,
+electric pairs) and its language services — eldoc, doc-at-point, symbol completion
+against the live image, the CST-driven indenter and the advisory checker as
+`:diagnostics`. Registered through `modes/register-prog-mode`, so a `.blsp` buffer
+stacks brood-mode over the shared `prog` motions and text-mode (src/modes.blsp)."
+  (:use editor/keymap) ; keymap-bind — brood-keymap
+  (:use editor/highlight) ; the pure analysis the language services adapt
+  (:use sexp) ; the CST queries the indenter is computed over
+  (:use modes :only [register-prog-mode]))
+
+;; ---- brood-mode: Brood (.blsp) source, stacked on prog + text-mode -----------------
+;; Structural s-expression navigation (`std/sexp`, via the `commands/cmd-*-sexp`
+;; wrappers) layered ON TOP of text-mode — so a `.blsp` buffer keeps every
+;; text-mode motion/edit binding and *gains* `C-M-f/b/u/d/a`. The trigger lives on
+;; the mode as a **regex** (`:file-pattern`), matched with `std/regex`; edit that
+;; one string to change which files get brood-mode.
+
+(def brood-keymap
+  ;; The structural motions/kills/marks come from the shared `prog-mode-layer`;
+  ;; brood-keymap adds only what is specific to Brood *source* — the paredit delimiter
+  ;; edits (incl. C-M-t transpose) and the sexp-aware C-k, all of which manipulate
+  ;; parentheses and so mean nothing over a tree-sitter tree.
+  (-> {}
+    ;; paredit-style structural editing. Chord encodings are best-guesses (the
+    ;; shifted-Ctrl ones especially — see ROADMAP "Loose ends"); all reachable via M-x
+    ;; (slurp-forward, …) and rebindable live. C-M-s for splice since M-s is the search
+    ;; prefix; M-r shadows move-to-window-line in .blsp, exactly as paredit-mode does.
+    (keymap-bind [(keyword "ctrl-)")] 'commands/cmd-slurp-forward) ; C-)
+    (keymap-bind [(keyword "ctrl-}")] 'commands/cmd-barf-forward) ; C-}
+    (keymap-bind [(keyword "ctrl-(")] 'commands/cmd-slurp-backward) ; C-(
+    (keymap-bind [(keyword "ctrl-{")] 'commands/cmd-barf-backward) ; C-{
+    (keymap-bind [:alt-r] 'commands/cmd-raise-sexp) ; M-r
+    (keymap-bind [(keyword "alt-(")] 'commands/cmd-wrap-round) ; M-(
+    (keymap-bind [:ctrl-meta-s] 'commands/cmd-splice-sexp) ; C-M-s
+    (keymap-bind [:ctrl-meta-t] 'commands/cmd-transpose-sexps) ; C-M-t
+    (keymap-bind [:ctrl-k] 'commands/cmd-sexp-kill) ; C-k (sexp-aware)
+    ;; A closer that is already there is stepped over rather than typed twice — Emacs's
+    ;; `electric-pair-mode` skip (`commands/cmd-close-delimiter`). Here rather than on
+    ;; `prog-structural-keymap` because the scan reads BROOD syntax: `;` starts a comment,
+    ;; which in Ruby is a statement separator.
+    (keymap-bind [")"] 'commands/cmd-close-delimiter)
+    (keymap-bind ["]"] 'commands/cmd-close-delimiter)
+    (keymap-bind ["}"] 'commands/cmd-close-delimiter)
+    ;; …and an opener wraps an active region, or (electric-pair-mode, default on) types
+    ;; its pair; a backspace between an empty pair takes both. `M-x electric-pair-mode`
+    ;; toggles the electric half — the region wrap has one meaning and is always on.
+    (keymap-bind ["("] 'commands/cmd-open-delimiter)
+    (keymap-bind ["["] 'commands/cmd-open-delimiter)
+    (keymap-bind ["{"] 'commands/cmd-open-delimiter)
+    ;; `"` is a self-closing pair: it opens a string and lands you inside, and typed at a
+    ;; closing `"` steps over it. (`'` is NOT bound — it is Brood's quote operator.)
+    (keymap-bind ["\""] 'commands/cmd-open-delimiter)
+    (keymap-bind [:backspace] 'commands/cmd-electric-backspace)))
+;; ---- brood-mode language services -------------------------------------------
+;; The four facets `ed-mode-service` (src/model.blsp) looks up. Each is a thin
+;; adapter over `std/highlight.blsp`'s pure analysis (the REPL's editor uses the
+;; same module) plus the live image — so the editor's view/completion gain
+;; highlighting, bracket-matching, eldoc, and symbol completion for `.blsp` buffers
+;; without the generic view ever naming Brood. A future json-/python-mode registers
+;; the same facets with its own functions.
+
+(defn- brood-arglist-of (callee)
+  "The arglist of the function/macro named by string `callee`, resolved in the live
+image, or nil if it isn't a bound symbol. (Mirrors `lineedit-arglist-of`.)"
+  ;; `callee` is a token at point, not necessarily readable or a function — no arglist is the answer
+  (check-allow :discarded-catch
+    (try
+      (let (sym (reflect/read-string callee))
+        (if (and (symbol? sym) (bound? sym)) (arglist (reflect/eval sym)) nil))
+      (catch e nil))))
+
+(defn- brood-doc-block (name)
+  ;; `name`'s documentation as pane lines — its arglist, its checker signature, its
+  ;; docstring — or nil when nothing is bound under it. `doc`/`arglist` take the function
+  ;; VALUE, so the symbol is resolved in the live image first, exactly as the eldoc service
+  ;; does; anything unbound (a local, a typo, a name this session has not defined yet)
+  ;; answers nil rather than an empty heading.
+  ;; `name` is a token at point: unreadable, unbound, or a value with no arglist/doc/sig — each nil is an answer
+  (check-allow :discarded-catch
+    (try
+      (let (sym (reflect/read-string name))
+        (when (and (symbol? sym) (bound? sym))
+          (let (v (reflect/eval sym)
+                args (check-allow :discarded-catch (try (arglist v) (catch _ nil)))
+                text (check-allow :discarded-catch (try (doc v) (catch _ nil)))
+                sig (check-allow :discarded-catch (try (reflect/type-signature sym) (catch _ nil))))
+            (append (list (if (nil? args)
+                            name
+                            (str "("
+                              name
+                              (if (empty? args) "" (str " " (string/join (map args str) " ")))
+                              ")")))
+              (if (nil? sig) '() (list (str "  : " sig)))
+              (if (nil? text) '() (cons "" (string/split text "\n")))))))
+      (catch _ nil))))
+
+(defn brood-doc-at (text pos)
+  "The brood-mode `:doc-at` service: what the cursor is pointing at, as pane lines — the
+symbol under it, else the head of the call it is inside, with that name's arglist, checker
+signature and docstring. Nil when neither names anything bound.
+
+Falling back to the enclosing call is what makes it useful without aiming: a cursor resting
+anywhere in `(map xs f)` documents `map`, which is what you wanted to know from the position
+you were already in. The symbol under the cursor wins, so pointing AT `f` documents `f`.
+
+One step further out when the enclosing form is not a call — `(map [1 2 |3] f)` is inside a
+vector whose head is `1`, and answering nothing there would make the middle of a literal a
+dead spot in an otherwise live pane."
+  (let (call-doc (fn (at)
+                   (when (>= at 0)
+                     (let (c (enclosing-call text at)) (when c (brood-doc-block (first c)))))))
+    (or (let (here (symbol-at text pos)) (when here (brood-doc-block (second here))))
+      (call-doc pos)
+      (call-doc (enclosing-open text pos)))))
+
+(defn brood-eldoc (text pos)
+  "The brood-mode `:eldoc` service: a `\"(callee arg…)\"` signature string for the call
+enclosing offset `pos` in `text` (`enclosing-call` + the live arglist), or nil when
+the cursor isn't in a call whose head is a bound function/macro."
+  (let (call (enclosing-call text pos))
+    (if (nil? call)
+      nil
+      (let ([callee argi] call
+            args (brood-arglist-of callee))
+        (if (nil? args)
+          nil
+          (str "(" callee (if (empty? args) "" (str " " (string/join (map args str) " "))) ")"))))))
+
+;; Memoised on the global-name list itself: `reflect/global-names` answers a fresh list per
+;; call, but an equal one until something defines a name, and `=` on two equal symbol lists
+;; is ~0.1 ms where stringifying, filtering and sorting ~8k names per Tab and per idle
+;; completion preview was ~13 ms. One slot — there is only ever one current image.
+(memo/defmemo brood-sorted-global-names
+  1
+  (names)
+  "The live global `names` as strings, sorted — a vector, so [[brood-names-with-prefix]]
+can binary-search it."
+  (into [] (sort (map names str))))
+
+(defn- brood-names-with-prefix (sorted prefix)
+  "The strings of the sorted vector `sorted` that start with `prefix`, in order.
+
+Binary search for the first name not below `prefix`, then read forward while names still
+start with it: every name with a prefix sorts as one contiguous run from there, so a Tab
+costs a dozen comparisons plus its own matches instead of a pass over every global."
+  (let (n (count sorted))
+    (letrec (lower (fn (lo hi)
+                     (if (>= lo hi)
+                       lo
+                       (let (mid (math/quot (+ lo hi) 2))
+                         (if (< (compare (nth sorted mid) prefix) 0)
+                           (lower (inc mid) hi)
+                           (lower lo mid)))))
+             run (fn (i acc)
+                   (if (and (< i n) (string/starts-with? (nth sorted i) prefix))
+                     (run (inc i) (cons (nth sorted i) acc))
+                     (reverse acc))))
+      (run (lower 0 n) '()))))
+
+(defn brood-complete-at (text pos)
+  "The brood-mode `:complete-at` service: `[start prefix candidates]` for offset `pos`
+— the symbol prefix at point (`symbol-prefix-at`) and the live global names that
+start with it (the same source as the REPL's Tab completion). `complete` adapts this
+pure `(text pos)` service into one source and merges it with the buffer-word source.
+
+Only the symbol before `pos` is read, so `text` need not be the whole buffer: the
+completion source hands it the current line up to point (`complete-source-mode`), which is
+what keeps a Tab on a 44k-line file from flattening the rope first."
+  (let ([start prefix] (symbol-prefix-at text pos))
+    [start
+      prefix
+      (if (= prefix "")
+        '()
+        (brood-names-with-prefix (brood-sorted-global-names (reflect/global-names)) prefix))]))
+
+;; ---- brood-mode indentation (the :indent service) ---------------------------
+;; Indentation that matches `nest format` (the canonical Brood style, std/format),
+;; computed purely over the CST (`std/sexp`). The rule the formatter uses: a broken
+;; form's body indents **+2** from its open delimiter — for BOTH calls and special
+;; forms (a form's header count only changes which args ride the head line, never
+;; the body column). The two exceptions align under the first element instead:
+;; **maps** and the **bindings list** of a let-family form (`let`/`let*`/`binding`/…).
+
+(def- brood-pair-binding-heads
+  ;; let-family heads whose first argument (the bindings list) aligns its pairs
+  ;; under the opening element — mirrors std/format's `*format-pair-bindings*`.
+  (list "let" "let*" "letrec" "binding" "dotimes" "dolist" "loop"))
+
+;; check-allow: a CST node's `:start`/`:end` are declared optional on the record, but a node
+;; that reached here came from a match on the tree, where both are set
+(check-allow :type-mismatch
+  (defn brood-head-text (text node)
+    "The source spelling of CST `node` in `text` — a list's head. Shared with the other
+Lisps' indent rule (`lisp-modes/lisp-indent-with`)."
+    (string/substring text (:start node) (:end node))))
+
+(defn- brood-binding-list? (text tr enc)
+  "True if `enc` is the bindings list of a let-family form: its parent's head is a
+pair-binding form and `enc` is that parent's first argument."
+  (let (parent (enclosing tr (:start enc)))
+    (and (not (= parent enc))
+      (= (:kind parent) :list)
+      (let (pk (forms-of parent))
+        (and (>= (count pk) 2)
+          (includes? brood-pair-binding-heads (brood-head-text text (first pk)))
+          (= (:start (second pk)) (:start enc)))))))
+
+(sig brood-first-elem-col (string any int -> int))
+(defn- brood-first-elem-col (text enc opencol)
+  "The column to align `enc`'s contents under — its first element's column, or
+`opencol + 1` when it's empty."
+  (let (kids (forms-of enc))
+    (if (empty? kids) (+ opencol 1) (model/ed-column-at text (:start (first kids))))))
+
+(defn- brood-label? (text node)
+  "True when CST `node` is a label — a bare symbol ending in `:` (`next:`), the
+convention `std/format`'s `label-node?` lays an asm listing out by."
+  (and (= (:kind node) :symbol)
+    (let (t (brood-head-text text node))
+      (and (> (string/length t) 1) (string/ends-with? t ":")))))
+
+(defn- brood-labelled? (text enc)
+  "True when list `enc`'s body (its forms after the head) holds a label."
+  (and (= (:kind enc) :list) (any? (rest (forms-of enc)) (fn (k) (brood-label? text k)))))
+
+(defn- brood-skip-indent (text j n)
+  "The first non-blank offset at or after `j` in `text` (`n` its length)."
+  (if (and (< j n) (includes? " \t" (string/char-at text j))) (brood-skip-indent text (inc j) n) j))
+(sig brood-skip-indent (string int int -> int))
+
+(defn- brood-token-end (text j n)
+  "The offset just past the token starting at `j`: up to whitespace or a bracket."
+  (if (and (< j n) (not (includes? " \t\n()[]{}" (string/char-at text j))))
+    (brood-token-end text (inc j) n)
+    j))
+(sig brood-token-end (string int int -> int))
+
+(defn- brood-label-line? (text bol)
+  "True when the line at `bol` begins (after indentation) with a label token."
+  (let (n (string/length text)
+        i (brood-skip-indent text bol n)
+        e (brood-token-end text i n))
+    (and (> e (inc i)) (= (string/char-at text (dec e)) ":"))))
+
+(sig brood-indent (string int -> int))
+(defn brood-indent (text bol)
+  "The brood-mode `:indent` service: the indent column for the line starting at
+offset `bol`, matching `nest format`. Top level → 0; a **map** or a **let-family
+bindings list** aligns its contents under the first element; every other form
+indents its body **+2** from the open delimiter. (Multi-line strings aren't
+special-cased.)"
+  ;; Parse only [defun-start, bol): the indent column depends solely on what's open
+  ;; BEFORE the line, so the CST never needs the buffer past it — O(enclosing defun),
+  ;; not O(buffer) (a full-buffer `tree` made every RET on a large file a ~14ms pause).
+  ;; `scan-form-start` (the native string/comment-aware beginning-of-defun behind
+  ;; `sexp/narrow` and `highlight/safe-restart`) finds the window start. It is
+  ;; depth-tracked, so the start may be an INDENTED top-level open (a form inside a
+  ;; tutorial box margin, a mis-indented file) — back the slice up to that line's
+  ;; start so columns inside the slice equal columns in `text`.
+  ;; The slice ends at `bol`, so the enclosing form is typically unclosed and its
+  ;; CST node runs to the slice end — a strict `enclosing` at the end would miss it
+  ;; and return root; probe just inside instead (the char there is `bol`'s newline,
+  ;; inside the same open forms).
+  ;; The slice runs to the END of the enclosing top-level form (`scan-form-end`), not
+  ;; just to `bol`: a labelled body (`asm` listings, see std/format's `label-node?`)
+  ;; is one whose items include a label ANYWHERE, so the rule needs the whole form —
+  ;; still O(enclosing defun), never O(buffer).
+  (let (fstart (reflect/scan-form-start text bol) ; clamps internally; 0 on an empty text
+        start (model/ed-line-start-offset text fstart)
+        n (- bol start))
+    (if (<= n 0)
+      0 ; bol at a top-level form start (or an empty buffer) — top level
+      ;; an UNCLOSED form (a `)` deleted above) ends at the buffer's end, so the slice is
+      ;; capped a few thousand chars past the line — a label further away than that is
+      ;; not seen (plain +2 there), and no keystroke parses the whole buffer
+      (let (fend (math/min (math/max bol (reflect/scan-form-end text fstart 1)) (+ bol 4000))
+            sub (string/substring text start fend)
+            tr (tree sub)
+            enc (enclosing tr (dec n))
+            kind (:kind enc))
+        (if (= kind :root)
+          0
+          (let (opencol (model/ed-column-at sub (:start enc)))
+            (cond
+              (or (= kind :map) (brood-binding-list? sub tr enc))
+                (brood-first-elem-col sub enc opencol)
+              ;; a labelled body: labels at +2, everything else at +4 — the line being
+              ;; indented is a label when its first token ends in `:`
+              (brood-labelled? sub enc)
+                (if (brood-label-line? text bol) (+ opencol 2) (+ opencol 4))
+              else (+ opencol 2))))))))
+
+(defn brood-diagnostics (text)
+  "The brood-mode `:diagnostics` service: the advisory type-checker's warnings for
+buffer `text`, each `{:line :col :message}` (1-based positions), via the in-process
+`check-string-structured` (same image — no LSP wire needed for Brood). `()` while the
+buffer doesn't parse, so a live recheck never errors mid-edit."
+  (or (reflect/check-string-structured text) '()))
+
+(def brood-mode-layer
+  {:name 'brood
+   :doc "Brood source: sexp motion, eval (C-x C-e), the checker and its gutter marks."
+   :parser :brood
+   ;; diagnostics run in the sandbox child, rooted in the buffer's project (diagcheck/ed-launch-diag)
+   :check-remote true
+   :file-pattern "\\.blsp$"
+   :keymap brood-mode/brood-keymap
+   :commands '("mark-sexp" "slurp-forward"
+                "barf-forward" "slurp-backward" "barf-backward" "raise-sexp" "splice-sexp"
+                "wrap-round" "transpose-sexps" "sexp-kill" "eval-last-sexp" "eval-region"
+                "eval-buffer")
+   :fontify 'editor/highlight/highlight-spans
+   :fontify-restart 'editor/highlight/safe-restart
+   :bracket-match 'editor/highlight/bracket-match
+   :eldoc 'brood-mode/brood-eldoc
+   :doc-at 'brood-mode/brood-doc-at
+   :complete-at 'brood-mode/brood-complete-at
+   :indent 'brood-mode/brood-indent
+   :diagnostics 'brood-mode/brood-diagnostics
+   ;; margin click = breakpoint toggle on the clicked definition (debugger is
+   ;; deferred; the service symbol resolves on first use, like every service)
+   :gutter-click 'debugger/brood-gutter-click
+   :comment-syntax ";; "})
+
+;; .blsp files → the :brood type; :brood stacks brood-mode over text-mode (head =
+;; higher precedence), and the file trigger is the mode's own :file-pattern regex.
+(register-prog-mode 'brood-mode/brood-mode-layer :brood)

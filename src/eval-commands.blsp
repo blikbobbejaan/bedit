@@ -1,0 +1,117 @@
+(defmodule eval-commands
+  "Eval-in-buffer: the C-x C-e family (`eval-last-sexp`, `eval-region`, `eval-buffer`) as
+`(model key) -> model` commands over `eval-command`, which does the reading and evaluating.
+An evaluation runs off the loop as a `std/task` ([[ed-eval-async]]); C-g
+(`commands/cmd-keyboard-quit`) cancels it, and `input` folds its reply — both through the
+row it registers ([[ed-apply-eval]]).
+
+Loaded with the image (`main`), so the M-x names are there before the first key.
+Split out of `commands.blsp`."
+  (:use editor/buffer) ; buffer-text / buffer-point / buffer-region — what is evaluated
+  (:use model) ; message / ed-current-buf / ed-mode-service / register-task-reply
+  (:use eval-command) ; last-sexp-source / eval-source / eval-source-value — the evaluator
+  (:use interactive) ; defcommand — the eval commands, on M-x
+  (:use commands :only [*no-region-message*])) ; the shared "no region" echo
+
+;; ---- eval-in-buffer (the C-x C-e family, via std/eval-command) --------------
+;; Thin `(model key) -> model` wrappers over `std/eval-command.blsp`, which does
+;; the work (read + eval + value/output capture) as a pure `buffer -> message
+;; string` and is shared with any editor. We just route the result to `message`.
+
+(defdyn *eval-timeout-ms*
+  ;; Optional safeguard: auto-kill a spawned eval after this many ms (nil = no limit).
+  ;; Redefine to arm it — e.g. `(defdyn *eval-timeout-ms* 5000)` via C-x C-e.
+  nil)
+
+(defn ed-eval-async (m src timeout)
+  "Evaluate Brood source string `src` off the editor's loop via `std/task`, so a
+long-running or looping form never freezes the editor (`ui-run` is single-process —
+a synchronous eval would block the loop). A still-running prior eval is cancelled
+first; `task` returns a *handle* that tags its reply — `[:task-done <handle>
+<message>]`, or `[:task-timeout <handle>]` past `timeout` (ms; nil = no limit) — so a
+stale reply from a finished/cancelled eval can't clobber a newer one (`ed-update`
+shows it only when the handle matches `:eval-proc`). Manual interrupt is C-g
+(`cmd-keyboard-quit`). Returns the model with the handle on `:eval-proc` and an
+`evaluating…` note. (Async delivery relies on the GUI display's mailbox-`receive`
+poll; the eval runs in its own process while the editor stays live.)"
+  (let (prev (:eval-proc m)
+        ;; the loop this runs in — its output streams back here (nil in tests / headless)
+        sink (or *ui-loop* (proc/whereis :editor))
+        opts (if (and timeout (> timeout 0)) {:timeout timeout} {})
+        ;; With a live editor, bind the eval's *out*/*err* to a process-port back to it,
+        ;; so the form's output STREAMS into *Messages* as it's produced — a long or
+        ;; looping form's prints appear immediately, not trapped in a capture buffer
+        ;; until (if ever) it returns; the reply carries just the value. Without an
+        ;; editor (tests / headless) capture + bundle output into the reply as before.
+        thunk (if (nil? sink)
+                (fn () (eval-source src))
+                (fn ()
+                  (binding (*out* (io/process-port sink) *err* (io/process-port sink))
+                    (eval-source-value src))))
+        job (task/latest prev thunk opts))
+    ; supersede a still-running eval (std/task)
+    (message (assoc m :eval-proc job) "evaluating…")))
+
+(defn ed-apply-eval (m event)
+  "Fold a finished evaluation's reply EVENT (`[:task-done h message]`, `[:task-error h
+message]` or `[:task-timeout h]`) into the echo area and free `:eval-proc`. Takes the whole
+event (`:folds-event?`) because a timeout says something different from an error, and only
+the event knows which it was."
+  (message (dissoc m :eval-proc)
+    (if (= (first event) :task-timeout)
+      (str "eval timed out after " *eval-timeout-ms* "ms")
+      (nth event 2))))
+
+;; C-x C-e reports in the echo area rather than folding a value, and C-g is how a runaway
+;; form is stopped — the one way out of `(receive)` typed by mistake
+(register-task-reply :eval-proc
+  'eval-commands/ed-apply-eval
+  nil
+  nil
+  {:cancel-on-quit? true :folds-event? true})
+
+(defn ed-eval-scope (buf)
+  "`[text point]` for the code around point — the buffer's own text and point unless
+its mode provides an `:eval-scope` service, which answers `[start end]` for a
+sub-region instead.
+
+Some buffers are only PARTLY code: a tutorial page is prose with playground boxes in
+it, a shell buffer is a transcript with one live input line. `last-sexp-source` reads
+from the start of whatever text it is given, so handed the whole buffer it throws on
+the first English sentence and C-x C-e reports \"no complete form before point\" while
+point sits inside a perfectly good form. The mode knows where its code lives; this asks
+it, rather than teaching every eval command about every buffer type."
+  (let (svc (ed-mode-service buf :eval-scope)
+        span (when svc (svc buf)))
+    (if (nil? span)
+      [(buffer-text buf) (buffer-point buf)]
+      (let ([start end] span
+            point (buffer-point buf))
+        [(string/substring (buffer-text buf) start end)
+          (math/max 0 (- (math/min point end) start))]))))
+
+(defcommand cmd-eval-last-sexp
+  (m key)
+  "C-x C-e — evaluate the last complete form ending at point (multi-line: reads every
+form up to point, evals the last) in a separate process; its value + output land in
+the echo area / *Messages* when it finishes, so a slow or looping form can't freeze
+the editor."
+  (let (buf (ed-current-buf m)
+        [text point] (ed-eval-scope buf)
+        src (last-sexp-source text point))
+    (if (nil? src)
+      (message m "no complete form before point")
+      (ed-eval-async m src *eval-timeout-ms*))))
+
+(defcommand cmd-eval-region
+  (m key)
+  "Evaluate the region (point↔mark) as Brood source in a separate process."
+  (let (region (buffer-region (ed-current-buf m)))
+    (if (nil? region)
+      (message m *no-region-message*)
+      (ed-eval-async m region *eval-timeout-ms*))))
+
+(defcommand cmd-eval-buffer
+  (m key)
+  "Evaluate the whole buffer as Brood source in a separate process."
+  (ed-eval-async m (buffer-text (ed-current-buf m)) *eval-timeout-ms*))

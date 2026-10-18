@@ -1,0 +1,219 @@
+(defmodule keyhelp
+  "Key and command LABELS — the vocabulary every piece of help text speaks: an Emacs-style
+spelling of a keymap key (`:ctrl-x` → `C-x`), a short name for a binding, the key bound to a
+command in the LIVE keymap (`ed-where-is`, Emacs's `where-is`), `\\[command]` substitution
+(`substitute-command-keys`), and a command's docstring.
+
+Pure functions of a keymap and a symbol, with nothing of the editor's model in them: the
+which-key panel, describe-key, `M-x`'s marginalia, the transient menus, the tutorial and the
+welcome text all ask the same questions, so they live here rather than in the model core
+every module loads."
+  (:use editor/keymap)) ; keymap-where-is — command → the key actually bound to it (help text)
+
+;; ---- key / command labels (which-key + describe-key) ------------------------
+;; Presentation helpers shared by the which-key panel (view) and describe-key (input):
+;; turn a keymap key into an Emacs-style label and a binding (a command symbol or a
+;; prefix sub-keymap) into a short command name, and read a command's docstring.
+
+(def- ed-key-modifiers
+  ;; A keyword-name prefix and its Emacs spelling, LONGEST FIRST so `ctrl-meta-` is seen
+  ;; before `ctrl-`. The list is the whole modifier vocabulary; add a row to add one.
+  [["ctrl-meta-" "C-M-"] ["ctrl-" "C-"] ["meta-" "M-"] ["alt-" "M-"] ["shift-" "S-"]])
+
+;; check-allow: deliberately non-tail — depth = the number of modifiers on one key (C-M-S-x
+;; is three), not any input size.
+(check-allow :non-tail-recursion
+  (defn- ed-key-name-label (n)
+    "The Emacs spelling of a key keyword's NAME — its modifier prefixes replaced one at a
+time, innermost last, and a bare space as `SPC`.
+
+This was seven chained `string/replace` passes over every key, each one scanning and
+allocating whether or not it matched. That is ~40 µs a key, and inverting a keymap labels a
+few hundred of them: 7.5 ms, paid to render fifteen rows of `M-x` marginalia. A prefix test
+costs one comparison and the recursion is at most as deep as the modifiers a key carries."
+    (let (hit (seq/find ed-key-modifiers (fn (p) (string/starts-with? n (first p)))))
+      (cond
+        (= n " ") "SPC"
+        (nil? hit) n
+        :else
+          (let ([prefix spelling] hit)
+            (str spelling
+              (ed-key-name-label (string/substring n (string/length prefix) (string/length n)))))))))
+
+(defn ed-key-label (k)
+  "An Emacs-style label for a keymap key: `:ctrl-e` → `C-e`, `:alt-g` → `M-g`,
+`:ctrl-meta-i` → `C-M-i`, `(keyword \"alt- \")` → `M-SPC`, a 1-char string as itself."
+  (cond
+    (string? k) (if (= k " ") "SPC" k)
+    (keyword? k) (ed-key-name-label (->string k))
+    :else (str k)))
+
+(defn ed-cmd-label (v)
+  "A short label for a keymap binding: a prefix sub-keymap → `+prefix`, else the command
+symbol's name with the module path and `cmd-` prefix stripped (`commands/cmd-find-file`
+→ `find-file`)."
+  (if (map? v)
+    "+prefix"
+    (let (base (last (string/split (->string v) "/")))
+      (if (string/starts-with? base "cmd-") (string/substring base 4 (string/length base)) base))))
+
+(defn ed-keys-label (keys)
+  "A space-joined Emacs label for a key sequence (`[:ctrl-x :ctrl-e]` → `C-x C-e`)."
+  (string/join (map keys ed-key-label) " "))
+
+(defn ed-cancel-key? (input)
+  "Whether `input` is a cancel key (Esc / C-g) — what every modal overlay reads as quit.
+Key vocabulary, so it lives beside the labels rather than in `input`: the dispatcher owns
+the overlays, and a module that one of those overlays drives (`transient`) would close a
+cycle around the whole of `input` just to ask this."
+  (or (= input :escape) (= input :ctrl-g)))
+
+;; ---- key-accurate help text: ask the keymap, don't hardcode -------------------
+;; Any text that tells the user which key to press goes stale the moment a key is
+;; rebound (or the profile switches). So text names the COMMAND and the renderer
+;; asks the live keymap what runs it — Emacs's `substitute-command-keys`, over
+;; std's `keymap-where-is`. `ed-command-keys` builds the vocabulary; pair it with
+;; `template/render`'s `{{name}}` holes and prose follows the user's own bindings.
+
+(defn ed-where-is (km command &optional fallback)
+  "The Emacs-style label of the key sequence bound to `command` in keymap `km`
+(`\"C-x C-e\"`), or `fallback` when nothing is — including when `command` is **nil**,
+the \"this key is grammar, not a binding, so document the literal\" case (a modal
+profile routing many keys through one command). With several bindings the choice is
+**deterministic** — the shortest sequence, then the alphabetically-first label (so
+`C-n` beats `down`, and re-rendering never reshuffles) rather than whatever the
+map's hash order happens to yield."
+  (let (labels (if (nil? command) '() (map (keymap-where-is km command) ed-keys-label))
+        ;; a `[key-count label]` sort key: structural order compares the number
+        ;; first (shortest chord wins), then the label as text — deterministic
+        ;; without needing a string comparator (`<` is numeric in Brood).
+        best (first (sort-by labels (fn (l) [(count (string/split l " ")) l]))))
+    (or best fallback)))
+
+(defn ed-command-tail (command)
+  "A command symbol's last segment — `bedit/commands/cmd-find-file` → `cmd-find-file`. The
+registry keeps a command qualified where it was defined (package root and all) while a
+keymap binds it as `commands/cmd-find-file`; the two name the same command, and the tail is
+what `M-x` names are keyed by, so it is unique among commands."
+  (last (string/split (->string command) "/")))
+
+;; Memoised on the keymap (`defmemo`, compared with `=` — immediate for the same map, and the
+;; scope keymap is the same map until a layer or binding changes). Inverting it is ~6 ms of
+;; std's `keymap-index` plus the grouping here, and M-x paid all of it on every open for a
+;; table that had not changed since the last one. Two entries: the global keymap and a
+;; buffer type's own, alternated between, both stay warm.
+(memo/defmemo ed-key-table
+  2
+  (km)
+  "`{command-tail -> key-sequence}` for every command `km` binds — the whole keymap inverted
+in ONE walk (`keymap-index`), each command taking its best binding by `ed-where-is`'s rule
+(shortest chord, then the alphabetically-first label).
+
+For a caller that needs the key beside MANY commands. `ed-where-is-named` answers for one,
+and walks the keymap twice to do it — fine for a help line, ruinous for a list: `M-x`'s
+marginalia did that per visible row per frame, which measured 48 ms a keystroke. Build this
+once for the prompt and each row is a map lookup.
+
+It holds the SEQUENCE, not the label. Labelling is ~25 µs a key in Brood and a keymap binds
+a few hundred; labelling them all here put 6 ms on opening `M-x` to render fifteen rows.
+`ed-keys-label` at the row is the same answer for the rows that actually exist."
+  (fold (editor/keymap/keymap-index km)
+    {}
+    (fn (acc entry)
+      (let ([command seqs] entry
+            ;; one binding is the overwhelming case, and it needs no ordering at all — the
+            ;; sort is only there to make a CHOICE deterministic when there are several, and
+            ;; it is the only place a label is built here
+            best (if (nil? (rest seqs))
+                   (first seqs)
+                   (first (sort-by seqs (fn (s) [(count s) (ed-keys-label s)])))))
+        (if (nil? best) acc (assoc acc (ed-command-tail command) best))))))
+
+(sig ed-where-is-named (map any &optional any -> (or nil string)))
+;; check-allow: `ed-where-is` reads the keymap's binding table (std's data), so the label is
+;; unknown to the checker; it is a string or the fallback
+(check-allow :trusted
+  (defn ed-where-is-named (km command &optional fallback)
+    "[[ed-where-is]] for a command known by a symbol that may be spelled differently in
+the keymap — matched by `ed-command-tail`. For one command; for a list of them build an
+`ed-key-table` instead, which inverts the keymap once rather than twice per command."
+    (let (tail (ed-command-tail command)
+          bound (seq/find (editor/keymap/keymap-commands km)
+                  (fn (c) (= tail (ed-command-tail c))))
+          label (if (nil? bound) nil (ed-where-is km bound)))
+      (or label fallback))))
+
+(defn- ed-run-by-name (km name)
+  ;; "how you'd run `name` with no key bound": the profile's command-prompt key plus
+  ;; the name. The SEPARATOR is part of the answer, not decoration — vim's prompt is
+  ;; `:` and you type `:save` with no space, while emacs' is a chord and you type
+  ;; `M-x save` with one. A hardcoded space made the vim rendering wrong in exactly
+  ;; the way a hardcoded "M-x" would have.
+  (let (prompt (ed-where-is km 'commands/cmd-execute-extended-command "M-x")
+        sep (if (= 1 (string/length prompt)) "" " "))
+    (str prompt sep name)))
+
+(defn- ed-subst-hole (km hole)
+  ;; One `\\[command]` hole -> the key bound to it, else how to run it by name.
+  (let (sym (symbol (string/trim hole)))
+    (or (ed-where-is km sym)
+      (ed-run-by-name km (ed-cmd-label sym)))))
+
+(defn ed-substitute-command-keys (km text)
+  "Emacs's `substitute-command-keys`: replace every `\\[command]` hole in `text` with
+the key sequence bound to that command in `km`, or `M-x <name>` when it has none.
+
+The low-ceremony half of key-accurate help text: `ed-command-keys` is right when the
+same key is named many times (a vocabulary worth declaring), this is right for the
+one-off mentions that would otherwise be hardcoded — a welcome message, a mode's
+help header, a commit buffer's instructions. Either way the text follows the user's
+real bindings instead of contradicting them."
+  (let (parts (string/split text "\\["))
+    (if (= (count parts) 1)
+      text
+      (str (first parts)
+        (apply str
+          (map (rest parts)
+            (fn (part)
+              (let (close (index-of part "]"))
+                (if (< close 0)
+                  (str "\\[" part) ; unterminated: leave it alone
+                  (str (ed-subst-hole km (string/substring part 0 close))
+                    (string/substring part (inc close) (string/length part))))))))))))
+
+(defn ed-command-keys (km specs)
+  "A `{name → key-label}` vocabulary derived from the live keymap `km`: `specs` is
+`{name [command-sym fallback]}` (the fallback covers a command the profile doesn't
+bind — e.g. a modal grammar key that isn't a command at all). The data half of
+key-accurate help text: render prose with `{{name}}` holes against this and a
+rebinding updates the documentation instead of contradicting it.
+
+    (template/render \"press {{save}} to save\"
+      (ed-command-keys km {:save ['commands/cmd-save-buffer \"C-x C-s\"]}))"
+  (fold specs
+    {}
+    (fn (acc kv)
+      (let ([name spec] kv
+            [command fallback] spec)
+        (assoc acc name (ed-where-is km command fallback))))))
+
+(defn ed-doc (sym)
+  "The docstring of command `sym` via the `doc` primitive. Tries it as given (a qualified
+keymap binding like `commands/cmd-find-file` resolves directly), then in the `commands/`
+namespace (where the M-x registry's bare `cmd-` symbols live). Nil if neither resolves."
+  ;; a bare `cmd-` name is unbound outside `commands/` — the first eval failing is the probe, not a fault
+  ;;
+  ;; The `commands/` retry is only for a BARE symbol. A qualified one (`bedit/commands/cmd-x`,
+  ;; which is what the M-x registry holds) that simply has no docstring would retry as
+  ;; `commands/bedit/commands/cmd-x`, a name that can never resolve — and raising an unbound
+  ;; symbol through `reflect/eval` costs ~9-35 ms. M-x's marginalia asks this per visible row
+  ;; per frame, so one doc-less command on screen (`backward-char`) put 9 ms on every frame.
+  (check-allow :discarded-catch
+    (or (check-allow :discarded-catch (try (reflect/eval (list 'doc sym)) (catch e nil)))
+      (when (not (includes? (->string sym) "/"))
+        (check-allow :discarded-catch
+          (try (reflect/eval (list 'doc (symbol (str "commands/" (->string sym))))) (catch e nil)))))))
+
+(defn ed-first-line (s)
+  "The first line of string `s` (the docstring summary shown in the echo area)."
+  (first (string/split s "\n")))

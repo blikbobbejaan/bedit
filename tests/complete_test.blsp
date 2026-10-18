@@ -4,6 +4,7 @@
 
 (defmodule complete-test
   (:use test)
+  (:use eldoc) ; ed-refresh-preview
   (:use model)
   (:use editor/buffer)
   (:use editor/highlight)
@@ -250,3 +251,90 @@
       (assert= start 30)
       (assert= prefix "alp")
       (assert= items (list "alphabetical")))))
+
+;; The buffer-words source searches the rope for the prefix rather than listing every word
+;; (a 44k-line buffer took seconds to list), so it reads word boundaries from a character
+;; SET handed to the native scanners. These pin that set to `symbol-char?`, the one rule.
+(describe "the buffer-words source's prefix search"
+  (test "the delimiter set is exactly the complement of symbol-char?"
+    (let (chars (append (map (range 0 256) string/int->char) ["é" "λ" " " "→"]))
+      (doseq (c chars)
+        (assert= (includes? *complete-word-delimiters* c) (not (symbol-char? c))))))
+  (test "only a prefix that STARTS a word counts, read through to the word's end"
+    (let (m (ed-init (make-buffer "xalpha (alpha-one) 'alpha-two,alphabet\"alp\" alpha")))
+      (assert= (completion-candidates m "alp")
+        (list "alpha" "alpha-one" "alpha-two" "alphabet"))))
+  (test "the word at point counts too, as it did when every word was listed"
+    (let (m (ed-init (goto-char (make-buffer "alphabet alp") 3)))
+      (assert= (completion-candidates m "alp") (list "alphabet")))))
+
+;; The mode source hands its `:complete-at` service the current line up to point instead of
+;; the whole buffer (flattening a 44k-line rope per Tab and per idle preview), so the start
+;; it answers is shifted back from a line offset — pinned on a line that is not the first.
+(describe "the mode source on a later line"
+  (test "its start is a buffer offset, and its candidates the live globals"
+    (let (text "(def alpha 1)\n  (string/starts-wi"
+          m (blsp-model text)
+          [start prefix items] (complete-source-mode m))
+      (assert= start 17)
+      (assert= prefix "string/starts-wi")
+      (assert= items (list "string/starts-with?")))))
+
+;; ---- a cached source narrows by filtering, not by asking again ---------------------
+;; A source whose answer carries `{:cache true}` (the LSP source, when the server's list was
+;; complete) is asked ONCE when the popup opens; narrowing keys filter what it said, and it
+;; is asked again only when the prefix stops extending the one it answered. Each call of the
+;; stand-in below leaves a message, so the tests count the asks.
+
+(defn ct-cached-source (m)
+  ;; always the same four items, whatever the prefix — so a re-ask is visible as items that
+  ;; a filter would have dropped
+  (let (buf (ed-current-buf m)
+        [start prefix] (symbol-prefix-at (buffer-text buf) (buffer-point buf)))
+    (send (self) [:ct-asked prefix])
+    [start prefix ["zebra" "zeta-alpha" "zeta-beta" "zeta-bravo"] {:cache true}]))
+
+(defn ct-prepare (m) (do (send (self) [:ct-prepared]) m))
+
+(defn- ct-drain (acc)
+  ;; the messages the stand-ins left, oldest first
+  (receive
+    ([:ct-asked prefix] (ct-drain (conj acc prefix)))
+    ([:ct-prepared] (ct-drain (conj acc :prepared)))
+    (after 0 acc)))
+
+(defn- ct-model (text) (ed-init (goto-char (make-buffer text) (string/length text))))
+
+(describe "completion: a cached source is asked once per prefix it covers"
+  (test "narrowing filters the cached answer; leaving its prefix asks again"
+    (binding (*completion-sources* (list 'complete-test/ct-cached-source)
+              *completion-prepare* (list 'complete-test/ct-prepare))
+      (ct-drain [])
+      (let (opened (cmd-complete (ct-model "x zeta") :tab)
+            opened-asks (ct-drain [])
+            narrowed (complete-handle (complete-handle opened "-") "b")
+            narrowed-asks (ct-drain [])
+            ;; back at the asked prefix: still covered, still filtered
+            back (complete-handle (complete-handle narrowed :backspace) :backspace)
+            back-asks (ct-drain [])
+            ;; one more: `zet` no longer extends `zeta`, so the source is asked again
+            past (complete-handle back :backspace)
+            past-asks (ct-drain []))
+        (assert= (:items (:completion opened)) (list "zebra" "zeta-alpha" "zeta-beta" "zeta-bravo"))
+        (assert= opened-asks [:prepared "zeta"]) ; prepared, then asked, once
+        (assert= (:items (:completion narrowed)) (list "zeta-beta" "zeta-bravo"))
+        (assert= narrowed-asks []) ; filtered: neither prepared nor asked
+        (assert= (:items (:completion back)) (list "zeta-alpha" "zeta-beta" "zeta-bravo"))
+        (assert= back-asks [])
+        (assert= past-asks [:prepared "zet"])
+        (assert= (:items (:completion past)) (list "zebra" "zeta-alpha" "zeta-beta" "zeta-bravo"))))))
+
+;; brood-mode's service binary-searches a memoised sorted name vector instead of filtering
+;; and sorting every global per call (~13 ms a Tab). Pinned against that computation.
+(describe "brood-mode's global-name completion"
+  (test "answers exactly the sorted globals starting with the prefix"
+    (doseq (prefix ["a" "def" "string/st" "*" "->" "zzz-no-such"])
+      (assert= (into [] (nth (brood-mode/brood-complete-at prefix (string/length prefix)) 2))
+        (into []
+          (sort (seq/filter (map (reflect/global-names) str)
+                  (fn (s) (string/starts-with? s prefix)))))))))

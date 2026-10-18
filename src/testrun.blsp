@@ -23,10 +23,9 @@ suite's own output is visible rather than lost."
   (:use editor/buffer) ; buffer-file / buffer-rope / buffer-line-count — the marks + jump
   (:use model) ; UiEvent + message / ed-append-named / ed-buf-at
   (:use interactive) ; defcommand
-  (:use commands) ; ed-show-named / ed-find-file / ed-apply / ed-goto-line
+  (:use pool) ; ed-show-named / ed-find-file / ed-goto-line
   (:use results) ; ed-append-follow / loc-at-line / default-line-loc — the results-buffer abstraction
-  (:use editor/keymap) ; keymap-bind — the *Tests* keys
-  (:use editor/layers)) ; register-type-layers — the :test-menu buffer type
+  (:use editor/keymap)) ; keymap-bind — the *Tests* keys
 (def *tests-buffer* "*Tests*")
 
 ;; ---- the async events (UiEvent records — see model.blsp) --------------------
@@ -323,7 +322,7 @@ rollup tell 'all ran' from 'some ran' (a line-filtered single-test run)."
 
 (defn- testrun-annotate (m r)
   "Stamp a finished test's verdict into its buffer's margin (`:test-marks
-{0-based-line passed?}`, drawn by `modes/gutter-mark-for`): ✓/✗/· on the test's
+{0-based-line passed?}`, drawn by `gutter/gutter-mark-for`): ✓/✗/· on the test's
 `(test …)` head line (`testrun-test-head-line` resolves it from `:where`, which
 points at the first body form) AND rolled up onto the enclosing `(describe …)` head
 (`:describe-marks` — ✓ all-pass, a mixed icon on any failure, a partial icon when
@@ -640,15 +639,15 @@ Falls back to the cold runner when the session declines the request: a backend's
 answers false when its session is not running, and a run that was never accepted must not
 be left looking like one in progress."
   (let (backend (warm-backend m)
-        id (inc (or (:warm-test-id m) 0))
+        ;; from the ONE id space every session mints from (`session/next-id`)
+        id (session/next-id m)
         sent? (and backend
                 (warm-call backend
                   :run (list id (warm-call backend :specs (list m specs) []))
                   false)))
     (if (not sent?)
       (testrun-start m specs root label)
-      (ed-show-named-aside (message (assoc (testrun-clear-marks m)
-                                      :warm-test-id id
+      (ed-show-named-aside (message (assoc (session/ids-used (testrun-clear-marks m) (inc id))
                                       :testrun
                                         {:specs specs
                                          :root root
@@ -729,11 +728,27 @@ one is the summary (or the reason there is not going to be one)."
                    (str "\n[" (or (get reply :error) "the run failed") "]\n"))
           (str "tests: " (or (get reply :error) "the run failed"))))))
 
-;; ---- the warm node's client hooks (registered in `sandbox-events/*clients*`) ----------
-;; A row in that list, like the playground and the process list, rather than `UiEvent`
+;; ---- the warm node's client hooks (registered with `sandbox-events`) -----------------
+;; A client of the router, like the playground and the process list, rather than `UiEvent`
 ;; impls of its own. It had its own impls while each session carried its own event records;
 ;; once the session's NAME started riding on the event there was nothing left for a private
 ;; vocabulary to distinguish, and one router serves every session the editor keeps.
+;;
+;; One row per warm session — the Elixir `MIX_ENV=test` node and the Brood eval-server
+;; child — with the SAME hooks, `:with-session` so each is told which session it is folding.
+;; A pair of one-line wrappers per language was the alternative.
+(sandbox-events/register-client {:session :elixir-test
+                                 :with-session true
+                                 :live? 'testrun/warm-live-of?
+                                 :ready 'testrun/warm-ready-of
+                                 :reply 'testrun/warm-reply
+                                 :down 'testrun/warm-down-of})
+(sandbox-events/register-client {:session :brood-test
+                                 :with-session true
+                                 :live? 'testrun/warm-live-of?
+                                 :ready 'testrun/warm-ready-of
+                                 :reply 'testrun/warm-reply
+                                 :down 'testrun/warm-down-of})
 
 (defn warm-live-of? (session m)
   "Does anything still want `session`? `*Tests*` has to exist — it is what a run fills — AND
@@ -747,42 +762,34 @@ has left."
   (and (not (nil? (ed-buffer-index-by-name m *tests-buffer*)))
     (= session (get (warm-backend m) :session))))
 
-(defn warm-live-elixir? (m) (warm-live-of? :elixir-test m))
-(defn warm-live-brood? (m) (warm-live-of? :brood-test m))
-
-(defn warm-ready-of (session m gen)
+(defn warm-ready-of (session m gen &optional banner)
   "`session` announced itself: it is past its own boot and will answer at once, which is the
 only state in which sending it a run beats starting a cold one. Keyed BY SESSION, because
 an editor open on a Brood project and an Elixir one at the same time has two of these and
-neither is evidence about the other."
+neither is evidence about the other. (The banner is the router's to hand over; a test
+session's says nothing a run needs.)"
   (assoc-in m [:warm-tests session :ready] gen))
 
-(defn warm-down-of (session m)
+(defn warm-down-of (session m &optional code)
   "`session` went away. A respawn usually follows, but until its banner lands nothing may be
 sent to it — so the next run takes the cold path rather than queueing behind a boot it
-cannot see."
+cannot see. Whatever the exit `code`, the answer is the same."
   (assoc-in m [:warm-tests session :ready] nil))
 
-(defn warm-reply (m reply gen)
+(defn warm-reply (session m reply gen)
   "One reply from a warm session, with the frame the loop put on the model (`:frame`) — a
 streaming buffer follows its own tail only in a pane already at the bottom, and that is a
-question about panes rather than about the reply. Shared by every session: a run's id says
-which one it belongs to, and only one runs at a time."
+question about panes rather than about the reply. The same for every `session`: a run's id
+says which one it belongs to, and only one runs at a time."
   (let ([cols rows] (or (:frame m) [80 24]))
     (testrun-warm-reply m reply cols rows)))
-
-;; One pair of one-liners per session rather than a session argument on every hook in the
-;; router: the two rows in `sandbox-events/*clients*` name these, and the shape underneath
-;; is shared. Two lines per language is cheaper than four arities across six clients.
-(defn warm-ready-elixir (m gen banner) (warm-ready-of :elixir-test m gen))
-(defn warm-down-elixir (m code) (warm-down-of :elixir-test m))
-(defn warm-ready-brood (m gen banner) (warm-ready-of :brood-test m gen))
-(defn warm-down-brood (m code) (warm-down-of :brood-test m))
 
 ;; ---- the commands ----------------------------------------------------------------
 
 (defn- testrun-root (m)
-  (or (:project-root m) (file/cwd)))
+  ;; The project (`projects/root-of`), else the cwd itself: a run outside any project
+  ;; still runs somewhere rather than nowhere.
+  (or (projects/root-of m) (file/cwd)))
 
 ;; ---- the three scopes, one route --------------------------------------------
 ;; `C-c t f` / `C-c t t` / `C-c t p` mean the same thing in every project. Where a
@@ -858,7 +865,7 @@ the compile that made it fast."
         proc (proc/whereis :testrun))
     (cond
       warm
-        (let (id (inc (or (:warm-test-id m) 0))
+        (let (id (session/next-id m)
               backend (warm-backend m))
           ;; ASK the session to abandon it — both backends can, and neither is killed for
           ;; it: the session is the expensive thing and the run inside it is not, so ending
@@ -866,7 +873,7 @@ the compile that made it fast."
           (warm-call backend :stop (list id) false)
           ;; …and forget it here too. Its stragglers are already on the way, and a verdict
           ;; for a run you stopped should not keep filling the buffer.
-          (message (assoc (update m :testrun dissoc :warm-id) :warm-test-id id)
+          (message (session/ids-used (update m :testrun dissoc :warm-id) (inc id))
             "test run stopped"))
       (nil? proc) (message m "no test run in progress")
       else
@@ -980,18 +987,11 @@ every other line takes its whole-line role face (`testrun-line-face`)."
 readable (red on failure), the `(N ms)` dim, group headers mauve, output dim.
 Clickability is the pointer cursor + font underline the view draws from `:line-loc`.
 
-Spans are `cons`'d onto a list (O(1) each) and `reverse`d once — NOT accumulated with
-`append`/`conj`, both of which recopy the whole accumulator per line and make this O(n²)
-in the window height. A live test run re-fontifies the visible window on every streamed
-append, so a linear fontify is what keeps a long *Tests* run from lagging as it fills."
-  (let (result (fold (string/split src "\n")
-                 [(list) 0]
-                 (fn (acc line)
-                   (let (spans (nth acc 0)
-                         off (nth acc 1))
-                     [(fold (testrun-line-spans line off) spans (fn (s span) (cons span s)))
-                       (+ off (string/length line) 1)]))))
-    (reverse (nth result 0))))
+The walk is `modes/fontify-lines`, which `cons`es spans and `reverse`s once — linear in
+the window height rather than the O(n²) of an `append`/`conj` accumulator. A live test
+run re-fontifies the visible window on every streamed append, so a linear fontify is what
+keeps a long *Tests* run from lagging as it fills."
+  (modes/fontify-lines src testrun-line-spans))
 
 (def test-menu-mode-layer
   ;; :line-loc is the SHARED `results/line-links-loc` — it reads the off-text `:line-links`
@@ -1001,10 +1001,8 @@ append, so a linear fontify is what keeps a long *Tests* run from lagging as it 
    :keymap testrun/test-menu-keymap
    :fontify 'testrun/testrun-fontify
    :line-loc 'results/line-links-loc
-   :commands '("test-rerun")})
+   :commands (modes/layer-commands testrun/test-menu-keymap)})
 
 ;; :test-menu stacks the jump/rerun keys over special-mode (read-only, no gutter)
 ;; over text-mode — the process list's shape.
-(register-type-layers :test-menu
-  (list 'testrun/test-menu-mode-layer
-    'results/location-jump-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+(modes/register-special-type :test-menu 'testrun/test-menu-mode-layer 'results/location-jump-layer)

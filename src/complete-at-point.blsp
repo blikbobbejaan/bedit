@@ -11,8 +11,9 @@ SOURCES are **multi**: `cmd-complete` merges candidates from an ordered list,
 `*completion-sources*` (Emacs' `completion-at-point-functions`) — the always-on
 buffer-word source, the buffer's language mode (`:complete-at` → brood-mode globals),
 and any added source (an LSP server via `src/lsp.blsp`). Each is a fn
-`(model) -> nil | [start prefix items]`; the first non-nil fixes the region and the
-rest merge in. The LOOK (`*completion-*-face*`, `*completion-max*`) and the menu
+`(model) -> nil | [start prefix items]` (plus an optional `{:cache true}` fourth element: the
+popup then narrows by filtering those items rather than asking again); the first non-nil
+fixes the region and the rest merge in. The LOOK (`*completion-max*`) and the menu
 rendering live in the shared `completion` framework, which the minibuffer also uses.
 
 Pure (data→data) apart from reading the buffer and (for an LSP source) a bounded
@@ -24,8 +25,7 @@ synchronous request; the popup is plain render ops, unit-testable without a wind
   (:use mincomplete) ; lcp — the common-prefix expansion Tab shares with the minibuffer
   (:use ui-kit) ; ui-panel / ui-list / ui-clip — the popup is one windowed list in a card
   (:use theme) ; ui-ctx — the kit's semantic-role palette
-  (:use editor/display) ; the `text` render op for the popup
-  (:use memo)) ; defmemo — the word list, rebuilt once per edit rather than per key
+  (:use editor/display)) ; the `text` render op for the popup
 ;; ---- what counts as a completion word ---------------------------------------
 
 (defn complete-word-char? (c)
@@ -44,48 +44,55 @@ and an LSP source agree on the prefix and merge instead of dropping each other."
 
 ;; ---- candidate source (redefine `completion-candidates` to rice) ------------
 
-;; `cur` accumulates the current word as a *reversed char list* (each `cons` is O(1)),
-;; flushed to a string with `list->string` only at the word boundary. The previous
-;; `(str cur c)` per char rebuilt the whole word string each step — O(wordlen²); this is
-;; O(wordlen). (`string->list` already walks the text once, so word access stays O(n).)
-(defn- complete-words-step (acc c)
-  (let (cur (first acc) done (second acc))
-    (if (complete-word-char? c)
-      [(cons c cur) done]
-      (if (empty? cur) acc [() (cons (string/list-> (reverse cur)) done)]))))
+;; The characters that END a completion word — exactly the complement of `symbol-char?`
+;; (`hl-delim?`'s whitespace, brackets, `"` and `;`, plus the reader-macro prefixes
+;; `' \` ~ ^ @ #`). Spelled out as a SET so the scan below can hand it to the native rope
+;; scanners (`text/skip-forward`) instead of asking `symbol-char?` once per character in
+;; Brood; tests/complete_test.blsp checks the two agree, so the one boundary rule cannot
+;; drift. (std/editor/highlight keeps the same set privately as `hl-delim-chars` minus the
+;; reader prefixes; exporting it there would retire this copy.)
+(def *complete-word-delimiters* " \t\n\r,()[]{}\";'`~^@#")
 
-(defn- complete-words (text)
-  "Every maximal run of word chars in `text`, as a list (with duplicates)."
-  (let (r (fold (string/->list text) [() ()] complete-words-step)
-        cur (first r)
-        done (second r))
-    (if (empty? cur) done (cons (string/list-> (reverse cur)) done))))
+(defn- complete-word-start? (rope i)
+  "Does a completion word begin at char `i` of `rope` — the start of the text, or right
+after a delimiter?"
+  (or (= i 0) (includes? *complete-word-delimiters* (text/slice rope (dec i) i))))
 
-(defmemo complete-rope-words 1 (rope)
-  "The distinct words of `rope`. Memoised on the rope (one entry): an edit makes a new rope
-and misses, and every narrowing keystroke after it (no edit) hits — O(buffer) once per
-edit rather than once per completion key."
-  (seq/distinct (complete-words (text/->string rope))))
-
-(defn- complete-cached-words (buf)
-  "The distinct words of `buf` — see `complete-rope-words`."
-  (complete-rope-words (buffer-rope buf)))
-
-(defn- complete-buffer-words (m)
-  "The distinct words of the current buffer — the (prefix-independent) word *universe*
-the baseline completion source draws from."
-  (complete-cached-words (ed-current-buf m)))
+;; Why a prefix SEARCH and not a word list: the source only ever wants the words that start
+;; with the prefix, and building the buffer's whole word universe to filter it walked every
+;; character in Brood — measured 7.4 s on a 44k-line buffer, once per edit, which the idle
+;; preview pays on every pause in typing. Searching the rope natively for the prefix and
+;; reading the word at each hit that sits on a word start reads only those words: 22 ms for
+;; `def` on the same buffer, 7 ms for a prefix that occurs nowhere.
+(defn- complete-prefix-words (buf prefix)
+  "Every word of `buf` that starts with `prefix` (non-empty), with duplicates — read at
+each occurrence of `prefix` that begins a word, through to the next delimiter."
+  (let (rope (buffer-rope buf))
+    (letrec (scan (fn (from acc)
+                    (let (hit (buffer-search-forward buf prefix from))
+                      (cond
+                        (nil? hit) acc
+                        (complete-word-start? rope hit)
+                          (let (end (text/skip-forward rope hit *complete-word-delimiters* false))
+                            (scan end (cons (text/slice rope hit end) acc)))
+                        :else (scan (inc hit) acc)))))
+      (scan 0 '()))))
 
 (defn completion-candidates-of (words prefix)
   "The `words` that start with `prefix` and aren't exactly it, sorted — the pure
-prefix-filter shared by the open scan and the cached narrowing path."
-  (sort (seq/filter words (fn (w) (and (string/starts-with? w prefix) (not (= w prefix)))))))
+prefix-filter every word source shares."
+  (sort (seq/distinct (seq/filter words
+                        (fn (w) (and (string/starts-with? w prefix) (not (= w prefix))))))))
+
+(defn- complete-buffer-candidates (buf prefix)
+  "The distinct words of `buf` that start with `prefix` and aren't exactly it, sorted."
+  (if (= prefix "") '() (completion-candidates-of (complete-prefix-words buf prefix) prefix)))
 
 (defn completion-candidates (m prefix)
   "Candidates for `prefix`. **Redefine to plug in another source** (global symbols
 via `all-globals`, file paths, snippets, …). Baseline: the distinct words in the
 current buffer that start with `prefix` and aren't exactly it, sorted."
-  (completion-candidates-of (complete-buffer-words m) prefix))
+  (complete-buffer-candidates (ed-current-buf m) prefix))
 
 ;; ---- multi-source completion-at-point (CAPF-style) --------------------------
 ;; Completion draws from an ordered LIST of sources, not one. A source is a fn
@@ -227,31 +234,46 @@ server connects). Highest precedence; redefining the global directly also works.
     (defdyn *completion-sources* (cons sym *completion-sources*)))
   nil)
 
+(defn- complete-line-to-point (buf)
+  "`[line-start line]` — the text of the current line up to point, and the buffer offset
+it starts at.
+
+A completion word never crosses a line, so this is all of the buffer any word-at-point
+question needs. Both sources below run on every Tab AND on every idle completion preview,
+and flattening a 44k-line buffer to find the word before point was their whole cost."
+  (let (line-start (buffer-point (beginning-of-line buf)))
+    [line-start (text/slice (buffer-rope buf) line-start (buffer-point buf))]))
+
 (defn complete-source-mode (m)
   "The mode source: the current buffer's `:complete-at` language service (e.g. brood-mode's
 live globals), adapted to the source protocol. `nil` when the mode offers no service or
-there's no prefix at point. The seam that keeps `complete` language-agnostic."
+there's no prefix at point. The seam that keeps `complete` language-agnostic.
+
+The service is called as `(svc text pos)` with `text` the CURRENT LINE UP TO POINT and
+`pos` its length — not the buffer. The prefix it completes is the symbol before point,
+which never crosses a line; handing it the whole buffer cost 10-17 ms per Tab and per idle
+preview on a 44k-line file, all of it spent flattening the rope. The `start` it answers is
+relative to that line and is shifted back to a buffer offset here."
   (let (buf (ed-current-buf m)
         svc (ed-mode-service buf :complete-at))
     (if (nil? svc)
       nil
-      (let ([start prefix items] (svc (buffer-text buf) (buffer-point buf)))
-        (if (= prefix "") nil [start prefix items])))))
+      (let ([line-start line] (complete-line-to-point buf)
+            [start prefix items] (svc line (string/length line)))
+        (if (= prefix "") nil [(+ line-start start) prefix items])))))
 
 (defn complete-source-buffer-words (m)
   "The baseline source: the distinct words of the current buffer that start with the
 word before point. `nil` when there's no word before point."
   (let (buf (ed-current-buf m)
-        p (buffer-point buf)
-        ;; a word never crosses a line, so only the line up to point is read — this runs
-        ;; on every keystroke, and flattening the buffer to find one word was its cost
-        line-start (buffer-point (beginning-of-line buf))
-        line (text/slice (buffer-rope buf) line-start p)
-        start (+ line-start (complete-prefix-start line (- p line-start)))
-        prefix (string/substring line (- start line-start) (- p line-start)))
+        ;; only the line up to point is read (see `complete-line-to-point`)
+        [line-start line] (complete-line-to-point buf)
+        offset (string/length line)
+        start (+ line-start (complete-prefix-start line offset))
+        prefix (string/substring line (- start line-start) offset))
     (if (= prefix "")
       nil
-      [start prefix (completion-candidates-of (complete-cached-words buf) prefix)])))
+      [start prefix (complete-buffer-candidates buf prefix)])))
 
 ;; ---- applying a completion --------------------------------------------------
 
@@ -262,19 +284,110 @@ word before point. `nil` when there's no word before point."
         buf2 (replace-region buf start p word))
     (assoc (ed-set-buf m buf2) :completion nil :status "modified")))
 
-(defn- complete-at (m)
-  "`[start prefix items]` for completion at point, **merged across every applicable
+;; ---- narrowing without asking again (company's / Corfu's cache) ---------------
+;; A source may answer a FOURTH element, an options map: `{:cache true}` says "these items
+;; are every candidate I have for any extension of this prefix" — the LSP source says so
+;; when the server's list was not `isIncomplete`. While the popup is open, typing another
+;; word character then FILTERS those items here instead of asking the source again, and it
+;; is asked again only once the prefix stops extending the one it answered (Backspace past
+;; it, or a different word). This is the whole reason a server-backed popup narrows
+;; instantly: the LSP source used to cost a full round-trip on EVERY narrowing keystroke.
+;; A source that answers three elements — every local one — is asked every time, exactly
+;; as before.
+
+(defn- complete-symbol-at-point (m)
+  "`[start prefix]` — the symbol before point by the shared boundary rule, read from the
+current line only (`complete-line-to-point`)."
+  (let ([line-start line] (complete-line-to-point (ed-current-buf m))
+        offset (string/length line)
+        start (complete-prefix-start line offset))
+    [(+ line-start start) (string/substring line start offset)]))
+
+(defn- complete-cache-covers? (entry here)
+  "Does the cached source answer `entry` (`[start prefix items opts]`) still cover the
+symbol at point `here` (`[start prefix]`)? Only while it is the same word and what is typed
+now extends what the source was asked about."
+  (and (= (first entry) (first here)) (string/starts-with? (second here) (second entry))))
+
+(defn- complete-ask-source (m sym cache here)
+  "Source `sym`'s answer at point: its cached answer filtered to the current prefix when the
+popup's `cache` still covers `here` ([[complete-cache-covers?]]), else the source itself."
+  (let (entry (get cache sym))
+    (if (and entry here (complete-cache-covers? entry here))
+      (let (prefix (second here))
+        [(first here)
+          prefix
+          (seq/filter (nth entry 2) (fn (item) (string/starts-with? item prefix)))
+          {:cached entry}])
+      ((reflect/eval sym) m))))
+
+(defn- complete-next-cache (sources results)
+  "The popup's cache after a query: for each source in `sources` whose answer in `results`
+is cacheable, the answer to keep — the ORIGINAL one when it came from the cache (so
+Backspace back towards the asked prefix still filters rather than asks), else the fresh
+one."
+  (fold (seq/zip sources results)
+    {}
+    (fn (acc pair)
+      (let ([sym result] pair
+            opts (when result (nth result 3 nil)))
+        (cond
+          (nil? opts) acc
+          (:cached opts) (assoc acc sym (:cached opts))
+          (:cache opts) (assoc acc sym result)
+          :else acc)))))
+
+(defn- complete-at (m &optional (cache {}))
+  "`[start prefix items cache]` for completion at point, **merged across every applicable
 source** (`*completion-sources*`). The first non-nil source fixes the region `[start
 prefix]`; the others contribute items only if they agree on `start` (deduped, source
-order kept). `[point \"\" ()]` when nothing applies. The seam that lets a language
-mode (or LSP) supply completions without `complete` naming the language."
-  (let (results (seq/keep *completion-sources* (fn (s) ((reflect/eval s) m))))
+order kept). `[point \"\" () {}]` when nothing applies. The seam that lets a language
+mode (or LSP) supply completions without `complete` naming the language.
+
+`cache` is the open popup's (see the section above): a source it still covers is filtered
+locally instead of asked. The `cache` answered is what the popup keeps for next time."
+  (let (sources *completion-sources*
+        ;; the symbol at point is only needed to test the cache; skip the read when empty
+        here (when (not (empty? cache)) (complete-symbol-at-point m))
+        answers (map sources (fn (s) (complete-ask-source m s cache here)))
+        results (seq/reject answers nil?)
+        next-cache (complete-next-cache sources answers))
     (if (empty? results)
-      [(buffer-point (ed-current-buf m)) "" '()]
-      (let ([start prefix _] (first results)
+      [(buffer-point (ed-current-buf m)) "" '() next-cache]
+      ;; read by position, not a `[start prefix _]` pattern: an answer may carry a fourth
+      ;; element (its options), and a tuple pattern matches only its own length
+      (let (start (first (first results))
+            prefix (second (first results))
             items (seq/distinct (apply append
                                   (map results (fn (r) (if (= (first r) start) (nth r 2) '()))))))
-        [start prefix items]))))
+        [start prefix items next-cache]))))
+
+(defdyn *completion-prepare*
+  ;; Steps `(model) -> model` run before the sources are ASKED (not when the popup merely
+  ;; filters a cached answer). The LSP layer adds its document sync here: the completion
+  ;; request then carries no text, because the server already has it — sent as the small
+  ;; incremental change it is, and recorded on the model, which a source (model -> answer)
+  ;; has no way to do. A list of fn symbols, resolved late like the sources.
+  (list))
+
+(defn complete-add-prepare! (sym)
+  "Add `sym` (a `(model) -> model` fn symbol) to `*completion-prepare*`, idempotently — the
+way a feature makes its state current before its completion source is asked (the LSP
+layer syncs the document)."
+  (when (not (includes? *completion-prepare* sym))
+    (defdyn *completion-prepare* (append *completion-prepare* (list sym))))
+  nil)
+
+(defn- complete-prepare (m)
+  "`m` after every `*completion-prepare*` step."
+  (fold *completion-prepare* m (fn (acc sym) ((reflect/eval sym) acc))))
+
+(defn- complete-cache-current? (m cache)
+  "Does the popup's `cache` cover the symbol at point for EVERY source it holds — so a
+refresh will ask none of the sources that needed preparing?"
+  (and (not (empty? cache))
+    (let (here (complete-symbol-at-point m))
+      (every? (vals cache) (fn (entry) (complete-cache-covers? entry here))))))
 
 (defn- complete-order (items)
   "Completion candidates in presentation order: distinct, alphabetical — Emacs'
@@ -288,12 +401,13 @@ matches by fuzzy score puts `foo-bar-baz` above `foo-bar` for no reason a user c
 whether its list still answers the question you are asking."
   (let (buf (ed-current-buf m)) [(buffer-name buf) (buffer-point buf)]))
 
-(defn- popup-state (m start prefix items)
+(defn- popup-state (m start prefix items &optional (cache {}))
   "The popup, stamped with the anchor it describes. One constructor, so the stamp cannot be
 forgotten at a site that opens one — which is exactly how the popup came to outlive its
-own line."
+own line. `cache` is what narrowing may filter instead of asking again (`complete-at`)."
   (assoc m
-    :completion {:items items :index 0 :start start :prefix prefix :at (popup-anchor m)}))
+    :completion
+      {:items items :index 0 :start start :prefix prefix :at (popup-anchor m) :cache cache}))
 
 (defn popup-stale? (m)
   "Has the popup stopped describing where you are?
@@ -315,6 +429,11 @@ covers the mouse, every movement command and a buffer switch alike."
 post-step's one call."
   (if (popup-stale? m) (assoc m :completion nil) m))
 
+;; …run after every event. The overlays dismiss the popup for a key it does not own, but a
+;; MOUSE click never reaches them (`ed-mouse` folds it directly), so clicking away left the
+;; list on screen anchored to a line you had left.
+(register-post-step :stale-completion-popup {:order 30 :run 'complete-at-point/close-stale-popup})
+
 (defn cmd-complete (m key)
   "Completion-at-point (Tab), the way Emacs' `completion-at-point` behaves: the symbol
 before point is completed against every source (mode globals + buffer words + …). One
@@ -333,8 +452,10 @@ differently."
     (cmd-complete-sources m key)))
 
 (defn- cmd-complete-sources (m key)
-  "`cmd-complete` proper: ask every source and act on what comes back."
-  (let ([start prefix items0] (complete-at m)
+  "`cmd-complete` proper: prepare (`*completion-prepare*`), ask every source and act on what
+comes back."
+  (let (m (complete-prepare m)
+        [start prefix items0 cache] (complete-at m)
         items (complete-order items0))
     (if (= prefix "")
       (message m "nothing to complete")
@@ -345,7 +466,7 @@ differently."
           (let (common (lcp items))
             (if (> (string/length common) (string/length prefix))
               (complete-apply m start common)
-              (popup-state m start prefix items)))))))
+              (popup-state m start prefix items cache)))))))
 
 ;; ---- popup navigation (input routes control keys here) ----------------------
 
@@ -363,24 +484,16 @@ Backspace (narrow back). Any other key dismisses the popup and is processed norm
 
 (defn complete-cancel (m) "Dismiss the completion popup." (assoc m :completion nil))
 
-(sig complete-move (model int -> model))
-(defn- complete-move (m d)
+(defn- complete-motion (m motion)
+  ;; C-n / C-p step (wrapping), M-< / M-> the ends — `editor/list-motion`, the keys every
+  ;; list in the editor reads the same way
   (let (c (:completion m))
     (if (nil? c)
       m ; no popup to move in
-      (let (n (count (:items c)))
-        (assoc m :completion (assoc c :index (math/mod (+ (:index c) d) n)))))))
-
-(defn- complete-jump (m end)
-  ;; M-< / M-> — the ends of the list, not a step through it. Same keys, same meaning as
-  ;; in a buffer and in the minibuffer's candidate list: the top and the bottom.
-  (let (c (:completion m))
-    (if (nil? c)
-      m
-      (let (n (count (:items c)))
-        (if (= n 0)
-          m
-          (assoc m :completion (assoc c :index (if (= end :first) 0 (dec n)))))))))
+      (assoc m
+        :completion
+          (assoc c
+            :index (editor/list-motion/motion-index (:index c) (count (:items c)) motion))))))
 
 (defn complete-accept (m)
   (let (c (:completion m))
@@ -394,23 +507,24 @@ the narrowing keystroke's insert/delete."
 (defn- complete-refresh (m)
   "Recompute the popup from the current point after a narrowing edit, closing it when the
 prefix is empty or nothing matches. Re-queries every source through `complete-at` so the
-merge stays correct across all of them (a mode/LSP source can't be prefix-cached the way a
-single word universe could) — the word at point changed, so the sources rescan it."
-  (let ([start prefix items0] (complete-at m)
+merge stays correct across all of them — the word at point changed, so the sources rescan
+it — EXCEPT a source whose answer the popup cached and which still covers the new prefix:
+that one is filtered locally, so a server-backed popup narrows without a round-trip.
+`*completion-prepare*` runs only when a cached source is about to be asked again."
+  (let (cache (:cache (:completion m) {})
+        m (if (complete-cache-current? m cache) m (complete-prepare m))
+        [start prefix items0 next-cache] (complete-at m cache)
         items (complete-order items0))
     (if (or (= prefix "") (empty? items))
       (assoc m :completion nil)
-      (popup-state m start prefix items))))
+      (popup-state m start prefix items next-cache))))
 
 (defn complete-handle (m input)
   "Fold a popup-control key: C-n/↓ C-p/↑ move; Enter/Tab accept; a word-char inserts and
 re-narrows; Backspace deletes and re-narrows; Esc/C-g cancel. M-< / M-> jump to the
 ends of the list, as they do everywhere else."
   (cond
-    (or (= input :ctrl-n) (= input :down)) (complete-move m 1)
-    (or (= input :ctrl-p) (= input :up)) (complete-move m -1)
-    (= input (keyword "alt-<")) (complete-jump m :first)
-    (= input (keyword "alt->")) (complete-jump m :last)
+    (editor/list-motion/motion-of input) (complete-motion m (editor/list-motion/motion-of input))
     (or (= input :enter) (= input :tab)) (complete-accept m)
     (= input :backspace) (complete-refresh (complete-edit m delete-backward-char))
     (and (string? input) (complete-word-char? input))

@@ -2,8 +2,8 @@
   "The interactive-command mechanism, à la Emacs. `defcommand` defines an editor
 command — a
 `(model key) -> model` function — and **registers it as interactive**, so it can be
-run by name with `M-x` (see `commands/cmd-execute-extended-command`). The registry
-`*commands*` maps a command's name (its function name minus a leading `cmd-`, e.g.
+run by name with `M-x` (see `commands/cmd-execute-extended-command`). The
+`:interactive/commands` registry maps a command's name (its function name minus a leading `cmd-`, e.g.
 `cmd-kill-line` → `\"kill-line\"`) to the function.
 
 Keymaps still bind commands by *symbol* (late-bound) independently; this is the
@@ -14,8 +14,9 @@ does over `defn` — exactly the role Emacs's `(interactive)` plays.
     ;; now `M-x newline` runs it, and (command-names) lists it.")
 
 ;; These are REGISTRIES: every module `defcommand`s into them at load, and they must
-;; accumulate across the whole session — so `defonce`, not `def`. Loading a project re-runs
-;; this file after other modules have already registered (a `require` cycle reached from two
+;; accumulate across the whole session — so they are `std/registry` tables (brood ADR-412),
+;; not globals. They began as plain `def`s: loading a project re-runs this file after other
+;; modules have already registered (a `require` cycle reached from two
 ;; directions; the loader says so: "macro defcommand redefined"), and a plain `def` here reset
 ;; the table to `{}` — silently dropping every command registered before that moment.
 ;;
@@ -23,8 +24,8 @@ does over `defn` — exactly the role Emacs's `(interactive)` plays.
 ;; while `M-x git-status` worked, and which ones survived depended only on whether their
 ;; module happened to load before or after the reload. The same hazard `editor/layers`
 ;; documents for its own three registries, in the same shape, with the same fix.
-(defonce *commands* {}) ; name (string) -> command fn
-(defonce *command-syms* {}) ; name (string) -> command symbol (for describe-function doc lookup)
+;; :interactive/commands      name (string) -> command fn
+;; :interactive/command-syms  name (string) -> command symbol (for describe-function doc lookup)
 (defn command-friendly-name (s)
   "A command's M-x name: its function name minus a leading `cmd-`."
   (if (string/starts-with? s "cmd-") (string/substring s 4 (string/length s)) s))
@@ -39,8 +40,8 @@ all find it whatever module defined the command. Re-registering replaces the ent
         qualified (if (or (nil? ns) (includes? (->string sym) "/"))
                     sym
                     (symbol (str ns "/" (->string sym)))))
-    (def *command-syms* (assoc *command-syms* nm qualified))
-    (def *commands* (assoc *commands* nm fn))))
+    (registry/put! :interactive/command-syms nm qualified)
+    (registry/put! :interactive/commands nm fn)))
 
 ;; ---- deferred commands: named by a keymap, not yet loaded ---------------------
 ;; `defcommand` registers at MODULE LOAD, so a deferred feature's commands did not exist for
@@ -54,7 +55,7 @@ all find it whatever module defined the command. Re-registering replaces the ent
 ;; harvests them at startup (`editor/keymap/keymap-commands`) and declares them here. A
 ;; deferred entry is a name plus the symbol to load; running it loads the module and then
 ;; dispatches to the real registration.
-(defonce *deferred* {}) ; name (string) -> command symbol, module not yet loaded
+;; :interactive/deferred  name (string) -> command symbol, module not yet loaded
 (defn- command-tail (sym)
   ;; the last segment of a possibly-qualified symbol: `playground/cmd-x` -> `cmd-x`
   (last (string/split (->string sym) "/")))
@@ -68,17 +69,30 @@ all find it whatever module defined the command. Re-registering replaces the ent
   "Declare that `sym` names an interactive command whose module may not be loaded yet, so
 `M-x` can offer it and load it on demand. A name already registered for real wins."
   (let (nm (command-friendly-name (command-tail sym)))
-    (when (nil? (get *commands* nm)) (def *deferred* (assoc *deferred* nm sym)))
+    (when (nil? (registry/lookup :interactive/commands nm))
+      (registry/put! :interactive/deferred nm sym))
     nm))
 
 (defn command-sym (nm)
   "The fully-qualified symbol of the interactive command named `nm`, or nil — including one
 that is only declared (its module unloaded), so `describe-function` can find its docstring."
-  (or (get *command-syms* nm) (get *deferred* nm)))
+  (or (registry/lookup :interactive/command-syms nm) (registry/lookup :interactive/deferred nm)))
+
+;; Memoised on the two registries' CONTENTS (`defmemo` compares with `=`, which is immediate
+;; for the same map). M-x asks for this on every open, and merging, deduplicating and
+;; sorting ~600 names was ~2 ms of each one while nothing had been registered since.
+;; Registering or declaring a command makes a new map, so the next call misses and the list
+;; is always the registries' current one.
+(memo/defmemo sorted-command-names
+  1
+  (registered deferred)
+  "The sorted, distinct names of the `registered` and `deferred` command registries."
+  (sort (seq/distinct (append (keys registered) (keys deferred)))))
 
 (defn command-names ()
   "All interactive command names, sorted — registered and declared-but-unloaded alike."
-  (sort (seq/distinct (append (keys *commands*) (keys *deferred*)))))
+  (sorted-command-names (registry/entries :interactive/commands)
+    (registry/entries :interactive/deferred)))
 
 ;; ---- the prefix argument (C-u N) -------------------------------------------
 ;; The numeric prefix a `C-u`/digit sequence builds lives on the model as
@@ -89,7 +103,7 @@ that is only declared (its module unloaded), so `describe-function` can find its
 ;; declared next to the command rather than hardcoded in the dispatch loop. (The fuller
 ;; Emacs model — every command an interactive arg spec — can grow from this seam.)
 
-(defonce *prefix-consuming* {}) ; command symbol -> true: reads the arg itself, runs once (defonce: a reload must not forget the registrations other modules made)
+;; :interactive/prefix-consuming  command symbol -> true: reads the arg itself, runs once
 (defn current-prefix-arg (m)
   "The numeric prefix argument a C-u/digit sequence built (Emacs `current-prefix-arg`),
 or nil when none is active. `(or (current-prefix-arg m) 1)` is the repeat count; a
@@ -99,11 +113,11 @@ command branching on mere presence tests this for nil."
 (defn register-prefix-consuming (sym)
   "Mark command `sym` as consuming the prefix argument itself — the dispatcher runs it
 once (it reads `current-prefix-arg`) instead of repeating it N times."
-  (def *prefix-consuming* (assoc *prefix-consuming* sym true)))
+  (registry/put! :interactive/prefix-consuming sym true))
 
 (defn prefix-consuming? (sym)
   "Whether command `sym` consumes the prefix argument itself (vs. the repeat default)."
-  (contains? *prefix-consuming* sym))
+  (= true (registry/lookup :interactive/prefix-consuming sym)))
 
 ;; ---- command inverses (the negative-argument direction, Emacs M-- / C--) ----
 ;; A command and its opposite-direction twin register as inverses; when the numeric
@@ -111,15 +125,15 @@ once (it reads `current-prefix-arg`) instead of repeating it N times."
 ;; command (so `C-- C-f` goes backward, `M-- 2 M-d` kills two words back). Direction
 ;; lives in the pairing, so individual commands need no sign handling.
 
-(defonce *command-inverse* {}) ; command symbol -> its opposite-direction command symbol (defonce, as above)
+;; :interactive/inverses  command symbol -> its opposite-direction command symbol
 (defn register-inverse (a b)
   "Register commands `a` and `b` as each other's inverse — the direction a negative
 prefix argument flips to. Bidirectional."
-  (def *command-inverse* (assoc (assoc *command-inverse* a b) b a)))
+  (do (registry/put! :interactive/inverses a b) (registry/put! :interactive/inverses b a)))
 
 (defn command-inverse (sym)
   "The command registered as `sym`'s inverse (its negative-argument direction), or nil."
-  (get *command-inverse* sym))
+  (registry/lookup :interactive/inverses sym))
 
 (defn run-command (m nm fallback)
   "Run the interactive command named `nm` on model `m` (key = nil), or call
@@ -128,11 +142,11 @@ prefix argument flips to. Bidirectional."
 A name that is only DECLARED ([[register-deferred]]) loads its module first and then runs
 the registration that appears — so a deferred feature is reachable by name on the first
 call, without every such module being loaded at startup to make `M-x` honest."
-  (let (f (get *commands* nm))
+  (let (f (registry/lookup :interactive/commands nm))
     (cond
       f (f m nil)
       else
-        (let (sym (get *deferred* nm)
+        (let (sym (registry/lookup :interactive/deferred nm)
               mod (when sym (command-module sym)))
           (if (nil? mod)
             (fallback m nm)
@@ -140,7 +154,7 @@ call, without every such module being loaded at startup to make `M-x` honest."
                       (require-one (symbol mod))
                       (catch e
                         (log/warn (str "could not load " mod " for " nm ": " (error-message e)))))
-                  loaded (get *commands* nm))
+                  loaded (registry/lookup :interactive/commands nm))
               (if loaded (loaded m nil) (fallback m nm))))))))
 
 (defmacro defcommand (cmd params & body)

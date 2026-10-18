@@ -1,0 +1,790 @@
+(defmodule gitcore
+  "The ground every part of the git porcelain stands on: running git (`git-git`, never
+prompting), finding the repo a buffer is about (`git-resolve-root`), reading `git status
+--porcelain -z`, the upstream and how far ahead or behind it HEAD is, the refs, remotes and
+stashes, and which operation (rebase, merge, cherry-pick, revert, bisect) is part-way through.
+
+Every command that changes the repo goes through one seam here: `git-run` journals it (the
+`*git-process*` buffer, Magit's `$`), `git-do` runs it and refreshes, `git-launch-op` runs a
+network one OFF the loop, and `git-confirm` asks before one that cannot be undone. The
+faces the git buffers share and the plain-text git buffer type live here too.
+
+Nothing here knows about the status buffer: refreshing it is `git-refresh-status`, which
+reaches `gitstatus` by name, because `gitstatus` stands on this module."
+  (:use editor/keymap :only [keymap-bind]) ; the *git-process* / plain-text keymaps below
+  (:use editor/layers :only [register-type-layers]) ; their buffer types
+  (:use model) ; message / ed-read-char / ed-apply / ed-buffer-index-by-name
+  (:use pool) ; ed-default-dir / ed-display-buffer / ed-upsert-named
+  (:use commands) ; cmd-kill-buffer — q in a git buffer
+  (:use interactive) ; defcommand
+  (:use sectionbuf) ; sb-ctx — the repo and `:reload` a git section buffer carries
+  (:use task)) ; task — a network git command, off the loop
+;; `theme` (a project source module, loaded with the image) provides the *green* / *red* /
+;; *blue* / *yellow* / *subtext* dynamic-var colour globals this file reads bare.
+;; ---- syntax highlighting for the diff / log / status buffers ----------------
+;; A `:fontify` service like every mode's: a pure `slice -> [start end face]`, line-
+;; structural (no lexer state) so the windowed slice the view passes colours correctly
+;; wherever it starts. The classifier trims leading whitespace first, so it works for the
+;; raw *git-diff* output AND the indented inline diff under a file in *git-status*.
+
+(theme/defchrome git-face-add {:fg *green*}) ; an added (+) line
+(theme/defchrome git-face-del {:fg *red*}) ; a removed (-) line
+(theme/defchrome git-face-hunk {:fg *blue* :bold true}) ; a @@ hunk header
+(theme/defchrome git-face-file {:fg *subtext* :bold true}) ; diff --git / +++ / --- file headers
+(theme/defchrome git-face-meta {:fg *subtext*}) ; index / mode / rename metadata
+(theme/defchrome git-face-section {:fg *blue* :bold true}) ; a *git-status* section header
+(theme/defchrome git-face-note {:fg *subtext* :italic true})
+(def git-face-summary {:bold true}) ; a commit's summary line, heading its message
+(theme/defchrome git-face-hash {:fg *yellow*}) ; a commit hash in the log
+;; the status-bar segment faces (branch + colour-coded working-tree indicator): staged reads
+;; green, unstaged yellow, untracked dim; a clean/staged tree dot is green. Built from the
+;; theme colour tokens (via `require`), like the diff faces above — kept here, not in theme,
+;; because git reaches the palette through `require` (dynamic-var colours only).
+(theme/defchrome git-face-branch {:fg *subtext*}) ; the ⎇ branch label (quiet, secondary)
+(theme/defchrome git-face-clean {:fg *green*}) ; the state dot when the tree is clean / staged
+(theme/defchrome git-face-staged {:fg *green*}) ; the +N staged-change count (ready to commit)
+(theme/defchrome git-face-unstaged {:fg *yellow*}) ; the ~N unstaged-change count (modified, dirty)
+(theme/defchrome git-face-untracked {:fg *overlay0*}) ; the ?N untracked-file count (dim)
+;; the *git-status* header block: a local branch (the `Head:` line) reads blue, a remote /
+;; upstream branch (the `Merge:` line) green — Magit's magit-branch-local / -remote.
+(theme/defchrome git-face-branch-local {:fg *blue* :bold true}) ; the `Head:` line's branch
+(theme/defchrome git-face-branch-remote {:fg *green* :bold true}) ; the `Merge:` line's upstream
+
+(defn- git-diff-text-face (line)
+  "The face for a line of raw unified-diff TEXT: headers, hunk headers, `+` and `-` lines;
+nil for a context line. For the plain-text git buffers (`!`'s output); the section buffers
+colour by what a line IS instead (`git-section-faces`)."
+  (cond
+    (string/starts-with? line "@@") git-face-hunk
+    (or (string/starts-with? line "+++") (string/starts-with? line "---")) git-face-file
+    (string/starts-with? line "diff ") git-face-file
+    (or (string/starts-with? line "index ")
+      (string/starts-with? line "new ")
+      (string/starts-with? line "deleted ")
+      (string/starts-with? line "rename ")
+      (string/starts-with? line "similarity ")
+      (string/starts-with? line "old mode")
+      (string/starts-with? line "new mode"))
+      git-face-meta
+    (string/starts-with? line "+") git-face-add
+    (string/starts-with? line "-") git-face-del
+    :else nil))
+
+(defn git-whole-line (off line face)
+  "A whole-line span `[off end face]`, or `()` when `face` is nil."
+  (if (nil? face) '() (list [off (+ off (string/length line)) face])))
+
+(defn git-diff-fontify (src)
+  "The `:fontify` of a plain-text git buffer — colour each unified-diff line."
+  (modes/fontify-lines src
+    (fn (l off) (git-whole-line off l (git-diff-text-face l)))))
+
+;; ---- running git ------------------------------------------------------------
+
+(def *git-env*
+  ;; Every git the editor runs: there is no terminal for git to prompt on — bedit started
+  ;; from a shell would hand git THAT terminal, and a password prompt would appear in a
+  ;; window nobody is looking at while the command hangs. A credential git cannot find is a
+  ;; failed command, reported like any other.
+  {"GIT_TERMINAL_PROMPT" "0"})
+
+(def *git-background-env*
+  ;; A git nobody asked for (the background fetch) must not ask anything at all: no askpass
+  ;; dialog popping up every three minutes, no ssh passphrase prompt. `true` as the askpass
+  ;; program answers every question with nothing, so the fetch fails quietly instead.
+  (merge *git-env*
+    {"GIT_ASKPASS" "true" "SSH_ASKPASS" "true" "GIT_SSH_COMMAND" "ssh -o BatchMode=yes"}))
+
+(defn git-git (root args &optional (opts {}))
+  "Run git in `root` with `args` (a vector); `{:exit :stdout :stderr}`. `core.quotePath=false`
+keeps non-ASCII paths literal (no octal escapes) in status / diff output; `*git-env*` keeps
+git from prompting. `opts` go to `os/cmd` (`:stdin`, `:timeout-ms`, `:env` over `*git-env*`)."
+  (os/cmd "git"
+    (into ["-C" root "-c" "core.quotePath=false"] args)
+    (assoc opts :env (merge *git-env* (get opts :env {})))))
+
+(defn git-output (root args)
+  "What `git args` printed on stdout in `root`, trimmed — \"\" when it printed nothing. For
+a question with a one-line answer (`rev-parse`, `config`, a commit message); a caller that
+must tell failure from an empty answer reads `git-git`'s `:exit`."
+  (string/trim (:stdout (git-git root args) "")))
+
+(defn git-lines (root args)
+  "The non-empty lines `git args` printed on stdout in `root` — `()` when it printed none.
+For a list, one name or hash a line (`git remote`, `git log --format=%h`)."
+  (seq/reject (string/split (git-output root args) "\n") empty?))
+
+(defn git-toplevel (dir)
+  "The git work-tree root containing `dir`, or nil when `dir` isn't in a repo."
+  (let (r (os/cmd "git" ["-C" dir "rev-parse" "--show-toplevel"]))
+    (if (= (:exit r) 0) (string/trim (:stdout r)) nil)))
+
+(defn git-branch (root)
+  "The current branch name (or a short hash when detached), `?` on error — `projects`'
+`git-branch`, the one implementation."
+  (or (projects/git-branch root) "?"))
+
+(defn- git-born? (root)
+  "Whether the repo at `root` has a first commit. Before one, HEAD names a branch with
+nothing on it, and everything that resolves `HEAD` fails."
+  (= 0 (:exit (git-git root ["rev-parse" "-q" "--verify" "HEAD"]))))
+
+(defn git-unstage-args (root paths)
+  "The git arguments that take `paths` out of the index, back to HEAD. `reset HEAD` is the
+usual way, and it fails in a repo with no commits yet (there is no HEAD to reset to) — so
+after `git init`, nothing could be unstaged. There, the index entry is simply removed."
+  (if (or (nil? root) (git-born? root))
+    (into ["reset" "-q" "HEAD" "--"] paths)
+    (into ["rm" "--cached" "-q" "-r" "--"] paths)))
+
+(defn git-resolve-root (m)
+  "The repo the current buffer is about: a git section buffer's own root (a status, a log, a
+commit — each knows which repo it shows), else the repo containing the buffer's directory,
+else the root the last git command ran in. Nil when there is none.
+
+The buffer comes first. `:git-root` is one slot on the MODEL, so reading it first meant a
+file in repo B, visited after a status of repo A, ran its git in A."
+  (or (get (sectionbuf/sb-ctx m) :root) (git-toplevel (pool/ed-default-dir m)) (:git-root m)))
+
+;; ---- applying a patch (hunk- and line-level staging) --------------------------
+;; A hunk, or a run of its lines, is turned back into a patch by `std/diff`
+;; (`diff/hunk-patch`, `diff/hunk-select` — brood ADR-388) and piped to `git apply` over
+;; stdin: `--cached` stages it, `--reverse` with it unstages, `--reverse` alone discards,
+;; and `--index --reverse` discards a staged change from the index and the work tree at once.
+
+(defn- git-apply-hunk (root patch-text cached? reverse?)
+  "Pipe `patch-text` to `git apply -` (stdin). `cached?` adds `--cached` (the index alone),
+or `:index` for `--index` (index and work tree together — discarding a staged hunk);
+`reverse?` adds `--reverse` (for unstage/discard). Returns `{:exit :stdout :stderr}`."
+  (git-git root
+    (append ["apply" "--ignore-space-change"]
+      (cond (= cached? :index) ["--index"] cached? ["--cached"] :else [])
+      (if reverse? ["--reverse"] [])
+      ["-"])
+    {:stdin patch-text}))
+
+;; ---- pure: parse `git status --porcelain -z` --------------------------------
+;; The NUL-separated form is robust to paths with spaces / quotes / newlines (no quoting, no
+;; octal escapes) — git never mangles a filename in `-z`. A rename or copy emits its NEW path
+;; in the status token and the OLD source as a separate trailing token, which we consume.
+
+(defn- git-parse-z (tokens acc)
+  "Walk NUL-split `git status --porcelain -z` tokens into `{:x :y :path}` entries; a rename or
+copy (`R`/`C` in the status code) consumes the following token as its source path, keeping the
+new path under point."
+  (if (empty? tokens)
+    (reverse acc)
+    (let (t (first tokens))
+      (if (< (string/length t) 4)
+        (git-parse-z (rest tokens) acc)
+        (let (x (string/substring t 0 1)
+              y (string/substring t 1 2)
+              path (string/substring t 3 (string/length t))
+              rename? (or (= x "R") (= x "C")))
+          ;; keep a rename's source: unstaging `new` alone left the deletion of `old` staged
+          (git-parse-z (if rename? (rest (rest tokens)) (rest tokens))
+            (cons (if rename?
+                    {:x x :y y :path path :orig-path (second tokens)}
+                    {:x x :y y :path path})
+              acc)))))))
+
+(defn git-entries (porcelain)
+  "Parse `git status --porcelain -z` output (NUL-separated; a rename/copy carries its source as
+a trailing field) into a list of `{:x :y :path}`."
+  (git-parse-z (seq/reject (string/split porcelain "\u{0}") empty?) '()))
+
+(defn git-conflicted? (e)
+  "Whether `e` is an unmerged path — a conflict waiting to be resolved.
+
+Porcelain v1 spells these `UU` `AA` `DD` `AU` `UA` `DU` `UD`: either side `U`, or both
+sides the same `A`/`D`. They are NOT staged-and-unstaged, which is how the plain
+`git-staged?` / `git-unstaged?` tests read them — so before this, a conflicted file
+appeared in both sections at once, and `s` on it staged a file with `<<<<<<<` markers in
+it. Its own section is the fix, and the reason Magit has one."
+  (let (x (:x e) y (:y e))
+    (or (= x "U") (= y "U") (and (= x "A") (= y "A")) (and (= x "D") (= y "D")))))
+
+(defn git-untracked? (e)
+  "Whether porcelain entry `e` is an untracked file (`??`)."
+  (and (= (:x e) "?") (= (:y e) "?")))
+
+(defn git-staged? (e)
+  "Whether porcelain entry `e` has a change in the index."
+  (and (not (= (:x e) " ")) (not (= (:x e) "?"))))
+
+(defn git-unstaged? (e)
+  "Whether porcelain entry `e` has a change in the work tree that is not staged."
+  (and (not (= (:y e) " ")) (not (git-untracked? e))))
+(defn git-upstream (root)
+  "The upstream ref (e.g. `origin/main`) of the current branch, or nil when it has none."
+  (let (r (git-git root ["rev-parse" "--abbrev-ref" "--symbolic-full-name" "@{u}"]))
+    (if (= (:exit r) 0) (string/trim (:stdout r)) nil)))
+
+(defn git-ahead-behind (root)
+  "`{:ahead :behind}` commit counts (as strings — tooltip-only) vs the upstream, or nil when
+there is no upstream. `--left-right` counts the upstream side (behind) and the HEAD side (ahead)."
+  (let (r (git-git root ["rev-list" "--left-right" "--count" "@{u}...HEAD"]))
+    (if (not (= (:exit r) 0))
+      nil
+      (let (parts (seq/reject (string/split (string/trim (:stdout r)) "\t") empty?))
+        (if (= (count parts) 2) {:behind (first parts) :ahead (second parts)} nil)))))
+
+(defn git-basename (path)
+  "The last path component of `path` (the repo directory name), tolerating a trailing slash."
+  (let (parts (seq/reject (string/split path "/") empty?))
+    (if (empty? parts) path (last parts))))
+
+(defn git-push-target (root)
+  "Where a plain `git push` of this branch goes (`@{push}`), or nil."
+  (let (r (git-git root ["rev-parse" "--abbrev-ref" "@{push}"]))
+    (if (= (:exit r) 0) (string/trim (:stdout r "")) nil)))
+
+;; ---- git off the loop: no git command ever blocks a keystroke -----------------
+;; Every `git-git` here is a SUBPROCESS, and three of them talk to a network: `pull`,
+;; `push`, `fetch`. Run on the loop, a pull over a slow link freezes the whole editor —
+;; no repaint, no C-g, nothing — for as long as the remote takes. That is not a git
+;; problem; it is the one thing a Brood editor has no excuse for, because the language's
+;; whole answer to blocking work is a process.
+;;
+;; So: a git command that can take longer than a frame goes through `git-launch-op`,
+;; which runs it in a `task` and folds the result when it lands (the same launch / fold /
+;; row shape as every other off-loop recompute — `model/register-task-reply`). The editor
+;; stays live, the mode line says what is running, and C-g cancels it.
+;;
+;; `ed-headless?` keeps the synchronous path for tests and `--headless`, where there is no
+;; loop for a reply to land in — so every existing git test still exercises real git.
+
+(def *git-op-timeout-ms* 120000)
+;; A network git operation gets two minutes before the task is killed and reported as a
+;; timeout. Unbounded is how a wedged `pull` against an unreachable host becomes a slot
+;; that never frees and a `git` that is "already running" until restart.
+
+(defn git-op-running (m)
+  "The verb of the git operation in flight (`\"pull\"`, `\"push\"`, …), or nil."
+  (get-in m [:git-op :verb]))
+
+;; check-allow: `then` is an opaque caller-supplied `(model result) -> model`, so the
+;; checker cannot see what the last branch returns. ADR-341 names `:trusted` for exactly
+;; this — the declaration is the contract, and every branch here is a `message` or a fold.
+(check-allow :trusted
+  (sig git-launch-op (model string seqable &optional any -> model))
+  (defn git-launch-op (m verb args &optional (then git-refresh-if-open))
+    "Run `git args` in the repo root OFF the loop and report when it lands. `then` is a
+`(model result) -> model` run after the report — by default refreshing *git-status* when it
+is open, which is what nearly every network command wants.
+
+Refuses to start a second operation while one is in flight: two pulls at once is not a
+thing anyone means, and the in-flight slot holds exactly one handle. Headless runs it
+synchronously, because there is no loop to hand the reply to."
+    (let (root (git-resolve-root m))
+      (cond
+        (nil? root) (message m "not in a git repository")
+        (git-op-running m) (message m (str "git " (git-op-running m) " is already running"))
+        (model/ed-headless?)
+          (let ([m0 r] (git-run (assoc m :git-root root) args)
+                m1 (git-report-cmd m0 verb r))
+            (if (nil? then) m1 (then m1 r)))
+        :else
+        ;; the entry is journalled when the command STARTS, so an in-flight pull reads as
+        ;; `run git pull` while it is still out there — which is the question you have
+        ;; when one is slow. `git-apply-op` completes it; the entry times itself.
+          (let (job (task (fn () (git-git root args)) {:timeout *git-op-timeout-ms*})
+                [logged id] (git-journal-add m (git-entry args)))
+            (assoc (message logged (str verb "…"))
+              :git-op-proc job
+              :git-op {:verb verb :root root :then then :entry id}))))))
+
+(check-allow :trusted
+  ;; a git command that can outlast a frame (pull / push / fetch) — network, so a task
+  (register-task-reply :git-op-proc 'gitcore/git-apply-op nil "git")
+  (sig git-apply-op (model any -> model))
+  (defn git-apply-op (m r)
+    "Fold a finished `git-launch-op`: report the outcome and run its `then`. A nil `r` is the
+task having errored or timed out — said plainly, rather than reported as a success with an
+empty output, which is what a bare exit-code check would do with it."
+    (let (op (:git-op m)
+          verb (or (:verb op) "git")
+          m1 (git-journal-finish (dissoc m :git-op :git-op-proc) (:entry op) r))
+      (if (nil? r)
+        (message m1
+          (str verb
+            " failed: no result (timed out after "
+            *git-op-timeout-ms*
+            "ms)"
+            (git-journal-note)))
+        (let (m2 (git-report-cmd m1 verb r))
+          (if (nil? (:then op)) m2 ((:then op) m2 r)))))))
+
+(defn git-status-root (m)
+  "The repo *git-status* shows, or nil when it is not open."
+  (let (i (ed-buffer-index-by-name m "*git-status*"))
+    (if (nil? i) nil (get-in (ed-buf-at m i) [:section-ctx :root]))))
+
+;; check-allow: the function is fetched by name, so the checker cannot see its result; it is
+;; `git-refresh`'s own `model -> model` contract.
+(check-allow :trusted
+  (sig git-refresh-status (model -> model))
+  (defn git-refresh-status (m)
+    "Refresh *git-status* — `git-refresh`, reached LATE, by name. The status buffer shows
+commits and diffs (`gitview`), and `gitview` stands on this module, so this module cannot
+`:use` the status back; every command that changes the working tree still has to refresh
+it. A qualified reference alone does not load a module in the released editor (the
+`unbound symbol: term/…` bug), which is why this asks for it first."
+    (do (require-one 'gitstatus) ((reflect/eval 'gitstatus/git-refresh) m))))
+
+(defn git-refresh-if-open (m _r)
+  "Refresh `*git-status*` when it is open — the usual `then` for a `git-launch-op`."
+  (if (nil? (git-status-root m)) m (git-refresh-status m)))
+
+(defcommand cmd-git-quit
+  (m key)
+  "Bury the git buffer (q)."
+  (cmd-kill-buffer m key))
+
+;; ---- the journal: what git actually ran (`$`) ---------------------------------
+;; Magit's `$` (`magit-process-buffer`): every git invocation, its exit code and its
+;; output, newest last — the answer to "what did it actually run" and to "it failed and
+;; the echo area only gave me one line of it".
+;;
+;; Called the JOURNAL and not the process log because the porcelain already has three `proc`s
+;; that are handles to running things (`:git-proc`, `:git-op-proc`, `:git-fetch-proc`),
+;; and a `:git-process` four characters away from `:git-proc` meaning a list of past
+;; commands is a misreading waiting to happen. The BUFFER is still `*git-process*`: that
+;; is the name a Magit user is looking for.
+;;
+;; It lives on the MODEL rather than in a shared table because every command worth
+;; recording already threads the model — the synchronous ones through `git-run`, the
+;; network ones through `git-launch-op` (recorded when they START, so an in-flight pull
+;; reads `run`) and `git-apply-op` (completed when they land). A read-only command a
+;; renderer runs to draw a diff is not in here; Magit logs those too and they are mostly
+;; noise.
+;;
+;; Four things this does that Magit does not:
+;;   - a DURATION per entry (Magit has an optional timestamp, off by default), which is
+;;     what you actually want to know when a push feels slow;
+;;   - `\r` progress applied properly — `git push`'s "Writing objects: 47%" rewrites its
+;;     line, so the entry holds the line it ended on rather than forty of them. Magit
+;;     does this by hand in its process filter (find the last ^M, delete the line); bedit
+;;     has `ansi/render`, a real terminal, from the terminal buffer (brood ADR-384);
+;;   - credentials in a remote URL are REDACTED, because a journal gets pasted into bug
+;;     reports;
+;;   - the NUL a `-z` command separates its paths with is shown as `^@` rather than
+;;     written into the rope. Emacs shows those raw.
+
+(def *git-journal-max* 64) ; entries kept; the oldest go first, never one still running
+;; ---- an entry ----------------------------------------------------------------
+;; `{:id :verb :args :exit :ms :output :running? :at}` — one map, built in ONE place, so
+;; the three producers (a synchronous run, a hunk apply, a launched network op) cannot
+;; drift into three shapes.
+
+(defn- git-redact (s)
+  "`s` with the credentials in its URLs replaced by `***`: the password of a
+`user:secret@`, and the whole user part of an `http(s)://token@` — a personal access
+token is sent as the USERNAME (`https://ghp_…@github.com`), so hiding only what follows a
+colon left the token itself in the log. An ssh `git@host` names an account, not a
+secret, and stays."
+  (regex/replace "(https?://)[^/@:\\s]+@"
+    (regex/replace "://([^/@:\\s]+):[^/@\\s]+@" s "://$1:***@")
+    "$1***@"))
+
+(defn- git-printable (s)
+  "`s` made fit to put in a rope: `\\r` progress and escape sequences APPLIED (so
+\"Writing objects: 47%\" is the line it ended on, not forty lines), the NUL a `-z`
+command separates paths with shown as `^@`, and credentials redacted."
+  (let (rendered (if (or (includes? s "\r") (includes? s "\e")) (ansi/render "" s) s))
+    (git-redact (string/trimr (string/replace rendered (string/int->char 0) "^@")))))
+
+(defn- git-entry-output (r)
+  "The output an entry shows: stderr then stdout — git says the interesting thing on
+stderr — or what a task that never answered leaves behind."
+  (if (nil? r)
+    "no result (timed out)"
+    (git-printable (str (:stderr r "") (:stdout r "")))))
+
+(defn- git-entry (args)
+  "A journal entry for `git args`, as it reads while it is still running. No `verb`: the
+label a command puts in the echo area (`stage hunk`) is the echo's business, and an entry
+that carried both could disagree with the command line — which is the one thing this
+buffer exists to be right about."
+  {:args (into [] args) :running? true :at (os/now)})
+
+(defn- git-entry-done (e r)
+  "Entry `e` completed by result `r` (nil = the task never answered), timed from its
+own `:at` — the entry knows when it started, so nothing else has to carry that."
+  (assoc e
+    :running? false
+    :ms (- (os/now) (or (:at e) (os/now)))
+    :exit (if (nil? r) nil (:exit r))
+    :output (git-entry-output r)))
+
+;; ---- the log ------------------------------------------------------------------
+;; The buffer is a VIEW of the log, not a copy of it: every write re-renders it in place
+;; (`ed-upsert-named` — no pane, no selection touched) when it happens to be open, so a
+;; `pull` you are watching completes in front of you rather than when you next press `g`.
+;; Nothing happens at all when it is closed, which is the usual case.
+
+;; check-allow: `:git-journal` is the log this file owns and only ever writes as a
+;; vector; the model record does not declare it, so `or` reads as every value a map
+;; key could hold.
+(check-allow :trusted
+  (sig git-journal (model -> vector))
+  (defn git-journal (m)
+    "The git journal, oldest first."
+    (or (:git-journal m) [])))
+
+(defn- git-journal-sync (m)
+  "Re-render *git-process* in place when it is open; the model unchanged when it is not."
+  (if (nil? (ed-buffer-index-by-name m "*git-process*"))
+    m
+    (pool/ed-upsert-named m "*git-process*" (git-journal-text m) :git-process)))
+
+(defn- git-journal-trim (entries)
+  "`entries` cut to `*git-journal-max*`, dropping the oldest — but never one still
+running, whose output has not arrived yet."
+  (let (n (count entries))
+    (if (<= n *git-journal-max*)
+      entries
+      (into []
+        (append (seq/filter (seq/subvec entries 0 (- n *git-journal-max*)) :running?)
+          (seq/subvec entries (- n *git-journal-max*)))))))
+
+(defn- git-journal-add (m entry)
+  "`[model' id]`: the model with `entry` appended under a fresh id, the log trimmed and
+the buffer re-rendered if it is open."
+  (let (id (or (:git-journal-seq m) 1))
+    [(git-journal-sync (assoc m
+                         :git-journal
+                           (git-journal-trim (into (git-journal m) [(assoc entry :id id)]))
+                         :git-journal-seq (inc id)))
+      id]))
+
+(defn- git-journal-finish (m id r)
+  "The model with running entry `id` completed by result `r` — unchanged when that entry
+has already been trimmed away. Re-renders the buffer if it is open, so a `pull` you are
+watching stops reading `run` the moment it lands."
+  (git-journal-sync (assoc m
+                      :git-journal
+                        (into []
+                          (map (git-journal m) (fn (e) (if (= (:id e) id) (git-entry-done e r) e)))))))
+
+(defn git-journal-note ()
+  "The hint appended to a failed command's message: how to see the whole output. Magit
+appends the same thing, for the same reason — the echo area shows one line, and nobody
+guesses that a key exists to show the rest. Nothing to point at when there is no UI."
+  (if (ed-headless?) "" " ($ for the full output)"))
+
+;; ---- running a git command, journalled -----------------------------------------
+;; One seam: `git-journal-run` takes what to RECORD and a thunk that runs it, so a
+;; command cannot be run without being recorded, and the two runners below differ only
+;; in how they invoke git.
+
+(check-allow :trusted
+  (sig git-journal-run (model seqable fn -> vector))
+  (defn- git-journal-run (m args run)
+    "`[model' result]`: record `git args` as started, call `run`, complete the entry."
+    (let ([m1 id] (git-journal-add m (git-entry args))
+          r (run))
+      [(git-journal-finish m1 id r) r])))
+
+(sig git-run (model seqable -> vector))
+(defn git-run (m args)
+  "Run `git args` in the repo root, journalled: `[model' result]`. The seam every
+model-threaded git command goes through, so the journal cannot disagree with what ran."
+  (git-journal-run m args (fn () (git-git (:git-root m) args))))
+
+(sig git-run-hunk (model string (or bool keyword) bool -> vector))
+(defn git-run-hunk (m patch cached? reverse?)
+  "[[git-run]] for the hunk path: the patch goes to `git apply` over stdin, so the entry
+names the arguments rather than the patch — which is in the diff above it anyway."
+  (git-journal-run m
+    (append ["apply"]
+      (cond (= cached? :index) ["--index"] cached? ["--cached"] :else [])
+      (if reverse? ["--reverse"] [])
+      ["-"])
+    (fn () (git-apply-hunk (:git-root m) patch cached? reverse?))))
+
+;; ---- rendering the buffer ------------------------------------------------------
+;; A heading starts at column 0 and its exit code is right-aligned in three columns; every
+;; line of output is indented FOUR, which is one more than the widest heading prefix can
+;; be. That is what lets the `:fontify` — which sees text and nothing else — tell the two
+;; apart by looking at the line alone: an output line that happens to read `0 …` cannot be
+;; mistaken for a command that exited 0. It also lines the output up under the command.
+
+(def- git-output-indent "    ")
+
+(def- git-global-flags
+  ;; bedit's own arguments, before the subcommand, on every call and typed by nobody:
+  ;; elided. Magit collapses the same thing to `…` with the full text in a tooltip.
+  #{"-C" "-c"})
+
+(defn- git-command-text (args)
+  "The command line as the user means it: `git` plus `args`, less bedit's own flags."
+  (letrec (strip (fn (a)
+                   (if (and (> (count a) 1) (contains? git-global-flags (first a)))
+                     (strip (drop a 2))
+                     a)))
+    (git-redact (string/join (into ["git"] (strip (into [] args))) " "))))
+
+(defn git-journal-heading (e)
+  "One entry's heading: the exit code (Magit's right-aligned three columns, `run` while
+in flight), the command, and how long it took."
+  ;; `(or …)` and not a `get` default: a timed-out entry HAS an `:exit`, whose value is
+  ;; nil, so a default would never be reached — and 0 is truthy in Brood, so an exit of 0
+  ;; still reads as itself
+  (str (if (:running? e) "run " (str (string/pad-left (str (or (:exit e) "?")) 3) " "))
+    (git-command-text (:args e))
+    (if (:running? e) "" (str "  (" (humanize/duration (:ms e 0)) ")"))))
+
+(defn- git-journal-block (e)
+  "An entry as text: its heading, then its output indented under it."
+  (let (out (:output e ""))
+    (if (= out "")
+      (git-journal-heading e)
+      (str (git-journal-heading e)
+        "\n"
+        (string/join (map (string/split out "\n") (fn (l) (str git-output-indent l))) "\n")))))
+
+(defn git-journal-text (m)
+  "The whole journal as the buffer shows it: one block per entry, oldest first."
+  (let (entries (git-journal m))
+    (if (empty? entries)
+      "(no git commands yet)"
+      (string/join (map entries git-journal-block) "\n"))))
+
+(defn git-process-fontify (src)
+  "The *git-process* `:fontify`: a heading reads by its exit code — green for 0, red for
+anything else, blue while it runs — and the output indented under it is plain."
+  (modes/fontify-lines src
+    (fn (line off)
+      (cond
+        (string/starts-with? line "run ") (git-whole-line off line git-face-hunk)
+        (string/starts-with? line git-output-indent) '()
+        (string/starts-with? line "  0 ") (git-whole-line off line git-face-add)
+        :else (git-whole-line off line git-face-del)))))
+
+(defcommand cmd-git-process
+  (m key)
+  "Show what git actually ran (`$`, Magit's `magit-process-buffer`): every command this
+editor issued, with its exit code, how long it took and its output — the whole of it,
+where the echo area could only show the first line. `g` refreshes, `k` clears, `q` quits."
+  (git-show-report m "*git-process*" (git-journal-text m) :git-process {:action :pop}))
+
+(defcommand cmd-git-process-clear
+  (m key)
+  "Clear the process log (k in *git-process*)."
+  (let (m1 (dissoc m :git-journal))
+    (git-show-report m1 "*git-process*" (git-journal-text m1) :git-process {:action :here})))
+
+;; ---- a read-only report buffer (diff / log) ---------------------------------
+
+(defn git-show-report (m name text type &optional (opts {:action :here}))
+  "Show `text` in a read-only report buffer `name` of `type` (e.g. *git-diff*, *git-log*),
+point at the top. `opts` routes through `ed-display-buffer` (default `{:action :here}` — replace
+the current pane); pass `{:action :pop}` to open it in another pane and jump there. Keeps
+`:git-root` for follow-up commands."
+  (ed-apply (pool/ed-display-buffer m name (if (= text "") "(empty)" text) type opts)
+    (fn (b) (pool/ed-goto-line b 1))))
+
+(defn git-report-cmd (m verb r)
+  "Echo the result of a git command `r` (`verb` names it), preferring stderr then stdout;
+falls back to the exit code when both streams are empty. A FAILURE says where the rest of
+the output is: the echo area holds one line, and nobody guesses that a key shows the whole
+of it (Magit appends the same hint, for the same reason)."
+  (let (e (string/trim (:stderr r ""))
+        raw (if (= e "") (string/trim (:stdout r "")) e)
+        failed? (not (= (:exit r) 0))
+        out (one-line (if (= raw "") (str "exit " (:exit r)) raw)))
+    (message m
+      (str verb (if failed? " failed: " ": ") out (if failed? (git-journal-note) "")))))
+
+(defn git-do (m verb args)
+  "Run `git args` (logged) in the repo the buffer is about, then refresh the status buffer
+on success -- else report what went wrong. The shape every working-tree action has: eight
+sites spelled the run, the log and the refresh separately, and the one that must not be got
+wrong is refreshing after a command that FAILED.
+
+The root is RESOLVED, not read from `(:git-root m)`: that is set while *git-status* is open
+and nil everywhere else, and every command is also reachable by `M-x` from a buffer that
+has never opened a status. Outside a repo it says so rather than running git in nil."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run (assoc m :git-root root) args)) (git-refreshed m1 verb r)))))
+
+(defn git-do-hunk (m verb patch cached? reverse?)
+  "[[git-do]] for a hunk: `git apply` over stdin, logged, then the same refresh."
+  (let ([m1 r] (git-run-hunk (assoc m :git-root (git-resolve-root m)) patch cached? reverse?))
+    (git-refreshed m1 verb r)))
+
+(defn- git-refreshed (m verb r)
+  "The outcome of a working-tree-changing git command `r`: re-read the status buffer when it
+succeeded, else say what went wrong (`git-report-cmd`, `verb` naming it). Every stage /
+unstage / discard action ends this way — eight sites spelled the same three lines, and the
+one thing they must not get wrong is refreshing after a command that FAILED, which is what
+having it in one place makes impossible."
+  (if (= (:exit r) 0) (git-refresh-status (git-reload-view m)) (git-report-cmd m verb r)))
+
+(defn git-reload-view (m)
+  "Re-run the git view the reader is in (a diff, a commit) when it has a `:reload` — so
+staging a hunk from *git-diff* takes it out of *git-diff*, not only out of the status."
+  (let (reload (get (sectionbuf/sb-ctx m) :reload))
+    (if (nil? reload) m ((reflect/eval reload) m))))
+
+(defn git-remotes (root)
+  "The repo's remote names, `origin` first when there is one."
+  (let (names (git-lines root ["remote"]))
+    (git-first (if (includes? names "origin") "origin" nil) names)))
+
+(defn git-current-branch (root)
+  "The checked-out branch's name, or nil when HEAD is detached."
+  (let (r (git-git root ["symbolic-ref" "--short" "-q" "HEAD"]))
+    (if (= (:exit r) 0) (string/trim (:stdout r "")) nil)))
+
+(defn git-first (here names)
+  "`names` with `here` moved to the front — the candidate RET takes in a completing prompt."
+  (if (nil? here) names (cons here (seq/reject names (fn (n) (= n here))))))
+
+(defn git-split-remote-branch (root ref)
+  "`[remote branch]` for a remote-tracking ref like `origin/feature/x`, when it names one
+of the repo's remotes; else nil."
+  (let (remote (seq/find (git-remotes root) (fn (r) (string/starts-with? ref (str r "/")))))
+    (if (nil? remote)
+      nil
+      [remote (string/substring ref (inc (string/length remote)) (string/length ref))])))
+
+(def git-no-editor
+  ;; `git rebase --continue`, `merge`, `commit --amend` and friends all open an EDITOR for
+  ;; the message unless told otherwise. There is no terminal on this side of the pipe, so
+  ;; git would launch a `vi` nobody can see and the command would hang until the 120 s
+  ;; timeout — the editor frozen, waiting on an editor.
+  ;;
+  ;; `core.editor=true` points git at `true(1)`, which exits 0 having changed nothing: the
+  ;; message git prepared is accepted as it stands, exactly what `--no-edit` means for the
+  ;; verbs that have such a flag. `sequence.editor` is the same thing for the interactive
+  ;; rebase todo list.
+  ;;
+  ;; Prepended to the ARGS rather than passed as config, because `git-git` puts our args
+  ;; immediately after its own `-c core.quotePath=false` and `-c` may repeat. The journal's
+  ;; `git-command-text` strips leading `-c` pairs, so `$` still shows `git rebase
+  ;; --continue` rather than the plumbing.
+  ["-c" "core.editor=true" "-c" "sequence.editor=true"])
+
+(def- git-sequencer-markers
+  ;; The file git leaves in `.git` while an operation is part-way through, and what to
+  ;; call it. Order matters: `rebase-merge` and `rebase-apply` are two implementations of
+  ;; the same verb, and a cherry-pick in the middle of a rebase is still a rebase.
+  [["rebase-merge" :rebase "rebase"]
+    ["rebase-apply" :rebase "rebase"]
+    ["CHERRY_PICK_HEAD" :cherry-pick "cherry-pick"]
+    ["REVERT_HEAD" :revert "revert"]
+    ["MERGE_HEAD" :merge "merge"]
+    ["BISECT_LOG" :bisect "bisect"]])
+
+(defn git-sequencer (root)
+  "The git operation this repo is part-way through — `{:kind :rebase :verb \"rebase\"}` —
+or **nil** when none is. Read from the marker `.git` leaves behind, which is how git
+itself knows, so this cannot disagree with what `--continue` would resume.
+
+`.git` is a FILE, not a directory, in a worktree or a submodule (it holds a `gitdir:`
+pointer), so the markers are looked for through `git rev-parse --git-dir` rather than at
+`<root>/.git` — otherwise every one of these features would be silently dead in a
+worktree, which is where a rebase is most likely to be happening."
+  (let (dir (git-output root ["rev-parse" "--absolute-git-dir"])
+        hit (if (= dir "")
+              nil
+              (seq/find git-sequencer-markers
+                (fn (row) (file/exists? (path/join dir (first row)))))))
+    (if (nil? hit) nil {:kind (nth hit 1) :verb (nth hit 2)})))
+
+;; ---- the repo's refs ---------------------------------------------------------
+
+(defn git-refs (root kind)
+  "The repo's refs of `kind` — `:branches` (local and remote), `:local` or `:tags` — newest
+first where git will say, as a list of plain names."
+  (let (args (case kind
+               :local ["branch" "--format=%(refname:short)" "--sort=-committerdate"]
+               :tags ["tag" "--sort=-creatordate"]
+               :remote ["branch" "-r" "--format=%(refname:short)" "--sort=-committerdate"]
+               ["branch" "-a" "--format=%(refname:short)" "--sort=-committerdate"])
+        r (git-git root args))
+    (if (= (:exit r) 0)
+      (seq/reject (string/split (string/trim (:stdout r "")) "\n") empty?)
+      '())))
+
+;; ---- asking before something that cannot be undone ---------------------------
+
+(defn git-confirm (m prompt then)
+  "Ask `prompt` (y/n) and run `then` on yes. The same one-key reader `cmd-git-discard`
+uses, pulled out because three more commands now need it — and the prompt NAMES what is
+about to happen (`Reset --hard to abc123, losing all uncommitted changes?`) rather than
+asking whether you are sure. \"Are you sure?\" is answered yes by reflex; a sentence that
+says what will be lost is not."
+  (ed-read-char m
+    (str prompt " (y/n) ")
+    (fn (mm c) (if (ed-yes-key? c) (then mm) (message mm "cancelled")))))
+
+;; ---- the stashes, in the status buffer --------------------------------------
+;; A stash you cannot see is a stash you forget you made. Magit lists them; so does this,
+;; below the commit sections, collapsed like any other section.
+
+(defn git-stashes (root)
+  "The repo's stashes as `{:hash :subject}` rows — the same shape the commit sections use,
+so `git-commit-pairs` renders them with no new code. `()` when there are none."
+  (let (r (git-git root ["stash" "list" "--format=%gd %s"]))
+    (if (not (= (:exit r) 0))
+      '()
+      (map (seq/reject (string/split (string/trim (:stdout r "")) "\n") empty?)
+        (fn (line) (let ([hash subject] (git-split-word line)) {:hash hash :subject subject}))))))
+
+(defn git-split-word (line)
+  "`line` split at its first space into `[word rest]` — `rest` is \"\" when there is no
+space. The shape of most of what git prints one record per line: `stash@{0} subject`, a
+porcelain blame's `author Ann`.
+
+    (gitcore/git-split-word \"author Ann Lee\") → [\"author\" \"Ann Lee\"]"
+  (let (space (index-of line " "))
+    (if (< space 0)
+      [line ""]
+      [(string/substring line 0 space) (string/substring line (inc space) (string/length line))])))
+
+;; *git-process* — the process log ($): every git command this editor ran. Its own layer
+;; rather than the shared report keymap, because `k` clears the log here.
+(def git-process-keymap
+  (-> {}
+    (keymap-bind ["q"] 'gitcore/cmd-git-quit)
+    (keymap-bind ["g"] 'gitcore/cmd-git-process)
+    (keymap-bind ["k"] 'gitcore/cmd-git-process-clear)
+    (keymap-bind ["$"] 'gitcore/cmd-git-process)
+    (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
+    (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)
+    (keymap-bind [:down] 'commands/cmd-next-line)
+    (keymap-bind [:up] 'commands/cmd-previous-line)))
+
+(def git-process-mode-layer
+  {:name 'git-process
+   :doc "What git actually ran: every command, its exit code, how long it took and its output."
+   :keymap gitcore/git-process-keymap
+   ;; NOT "git-process": a layer's `:commands` are subtracted from the GLOBAL M-x set
+   ;; (`model/ed-all-layer-commands`), and `M-x git-process` has to work from anywhere —
+   ;; the buffer it opens is exactly where you are not
+   :commands '("git-process-clear" "git-quit")
+   :fontify 'gitcore/git-process-fontify})
+
+(register-type-layers :git-process
+  (list 'gitcore/git-process-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+
+;; *git-remotes* / *git-worktrees* / `!`'s output — plain text git reports: q quits, and a
+;; diff in one is coloured by its text.
+(def git-report-keymap
+  (-> {}
+    (keymap-bind ["$"] 'gitcore/cmd-git-process) ; $ reaches the process log from any git buffer
+    (keymap-bind ["q"] 'gitcore/cmd-git-quit)))
+
+(def git-text-mode-layer
+  {:name 'git-text
+   :keymap gitcore/git-report-keymap
+   :commands '("git-quit")
+   :fontify 'gitcore/git-diff-fontify})
+
+(register-type-layers :git-text
+  (list 'gitcore/git-text-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))

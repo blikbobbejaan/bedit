@@ -108,3 +108,110 @@ as you type (shares `ed-dir-matches` with `ed-complete-path`)."
   "Complete `text` against `names` (the sole match, else their common prefix) — the
 `complete-prefix` core over the `names` that start with `text`."
   (complete-prefix text (seq/filter names (fn (nm) (string/starts-with? nm text)))))
+
+;; ---- the live find-file list, without listing what is never shown -----------
+;; `ed-path-candidates` builds EVERY entry completing the typed path — a `file/dir?` stat
+;; for each — and the prompt then sorted them all to show twelve. On a directory like /tmp
+;; (10k entries) that was ~200 ms a keystroke, re-done on every character typed after the
+;; `/`, and a path typed in one burst could not keep up. So:
+;;   - a directory's listing is read and sorted ONCE per state of the directory — memoised
+;;     on its path and mtime (one `file/stat`, which an entry being added, removed or renamed
+;;     changes), so typing within it never lists it again;
+;;   - the entries matching the typed fragment are a contiguous run of that sorted listing,
+;;     found by binary search rather than by filtering every name;
+;;   - only the entries that will be SHOWN are stat'ed (`file/dir?`, for the trailing `/`).
+;; The answer is the same list `(take (ed-sort-candidates (ed-path-candidates t) recent) n)`
+;; gives: name order is the sort order with or without the `/`, and a recent file floats
+;; exactly when it is one of the candidates.
+
+(def- *dir-listings* '()) ; [[dir mtime] sorted-names] — most recent first, bounded
+
+(def- *listing-slack-ms* 1000)
+;; A listing taken within this long of the directory's mtime is not trusted on the next
+;; keystroke — the "racy" case git's index has: an entry added in the same clock tick as the
+;; listing leaves the mtime unchanged, so the cache could never notice it. Such a directory
+;; (one being written to right now) is simply listed again until it has been quiet a second.
+
+(defn- read-listing (dir frag)
+  "`dir`'s entries starting with `frag`, sorted, as a vector."
+  (let (names (sort (seq/filter (check-allow :discarded-catch (try (file/ls dir) (catch e ())))
+                      (fn (nm) (string/starts-with? nm frag)))))
+    (vec names)))
+
+(defn- current-listing (dir frag)
+  "`dir`'s listing — the cached one while the directory is unchanged since it was read
+(same mtime, read after it settled), else read now. Nil when `dir` does not exist.
+
+A directory still being written to is read afresh for just the entries starting with `frag`
+— sorting all of /tmp's 10k names on every keystroke to show twelve would cost more than
+the listing it caches. Once it has settled the whole listing is read and cached."
+  (let (st (file/stat dir))
+    (when st
+      (let (key [dir (:mtime st)]
+            hit (memo/recent-lookup *dir-listings* key))
+        ;; only a listing read after the directory settled is ever cached
+        (if hit
+          (second hit)
+          (let (settled? (> (os/now) (+ (:mtime st) *listing-slack-ms*))
+                listing (read-listing dir (if settled? "" frag)))
+            (do
+              (when settled?
+                (def *dir-listings* (memo/recent-remember *dir-listings* key listing 4)))
+              listing)))))))
+
+(sig first-at-or-after (any string int int -> int))
+(defn- first-at-or-after (names frag lo hi)
+  "The first index in sorted `names` (within [lo, hi)) whose name is not before `frag`."
+  (if (>= lo hi)
+    lo
+    (let (mid (math/quot (+ lo hi) 2))
+      (if (< (compare (nth names mid) frag) 0)
+        (first-at-or-after names frag (inc mid) hi)
+        (first-at-or-after names frag lo mid)))))
+
+(defn- sorted-member? (names nm)
+  "Is `nm` in the sorted vector `names`? A binary search — no set is kept beside the listing."
+  (let (i (first-at-or-after names nm 0 (count names)))
+    (and (< i (count names)) (= (nth names i) nm))))
+
+(defn- path-candidate (p nm)
+  "The candidate string for entry `nm` of split-path `p` — a directory marked with `/`."
+  (str (:prefix p) (if (file/dir? (ed-join (:dir p) nm)) (str nm "/") nm)))
+
+(defn- recent-candidate? (p names r)
+  "Is recent path `r` one of the candidates of split-path `p` (whose directory's entries are
+`names`, sorted)? Exactly when it is `prefix + entry` for a matching file, or `prefix + entry/`
+for a matching directory."
+  (and (string/starts-with? r (:prefix p))
+    (let (tail (string/substring r (string/length (:prefix p)) (string/length r))
+          dir? (string/ends-with? tail "/")
+          nm (if dir? (string/substring tail 0 (dec (string/length tail))) tail))
+      (and (sorted-member? names nm)
+        (string/starts-with? nm (:frag p))
+        (= dir? (file/dir? (ed-join (:dir p) nm)))))))
+
+(defn ed-path-candidates-top (text recent n)
+  "The first `n` live find-file candidates for path `text` — the same list as
+`(take (ed-sort-candidates (ed-path-candidates text) recent) n)`: the `recent` paths among
+them first (most recent first), then the rest by name. Lists the directory once per change
+to it and stats only the entries returned."
+  (let (p (ed-split-path text)
+        listing (current-listing (:dir p) (:frag p)))
+    (if (nil? listing)
+      ()
+      (let (names listing
+            frag (:frag p)
+            present (if (empty? recent)
+                      '()
+                      (seq/filter recent (fn (r) (recent-candidate? p names r))))
+            present-set (into #{} present)
+            total (count names)
+            want (math/max 0 (- n (count present))))
+        (letrec (walk (fn (i acc)
+                        (if (or (>= (count acc) want)
+                              (>= i total)
+                              (not (string/starts-with? (nth names i) frag)))
+                          (reverse acc)
+                          (let (cand (path-candidate p (nth names i)))
+                            (walk (inc i) (if (contains? present-set cand) acc (cons cand acc)))))))
+          (take (append present (walk (first-at-or-after names frag 0 total) '())) n))))))

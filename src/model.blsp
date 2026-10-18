@@ -30,7 +30,6 @@ it never hits the console.
 pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use editor/buffer) ; make-buffer / insert / end-of-buffer / buffer-name / accessors
   (:use editor/layers) ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
-  (:use editor/keymap) ; keymap-where-is — command → the key actually bound to it (help text)
   (:use editor/pane) ; the pane-tree layout: pane-single / selected payload / update / map
   (:use completion) ; completion-rank — the minibuffer's fuzzy rank, capped to what it shows
   ;; `:exclude [error]` — log's `error` would shadow the prelude's `error`.
@@ -38,11 +37,9 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   ;; `:exclude [inspect]` — `io/inspect` WRITES; the root `inspect` is the ability op
   ;; that RETURNS the string. Referring the writer bare here would shadow the op.
   (:use io :exclude [inspect]) ; fn-port — the editor-targeting log sink (buffer-log-event)
-  (:use keymaps) ; profile-layers — seed the model-scope keybinding profile (emacs default)
-  (:use task) ; task — run the advisory diagnostics check off the loop (async recheck)
-  (:use wrap)) ; line-segments / row-of / row-count — a wrapped buffer's rows, for the scroll clamp
-;; editor/lineedit (minibuffer core), gitdiff (diff-hl annotate) and json (runner event
-;; decode) are referenced qualified below — each `mod/name` auto-loads its module.
+  (:use keymaps)) ; profile-layers — seed the model-scope keybinding profile (emacs default)
+;; editor/lineedit (minibuffer core) and json (runner event decode) are referenced
+;; qualified below — each `mod/name` auto-loads its module.
 
 (defdyn *blink-ms* 530)
 (def *spinner-ms* 120) ; the activity-spinner beat — fast enough to read as motion, and
@@ -301,28 +298,51 @@ the filename, then `init-buffer-layers` re-seeds the full layer stack."
 first. Each list holds the M-x names the layer claims as mode-specific."
   (layer-collect buf :commands))
 
+;; Every M-x open asks for the layer-owned names, and walking every type's layer list
+;; resolved each reference once per TYPE that names it — 169 `reflect/eval`s for ~45
+;; distinct layers, ~1 ms. The distinct references are a function of the two registries
+;; alone, which are the very maps stored until something registers (so `defmemo`'s `=` is
+;; immediate on them); the layers themselves are still resolved per call below, so a layer
+;; redefined live is seen on the next M-x.
+(memo/defmemo ed-distinct-layer-refs
+  1
+  (type-layers system-layers)
+  "Every distinct layer reference in the `type-layers` registry and the `system-layers`
+list, each once."
+  (seq/distinct (append (apply append (vals type-layers)) system-layers)))
+
+;; …and the names themselves, memoised on the layers' own `:commands` lists. Those are the
+;; values stored on each layer, so an unchanged layer set compares element-by-identity, and
+;; the answer is the SAME list object until a layer changes — which is what lets M-x key its
+;; own memo on this result cheaply (`commands/ed-mx-command-names`).
+(memo/defmemo ed-layer-command-names
+  1
+  (command-lists)
+  "The names in every one of `command-lists`, appended."
+  (apply append command-lists))
+
 (defn ed-all-layer-commands ()
   "All command names claimed by any registered layer (all types + system layers) —
 used to subtract layer-owned names from the global M-x set."
-  (let (type-refs (mapcat (keys *type-layers*) layers-for-type)
-        all-refs (append type-refs *system-layers*))
-    (apply append (layer-collect {:layers all-refs} :commands))))
+  (ed-layer-command-names (layer-collect {:layers (ed-distinct-layer-refs *type-layers*
+                                                    *system-layers*)}
+                            :commands)))
 
 (defn ed-mode-service (buf facet)
   "The value the buffer's active mode provides for `facet` — from the
-highest-precedence active layer that defines it (`layer-collect`), resolved late
+highest-precedence active layer that defines it (`layer-facet`, which stops there), resolved late
 (`reflect/eval`) if stored as a fn *symbol*, else nil when no layer offers it. The generic
 per-language services hook: the view and completion ask the buffer's mode for
 `:fontify` / `:bracket-match` / `:eldoc` / `:complete-at` *without naming any
 language*, so a new mode (json, python, …) is the same registration with its own
 functions. `brood-mode` is the first to supply these (see `modes`)."
-  (let (v (first (layer-collect buf facet)))
+  (let (v (layer-facet buf facet))
     (if (symbol? v) (reflect/eval v) v)))
 
 (defn gutter-cell-chunks (cell)
   "A `:gutter-cell` service result normalised to a **list of `[text face]` chunks**. The
 service may return either a single `[text face]` pair (a plain line number) or a list of such
-chunks (a file buffer's diff-hl change bar *plus* the number — see `modes/line-number-cell`).
+chunks (a file buffer's diff-hl change bar *plus* the number — see `gutter/line-number-cell`).
 Decoding that two-forms shape used to live in each renderer separately, so the web mirror
 assumed the single form and crashed on the list — silently dropping the browser the moment you
 opened a file buffer. This is the single decoder both the native view (`view/ed-gutter-line-ops`)
@@ -346,16 +366,10 @@ the previous newline (0 at the first line). Tail-recursive."
   "The 0-based column of char offset `off` in `text` (chars since the line start)."
   (- off (ed-line-start-offset text off)))
 
-;; ---- diagnostics cache (async, recomputed only when the text changes) -------
-;; A full advisory type-check is O(buffer) — hundreds of ms on a large file — far too
-;; heavy for the loop. Two things keep it off the critical path: (1) staleness is keyed
-;; on the buffer's ROPE HANDLE (an edit mints a fresh rope; movement keeps it), an O(1)
-;; check rather than a whole-buffer text compare, so movement never even materialises
-;; the text; (2) the check itself runs in a SPAWNED PROCESS (std/task) and its result is
-;; folded back through `ed-update` as a `[:task-done …]` event, so the editor stays live
-;; while the checker runs. Without a live `:editor` process (tests / headless) it falls
-;; back to a synchronous check. The check is the buffer mode's `:diagnostics` service
-;; (brood-mode → the in-process type checker); buffers whose mode offers none never pay.
+;; ---- the diagnostics cache: what the view reads, whoever produced it ----------
+;; Two producers fill it — the advisory checker (`diagcheck`, off the loop on the idle beat)
+;; and a language server (`lsp-commands`, on `publishDiagnostics`) — and both land in
+;; [[ed-set-diagnostics]], so the list, its line index and the buffer's margin stamp agree.
 
 (sig ed-diag-index ((seqable diagnostic) -> (map int (list diagnostic))))
 ;; ---- a diagnostic's position, converted in ONE place --------------------------------
@@ -411,7 +425,7 @@ producer bedit has (the checker, every language server) gives a line."
   "Call `sym` — a `(model) -> model` hook in a DEFERRED module — if that module has been
 loaded, else answer `fallback`. The one guard every such call shares: a module nobody has
 opened yet is not a client, and asking it anything is an unbound symbol."
-  (if (bound? sym) ((reflect/eval sym) m) fallback))
+  (reflect/call-if-bound sym fallback m))
 
 ;; `(seqable diagnostic)`, not `(list …)`: the LSP path hands over a VECTOR, which the
 ;; runtime contract (ADR-380) refused.
@@ -464,237 +478,11 @@ away. The mark then outlived the text it described, with nothing able to clear i
     i
     (editor/buffer/annotate (ed-buf-at m i) :diagnostic-lines (ed-diag-index diags))))
 
-(defn ed-refresh-diagnostics (m)
-  "The model with `:diagnostics` (a list of `{:line :col :message}`) + `:diag-rope`
-refreshed iff the current buffer has a `:diagnostics` service and its rope changed since
-the last check; otherwise `m` unchanged. Synchronous — the core the async path and the
-tests share."
-  (let (buf (ed-current-buf m)
-        svc (ed-mode-service buf :diagnostics)
-        rope (buffer-rope buf))
-    (if (or (nil? svc) (= rope (:diag-rope m)))
-      m
-      (ed-set-diagnostics m (svc (buffer-text buf)) rope))))
-
-(defn- ed-buffer-dir (buf)
+(defn ed-buffer-dir (buf)
   "The directory `buf` lives in — its `:dir`, else its file's folder, else the working
-dir (the `commands/ed-default-dir` rule, for a given buffer)."
+dir — what `pool/ed-default-dir` answers for the current buffer (Emacs `default-directory`)."
   (or (:dir buf)
     (let (f (buffer-file buf)) (if (nil? f) (file/cwd) (path/dirname f)))))
-
-;; How long a sandboxed check may run before the child answers `:timeout` (and the
-;; next idle beat re-sends). A large file's check is hundreds of ms; a project's first
-;; check also loads its modules in the child.
-(def *diag-check-timeout-ms* 20000)
-
-(defn ed-launch-diag (m)
-  "Start the deferred diagnostics check. A no-op when nothing is stale or a check is
-already in flight (`:diag-proc` — an in-image task — or `:diag-req`, a sandbox
-request). Headless (no `:editor`) → synchronous (`ed-refresh-diagnostics`).
-
-A mode marked `:check-remote` (brood-mode) is checked in the SANDBOX CHILD, the way
-an LSP server checks its language: `sandbox-check` sends the text as a `:check`
-request to a child rooted in the buffer's project (`sandbox-start root` — it is
-re-rooted when the project changes), whose checker resolves that project's modules
-in its own image; the reply folds back through `sandbox-events` as the model's
-`:reply` client. Nothing of the project is ever loaded into the editor. When the
-sandbox cannot take the request (no runtime to spawn), the check falls back to the
-in-image task, which sees only the editor's own image."
-  (let (buf (ed-current-buf m)
-        svc (ed-mode-service buf :diagnostics))
-    (cond
-      (or (nil? svc) (not (ed-diag-stale? m))) m
-      (:diag-proc m) m
-      ;; a sandbox check in flight — unless it is overdue (a worker that was shutting
-      ;; down took the request and never answered): forget it and send again
-      (and (:diag-req m) (< (- (os/now) (or (:diag-sent m) 0)) (+ *diag-check-timeout-ms* 5000))) m
-      (ed-headless?) (ed-refresh-diagnostics m)
-      :else
-        (let (text (buffer-text buf)
-              rope (buffer-rope buf)
-              ;; the sandbox is off for this model once its worker gave up (`:diag-sandbox-off`,
-              ;; set by the down hook): from then on the in-image task checks, so a project
-              ;; whose child cannot boot is not respawned on every idle beat
-              remote? (and (ed-mode-service buf :check-remote) (not (:diag-sandbox-off m)))
-              id (sandbox/sandbox-next-id m)
-              sent? (and remote?
-                      (do
-                        (sandbox-events/ensure)
-                        ;; the CURRENT buffer's project, resolved live from its directory —
-                        ;; `:project-root` is the last visit's, which another project's
-                        ;; buffer switched to by C-x b must not inherit
-                        (sandbox/sandbox-check-start (or (projects/project-root (ed-buffer-dir buf))
-                                                       (:project-root m)
-                                                       (sandbox/sandbox-projectless-root)))
-                        (sandbox/sandbox-check id text *diag-check-timeout-ms*))))
-          (if sent?
-            (assoc (sandbox/sandbox-ids-used m (inc id))
-              :diag-req id
-              :diag-sent (os/now)
-              :diag-checking rope
-              :diag-checking-buf (buffer-name buf))
-            (let (job (task (fn () (svc text))))
-              (assoc m :diag-proc job :diag-checking rope :diag-checking-buf (buffer-name buf))))))))
-
-;; ---- the sandbox's diagnostics client (registered in `sandbox-events`) --------
-
-(defn ed-diag-client-live? (m)
-  "Somebody still wants the sandbox for checks: the current buffer's mode checks remotely."
-  (not (nil? (ed-mode-service (ed-current-buf m) :check-remote))))
-
-(defn ed-diag-sandbox-ready (m gen banner)
-  "The child came up (or back): nothing to do — a queued check flushes on its own."
-  m)
-
-(defn ed-diag-sandbox-reply (m reply gen)
-  "Fold a sandbox reply: ours iff its `:id` is the check in flight (`:diag-req`) — then
-its `:diagnostics` (or `()` for a timeout / a checker error, so the next idle beat
-re-sends) become the cache, against the rope they were computed for. Any other id
-is another client's, untouched."
-  (if (and (:diag-req m) (= (get reply :id) (:diag-req m)))
-    (if (get reply :ok)
-      (dissoc (ed-apply-diag m (or (get reply :diagnostics) '())) :diag-req)
-      ;; a timeout (the child was re-rooted or reset mid-check, or a first check that
-      ;; loaded a large project overran) or a checker error: keep the old cache and
-      ;; leave `:diag-rope` as it was, so the buffer stays stale and the next idle beat
-      ;; sends again — `ed-apply-diag` would record the rope as checked
-      (dissoc (dissoc m :diag-req :diag-checking) :diag-checking-buf))
-    m))
-
-(defn ed-diag-sandbox-down (m code)
-  "The child went away: forget the check in flight (the worker answered it `:timeout`
-or never will), so the next idle beat re-sends. A worker that GAVE UP (`:gave-up` —
-the child died three times in a row, e.g. a project whose manifest it cannot load —
-or `:spawn-failed`) turns the sandbox off for this model's checks (`:diag-sandbox-off`):
-they run in-image from then on rather than respawning a doomed child on every idle beat."
-  (let (m1 (dissoc (dissoc m :diag-req :diag-checking) :diag-checking-buf))
-    (if (or (= code :gave-up) (= code :spawn-failed)) (assoc m1 :diag-sandbox-off true) m1)))
-
-(defdyn *warm-tree-min*
-  ;; Below this many characters a whole-file parse is already imperceptible, so warming
-  ;; it would only spend a task. Around 40 KB is where the cold parse starts to be felt.
-  40000)
-
-(defn ed-tree-warm-stale? (m)
-  "True when the current buffer is a tree-sitter buffer big enough to be worth warming,
-and the tree cached for it is not the one it has now."
-  (let (buf (ed-current-buf m))
-    (and (ed-mode-service buf :ts-lang)
-      (> (buffer-length buf) *warm-tree-min*)
-      (not (= (buffer-rope buf) (:tree-warm m)))
-      (not (:tree-warm-proc m)))))
-
-(defn ed-launch-tree-warm (m)
-  "Parse the current buffer's whole text in a spawned task, so the tree is already in the
-runtime's cache when something asks for it.
-
-The queries an editor makes of a tree — the enclosing chain for RET, the sibling list for
-`C-M-f` — are cheap once the tree exists and dominated by the parse when it does not: on
-a 250 KB Elixir file the FIRST of them costs ~650 ms and every one after it ~1 ms. That
-first one used to land on whichever keypress happened to need it, which is precisely the
-key that then felt broken. Incremental reparse cannot help it — there is no previous tree
-to reparse from — so the answer is to stop it landing on a keypress at all.
-
-Runs on the idle beat beside the diff-hl and diagnostics launches, and for the same
-reason. The cache it warms lives in the runtime, not the model, so a task warming it is
-visible to the editor process without anything being sent back; the reply exists only to
-clear the in-flight flag."
-  (if (or (not (ed-tree-warm-stale? m)) (ed-headless?))
-    m
-    (let (buf (ed-current-buf m)
-          text (buffer-text buf)
-          lang (ed-mode-service buf :ts-lang)
-          job (task (fn ()
-                      (check-allow :discarded-catch
-                        (try
-                          (do (%tree-sitter-chain text lang 0) :warm)
-                          (catch _ :failed))))))
-      (assoc m :tree-warm-proc job :tree-warming (buffer-rope buf)))))
-
-(sig ed-apply-tree-warm (model any -> model))
-(defn ed-apply-tree-warm (m result)
-  "A finished warm: record which rope is now parsed and clear the in-flight handle. If
-the buffer moved on while it ran, `ed-tree-warm-stale?` fires again on the next beat."
-  (assoc m :tree-warm (:tree-warming m) :tree-warm-proc nil :tree-warming nil))
-
-(sig ed-apply-diag (model any -> model))
-(defn ed-apply-diag (m result)
-  "Fold a finished diagnostics check's `result` (its `[:task-done …]` value, `()` if it
-errored / timed out) into the model: store it against the rope it was computed for
-(`:diag-checking` → `:diag-rope`) and clear the in-flight handle. `ed-diag-stale?` then
-re-fires iff the buffer moved on while the check ran, so the next idle tick relaunches."
-  (assoc (ed-set-diagnostics m (or result '()) (:diag-checking m) (:diag-checking-buf m))
-    :diag-proc nil
-    :diag-checking nil
-    :diag-checking-buf nil))
-
-;; ---- diff-hl annotation, off the loop (mirrors the diagnostics pair) ---------
-;; Diffing a buffer against its HEAD blob is `std/diff` over the whole file. On a large
-;; file that is seconds of work — far too slow for the per-event loop (it once wedged the
-;; whole editor on a 3000-line file: the single ui-run process never returned, so no key,
-;; not even C-g, could be processed). So the diff runs in a spawned task, exactly like the
-;; advisory diagnostics check: launch on the idle beat, fold the result back on its reply.
-
-(defn ed-gitdiff-stale? (m)
-  "True when the current buffer wants a diff-hl recompute: diff-hl is on (`:diff-hl?`,
-default true), it's a file buffer, and its **rope differs from the one the cached gutter was
-computed for** — its first view (no annotation at all), or any edit since. An O(1)
-rope-handle compare (`annotation`'s `:stale?`), so plain motion costs nothing but a text change
-re-arms the diff, so the change bars follow edits instead of freezing at their old lines until
-a save (the 'bars drift the further down you scroll' symptom). No size cap — the recompute
-runs OFF the loop (`ed-launch-gitdiff`), so a large file no longer blocks it."
-  (and (:diff-hl? m true)
-    (let (b (ed-current-buf m))
-      (and (buffer-file b)
-        (let (a (editor/buffer/annotation b :git-line-status))
-          (or (nil? a) (:stale? a)))))))
-
-(defn ed-launch-gitdiff (m)
-  "Recompute the current buffer's diff-hl gutter when stale, OFF THE LOOP — mirroring
-`ed-launch-diag`. `git show HEAD:file` + `git diff` is tens of ms on a normal file but scales
-with the file size (~45ms on an 848KB / 12k-line doc, seconds on a huge one) — too much for the
-per-event loop, which once wedged the whole editor on a large file — so it runs in a spawned
-task (std/task): record the task handle on `:gitdiff-proc` and the rope it is diffing on
-`:gitdiff-checking`, so a stale reply can't clobber a newer cache. Fires on the idle beat, gated
-on an in-flight check. Headless (no `:editor`) → synchronous fallback.
-
-(An earlier async version was blamed for a frozen gutter but later exonerated — the real bug
-was the idle beat suppressed by a stuck `:held-key`, cac0ce3; the task-reply contract is pinned
-by tests/gitdiff_async_test.blsp's last describe. Async is restored here because sync scales
-with file size and blocks the loop — the very failure the user hit on a 12k-line file.)"
-  (cond
-    (not (ed-gitdiff-stale? m)) m
-    (:gitdiff-proc m) m
-    (not (bound? 'gitdiff/gitdiff-status)) m
-    (ed-headless?) (ed-set-buf m (gitdiff/gitdiff-annotate (ed-current-buf m)))
-    :else
-      (let (b (ed-current-buf m)
-            path (buffer-file b))
-        (if (nil? path)
-          m ; `ed-gitdiff-stale?` already said it is a file buffer; this says so to the checker
-          (let (text (buffer-text b)
-                job (task (fn () (gitdiff/gitdiff-status path text))))
-            (assoc m :gitdiff-proc job :gitdiff-checking (buffer-rope b)))))))
-
-(sig ed-apply-gitdiff (model any -> model))
-(defn ed-apply-gitdiff (m result)
-  "Fold a finished diff-hl compute's `result` (the `{0-based-line -> status}` map; nil/() on
-error/timeout) into the buffer it was diffed for — located by the rope it carried
-(`:gitdiff-checking`), so a buffer switch mid-flight still stamps the RIGHT buffer — with the
-rope + line count, and clear the in-flight handle. A buffer edited since the launch has no
-matching rope, so its stale result is dropped and `ed-gitdiff-stale?` re-fires next idle tick.
-Mirrors `ed-apply-diag`."
-  (let (rope (:gitdiff-checking m)
-        m1 (dissoc m :gitdiff-proc :gitdiff-checking)
-        idx (seq/index-where (:buffers m1) (fn (b) (= (buffer-rope b) rope))))
-    (if (< idx 0)
-      m1
-      ;; stamp the result onto the buffer we diffed (found BY ROPE, so a mid-flight
-      ;; buffer switch still lands on the right one)
-      (update m1
-        :buffers assoc
-        idx
-        (editor/buffer/annotate (ed-buf-at m1 idx) :git-line-status (or result {}))))))
 
 (defn ed-layer-modeline-segments (m buf)
   "The status-bar segments `buf`'s active layers contribute via a `:modeline` service — each a
@@ -707,148 +495,6 @@ nils are dropped. The view appends these (and the global git branch) on the sele
             s (f m buf))
         (if (or (nil? s) (= "" s)) nil s)))))
 
-(defn ed-web-dirty? (m)
-  "True when a web mirror is running (`:server`) and has an unpublished edit/move
-(`:web-dirty`) — so the idle beat should push a fresh snapshot. Set on real input by
-`ed-post-step`, cleared by the publish in `input/ed-timer-fire`."
-  (and (:server m) (:web-dirty m)))
-
-;; ---- the post-event step: cached eldoc + debounced diagnostics --------------
-;; Both the eldoc hint and the advisory type-check are too costly to recompute on the
-;; render path (eldoc, every frame) or on every keystroke (the whole-buffer check).
-;; Emacs runs eldoc / flymake on an *idle timer*; we do the same with the editor's
-;; existing `:tick` beat. `input/ed-update` runs `ed-post-step` after each event folds
-;; in: it caches the eldoc string on the model (so `view` just paints it) and, instead
-;; of type-checking per key, arms a short debounce tick whose firing runs the check
-;; once typing settles. While a key auto-repeats, the typematic delay is the debounce.
-
-(sig ed-cache-eldoc (model -> model))
-(defn ed-cache-eldoc (m)
-  "Refresh the model's cached `:eldoc` hint — the current buffer mode's `:eldoc`
-service applied to point, or nil when the mode offers none. Also stamps `:eldoc-point`
-(the point it was computed at) so `ed-eldoc-stale?` can tell when point has moved and a
-refresh is due. Computed on the idle tick (`ed-post-step`), not per keystroke: the
-service parses around point (O(point) for brood-mode's `enclosing-call`), too costly to
-run on every key in a large buffer. A service error caches nil rather than disrupting
-the edit."
-  (let (buf (ed-current-buf m)
-        svc (ed-mode-service buf :eldoc)
-        pt (buffer-point buf))
-    (if (nil? svc)
-      (assoc m :eldoc nil :eldoc-point pt)
-      (assoc m
-        :eldoc
-          (try
-            (svc (buffer-text buf) pt)
-            (catch e (do (log/warn (str "eldoc service failed: " (error-message e))) nil)))
-        :eldoc-point pt))))
-
-(defn ed-eldoc-stale? (m)
-  "True if the current buffer offers an `:eldoc` service and point has moved since the
-cached `:eldoc` was computed (`:eldoc-point`) — a refresh is due. Buffers whose mode
-offers no eldoc never pay. (Point-move covers typing too, since inserting moves point.)"
-  (let (buf (ed-current-buf m))
-    (and (ed-mode-service buf :eldoc)
-      (not (= (buffer-point buf) (:eldoc-point m))))))
-
-(defn ed-signature-stale? (m)
-  "True when the LSP argument hint (`textDocument/signatureHelp`) is due a refresh — a
-server is connected, point or the text has moved since the last one was asked for
-(`:signature-at`), and the buffer's mode does not answer for itself.
-
-The mode's own `:eldoc` service wins where there is one, and not by seniority: it is
-local, instant and always right about the language it was written for, whereas this costs
-a round-trip. They share the `:eldoc` slot, so letting both write it would make the hint
-depend on which reply landed last."
-  (let (buf (ed-current-buf m))
-    (and (:lsp m)
-      (nil? (ed-mode-service buf :eldoc))
-      (not (= [(buffer-point buf) (buffer-rope buf)] (:signature-at m))))))
-
-(defn ed-preview-stale? (m)
-  "True when the inline completion preview needs recomputing — point moved, or the text
-did, since the cached one was made. Keyed on both because a preview is about the word
-before point and both of those change it."
-  (let (buf (ed-current-buf m))
-    (not (= [(buffer-point buf) (buffer-rope buf)] (:completion-preview-at m)))))
-
-(defn ed-refresh-preview (m)
-  "Recompute the inline completion preview (`:completion-preview`), stamped with the point
-and rope it was computed for so the view can tell a live one from a stale one.
-
-A no-op unless [[ed-preview-stale?]] — not (only) for the cost, but because the preview
-carries a CHOICE: M-n/M-p cycle which candidate it shows, and recomputing a preview the
-text has not changed under would silently walk it back to the first one while your hands
-were off the keys.
-
-Deferred-module guarded and late-bound like every other idle-beat client: a preview is a
-nicety, and a model that could not be built without it would be the wrong shape."
-  (if (or (not (bound? 'complete-at-point/completion-preview)) (not (ed-preview-stale? m)))
-    m
-    (let (buf (ed-current-buf m))
-      (assoc m
-        :completion-preview
-        ;; a source that raises must cost the reader a missing suggestion, never the frame
-          (check-allow :discarded-catch
-            (try ((reflect/eval 'complete-at-point/completion-preview) m) (catch _ nil)))
-        :completion-preview-at [(buffer-point buf) (buffer-rope buf)]))))
-
-(defn ed-launch-eldoc (m)
-  "Refresh the eldoc hint OFF the loop (the diagnostics pattern): with a live `:editor`
-process, run the mode's `:eldoc` service in a spawned task — recording its handle on
-`:eldoc-proc` and the point it is computed at on `:eldoc-checking`, so a stale reply
-can't clobber a newer hint — and fold the reply via `ed-apply-eldoc` on `[:task-done]`.
-Headless (no `:editor`) → synchronous (`ed-cache-eldoc`). A no-op when nothing is
-stale or a compute is already in flight."
-  (let (buf (ed-current-buf m)
-        svc (ed-mode-service buf :eldoc))
-    (cond
-      (or (nil? svc) (not (ed-eldoc-stale? m))) m
-      (:eldoc-proc m) m
-      (ed-headless?) (ed-cache-eldoc m)
-      :else
-        (let (text (buffer-text buf)
-              pt (buffer-point buf)
-              job (task (fn ()
-                          (try
-                            (svc text pt)
-                            (catch e
-                              (do (log/warn (str "eldoc service failed: " (error-message e))) nil))))))
-          ;; :eldoc-checking records the point AND the rope the hint is being
-          ;; computed for — the reply is dropped if the user switched buffers
-          ;; (or the text changed) while the task ran, else buffer A's signature
-          ;; would be cached (and shown) as buffer B's
-          (assoc m :eldoc-proc job :eldoc-checking {:pt pt :rope (buffer-rope buf)})))))
-
-(sig ed-apply-eldoc (model any -> model))
-(defn ed-apply-eldoc (m result)
-  "Fold a finished eldoc task's reply (nil on error/timeout): cache the hint against
-the point it was computed at (`:eldoc-checking` → `:eldoc-point`) and clear the
-in-flight handle — but only when the CURRENT buffer still holds the rope the hint
-was computed for; a reply landing after a buffer switch (or an edit) is dropped
-(the stale `:eldoc-point` mismatch then lets the next idle beat relaunch).
-`ed-eldoc-stale?` re-fires iff point moved on while the task ran."
-  (let (chk (:eldoc-checking m)
-        m1 (assoc m :eldoc-proc nil :eldoc-checking nil))
-    (if (= (buffer-rope (ed-current-buf m1)) (:rope chk))
-      (assoc m1 :eldoc result :eldoc-point (:pt chk))
-      m1)))
-
-(defn ed-diag-stale? (m)
-  "True if the current buffer offers a `:diagnostics` service and its rope differs from
-`:diag-rope` (the rope the cached `:diagnostics` were computed from) — i.e. a recheck is
-due. An O(1) rope-handle compare, not a whole-buffer text compare, so movement (which
-keeps the rope) costs nothing. Buffers whose mode offers no service are never stale."
-  (let (buf (ed-current-buf m))
-    (and (ed-mode-service buf :diagnostics)
-      (not (= (buffer-rope buf) (:diag-rope m))))))
-
-(defn ed-run-diag (m)
-  "Launch the deferred diagnostics check (async via `ed-launch-diag` when an `:editor`
-process is live, synchronous otherwise) — a no-op when not stale or one is in flight.
-What the `:idle-recompute` timer (ADR-102) runs once the debounce window has elapsed."
-  (ed-launch-diag m))
-
 ;; ---- the off-loop job table: what is in flight, and what to call it ----------
 ;; It lives in `model` rather than in the dispatcher because it is MODEL vocabulary —
 ;; which model field holds which handle — and two very different readers need it: the
@@ -857,33 +503,22 @@ What the `:idle-recompute` timer (ADR-102) runs once the debounce window has ela
 ;; `(:use view)` for the mode-line hit-tests, so the reverse is a CYCLE, and a cycle here
 ;; does not fail loudly — it leaves a half-initialised module and breaks something else
 ;; entirely. (It broke the `:on-move` facet, which is nowhere near any of this.)
-(def ed-task-replies
-  ;; The model field a launch parks its task handle on -> `[fold-fn failure-value]`: the
-  ;; function that folds the answer in, and what to fold instead when the task errored or
-  ;; timed out. Resolved at dispatch (`reflect/eval`), like the event handlers above and for
-  ;; the same reason — redefining a fold hot-swaps it, and a deferred module's fold can be
-  ;; named here before its module has loaded.
-  ;;
-  ;; A TABLE, because every row was the same three lines of `cond` with two words changed.
-  ;; Adding an off-the-loop recompute is a launch, a fold and a row — the branch it used to
-  ;; also need was pure ceremony, and the sixth copy of it is how a default gets forgotten.
-  ;;
-  ;; The third element is the LABEL the activity indicator shows while the job is in
-  ;; flight, or nil for the ones not worth announcing (eldoc, the tree warm — they finish
-  ;; in a frame and a chip that flickers on every keystroke is worse than no chip). It
-  ;; lives here so a new off-loop job is still ONE row: a launch, a fold, and what to call
-  ;; it while it runs.
-  ;;
-  ;; These are the MODEL's own jobs. A feature's rows are not listed here: the feature
-  ;; registers them when it loads ([[register-task-reply]]) — a task can only be running once
-  ;; the module that started it has loaded, so that is exactly when its row is first needed,
-  ;; and the model no longer names every feature that happens to work off the loop (X4).
-  {:diag-proc ['model/ed-apply-diag '() nil]
-   :gitdiff-proc ['model/ed-apply-gitdiff '() nil]
-   :eldoc-proc ['model/ed-apply-eldoc nil nil]
-   ;; the tree warm has nothing to fold — the cache it filled lives in the runtime, so the
-   ;; reply exists only to record which rope is parsed and free the slot
-   :tree-warm-proc ['model/ed-apply-tree-warm nil nil]})
+;; How an off-the-loop job is declared. The table is keyed by the model field a launch parks
+;; its task handle on -> `[fold-fn failure-value label]`: the function that folds the answer
+;; in, what to fold instead when the task errored or timed out, and the LABEL the activity
+;; indicator shows while it is in flight (nil for one not worth announcing). Folds are
+;; SYMBOLS resolved at dispatch (`reflect/eval`), like the event handlers and for the same
+;; reason — redefining a fold hot-swaps it.
+;;
+;; A TABLE, because every row was the same three lines of `cond` with two words changed.
+;; Adding an off-the-loop recompute is a launch, a fold and a row — the branch it used to
+;; also need was pure ceremony, and the sixth copy of it is how a default gets forgotten.
+;;
+;; Every row is REGISTERED by the module that runs the job, when it loads
+;; ([[register-task-reply]]) — the diagnostics check, the diff-hl gutter, eldoc and the
+;; tree warm included. A task can only be running once the module that started it has
+;; loaded, so that is exactly when its row is first needed, and the model names none of
+;; the features that happen to work off the loop (X4).
 
 ;; Which jobs get a label, and why the rest do not: eldoc, the diagnostics check, the
 ;; diff-hl gutter, the status-bar git summary and the tree warm all finish inside a frame
@@ -893,21 +528,142 @@ What the `:idle-recompute` timer (ADR-102) runs once the debounce window has ela
 ;; and that you asked for: a pull, a fetch, a status on a big repo, a shell command, a
 ;; project scan.
 
-(defonce *task-reply-clients* {})
-;; slot -> `[fold failure label]`, the rows FEATURES register ([[register-task-reply]]).
-;; `defonce`: a reload of this file must not forget what other modules registered (C5).
+;; Every table in this section is a `std/registry` (brood ADR-412), not a `defonce` global
+;; re-bound with `def`: a registration is one atomic write (two processes registering at once
+;; both land), it survives an `%isolate` restore, and the startup image carries it with the
+;; module that made it. A `def`-rebound global had none of the three.
 
-(defn register-task-reply (slot fold failure label)
+;; What C-g does to a job is ALSO on its row, for the same reason the fold is: the
+;; universal cancel used to name the four jobs it killed (and the `-checking` flags each
+;; kept beside its handle), so every feature that worked off the loop was a line in
+;; `commands`, and one that forgot to add itself (the shell command) was quietly
+;; uncancellable. A row opts in with `:cancel-on-quit?` and may name an `:on-quit` hook
+;; for the clean-up its feature alone knows (a re-stamped gutter, a cleared rope); the
+;; cancel itself — kill the task, free the slot — is the same for every job, so it lives
+;; once, in [[ed-cancel-quit-jobs]].
+;;
+;; Not every job opts in. A git operation half-killed can leave a lock or a half-applied
+;; rebase; a format job rewrites the buffer when it lands; the status-bar summary and the
+;; tree warm are upkeep nobody is waiting on. C-g is for the work you would want to stop.
+
+(defn register-task-reply (slot fold failure label &optional (options {}))
   "Declare an off-the-loop job a feature runs: the model field `slot` its task handle is
 parked on, the `fold` symbol that folds the answer in, what to fold instead when the task
 errored or timed out (`failure`), and the activity `label` to show while it runs (nil for a
-job not worth announcing). Called at the feature's load; re-registering replaces the row."
-  (def *task-reply-clients* (assoc *task-reply-clients* slot [fold failure label])))
+job not worth announcing). Called at the feature's load; re-registering replaces the row.
+
+`options` (a map, all optional):
+- `:cancel-on-quit?` — C-g kills the task in flight and frees `slot`
+- `:on-quit` — a `(model) -> model` symbol C-g runs after, for the feature's own clean-up
+- `:folds-event?` — the fold receives the whole `[:task-… handle …]` event instead of the
+  value or `failure`, for a job whose report depends on HOW it failed (a timeout vs an error)"
+  (registry/put! :model/task-replies slot [fold failure label options]))
 
 (defn ed-task-reply-table ()
-  "Every off-the-loop job's row — the model's own ([[ed-task-replies]]) and the ones
-features registered. What the reply dispatcher and the activity indicator read."
-  (merge *task-reply-clients* ed-task-replies))
+  "Every off-the-loop job's row — slot -> `[fold failure label options]` — as the modules
+running them registered them. What the reply dispatcher, the activity indicator and C-g read."
+  (registry/entries :model/task-replies))
+
+(defn ed-cancel-quit-jobs (m)
+  "`[model cancelled?]`: every registered job that opted into `:cancel-on-quit?` and is in
+flight, killed (`task/cancel` — a hard kill, so a runaway loop dies too), its slot freed and
+its `:on-quit` hook run; `cancelled?` says whether there was any. A hook whose module is not
+loaded is skipped (`ed-call-deferred`) — the slot is still freed, which is all a reply needs
+to be dropped as stale. What C-g runs, naming none of the jobs."
+  (fold (%map-pairs (ed-task-reply-table))
+    [m false]
+    (fn (acc entry)
+      (let ([model cancelled?] acc
+            [slot row] entry
+            options (nth row 3 {})
+            handle (get model slot))
+        (if (and (:cancel-on-quit? options) (not (nil? handle)))
+          (let (_ (task/cancel handle)
+                hook (:on-quit options)
+                freed (dissoc model slot))
+            [(if hook (ed-call-deferred freed hook freed) freed) true])
+          acc)))))
+
+;; ---- inbound `[:tag …]` events a feature handles ------------------------------
+;; The dispatcher (`input`) owns the handlers for the events the loop itself is the
+;; consumer of — output, task replies, resize, mouse. A FEATURE's events (a language
+;; server's replies, another frame's buffer registry) are registered by the feature when it
+;; loads, so the dispatcher's table names none of them. Safe because each such event is only
+;; ever produced by something that feature started: no `:lsp-…` reply before `lsp-commands`
+;; has started a server, no `:registry-…` before `frames` watched the registry.
+
+(defn register-event-handler (tag handler)
+  "Route inbound `[tag …]` events to `handler` — a symbol naming a `(m input textrows cols
+rows) -> model` fold, resolved at dispatch so a redefinition hot-swaps. Called when the
+feature's module loads; re-registering a tag replaces its handler."
+  (registry/put! :model/event-handlers tag handler))
+
+(defn ed-registered-event-handler (tag)
+  "The handler symbol a feature registered for `[tag …]` events, or nil."
+  (registry/lookup :model/event-handlers tag))
+
+;; ---- the idle beat's jobs ------------------------------------------------------
+;; The `:idle-recompute` beat (Emacs's idle timer) runs everything deferred off the per-key
+;; path: the completion preview, the LSP autostart + text push + signature hint, eldoc, the
+;; advisory check, the minibuffer re-rank, the diff-hl gutter, the tree warm, the git
+;; summary, auto-save + auto-revert, the mode's `:on-idle` hooks and the web-mirror push.
+;; Each is a ROW its module registers at load ([[register-idle-job]]) — the arming side
+;; (`ed-sync-timers`) and the firing side (`input/ed-timer-fire`) fold over the table and
+;; name none of them, and a deferred module's job simply is not a job until it has loaded
+;; (what the `bound?` guards used to say one call at a time).
+;;
+;; A row is `{:order :run :stale? :held-key-gated? :on-blink?}`:
+;;   :order   the position in the chain. ORDER MATTERS — a job sees the model every earlier
+;;            one left: the LSP push must follow the autostart that connects it, the
+;;            signature ask follows eldoc (which owns the slot when the mode answers), and
+;;            the web mirror publishes last, a snapshot of everything the beat changed.
+;;            Kept explicit rather than load order, which differs between a test image and
+;;            the released editor.
+;;   :run     `(model) -> model` symbol — what the beat does. Runs on every firing (a launch
+;;            gates itself on its own staleness and in-flight handle).
+;;   :stale?  optional `(model) -> bool` symbol — whether this job's work is pending, which
+;;            is what ARMS the beat. A job without one rides a beat something else armed.
+;;   :held-key-gated?  true when a held (auto-repeating) key suppresses the arming: eldoc,
+;;            the check, the completion work are point/typing-driven and should not
+;;            recompute on every repeat. The diff-hl gutter and the web mirror are NOT
+;;            gated: a missed key-up can leave `:held-key` stuck, which would otherwise
+;;            suppress the beat forever and freeze them (the `:idle?` deadline still
+;;            debounces — a repeating key resets the countdown).
+;;   :on-blink?  also run on the `:cursor-blink` tick — the diff gutter's second, ungated
+;;            trigger, so a stuck `:held-key` can never freeze it.
+
+(defn register-idle-job (name job)
+  "Add an idle-beat job `name` — `{:order :run :stale? :held-key-gated? :on-blink?}`, the
+hooks as symbols (resolved late, so a redefinition hot-swaps; see the comment above) —
+replacing any job already registered under `name`. Called when the job's module loads."
+  (registry/put! :model/idle-jobs name (assoc job :name name :rank (:order job))))
+
+(defn ed-idle-jobs ()
+  "The registered idle jobs, in `:order` — the order the beat runs them in."
+  (map (registry/ranked :model/idle-jobs) second))
+
+(defn ed-idle-due? (m held)
+  "Whether some idle job has work pending — i.e. the `:idle-recompute` beat should be armed.
+A `:held-key-gated?` job is not asked while a key is `held`; a job whose module has not
+loaded is never due. Asked after every event, and order does not matter to an `any?`, so it
+reads the table unsorted."
+  (any? (vals (registry/entries :model/idle-jobs))
+    (fn (job)
+      (let (stale (:stale? job))
+        (and (not (nil? stale))
+          (not (and held (:held-key-gated? job)))
+          (ed-call-deferred m stale false))))))
+
+(defn ed-run-idle-jobs (m)
+  "The `:idle-recompute` beat: every registered job's `:run`, in `:order`, each seeing the
+model the previous one left."
+  (fold (ed-idle-jobs) m (fn (acc job) (ed-call-deferred acc (:run job) acc))))
+
+(defn ed-run-blink-jobs (m)
+  "The jobs that also ride the `:cursor-blink` tick (`:on-blink?`), in `:order`."
+  (fold (ed-idle-jobs)
+    m
+    (fn (acc job) (if (:on-blink? job) (ed-call-deferred acc (:run job) acc) acc))))
 
 (defn ed-activity (m)
   "The labels of every announced job currently in flight — what the activity indicator
@@ -951,14 +707,6 @@ input, then the idle `:cursor-blink` timer takes over once you stop."
 
 (sig ed-sync-timers (model -> model))
 
-;; ---- scroll settling: a glide ends on a whole line --------------------------
-;; A trackpad step or a wheel notch's kinetic glide (the runtime's fractional deltas)
-;; leaves a pane resting between lines — `:scroll-frac` ≠ 0 — which is fine while it
-;; moves and wrong once it stops: the click→line mapping reads `top`, the cursor sits
-;; half a cell off, and a screen row shows most of the line BELOW the one point is on.
-;; Emacs's pixel scrolling snaps to the nearest line when the gesture ends; so does this,
-;; on the `:scroll-settle` idle one-shot armed whenever a pane holds a fraction.
-
 (sig ed-buffer-displayed? (model string -> bool))
 (defn ed-buffer-displayed? (m nm)
   "Whether the buffer named `nm` is showing in some pane right now — ON SCREEN, not merely
@@ -973,25 +721,13 @@ timer asks this first."
       (any? (pane-leaf-paths (:layout m))
         (fn (path) (= idx (:buffer (pane-payload-at (:layout m) path))))))))
 
+;; A pane resting between lines (a trackpad glide's fraction) snaps onto a whole line on the
+;; `:scroll-settle` idle one-shot, armed while one holds a fraction — `scroll/ed-settle-scroll`.
 (def *scroll-settle-ms* 140) ; quiet time after the last scroll delta before the snap
 (defn ed-any-pane-fractional? (m)
   "True when some pane rests between lines (`:scroll-frac` ≠ 0)."
   (any? (pane-leaf-paths (:layout m))
     (fn (path) (> (or (:scroll-frac (pane-payload-at (:layout m) path)) 0.0) 0.001))))
-
-(defn ed-settle-scroll (m)
-  "Every pane snapped onto a whole line: a fraction of half a line or more advances `top`\n(clamped to the buffer), less falls back; `:scroll-frac` is 0 everywhere after."
-  (ed-map-panes m
-    (fn (w)
-      (let (frac (or (:scroll-frac w) 0.0))
-        (if (<= frac 0.001)
-          w
-          (let (buf (ed-buf-at m (:buffer w))
-                top (or (:top w) 0)
-                snapped (if (>= frac 0.5) (inc top) top))
-            (assoc w
-              :top (if buf (math/min snapped (math/max top (ed-max-top buf 1))) snapped)
-              :scroll-frac 0.0)))))))
 
 ;; ---- the live-evaluating buffers ---------------------------------------------
 ;; A buffer that runs as you type — the tutorial's lesson boxes, the Brood playground,
@@ -1008,16 +744,15 @@ timer asks this first."
 ;; is the same fold. Each client REGISTERS itself when its module loads
 ;; ([[register-live-eval-client]]): every one of these modules is deferred-loaded, and an
 ;; unopened playground is not a client until then — the model need not name them (X4).
-(defonce *live-eval-clients* [])
-;; `defonce`: a reload of this file must not forget the clients other modules registered.
-
 (defn register-live-eval-client (client)
   "Add a live-evaluating buffer — `{:timer :stale? :launch :reanchor}`, the hooks as
 symbols (resolved late, so a redefinition hot-swaps) — replacing any client registered
 under the same `:timer`. Called when the client's module loads."
-  (def *live-eval-clients*
-    (conj (into [] (seq/reject *live-eval-clients* (fn (c) (= (:timer c) (:timer client)))))
-      client)))
+  (registry/put! :model/live-eval-clients (:timer client) client))
+
+(defn ed-live-eval-clients ()
+  "Every registered live-evaluating buffer, in a stable order (by timer name)."
+  (map (registry/ranked :model/live-eval-clients) second))
 
 ;; ---- timers a feature arms ----------------------------------------------------
 ;; A repeating timer a feature wants while it has work: git's background upstream watch
@@ -1026,14 +761,15 @@ under the same `:timer`. Called when the client's module loads."
 ;; ([[register-timer-client]]), so neither the arming here nor the firing in `input` names
 ;; the module.
 
-(defonce *timer-clients* {})
-;; timer name -> `{:spec sym :fire sym}`. `defonce`, for the reason every registry here is.
-
 (defn register-timer-client (name spec fire)
   "A feature's timer: `spec` names a `(model) -> timer spec or nil` function — `{:every ms}`
 while the feature wants the timer, nil while it does not — and `fire` the `(model) -> model`
 it runs when the timer goes off. Called when the feature's module loads."
-  (def *timer-clients* (assoc *timer-clients* name {:spec spec :fire fire})))
+  (registry/put! :model/timer-clients name {:spec spec :fire fire}))
+
+(defn ed-timer-clients ()
+  "Timer name -> `{:spec sym :fire sym}`, as the features registered them."
+  (registry/entries :model/timer-clients))
 
 (defn- ed-live-eval-call (m sym fallback)
   ;; A live-eval client's hook, through the shared deferred-call guard.
@@ -1049,88 +785,79 @@ somebody opens the buffer."
   "Run the launch of whichever live-eval client owns `timer`, or leave `m` alone when no
 client does. What `input/ed-timer-fire` calls, so the set of languages that evaluate as
 you type is one table and not a chain of `cond` arms."
-  (let (client (seq/find *live-eval-clients* (fn (c) (= (:timer c) timer))))
+  (let (client (seq/find (ed-live-eval-clients) (fn (c) (= (:timer c) timer))))
     (if client (ed-live-eval-call m (:launch client) m) m)))
 
 (defn ed-live-eval-reanchor (m)
   "Move every live-evaluating buffer's notes with the text — on the EDIT itself, not the
 debounce, since a note is stored with the line it sits on and the whole set hides the
 moment the line count changes. O(1) per client until that client's own notes go stale."
-  (fold *live-eval-clients* m (fn (acc client) (ed-live-eval-call acc (:reanchor client) acc))))
+  (fold (ed-live-eval-clients) m (fn (acc client) (ed-live-eval-call acc (:reanchor client) acc))))
+
+(defn- ed-idle-one-shots (m held)
+  "Every managed idle one-shot as `[name delay-ms due?]` — the timer, how long the quiet
+before it fires, and whether its work is pending now. Each is armed only while due; listing
+the NOT-due ones too is what lets `ed-sync-timers` drop every managed one-shot from one list,
+so none can be armed here and forgotten there.
+
+The idle beat is armed while any registered job has work pending ([[ed-idle-due?]]). Some are
+held-key-gated (eldoc, the check, the completion work — point/typing-driven, not worth
+recomputing on every repeat tick); the diff-hl gutter and the web mirror are not, since a
+missed key-up can leave `:held-key` stuck and would otherwise freeze them. The `:idle?`
+deadline still debounces — a repeating key resets the countdown. A pane resting between
+lines snaps once the scroll deltas stop. Every live-evaluating buffer's eval-on-type debounce
+is one timer each, so they arm and fire independently ([[ed-live-eval-clients]]); each is
+deferred-loaded — bound?-guarded + late-bound, the keymap idiom — so this core file never
+links any of them eagerly. The rest wait for a key that is not held."
+  (append [[:idle-recompute *diag-debounce-ms* (ed-idle-due? m held)]
+            [:scroll-settle *scroll-settle-ms* (ed-any-pane-fractional? m)]
+            [:which-key *which-key-delay-ms* (and (not held) (:pending m) (not (:which-key m)))]
+            [:undo-pause
+              *undo-pause-ms*
+              (and (not held) (includes? *typing-commands* (:this-command m)) (not (:undo-break m)))]]
+    (map (ed-live-eval-clients)
+      (fn (client)
+        [(:timer client)
+          *tutor-eval-debounce-ms*
+          (and (not held) (ed-live-eval-stale? m client))]))))
+
+(defn- ed-feature-timers (m)
+  "The timers features registered ([[register-timer-client]]) — git's background upstream
+watch, the BEAM views' refresh — each asked whether it wants one now: name -> spec."
+  (fold (ed-timer-clients)
+    {}
+    (fn (acc [name client])
+      (let (spec (ed-call-deferred m (:spec client) nil))
+        (if spec (assoc acc name spec) acc)))))
 
 (defn ed-sync-timers (m)
   "Reconcile `:timers` (ADR-102) with the model after each event — the declarative
 replacement for the old arm-the-tick cascade. `:cursor-blink` is always present; the
 idle one-shots — eldoc/diagnostics debounce (`:idle-recompute`), the which-key reveal
-delay, the undo-pause boundary — are present only while their work is pending; the
-imperatively-managed `:key-repeat` is preserved untouched. A held key suppresses the idle
-one-shots (as the old held-key short-circuit did). Also clears the `:which-key` reveal
-flag once no prefix is pending (what `ed-which-key-arm` used to do)."
+delay, the undo-pause boundary — are present only while their work is pending
+(`ed-idle-one-shots`); the imperatively-managed `:key-repeat` is preserved untouched. A held
+key suppresses the idle one-shots (as the old held-key short-circuit did). Also clears the
+`:which-key` reveal flag once no prefix is pending (what `ed-which-key-arm` used to do)."
   (let (m (if (:pending m) m (dissoc m :which-key))
-        held (:held-key m)
-        ;; The diff-hl gutter and web-mirror recompute is armed regardless of `:held-key`:
-        ;; a missed key-up can leave that flag stuck, which would otherwise suppress the idle
-        ;; beat forever and freeze the gutter. The `:idle?` deadline still debounces it — a
-        ;; repeating key resets the countdown, so it fires only once typing/holding settles.
-        ;; (eldoc/diagnostics/completion stay held-key-gated: they're point/typing-driven and
-        ;; shouldn't recompute on every repeat tick. The blink tick is a second, ungated
-        ;; trigger for the gutter — see `input/ed-timer-fire :cursor-blink`.)
-        recompute? (or (ed-gitdiff-stale? m)
-                     (ed-web-dirty? m)
-                     (and (not held)
-                       (or (ed-eldoc-stale? m)
-                         (ed-signature-stale? m)
-                         (ed-diag-stale? m)
-                         (mb-cands-stale? m)
-                         (ed-preview-stale? m))))
-        ;; Every live-evaluating buffer's eval-on-type debounce, one timer each so they arm
-        ;; and fire independently (`*live-eval-clients*`). Each is deferred-loaded —
-        ;; bound?-guarded + late-bound (`reflect/eval`), the keymap idiom — so this core
-        ;; file never links any of them eagerly.
-        live-eval (fold *live-eval-clients*
-                    {}
-                    (fn (acc client)
-                      (if (and (not held) (ed-live-eval-stale? m client))
-                        (assoc acc (:timer client) {:after *tutor-eval-debounce-ms* :idle? true})
-                        acc)))
-        idle (merge (if recompute? {:idle-recompute {:after *diag-debounce-ms* :idle? true}} {})
-               ;; a pane resting between lines snaps once the scroll deltas stop
-               (if (ed-any-pane-fractional? m)
-                 {:scroll-settle {:after *scroll-settle-ms* :idle? true}}
-                 {})
-               live-eval
-               (if held
-                 {}
-                 (merge (if (and (:pending m) (not (:which-key m)))
-                          {:which-key {:after *which-key-delay-ms* :idle? true}}
-                          {})
-                   (if (and (includes? *typing-commands* (:this-command m)) (not (:undo-break m)))
-                     {:undo-pause {:after *undo-pause-ms* :idle? true}}
-                     {}))))
-        ;; The spinner frame, ticking ONLY while an announced job is in flight. A timer
-        ;; armed unconditionally is an editor that never goes idle — this one appears
-        ;; with the work and drops itself with it, the `:scrollbar-fade` pattern.
-        spin (if (ed-busy? m) {:spinner {:every *spinner-ms*}} {})
-        ;; the timers features registered ([[register-timer-client]]) — git's background
-        ;; upstream watch, the BEAM views' refresh — each asked whether it wants one now
-        feature-timers (fold (%map-pairs *timer-clients*)
-                         {}
-                         (fn (acc kv)
-                           (let ([name client] kv
-                                 spec (ed-call-deferred m (:spec client) nil))
-                             (if spec (assoc acc name spec) acc))))
+        one-shots (ed-idle-one-shots m (:held-key m))
         managed (merge {:cursor-blink {:every *blink-ms* :idle? true}}
-                  spin feature-timers idle)
-        ;; Every managed one-shot is dropped here and re-added by `managed` while its work
-        ;; is pending — that drop is what RE-ARMS it. A one-shot the loop has already fired
-        ;; is dead until its entry is recreated, so a managed timer missing from this list
-        ;; fires once and never again.
+                  ;; The spinner frame, ticking ONLY while an announced job is in flight. A
+                  ;; timer armed unconditionally is an editor that never goes idle — this one
+                  ;; appears with the work and drops itself with it, the `:scrollbar-fade`
+                  ;; pattern.
+                  (if (ed-busy? m) {:spinner {:every *spinner-ms*}} {})
+                  (ed-feature-timers m)
+                  (into {}
+                    (for ([name delay due?] one-shots :when due?)
+                      [name {:after delay :idle? true}])))
+        ;; Every managed timer is dropped here and re-added by `managed` while its work is
+        ;; pending — that drop is what RE-ARMS a one-shot. A one-shot the loop has already
+        ;; fired is dead until its entry is recreated, so a managed timer missing from this
+        ;; list would fire once and never again.
         kept (apply dissoc
                (or (:timers m) {})
-               :cursor-blink :idle-recompute
-               :which-key :undo-pause
-               :spinner :scroll-settle
-               (append (keys *timer-clients*) (map *live-eval-clients* :timer))))
+               :cursor-blink :spinner
+               (append (keys (ed-timer-clients)) (map one-shots first))))
     (assoc m :timers (merge kept managed))))
 
 ;; ---- overlay scrollbar fade (macOS-style auto-hide) -------------------------
@@ -1163,200 +890,6 @@ view omits the thumb entirely."
         0.0
         (math/min 1.0 (/ (* 1.0 budget) *scrollbar-fade-ticks*))))))
 
-;; ---- key / command labels (which-key + describe-key) ------------------------
-;; Presentation helpers shared by the which-key panel (view) and describe-key (input):
-;; turn a keymap key into an Emacs-style label and a binding (a command symbol or a
-;; prefix sub-keymap) into a short command name, and read a command's docstring.
-
-(def- ed-key-modifiers
-  ;; A keyword-name prefix and its Emacs spelling, LONGEST FIRST so `ctrl-meta-` is seen
-  ;; before `ctrl-`. The list is the whole modifier vocabulary; add a row to add one.
-  [["ctrl-meta-" "C-M-"] ["ctrl-" "C-"] ["meta-" "M-"] ["alt-" "M-"] ["shift-" "S-"]])
-
-;; check-allow: deliberately non-tail — depth = the number of modifiers on one key (C-M-S-x
-;; is three), not any input size.
-(check-allow :non-tail-recursion
-  (defn- ed-key-name-label (n)
-    "The Emacs spelling of a key keyword's NAME — its modifier prefixes replaced one at a
-time, innermost last, and a bare space as `SPC`.
-
-This was seven chained `string/replace` passes over every key, each one scanning and
-allocating whether or not it matched. That is ~40 µs a key, and inverting a keymap labels a
-few hundred of them: 7.5 ms, paid to render fifteen rows of `M-x` marginalia. A prefix test
-costs one comparison and the recursion is at most as deep as the modifiers a key carries."
-    (let (hit (seq/find ed-key-modifiers (fn (p) (string/starts-with? n (first p)))))
-      (cond
-        (= n " ") "SPC"
-        (nil? hit) n
-        :else
-          (let ([prefix spelling] hit)
-            (str spelling
-              (ed-key-name-label (string/substring n (string/length prefix) (string/length n)))))))))
-
-(defn ed-key-label (k)
-  "An Emacs-style label for a keymap key: `:ctrl-e` → `C-e`, `:alt-g` → `M-g`,
-`:ctrl-meta-i` → `C-M-i`, `(keyword \"alt- \")` → `M-SPC`, a 1-char string as itself."
-  (cond
-    (string? k) (if (= k " ") "SPC" k)
-    (keyword? k) (ed-key-name-label (->string k))
-    :else (str k)))
-
-(defn ed-cmd-label (v)
-  "A short label for a keymap binding: a prefix sub-keymap → `+prefix`, else the command
-symbol's name with the module path and `cmd-` prefix stripped (`commands/cmd-find-file`
-→ `find-file`)."
-  (if (map? v)
-    "+prefix"
-    (let (base (last (string/split (->string v) "/")))
-      (if (string/starts-with? base "cmd-") (string/substring base 4 (string/length base)) base))))
-
-(defn ed-keys-label (keys)
-  "A space-joined Emacs label for a key sequence (`[:ctrl-x :ctrl-e]` → `C-x C-e`)."
-  (string/join (map keys ed-key-label) " "))
-
-(defn ed-cancel-key? (input)
-  "Whether `input` is a cancel key (Esc / C-g) — what every modal overlay reads as quit.
-Key vocabulary, so it lives beside the labels rather than in `input`: the dispatcher owns
-the overlays, and a module that one of those overlays drives (`transient`) would close a
-cycle around the whole of `input` just to ask this."
-  (or (= input :escape) (= input :ctrl-g)))
-
-;; ---- key-accurate help text: ask the keymap, don't hardcode -------------------
-;; Any text that tells the user which key to press goes stale the moment a key is
-;; rebound (or the profile switches). So text names the COMMAND and the renderer
-;; asks the live keymap what runs it — Emacs's `substitute-command-keys`, over
-;; std's `keymap-where-is`. `ed-command-keys` builds the vocabulary; pair it with
-;; `template/render`'s `{{name}}` holes and prose follows the user's own bindings.
-
-(defn ed-where-is (km command &optional fallback)
-  "The Emacs-style label of the key sequence bound to `command` in keymap `km`
-(`\"C-x C-e\"`), or `fallback` when nothing is — including when `command` is **nil**,
-the \"this key is grammar, not a binding, so document the literal\" case (a modal
-profile routing many keys through one command). With several bindings the choice is
-**deterministic** — the shortest sequence, then the alphabetically-first label (so
-`C-n` beats `down`, and re-rendering never reshuffles) rather than whatever the
-map's hash order happens to yield."
-  (let (labels (if (nil? command) '() (map (keymap-where-is km command) ed-keys-label))
-        ;; a `[key-count label]` sort key: structural order compares the number
-        ;; first (shortest chord wins), then the label as text — deterministic
-        ;; without needing a string comparator (`<` is numeric in Brood).
-        best (first (sort-by labels (fn (l) [(count (string/split l " ")) l]))))
-    (or best fallback)))
-
-(defn ed-command-tail (command)
-  "A command symbol's last segment — `bedit/commands/cmd-find-file` → `cmd-find-file`. The
-registry keeps a command qualified where it was defined (package root and all) while a
-keymap binds it as `commands/cmd-find-file`; the two name the same command, and the tail is
-what `M-x` names are keyed by, so it is unique among commands."
-  (last (string/split (->string command) "/")))
-
-(defn ed-key-table (km)
-  "`{command-tail -> key-sequence}` for every command `km` binds — the whole keymap inverted
-in ONE walk (`keymap-index`), each command taking its best binding by `ed-where-is`'s rule
-(shortest chord, then the alphabetically-first label).
-
-For a caller that needs the key beside MANY commands. `ed-where-is-named` answers for one,
-and walks the keymap twice to do it — fine for a help line, ruinous for a list: `M-x`'s
-marginalia did that per visible row per frame, which measured 48 ms a keystroke. Build this
-once for the prompt and each row is a map lookup.
-
-It holds the SEQUENCE, not the label. Labelling is ~25 µs a key in Brood and a keymap binds
-a few hundred; labelling them all here put 6 ms on opening `M-x` to render fifteen rows.
-`ed-keys-label` at the row is the same answer for the rows that actually exist."
-  (fold (editor/keymap/keymap-index km)
-    {}
-    (fn (acc entry)
-      (let ([command seqs] entry
-            ;; one binding is the overwhelming case, and it needs no ordering at all — the
-            ;; sort is only there to make a CHOICE deterministic when there are several, and
-            ;; it is the only place a label is built here
-            best (if (nil? (rest seqs))
-                   (first seqs)
-                   (first (sort-by seqs (fn (s) [(count s) (ed-keys-label s)])))))
-        (if (nil? best) acc (assoc acc (ed-command-tail command) best))))))
-
-(sig ed-where-is-named (map any &optional any -> (or nil string)))
-;; check-allow: `ed-where-is` reads the keymap's binding table (std's data), so the label is
-;; unknown to the checker; it is a string or the fallback
-(check-allow :trusted
-  (defn ed-where-is-named (km command &optional fallback)
-    "[[ed-where-is]] for a command known by a symbol that may be spelled differently in
-the keymap — matched by `ed-command-tail`. For one command; for a list of them build an
-`ed-key-table` instead, which inverts the keymap once rather than twice per command."
-    (let (tail (ed-command-tail command)
-          bound (seq/find (editor/keymap/keymap-commands km)
-                  (fn (c) (= tail (ed-command-tail c))))
-          label (if (nil? bound) nil (ed-where-is km bound)))
-      (or label fallback))))
-
-(defn- ed-run-by-name (km name)
-  ;; "how you'd run `name` with no key bound": the profile's command-prompt key plus
-  ;; the name. The SEPARATOR is part of the answer, not decoration — vim's prompt is
-  ;; `:` and you type `:save` with no space, while emacs' is a chord and you type
-  ;; `M-x save` with one. A hardcoded space made the vim rendering wrong in exactly
-  ;; the way a hardcoded "M-x" would have.
-  (let (prompt (ed-where-is km 'commands/cmd-execute-extended-command "M-x")
-        sep (if (= 1 (string/length prompt)) "" " "))
-    (str prompt sep name)))
-
-(defn- ed-subst-hole (km hole)
-  ;; One `\\[command]` hole -> the key bound to it, else how to run it by name.
-  (let (sym (symbol (string/trim hole)))
-    (or (ed-where-is km sym)
-      (ed-run-by-name km (ed-cmd-label sym)))))
-
-(defn ed-substitute-command-keys (km text)
-  "Emacs's `substitute-command-keys`: replace every `\\[command]` hole in `text` with
-the key sequence bound to that command in `km`, or `M-x <name>` when it has none.
-
-The low-ceremony half of key-accurate help text: `ed-command-keys` is right when the
-same key is named many times (a vocabulary worth declaring), this is right for the
-one-off mentions that would otherwise be hardcoded — a welcome message, a mode's
-help header, a commit buffer's instructions. Either way the text follows the user's
-real bindings instead of contradicting them."
-  (let (parts (string/split text "\\["))
-    (if (= (count parts) 1)
-      text
-      (str (first parts)
-        (apply str
-          (map (rest parts)
-            (fn (part)
-              (let (close (index-of part "]"))
-                (if (< close 0)
-                  (str "\\[" part) ; unterminated: leave it alone
-                  (str (ed-subst-hole km (string/substring part 0 close))
-                    (string/substring part (inc close) (string/length part))))))))))))
-
-(defn ed-command-keys (km specs)
-  "A `{name → key-label}` vocabulary derived from the live keymap `km`: `specs` is
-`{name [command-sym fallback]}` (the fallback covers a command the profile doesn't
-bind — e.g. a modal grammar key that isn't a command at all). The data half of
-key-accurate help text: render prose with `{{name}}` holes against this and a
-rebinding updates the documentation instead of contradicting it.
-
-    (template/render \"press {{save}} to save\"
-      (ed-command-keys km {:save ['commands/cmd-save-buffer \"C-x C-s\"]}))"
-  (fold specs
-    {}
-    (fn (acc kv)
-      (let ([name spec] kv
-            [command fallback] spec)
-        (assoc acc name (ed-where-is km command fallback))))))
-
-(defn ed-doc (sym)
-  "The docstring of command `sym` via the `doc` primitive. Tries it as given (a qualified
-keymap binding like `commands/cmd-find-file` resolves directly), then in the `commands/`
-namespace (where the M-x registry's bare `cmd-` symbols live). Nil if neither resolves."
-  ;; a bare `cmd-` name is unbound outside `commands/` — the first eval failing is the probe, not a fault
-  (check-allow :discarded-catch
-    (or (check-allow :discarded-catch (try (reflect/eval (list 'doc sym)) (catch e nil)))
-      (check-allow :discarded-catch
-        (try (reflect/eval (list 'doc (symbol (str "commands/" (->string sym))))) (catch e nil))))))
-
-(defn ed-first-line (s)
-  "The first line of string `s` (the docstring summary shown in the echo area)."
-  (first (string/split s "\n")))
-
 (defn ed-strip-newline (s)
   "`s` without a single trailing newline — a buffer line's text with the `\\n` that
 `buffer-line-at` keeps dropped. Shared by the view (line rendering) and the editing
@@ -1369,6 +902,11 @@ commands (transpose-lines, occur)."
 model` continuation), via the read-char transient (`input`). Esc/C-g aborts. The shared
 one-key reader behind zap-to-char and the register / bookmark commands."
   (assoc (message m prompt) :read-char {:then then}))
+
+(defn ed-yes-key? (key)
+  "Whether `key` — what an `ed-read-char` continuation was handed for a `(y or n)`
+question — answers yes: `y` or `Y`. Anything else declines, as in Emacs `y-or-n-p`."
+  (or (= key "y") (= key "Y")))
 
 (sig ed-break-undo-run (model -> model))
 (defn ed-break-undo-run (m)
@@ -1414,47 +952,64 @@ the pool, then any pool buffer never selected in this session (in pool order)."
   (let (cur (buffer-name (ed-current-buf m)))
     (seq/find (ed-recent-buffers m) (fn (n) (not (= n cur))))))
 
+;; ---- post-step hooks ------------------------------------------------------------
+;; The per-event follow-ups that keep a derived view in step with the model the event left:
+;; buffer recency, a *Diagnostics* pane following the findings, a stale completion popup
+;; closing, the live-evaluating buffers' notes following the text. Each is a ROW its module
+;; registers at load ([[register-post-step]]), so `ed-post-step` folds the table and names
+;; none of the features — the idle-job shape (`register-idle-job`), run on EVERY event
+;; rather than the idle beat, so a row must be O(1) when it has nothing to do.
+
+(defn register-post-step (name step)
+  "Add a post-event hook `name` — `{:order :run}`, `:run` a `(model) -> model` symbol
+(resolved late, so a redefinition hot-swaps; a deferred module's hook is skipped until it
+loads) and `:order` its position in the chain — replacing any hook registered under `name`.
+Called when the hook's module loads."
+  (registry/put! :model/post-steps name (assoc step :name name :rank (:order step))))
+
+(defn ed-run-post-steps (m)
+  "Every registered post-step hook's `:run`, in `:order`, each seeing the model the previous
+one left."
+  (fold (registry/ranked :model/post-steps)
+    m
+    (fn (acc [_ step]) (ed-call-deferred acc (:run step) acc))))
+
+;; buffer recency (Emacs's `buffer-list` order): whatever buffer is current after this event
+;; moves to the head — the one place every path that switches a buffer (C-x b, RET in dired,
+;; a results jump, a pane click) passes through
+(register-post-step :buffer-recency {:order 10 :run 'model/ed-note-buffer-recency})
+;; the live-evaluating buffers' notes follow the text on the edit itself (the debounce only
+;; EVALUATES) — O(1) per client until its own buffer's notes go stale
+(register-post-step :live-eval-reanchor {:order 40 :run 'model/ed-live-eval-reanchor})
+
 (defn ed-post-step (m input)
   "The post-event step run after `input/ed-update` folds an event in. The eldoc hint and
 the advisory type-check are **debounced onto idle timers** (ADR-102; Emacs's idle-timer
 model) — recomputing them per keystroke makes a large buffer crawl. So this recomputes
-nothing directly; it just reconciles `:timers` (`ed-sync-timers`) with the new model
+nothing directly; it reconciles `:timers` (`ed-sync-timers`) with the new model
 state — arming the eldoc/diagnostics debounce, the which-key delay, and the undo-pause
 boundary when each is due — and the timers' firing (in `input/ed-timer-fire`) does the
-work. A real keystroke/click also forces the caret solid (`ed-real-input?`), so it only
-blinks at rest. Finally refreshes the open minibuffer's memoized candidate list
-(`ed-cache-mb-candidates`) so the view/input read it cheaply."
+work; then runs the registered post-step hooks (`ed-run-post-steps`). A real keystroke/click
+also forces the caret solid (`ed-real-input?`), so it only blinks at rest. Finally refreshes
+the open minibuffer's memoized candidate list (`ed-cache-mb-candidates`) so the view/input
+read it cheaply."
   (let (real (ed-real-input? input)
         ;; a real keystroke/click forces the caret solid AND, while a web mirror is
         ;; running, marks the snapshot dirty so the idle beat republishes it once (debounced
         ;; off the hot key path — `ed-sync-timers` arms `:idle-recompute`, `web-publish!`
         ;; fires there). Timer/blink/system events don't dirty it, so the mirror only
         ;; refreshes after actual edits/moves.
-        m0 (if real (assoc m :blink-on? true) m)
-        m1 (if (and real (:server m)) (assoc m0 :web-dirty true) m0)
-        m2 (ed-sync-timers m1)
-        ;; buffer recency (Emacs's `buffer-list` order): whatever buffer is current after
-        ;; this event moves to the head — the one place every path that switches a
-        ;; buffer (C-x b, RET in dired, a results jump, a pane click) passes through
-        m2 (ed-note-buffer-recency m2)
-        ;; the *Diagnostics* pane, if one is up, follows the findings — free unless they
-        ;; moved (`diagnostics/refresh` compares the staleness key before it renders)
-        m2 (ed-call-deferred m2 'diagnostics/refresh m2)
-        ;; …and a completion popup that no longer describes where point is closes. The
-        ;; overlays dismiss it for a key it does not own, but a MOUSE click never reaches
-        ;; them (`ed-mouse` folds it directly), so clicking away left the list on screen
-        ;; anchored to a line you had left
-        m2 (ed-call-deferred m2 'complete-at-point/close-stale-popup m2)
-        ;; the live-evaluating buffers' notes follow the text on the edit itself (the
-        ;; debounce only EVALUATES) — the same deferred-module guard as their stale? probes
-        ;; above, and both are O(1) until their own buffer's notes go stale
-        m2 (ed-live-eval-reanchor m2)
-        mb (:minibuffer m2))
+        touched (cond
+                  (not real) m
+                  (:server m) (assoc m :blink-on? true :web-dirty true)
+                  else (assoc m :blink-on? true))
+        stepped (ed-run-post-steps (ed-sync-timers touched))
+        mb (:minibuffer stepped))
     ;; Bring the candidate list up to date with the typed text: a small source ranks here on
     ;; the keystroke (instant), a large one ASKS its ranking session and folds the answer
     ;; when it arrives (`ed-cache-mb-candidates`). Either way this is O(1) on the event when
     ;; the text has not changed, which is every frame, tick and selection move.
-    (if (or (nil? mb) (not (mb-source? mb))) m2 (ed-cache-mb-candidates m2))))
+    (if (or (nil? mb) (not (mb-source? mb))) stepped (ed-cache-mb-candidates stepped))))
 
 ;; ---- the minibuffer (a one-line prompt over lineedit's pure editor core) -----
 ;; The `:minibuffer` field is `{:edit <lineedit-state> :on-complete :complete-fn
@@ -1623,6 +1178,10 @@ list until the reader gives up and retypes. A no-op when the cache is current."
   (if (mb-cands-stale? m)
     (ed-cache-mb-candidates (assoc m :minibuffer (dissoc (:minibuffer m) :asked)))
     m))
+
+;; the minibuffer is the model's own, so this job is the one row the model registers itself
+(register-idle-job :minibuffer-rerank
+  {:order 70 :run 'model/ed-mb-reask :stale? 'model/mb-cands-stale? :held-key-gated? true})
 
 (defn ed-cache-mb-candidates (m)
   "Bring the open minibuffer's `:cand-cache` (`{:for <text> :cands …}`) up to date with the
@@ -1986,6 +1545,27 @@ binding)."
   "Whether `input` is an async event record (implements `UiEvent`)."
   (and (record? input) (satisfies? 'UiEvent input)))
 
+(defmacro defuievent (name fields handler)
+  "Declare the async event record `name` (with `fields`) and fold it into the model by
+calling the NAMED `handler` — `(handler m event textrows cols rows) -> model`. The
+record + `UiEvent` impl pair every producer wrote out by hand, in one line:
+
+    (defuievent compile-done-event (code) ed-ev-compile-done)
+
+The impl body only CALLS `handler`, a global resolved at each fold, so redefining the
+handler hot-swaps the live editor exactly as the hand-written impl did. An event whose
+fold is more than that delegation (a generation guard, an inline body) keeps its own
+`impl`."
+  ;; `~'UiEvent` / `~'ui-event-fold`: written bare, as a hand impl writes them. The
+  ;; quasiquote would qualify them to `bedit/model/…`, and the impl then registers under
+  ;; a name `ui-event?`'s `(satisfies? 'UiEvent …)` does not ask about — every such
+  ;; event silently stops folding
+  `(do
+     (defrecord ~name ~fields)
+     (impl ~'UiEvent
+       ~name
+       (~'ui-event-fold [event m textrows cols rows] (~handler m event textrows cols rows)))))
+
 (defrecord buffer-log-event (buffer line)) ; a routed log line -> append to that buffer
 (impl UiEvent
   buffer-log-event
@@ -2031,7 +1611,7 @@ supervised logger, so routes survive a restart."
           {:filter (fn (r) (= (ed-record-category r) (:category rt)))})))))
 
 ;; ---- the kill ring's head: what a yank inserts ------------------------------
-;; The ring itself is maintained by the kill commands (`commands/ed-push-kill`); what
+;; The ring itself is pushed by the kill commands through `ed-push-kill` (below); what
 ;; every YANK site shares — the buffer's `C-y`, the minibuffer's, isearch's — is the
 ;; question "what text does a yank insert right now?", which first asks the OS
 ;; clipboard whether another app copied something newer. That lives here, on the model,
@@ -2063,6 +1643,49 @@ clipboard — or `[m' nil]` when the ring is empty."
         ring (:kill-ring m1))
     [m1 (if (empty? ring) nil (first ring))]))
 
+;; ---- pushing onto the ring: what a kill or a copy does ----------------------
+;; Commands whose consecutive use coalesces into one kill-ring entry (like Emacs).
+;; Every command that kills, so consecutive kills coalesce into one entry (Emacs
+;; `kill-append`). `cmd-copy-region` is here on purpose: Emacs's copy-region-as-kill appends
+;; after a kill too. A kill command left off this list silently starts a new entry —
+;; `M-k M-k` used to leave two sentences on the ring instead of one.
+(def- ed-kill-commands
+  '(commands/cmd-kill-region commands/cmd-copy-region
+     commands/cmd-kill-line commands/cmd-kill-word commands/cmd-backward-kill-word
+     commands/cmd-kill-whole-line commands/cmd-sexp-kill commands/cmd-kill-sentence
+     commands/cmd-backward-kill-sentence commands/cmd-kill-sexp commands/cmd-backward-kill-sexp
+     commands/cmd-zap-to-char))
+
+(defn- ed-kill-command? (sym) (includes? ed-kill-commands sym))
+
+(defn ed-push-kill (m text forward?)
+  "Push killed `text` onto the kill ring. If the previous command was also a kill,
+**append** to the current head entry instead of starting a new one — at the end for
+a forward kill, the front for a backward kill (Emacs's consecutive-kill coalescing).
+Otherwise cons a fresh entry. The new ring head is also mirrored to the OS clipboard
+(`os/clipboard-set`, itself a no-op without a clipboard) so every kill / copy is system-wide — Emacs's
+`interprogram-cut-function` / `select-enable-clipboard`; `cmd-yank` reads it back."
+  (let (ring (:kill-ring m)
+        coalesce? (and (ed-kill-command? (:last-command m)) (not (empty? ring)))
+        head (if coalesce?
+               (if forward? (str (first ring) text) (str text (first ring)))
+               text)
+        tail (if coalesce? (rest ring) ring))
+    ;; `os/clipboard-set` is itself a no-op without a clipboard, so nothing here is guarded:
+    ;; a stale name must raise, not leave every kill un-mirrored.
+    (when (:os-clipboard m) (os/clipboard-set head))
+    (assoc m :kill-ring (take (cons head tail) ed-kill-ring-max))))
+
+(defn ed-drag-copy (m)
+  "Emacs `mouse-drag-copy-region`: when a mouse drag-select ends with a real region,
+copy it to the kill ring — and thus the OS clipboard (`ed-push-kill`) — WITHOUT clearing
+it, so releasing a highlight makes it immediately paste-able in any buffer, read-only or
+not. Silent (no echo — a drag shouldn't spam the echo area). A plain click selects
+nothing, so it's a no-op. Coalescing is suppressed (`:last-command` cleared) so the
+selection is its own entry, never appended to a prior kill."
+  (let (text (buffer-region (ed-current-buf m)))
+    (if (nil? text) m (ed-push-kill (assoc m :last-command nil) text true))))
+
 ;; ---- OS window title --------------------------------------------------------
 
 (defn ed-reds-human (n)
@@ -2089,244 +1712,3 @@ metric."
         branch (:branch (:git-summary m))
         branch-seg (if (nil? branch) "" (str " — " branch)))
     (str name modified branch-seg " — " *app-name*)))
-
-;; ---- auto-save --------------------------------------------------------------
-;; On the idle beat, write `#filename#` sidecar files for modified file-backed
-;; buffers. `cmd-save` clears the sidecar on a real save (`delete-file`).
-
-(def *auto-save-interval-ms* 30000)
-
-(defn ed-auto-save-path (path)
-  "The auto-save sidecar path: `#basename#` in the same directory as `path`."
-  (path/join (path/dirname path) (str "#" (path/basename path) "#")))
-
-(defn ed-auto-save! (m)
-  "Write `#filename#` sidecars for all modified file-backed buffers, throttled to
-once per `*auto-save-interval-ms*`. Returns the model with `:auto-saved-at` updated."
-  (let (now-ms (os/now)
-        last (or (:auto-saved-at m) 0))
-    (if (< (- now-ms last) *auto-save-interval-ms*)
-      m
-      (do
-        (doseq (buf (:buffers m))
-          (let (path (buffer-file buf))
-            (when (and path (buffer-modified? buf))
-              (try
-                (file/spit (ed-auto-save-path path) (buffer-text buf))
-                (catch e (log/warn (str "auto-save of " path " failed: " (error-message e))))))))
-        (assoc m :auto-saved-at now-ms)))))
-
-(defn ed-revert-at (m i)
-  "Re-read pool buffer `i` from its file, discarding its unsaved changes: the buffer
-keeps its name, mode (`:layers`) and dir, every pane on it keeps its point (clamped to
-the new length), undo history resets. The shared core of `M-x revert-buffer` (the
-current buffer) and the idle beat's auto-revert (any buffer another writer changed).
-Raises if the file cannot be read — the callers report."
-  (let (b (ed-buf-at m i)
-        f (or (buffer-file b) (error "revert: buffer " (buffer-name b) " has no file"))
-        fresh (find-file-buffer f)
-        len (buffer-length fresh)
-        ;; Carry the original buffer's MODE (`:layers`) + dir onto the reverted buffer.
-        ;; The line-number / diff-hl gutter, highlighting and eldoc are all `:layers`
-        ;; mode services — a bare `find-file-buffer` has none (they're seeded lazily on
-        ;; the next dispatch), so without this the gutter vanishes until the next
-        ;; keystroke re-inits them. diff-hl re-arms on its own (fresh has no
-        ;; `:git-status-rope`, so it recomputes against the new content on the idle beat).
-        reverted (goto-char (assoc fresh :name (buffer-name b) :layers (:layers b) :dir (:dir b))
-                   (math/min (buffer-point b) len)))
-    (ed-map-panes (ed-set-buf-at m i reverted)
-      (fn (w)
-        (if (and (= (:buffer w) i) (not (nil? (:point w))))
-          (assoc w :point (math/min (:point w) len) :mark nil)
-          w)))))
-;; ---- files that change under the editor ------------------------------------
-;; Another writer — a formatter, `git checkout`, a build step, a colleague's editor —
-;; rewrites a file this editor has open. Emacs's answer is two-fold: `auto-revert` reloads
-;; a buffer with no unsaved changes, and a buffer WITH changes is protected: the save
-;; asks before overwriting the other writer's work. The knowledge of "changed since we
-;; last agreed" lives in `std/editor/buffer` (`:file-mtime`, `buffer-file-changed?`);
-;; this is the policy over it, run on the idle beat so it costs a keystroke nothing.
-
-(sig ed-revert-changed-files (model -> model))
-(defn ed-revert-changed-files (m)
-  "For every file buffer whose file was written since it last agreed with the buffer
-(`buffer-file-changed?`): a buffer with NO unsaved changes is reverted in place (Emacs
-`global-auto-revert-mode`) with a note in the echo area; one WITH unsaved changes is left
-alone and warned about once per on-disk version (`:disk-warned` remembers the mtime told
-about), since `cmd-save` will ask before overwriting. A revert that fails (the file
-unreadable now) is logged and skipped. Runs on the idle beat."
-  (fold (range (count (:buffers m)))
-    m
-    (fn (acc i)
-      (let (b (ed-buf-at acc i)
-            f (buffer-file b))
-        (if (or (nil? f) (not (buffer-file-changed? b)))
-          acc
-          (let (now (file/mtime f))
-            (cond
-              (not (buffer-modified? b))
-                (try
-                  (message (ed-revert-at acc i) (str "reverted " f " (changed on disk)"))
-                  (catch e
-                    (do
-                      (log/warn (str "auto-revert of " f " failed: " (error-message e)))
-                      acc)))
-              (= (:disk-warned b) now) acc
-              else
-                (message (assoc acc :buffers (assoc (:buffers acc) i (assoc b :disk-warned now)))
-                  (str f " changed on disk — save will ask; M-x revert-buffer to reload")))))))))
-
-;; ---- scrolling --------------------------------------------------------------
-
-(def *scroll-margin* 4) ; Emacs `scroll-margin`: lines of context kept above/below point
-(sig ed-margin (int -> int))
-(defn ed-margin (textrows)
-  "The effective scroll margin for a `textrows`-tall viewport: `*scroll-margin*`, capped
-below half the viewport (so a tall margin in a short pane can't exceed what fits)."
-  (math/max 0 (math/min *scroll-margin* (math/quot (dec textrows) 2))))
-
-(sig ed-max-top (buffer int &optional (or nil int) -> int))
-(defn ed-max-top (buf textrows &optional (w nil))
-  "The largest scroll offset that still fills a `textrows`-tall viewport — the last
-line sits on the bottom row. Beyond this there'd be blank space past end-of-buffer, so
-scrolling clamps here (and the bottom margin relaxes near EOF, as in Emacs). For a
-wrapped buffer (`ed-wrap?`) given its text width `w`, the last line's LAST row sits on
-the bottom row — a wrapped line takes several, so the top can be higher than the line
-count says; without `w` the line arithmetic stands (a caller with no width to measure at)."
-  (if (and w (> w 0) (ed-wrap? buf))
-    (let (last (dec (buffer-line-count buf))
-          segs (wrap/line-segments buf last w))
-      (ed-wrap-top-for buf last (dec (count segs)) w textrows 0))
-    (math/max 0 (- (buffer-line-count buf) textrows))))
-
-(sig ed-wrap? (buffer -> bool))
-(defn ed-wrap? (buf)
-  "Whether `buf` wraps long lines visually (`visual-line-mode`, M-x visual-line-mode):
-a long line takes as many screen rows as it needs instead of scrolling sideways. Per
-buffer, as in Emacs: the buffer's own `:visual-line` when it has been toggled, else the
-mode's `:visual-line` facet (markdown wraps by default). The break rule is
-`wrap/segments`."
-  (let (own (:visual-line buf))
-    (if (nil? own) (= true (ed-mode-service buf :visual-line)) (= true own))))
-
-(defn ed-row-wise? (buf inlays)
-  "Whether `buf`'s rows on screen stop being one per line, in order, from the top — so what
-is visible has to be COUNTED in a row table (`wrap/rows-from`) rather than read off as
-`top + k`. Two things do that: WRAPPING (`ed-wrap?`, a long line takes several rows) and
-INLAY rows (`inlays`, from `results/inlay-lines` — derived text on a row of its own above
-a line). The one rule the scroll clamp (`ed-scroll`), the pane's row table
-(`panes/ed-pane-rows`) and the point-follows-view step (`input/ed-point-into-view`) share:
-when they disagreed, an inlay pushed the last line off the bottom while the cursor step
-still counted it as shown."
-  (or (ed-wrap? buf) (not (empty? inlays))))
-
-(sig ed-wrap-top-for (buffer int int int int int &optional map -> int))
-(defn- ed-wrap-top-for (buf line seg-row w budget floor &optional (inlays {}))
-  "The highest scroll top that still shows point's row within `budget` rows from the top:
-from `line` (whose rows through point's, `seg-row + 1`, are already spent) walk up a line
-at a time while the line above fits — never above `floor`. Tail-recursive over the lines
-above.
-
-A line above point costs its wrapped segments PLUS its inlay rows: both occupy rows, and a
-walk that counted only the segments would stop one line too high for every inlay it passed."
-  (let (step (fn (t used)
-               (if (<= t floor)
-                 t
-                 (let (above (+ (count (wrap/line-segments buf (dec t) w))
-                               (count (get (or inlays {}) (dec t) []))))
-                   (if (> (+ used above) budget)
-                     t
-                     (step (dec t) (+ used above)))))))
-    (step line (inc seg-row))))
-
-(sig ed-scroll (model int -> model))
-(defn ed-scroll (m textrows)
-  "Adjust the selected pane's `:top` so point keeps `*scroll-margin*` lines of context
-above and below it within a `textrows`-tall viewport — scrolling only as far as needed
-(Emacs `scroll-margin` + `scroll-conservatively`: never recenter, just enough). Clamped
-so it never scrolls past end-of-buffer (no blank void below the last line); near the
-edges the margin is whatever the buffer allows. A wrapped buffer (`ed-wrap?`) counts
-ROWS below the top, not lines — a long line above point takes several — against the
-text width the loop last stored (`:view-cols`); the margin above stays in lines. Pure."
-  (let (buf (ed-current-buf m)
-        line (buffer-current-line buf)
-        top (ed-current-top m)
-        mgn (ed-margin textrows)
-        ;; a narrowed pane scrolls only within its restriction — first line `rtop`, and a
-        ;; top no further than shows the last restricted line on the bottom row; a wide pane
-        ;; gets `[0 .. ed-max-top]`, exactly as before (the restriction range is the whole
-        ;; buffer then, so these reduce to the old bounds).
-        restrict (ed-selected-restrict m)
-        [rtop rbot] (if restrict (ed-restrict-lines buf restrict) [0 (dec (buffer-line-count buf))])
-        mintop rtop
-        w (or (:view-cols m) 0)
-        inlays (results/inlay-lines buf)
-        wrap? (and (> w 0) (ed-row-wise? buf inlays))
-        ;; row-wise: the top that puts the last (restricted) line's last row on the bottom row
-        maxtop (math/max rtop
-                 (if wrap?
-                   (ed-wrap-top-for buf
-                     rbot
-                     (dec (count (wrap/line-segments buf rbot w)))
-                     w
-                     textrows
-                     rtop
-                     inlays)
-                   (math/min (ed-max-top buf textrows) (math/max 0 (- (inc rbot) textrows)))))
-        lo (+ top mgn) ; first comfortable line (margin below top)
-        hi (- (+ top textrows) 1 mgn) ; last comfortable line (margin above bottom)
-        want (cond
-               (< line lo) (- line mgn)
-               (not wrap?) (if (> line hi) (+ (- line textrows) 1 mgn) top)
-               else
-               ;; point's row below the top: the rows of the lines above it plus its
-               ;; own segment; past the comfortable last row, raise the top just enough
-                 (let (seg-row (wrap/row-of (wrap/line-segments buf line w) (buffer-column buf))
-                       r (+ (wrap/row-count buf top line w inlays) seg-row))
-                   (if (> r (- textrows 1 mgn))
-                     (math/max top
-                       (ed-wrap-top-for buf line seg-row w (- textrows mgn) mintop inlays))
-                     top))))
-    (ed-set-top m (math/max mintop (math/min maxtop want)))))
-
-;; ---- horizontal scroll (long lines, no wrap): keep point's column in view ----
-(def *hscroll-margin* 8) ; columns of context kept left/right of point
-(sig ed-current-hscroll (map -> int))
-(defn ed-current-hscroll (m)
-  "The selected pane's horizontal scroll offset (leftmost visible char column), 0 if unset."
-  (let (h (:hscroll (ed-current-pane m)))
-    (if (int? h) (math/max 0 h) 0)))
-
-(sig ed-set-hscroll (model int -> model))
-(defn ed-set-hscroll (m n)
-  "The model with the selected pane's `:hscroll` set to `n` (clamped non-negative)."
-  (assoc m :layout (pane-update-selected (:layout m) (fn (w) (assoc w :hscroll (math/max 0 n))))))
-
-(sig ed-scroll-horizontal (model int -> model))
-(defn ed-scroll-horizontal (m cols)
-  "Adjust the selected pane's `:hscroll` so point's column stays within the `cols`-wide
-text area, keeping `*hscroll-margin*` columns of slack — the horizontal analogue of
-`ed-scroll`, so a long line scrolls sideways to follow point instead of clipping.
-
-`:hscroll` is a CHARACTER offset into the line (where the view starts slicing), but the pane
-is `cols` display CELLS wide, so the decision is made in cells — measured as the view lays
-the line out, tabs expanded — and the new origin converted back with `width->index`. It
-compared characters to cells, and a line of leading tabs (a Makefile, Go) put point ninety
-cells in while its column read twenty: no scroll, and the cursor painted off-screen."
-  (let (buf (ed-current-buf m)
-        col (buffer-column buf)
-        hs (ed-current-hscroll m)
-        line (ed-strip-newline (buffer-line-at buf (buffer-current-line buf)))
-        cell-of (fn (i)
-                  (string/display-width (string/substring line 0 (math/min i (string/length line)))))
-        pcell (cell-of col)
-        hcell (cell-of hs)
-        mgn (math/max 0 (math/min *hscroll-margin* (math/quot (dec cols) 2))))
-    (cond
-      ;; a wrapped buffer never scrolls sideways: its long lines take more rows instead
-      (ed-wrap? buf) (if (= hs 0) m (ed-set-hscroll m 0))
-      (< (- pcell hcell) mgn)
-        (ed-set-hscroll m (string/width->index line (math/max 0 (- pcell mgn))))
-      (> (- pcell hcell) (- cols 1 mgn))
-        (ed-set-hscroll m (string/width->index line (math/max 0 (+ (- pcell cols) 1 mgn))))
-      else m)))

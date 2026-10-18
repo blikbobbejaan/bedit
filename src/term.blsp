@@ -37,8 +37,10 @@
   "A terminal buffer (M-x term, M-x claude): a full-screen program under a pty,
 its screen emulated by `std/vt` and painted into a buffer — every key goes to the
 program, the buffer's tail is its screen, everything above it is scrollback."
+  (:use editor/keymap :only [keymap-bind]) ; the mode keymap below
+  (:use editor/layers :only [register-type-layers]) ; the buffer type below
   (:use model)
-  (:use commands)
+  (:use pool) ; ed-open-buffer / ed-select / ed-project-root — the terminal buffer and where it runs
   (:use editor/buffer)
   (:use interactive))
 
@@ -167,15 +169,10 @@ buffer's life. Returns its pid. Its screens go to the loop that opened it
 
 ;; ---- the inbound events -------------------------------------------------------------
 
-(defrecord term-screen-event (buffer lines screen)) ; rows evicted since the last screen, then the screen
-(defrecord term-exit-event (buffer code)) ; the program exited
+;; each folds through its named `ed-ev-*` fn (`model/defuievent`) — redefining one hot-swaps
+(defuievent term-screen-event (buffer lines screen) ed-ev-term-screen) ; rows evicted since the last screen, then the screen
+(defuievent term-exit-event (buffer code) ed-ev-term-exit) ; the program exited
 (deftype screen (record &open :text string :spans vector :cursor int)) ; what `vt/screen` answers
-(impl UiEvent
-  term-screen-event
-  (ui-event-fold [e m textrows cols rows] (ed-ev-term-screen m e textrows cols rows)))
-(impl UiEvent
-  term-exit-event
-  (ui-event-fold [e m textrows cols rows] (ed-ev-term-exit m e textrows cols rows)))
 
 ;; ---- history: the rows above the screen ----------------------------------------------
 ;; A program that runs for hours must not leave a buffer the renderer carries whole, so
@@ -232,21 +229,15 @@ every cell reaching that first; a no-op below both."
           :term-hstart (- hstart cut)
           :term-hspans (shift-spans kept (- cut)))))))
 
-(defn- input-region (b)
-  "`[start end]` of the input region — CLAMPED into the buffer. A kill that reached above
-`:input-start` (click up into the scrollback, then C-k: the layer binds Backspace, not
-every kill) leaves the field past the end of the rope, and the next screen would index
-off it. bshell clamps the same field for the same reason."
-  (let (end (buffer-length b))
-    [(math/min (or (:input-start b) end) end) end]))
-(sig input-region (buffer -> (tuple int int)))
+;; The input region is bshell's (`bshell/input-region`, CLAMPED into the buffer): a kill
+;; that reached above `:input-start` leaves the field past the end of the rope, and the
+;; next screen would index off it — the shell's commands read the same field, so one
+;; clamped reader serves both.
 
 (defn- pending-input (b)
   "In line mode, what the user has typed past the program's cursor and not yet sent —
 kept across a redraw, as comint keeps the text after its process mark. \"\" otherwise."
-  (if (not (:term-line-mode b))
-    ""
-    (let ([start end] (input-region b)) (string/substring (buffer-text b) start end))))
+  (if (not (:term-line-mode b)) "" (bshell/input-text b)))
 (sig pending-input (buffer -> string))
 
 (defn- term-apply-screen (b lines screen)
@@ -434,7 +425,7 @@ in line mode when `line-mode?`."
       ;; everything below the click
       (let (cut (if on
                   (math/min (or (:term-cursor b) (buffer-length b)) (buffer-length b))
-                  (first (input-region b)))
+                  (first (bshell/input-region b)))
             trimmed (replace-region (set-read-only b false) cut (buffer-length b) "")
             switched (assoc (set-read-only trimmed (not on))
                        :term-line-mode on
@@ -458,16 +449,18 @@ edited here with the shell's history and boundary keys, and RET sends it whole."
 (defcommand cmd-term-send-line
   (m key)
   "RET in a line-mode terminal: send the input region to the program as one line and
-remember it in the buffer's history; the program's echo replaces it."
+remember it in the buffer's history — in memory, this terminal's own: a line typed at iex
+or `nest repl` is not a shell command, so it stays out of the shell's history file. The
+program's echo replaces it."
   (let (b (ed-current-buf m)
-        [start end] (input-region b)
+        [start end] (bshell/input-region b)
         line (string/substring (buffer-text b) start end)
         pid (live-program b))
     (if (nil? pid)
       m
       (do
         (send pid [:term-line line])
-        (let (remembered (if (string/blank? line) m (bshell/bshell-remember m line))
+        (let (remembered (if (string/blank? line) m (bshell/remember-input m line))
               cleared (replace-region (ed-current-buf remembered) start end ""))
           (ed-set-buf remembered cleared))))))
 
@@ -595,3 +588,42 @@ palette. History keeps the colours it was written in — its cells are gone."
         (when-let (pid (and (term-buffer? b) (live-program b)))
           (send pid [:term-palette (term-palette)]))))
     m))
+
+;; term-mode: a full-screen program under a real terminal emulator (M-x term, M-x claude —
+;; src/term.blsp). Its keys never reach a keymap: `input/term-overlay` hands every key but
+;; C-x to the program, so the layer is the buffer's IDENTITY — no gutter (a terminal has
+;; none, and the vt is sized to the pane's full width), the one editor binding a terminal
+;; needs (C-y pastes, as in vterm — the program never wanted a ^Y), and the hook that stops the program with the buffer. Not stacked on text-mode.
+(def term-mode-layer
+  {:name 'term
+   :doc "A terminal: every key goes to the program; C-x is still yours, C-y pastes, C-x c is C-c. In line mode RET sends the line."
+   :keymap (-> {}
+             (keymap-bind [:ctrl-y] 'term/cmd-term-paste)
+             ;; the two modes (Emacs term: C-c C-j line, C-c C-k char); reachable from char
+             ;; mode as C-x c C-j, since C-c itself belongs to the program there
+             (keymap-bind [:ctrl-c :ctrl-j] 'term/cmd-term-line-mode)
+             (keymap-bind [:ctrl-c :ctrl-k] 'term/cmd-term-char-mode)
+             ;; LINE mode only (in char mode the overlay owns these keys before any keymap):
+             ;; RET sends the input region; the history and boundary keys are bshell's, over
+             ;; the same `:input-start` field
+             (keymap-bind [:enter] 'term/cmd-term-send-line)
+             (keymap-bind [:ctrl-a] 'bshell/cmd-bshell-beginning-of-input)
+             (keymap-bind [:home] 'bshell/cmd-bshell-beginning-of-input)
+             (keymap-bind [:ctrl-b] 'bshell/cmd-bshell-backward-char)
+             (keymap-bind [:left] 'bshell/cmd-bshell-backward-char)
+             (keymap-bind [:backspace] 'bshell/cmd-bshell-delete-backward)
+             (keymap-bind [:up] 'bshell/cmd-bshell-previous-history)
+             (keymap-bind [:ctrl-p] 'bshell/cmd-bshell-previous-history)
+             (keymap-bind [:down] 'bshell/cmd-bshell-next-history)
+             (keymap-bind [:ctrl-n] 'bshell/cmd-bshell-next-history)
+             (keymap-bind [:ctrl-r] 'bshell/cmd-bshell-history-search)
+             ;; the two keys kept from the program, sent as themselves
+             (keymap-bind [:ctrl-x :ctrl-x] 'term/cmd-term-send-literal)
+             (keymap-bind [:ctrl-x :ctrl-y] 'term/cmd-term-send-literal)
+             ;; the editor's C-c map, under a key the program does not own
+             (keymap-bind [:ctrl-x "c"] 'term/cmd-term-editor-c-c))
+   ;; line mode: point never enters the program's prompt (the shell's guard, same field)
+   :post-key 'bshell/bshell-post-key
+   :modeline 'term/term-modeline
+   :hooks {:on-close '(term/term-on-close)}})
+(register-type-layers :term (list 'term/term-mode-layer))

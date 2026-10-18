@@ -12,7 +12,9 @@ where only the tutorial could reach it.
 What lives here is exactly what both need and neither owns:
 
   [[parse-state]]    is this text blank, mid-form, broken, or ready to send?
-  [[in-flight]]      which regions are already waiting on an answer?
+  [[in-flight]]      which regions are already waiting on an answer? ([[awaiting?]] for one,
+                     [[settled]] for the records that are not promises)
+  [[form-step]]      one form's turn in a launch: carry, note, hold, send, or answer in-image
   [[slow-text]]      how long it took, once that is worth knowing
   [[procs-text]]     what it left running (concurrency has no return value to look at)
   [[result-note]]    the `=> value` line, with `printed:` when it printed
@@ -22,7 +24,8 @@ What lives here is exactly what both need and neither owns:
   [[spy-lines]]      spy entries → an indented call/return cascade
   [[report-lines]]   the WHOLE reply as a pane's body — value, printed, cost, cascade
 
-All pure: a string or a decoded reply map in, a string or a note map out. No model, no
+All pure: a string or a decoded reply map in, a string or a note map out ([[form-step]]
+threads a launch's model through without reading it — every touch is a callback). No model, no
 buffer, no sandbox — which is what makes it testable without any of them, and what stops
 this from quietly becoming a third feature.
 
@@ -99,6 +102,16 @@ holds a definition that never arrived."
     (fn (acc id)
       (let (request (get pending id))
         (assoc acc (:region request) (assoc (dissoc request :region) :in-flight? true))))))
+
+(defn settled (records)
+  "`records` — `{region -> record}` — without the promises [[in-flight]] tagged: only what
+the session has actually evaluated. What a caller writes back after aligning the two kinds
+together, since only a reply landing may say the session holds a form."
+  (into {} (seq/reject records (fn (kv) (:in-flight? (second kv))))))
+
+(defn awaiting? (pending region)
+  "Does the request book `pending` (`{id -> request}`) hold a request for `region`?"
+  (any? (vals pending) (fn (request) (= (:region request) region))))
 
 ;; ---- what a reply is worth saying about ----------------------------------------
 
@@ -243,10 +256,14 @@ Pending voice, like a form still being typed: it has not run, and a verdict colo
 say it had. The way out is in the note because a hold nobody can release is a bug report."
   {:kind :held :text (str "held — " reason " · " how)})
 
-(def- *definition-heads*
+(def *definition-heads*
   ;; Evaluating one of these DEFINES a function; the calls in its body run later, when
-  ;; something calls it — so a definition is never held for what its body does.
-  (list 'defn 'defn- 'defmacro 'defmacro-))
+  ;; something calls it — so a definition is never held for what its body does, and it is
+  ;; what `eval-command` gives a contract verdict on. ONE list for both: they had drifted
+  ;; apart (a `defcommand` was a definition to one and not the other). Not `def`: its value
+  ;; is computed NOW, so `(def x (file/spit …))` writes the file. (`reflect/source-deps`'
+  ;; `:defines` cannot stand in for this — it counts `def` and does not see `defcommand`.)
+  (list 'defn 'defn- 'defmacro 'defmacro- 'defcommand 'interactive/defcommand))
 
 (defn held-reason (src)
   "Why a live evaluator must NOT run the Brood form `src` as you type — `\"runs file/spit\"` —
@@ -292,6 +309,67 @@ or changing never moves the answer. Errors and timeouts are [[error-note]]'s."
                         (slow-note reply)
                         (proc-note reply))})
       (if hint (assoc note :hint hint) note))))
+
+;; ---- one form's turn in a launch -------------------------------------------------
+;; The tutorial and the playground each walked their forms with the same per-form step —
+;; the same states, the same three outcomes for a ready form, the same request book —
+;; written out twice, ninety lines apiece. They are one rule, so it is spelled once here.
+;; The accumulator is OPAQUE to it: the model is threaded, never read — every touch of it
+;; is a callback the client supplies, which is what keeps this module free of the model.
+
+(defn form-step (acc i src state old client)
+  "One form's turn in a live launch: fold form `i` (source `src`, classified `state`) into
+`acc` — `[m next-id pending]` — and answer the next `[m next-id pending]`.
+
+`state` is `:carry` (nothing this edit could reach: re-stamp `old`, its previous note, if
+there is one), `:blank`, or a [[parse-state]]. A ready (`:ok`) form the client's
+`:held-reason` holds is noted as held and not sent ([[held-note]]); otherwise it is SENT
+when live — noted [[running-note]], its request booked under `next-id` — or answered
+in-image when headless. `client` is the launch's half, fixed per launch:
+
+  `:note-at`      (m i note) -> m — stamp a note on form `i`
+  `:held-reason`  (src) -> why a ready form must not run as you type, or nil
+  `:held-how`     what releases a held form here (default [[held-note]]'s)
+  `:live?`        is there a loop to deliver a reply to?
+  `:send`         (id i src) -> was request `id` accepted by the session?
+  `:request`      (i src) -> the request booked in `pending` for a send
+  `:no-session`   what a refused send says — the session is gone
+  `:headless`     (m i src) -> m answered in-image, or nil when there is no such answer
+
+A refused send is NOT booked: nothing is coming, and a form whose answer is already in
+flight is never re-sent, so booking it would wedge the form on `⋯ evaluating…` forever."
+  (let ([m next-id pending] acc
+        note-at (:note-at client)
+        held (when (= state :ok) ((:held-reason client) src))
+        step (if held [:held held] state))
+    (match step
+      ;; nothing this edit could reach: keep the verdict as it is
+      (:carry (if old [(note-at m i old) next-id pending] acc))
+      (:blank acc)
+      ;; Mid-form. Neither re-stamp the old verdict (a confident `=> 6` beside a form that
+      ;; can no longer produce it) nor show nothing (indistinguishable from "no feedback
+      ;; yet"): say what it is waiting for, in the pending voice.
+      ([:incomplete reason] [(note-at m i (incomplete-note reason)) next-id pending])
+      ([:err message] [(note-at m i (syntax-error-note message)) next-id pending])
+      ;; Ready, but running it would reach outside the session — a file written, a program
+      ;; run — and nobody asked yet: say so, send nothing.
+      ([:held reason] [(note-at m
+                         i
+                         (if (:held-how client)
+                           (held-note reason (:held-how client))
+                           (held-note reason)))
+                        next-id pending])
+      ;; Live: fire the request and let the reply land through `sandbox-events`. Headless
+      ;; (tests, no loop to deliver an event to): the client's in-image answer, if any.
+      (:ok (cond
+             (not (:live? client))
+               (let (answered ((:headless client) m i src))
+                 (if (nil? answered) acc [answered next-id pending]))
+             ((:send client) next-id i src)
+               [(note-at m i (running-note))
+                 (inc next-id)
+                 (assoc pending next-id ((:request client) i src))]
+             else [(note-at m i (syntax-error-note (:no-session client))) next-id pending])))))
 
 ;; ---- the spy cascade ------------------------------------------------------------
 

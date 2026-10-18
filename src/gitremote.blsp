@@ -1,0 +1,323 @@
+(defmodule gitremote
+  "Talking to other repositories: push (`P`), pull (`F`), fetch (`f`) and the remotes
+themselves (`M`). Each is a transient of flags (`src/transient.blsp`) and runs OFF the loop
+(`git-launch-op`), because a remote can take as long as it likes to answer."
+  (:use model) ; message
+  (:use pool) ; ed-name-prompt
+  (:use interactive) ; defcommand
+  ;; `:use`d, not referenced qualified: `cmd-git-push` calls `ed-transient-args` on EVERY
+  ;; push, including one reached by a keybinding with no menu in sight, and a qualified
+  ;; reference does not load a module (that is the `unbound symbol: term/…` bug, 154d4a73).
+  (:use transient) ; ed-transient-open / ed-transient-args — the P and F menus
+  (:use gitcore)
+  (:use gitpick)) ; git-with-remote / git-with-name / git-with-ref
+
+;; ---- the push / pull MENUS (Magit's `P` and `F`) -----------------------------
+;; The reason a transient exists at all: `--force-with-lease` has nowhere to live in a
+;; keymap, so before this it could not be typed. A spec is plain data — adding a flag is a
+;; row, not code — and the commands below splice `transient/ed-transient-args` into their
+;; argv, so each one behaves identically whether it was reached from the menu, from `P`,
+;; or from `M-x`.
+;;
+;; `--force-with-lease` and not `--force`: the lease is the one that refuses when the
+;; remote moved under you, which is the difference between overwriting your own rewritten
+;; history and overwriting a colleague's push. Magit puts `--force` in its menu too; we
+;; leave it out, because the menu is also a recommendation.
+;;
+;; WHERE to push is Magit's split: `p` to where this branch pushes (its push remote, else
+;; its upstream), `u` to its upstream, `e` elsewhere, `o` another branch, `t` / `T` tags. A
+;; branch with nowhere to go is ASKED where, and remembers the answer (`--set-upstream`):
+;; the first push of a new branch used to answer "has no upstream branch" and stop.
+
+(def git-push-transient
+  {:name 'git-push
+   :title "Push"
+   :groups [{:title "Arguments"
+             :suffixes [["-f" :switch "--force-with-lease" "refuses if the remote moved"]
+                         ["-n" :switch "--dry-run" "show what would be pushed"]
+                         ["-h" :switch "--no-verify" "skip the pre-push hook"]
+                         ["-u" :switch "--set-upstream" "set the upstream"]]}
+             {:title "Push the current branch to"
+              :suffixes [["p" 'gitremote/cmd-git-push "where it pushes"]
+                          ["u" 'gitremote/cmd-git-push-upstream "its upstream"]
+                          ["e" 'gitremote/cmd-git-push-elsewhere "elsewhere"]]}
+             {:title "Push"
+              :suffixes [["o" 'gitremote/cmd-git-push-other "another branch"]
+                          ["t" 'gitremote/cmd-git-push-tags "all tags"]
+                          ["T" 'gitremote/cmd-git-push-tag "a tag"]]}]})
+
+(def git-pull-transient
+  {:name 'git-pull
+   :title "Pull"
+   :groups [{:title "Arguments"
+             :suffixes [["-r" :switch "--rebase" "rebase instead of merging"]
+                         ["-f" :switch "--ff-only" "fast-forward only"]
+                         ["-a" :switch "--autostash" "autostash local changes"]]}
+             {:title "Pull into the current branch from"
+              :suffixes [["F" 'gitremote/cmd-git-pull "its upstream"]
+                          ["u" 'gitremote/cmd-git-pull "its upstream"]
+                          ["e" 'gitremote/cmd-git-pull-elsewhere "elsewhere"]]}]})
+
+(defcommand cmd-git-push-menu
+  (m key)
+  "The push menu (P): the flags, then where to. It reopens with the arguments you used
+last time."
+  (transient/ed-transient-open m git-push-transient))
+
+(defcommand cmd-git-pull-menu
+  (m key)
+  "The pull menu (F): `--rebase` / `--ff-only` / `--autostash`, then from where."
+  (transient/ed-transient-open m git-pull-transient))
+
+(defn- git-push-to (m args remote refspec)
+  "Push `refspec` to `remote` with the menu's `args`, off the loop."
+  (git-launch-op m "push" (append ["push"] args [remote refspec])))
+
+(defn- git-push-first (m args branch)
+  "A branch with nowhere to push: ask which remote, push it there under its own name, and
+remember that as its upstream."
+  (git-with-remote m
+    (str "Push " branch " to remote (and set it as upstream): ")
+    (fn (mm remote)
+      (git-push-to mm
+        (append (seq/reject args (fn (a) (= a "--set-upstream"))) ["--set-upstream"])
+        remote
+        branch))))
+
+(defcommand cmd-git-push
+  (m key)
+  "Push the current branch to where it pushes (P p) — its push remote, else its upstream —
+off the loop, so the editor stays live while the remote thinks about it. A branch with
+neither is asked where to go, and remembers it."
+  (let (root (git-resolve-root m)
+        args (transient/ed-transient-args m)
+        branch (if (nil? root) nil (git-current-branch root)))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (nil? branch)
+        (message m "HEAD is detached — there is no branch to push (P o pushes a branch)")
+      (and (nil? (git-push-target root)) (nil? (git-upstream root))) (git-push-first m args branch)
+      :else (git-launch-op m "push" (into ["push"] args)))))
+
+(defcommand cmd-git-push-upstream
+  (m key)
+  "Push the current branch to its upstream (P u), asking for one when it has none."
+  (let (root (git-resolve-root m)
+        args (transient/ed-transient-args m)
+        branch (if (nil? root) nil (git-current-branch root))
+        up (if (nil? root) nil (git-upstream root))
+        split (if (nil? up) nil (git-split-remote-branch root up)))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (nil? branch) (message m "HEAD is detached — there is no branch to push")
+      (nil? split) (git-push-first m args branch)
+      :else (git-push-to m args (first split) (str "HEAD:" (second split))))))
+
+(defcommand cmd-git-push-elsewhere
+  (m key)
+  "Push the current branch to a remote branch you pick (P e) — `origin/other` pushes HEAD
+there."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m
+      "Push HEAD to: "
+      :remote (fn (mm ref)
+        (let (split (git-split-remote-branch (git-resolve-root mm) ref))
+          (if (nil? split)
+            (message mm (str ref " is not a remote branch — spell it remote/branch"))
+            (git-push-to mm args (first split) (str "HEAD:" (second split)))))))))
+
+(defcommand cmd-git-push-other
+  (m key)
+  "Push a local branch you pick to a remote (P o), under its own name."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m
+      "Push branch: "
+      :local (fn (mm branch)
+        (git-with-remote mm
+          (str "Push " branch " to remote: ")
+          (fn (m2 remote) (git-push-to m2 args remote branch)))))))
+
+(defcommand cmd-git-push-tags
+  (m key)
+  "Push every tag to a remote (P t)."
+  (let (args (transient/ed-transient-args m))
+    (git-with-remote m
+      "Push all tags to: "
+      (fn (mm remote)
+        (git-launch-op mm
+          "push --tags"
+          (append ["push"] args [remote "--tags"]))))))
+
+(defcommand cmd-git-push-tag
+  (m key)
+  "Push one tag to a remote (P T)."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m
+      "Push tag: "
+      :tags (fn (mm tag)
+        (git-with-remote mm
+          (str "Push " tag " to: ")
+          (fn (m2 remote) (git-push-to m2 args remote tag)))))))
+
+(defcommand cmd-git-pull
+  (m key)
+  "Pull the current branch from its upstream, then refresh status (F F) — off the loop.
+
+This is the command that froze the editor: a pull is a NETWORK round trip, and it ran on
+the dispatch path, so the window stopped repainting until the remote answered. It now runs
+in a task like everything else that can outlast a frame.
+
+`--ff-only` unless the menu said otherwise: a pull that silently makes a merge commit is
+how an accidental merge of `main` into `main` happens, and `--rebase` from the menu is the
+other answer. Both are refusals to guess."
+  (let (args (transient/ed-transient-args m))
+    (git-launch-op m
+      "pull"
+      (into ["pull"] (if (empty? args) ["--ff-only"] args)))))
+
+(defcommand cmd-git-pull-elsewhere
+  (m key)
+  "Pull a remote branch you pick into the current one (F e)."
+  (let (args (transient/ed-transient-args m))
+    (git-with-ref m
+      "Pull from: "
+      :remote (fn (mm ref)
+        (let (split (git-split-remote-branch (git-resolve-root mm) ref))
+          (if (nil? split)
+            (message mm (str ref " is not a remote branch — spell it remote/branch"))
+            (git-launch-op mm
+              "pull"
+              (append ["pull"] (if (empty? args) ["--ff-only"] args) split))))))))
+
+;; ---- remotes (M) -------------------------------------------------------------
+
+(defcommand cmd-git-remote-list
+  (m key)
+  "Every remote and where it points (M l)."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let ([m1 r] (git-run (assoc m :git-root root) ["remote" "-v"]))
+        (git-show-report m1 "*git-remotes*" (:stdout r "") :git-text {:action :pop})))))
+
+(defcommand cmd-git-remote-add
+  (m key)
+  "Add a remote: prompts for the name, then the URL."
+  (git-prompt m
+    {:prompt "Remote name: "
+     :blank "remote name cannot be empty"
+     :then (fn (mm name)
+             (git-prompt mm
+               {:prompt (str "URL for " name ": ")
+                :blank "url cannot be empty"
+                :then (fn (m2 url) (git-do m2 "remote add" ["remote" "add" name url]))}))}))
+
+(defcommand cmd-git-remote-remove
+  (m key)
+  "Remove a remote, completing over the ones this repo has."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (assoc m
+        :minibuffer
+          (pool/ed-name-prompt "Remove remote: "
+            (git-lines root ["remote"])
+            (fn (mm name)
+              (git-confirm mm
+                (str "Remove remote " name "?")
+                (fn (m2) (git-do m2 "remote remove" ["remote" "remove" (string/trim name)])))))))))
+
+(defcommand cmd-git-remote-rename
+  (m key)
+  "Rename a remote (M r)."
+  (git-with-remote m
+    "Rename remote: "
+    (fn (mm old)
+      (git-with-name mm
+        (str "Rename " old " to: ")
+        (fn (m2 new) (git-do m2 "remote rename" ["remote" "rename" old new]))))))
+
+(defcommand cmd-git-remote-set-url
+  (m key)
+  "Point a remote at another URL (M u)."
+  (git-with-remote m
+    "Set the URL of remote: "
+    (fn (mm name)
+      (git-with-name mm
+        (str "New URL for " name ": ")
+        (fn (m2 url) (git-do m2 "remote set-url" ["remote" "set-url" name url]))))))
+
+(defcommand cmd-git-remote-prune
+  (m key)
+  "Forget a remote's branches that are gone from it (M p)."
+  (git-with-remote m
+    "Prune remote: "
+    (fn (mm name) (git-do mm "remote prune" ["remote" "prune" name]))))
+
+(def git-remote-transient
+  {:name 'git-remote
+   :title "Remote"
+   :groups [{:title "Remote"
+             :suffixes [["l" 'gitremote/cmd-git-remote-list "list"]
+                         ["a" 'gitremote/cmd-git-remote-add "add"]
+                         ["r" 'gitremote/cmd-git-remote-rename "rename"]
+                         ["u" 'gitremote/cmd-git-remote-set-url "set its URL"]
+                         ["p" 'gitremote/cmd-git-remote-prune "prune gone branches"]
+                         ["k" 'gitremote/cmd-git-remote-remove "remove"]]}]})
+
+(defcommand cmd-git-remote-menu
+  (m key)
+  "The remote menu (M)."
+  (transient/ed-transient-open m git-remote-transient))
+
+;; ---- fetch (f) ---------------------------------------------------------------
+
+(def git-fetch-transient
+  {:name 'git-fetch
+   :title "Fetch"
+   :groups [{:title "Arguments"
+             :suffixes [["-p" :switch "--prune" "drop remote branches that are gone"]
+                         ["-t" :switch "--tags" "fetch tags too"]
+                         ["-f" :switch "--force" "force"]]}
+             {:title "Fetch from"
+              :suffixes [["f" 'gitremote/cmd-git-fetch-upstream "the upstream"]
+                          ["e" 'gitremote/cmd-git-fetch-other "another remote"]
+                          ["a" 'gitremote/cmd-git-fetch-all "every remote"]
+                          ["m" 'gitremote/cmd-git-fetch-submodules "every submodule"]]}]})
+
+(defcommand cmd-git-fetch-menu
+  (m key)
+  "The fetch menu (f)."
+  (transient/ed-transient-open m git-fetch-transient))
+
+(defcommand cmd-git-fetch-all
+  (m key)
+  "Fetch from every remote (f a) — off the loop, like every other network command."
+  (git-launch-op m
+    "fetch"
+    (append ["fetch" "--all"] (transient/ed-transient-args m))))
+
+(defcommand cmd-git-fetch-other
+  (m key)
+  "Fetch from a remote you pick (f e)."
+  (let (args (transient/ed-transient-args m))
+    (git-with-remote m
+      "Fetch from: "
+      (fn (mm remote)
+        (git-launch-op mm "fetch" (append ["fetch"] args [remote]))))))
+
+(defcommand cmd-git-fetch-submodules
+  (m key)
+  "Fetch in every submodule too (f m)."
+  (git-launch-op m
+    "fetch"
+    (append ["fetch" "--recurse-submodules"] (transient/ed-transient-args m))))
+
+(defcommand cmd-git-fetch-upstream
+  (m key)
+  "Fetch from the upstream remote with the fetch menu's arguments (f f) — off the loop.
+
+Distinct from `cmd-git-fetch`, which is the *background* watch's quick fetch on a timer
+and takes no arguments: a menu that offered `--prune` and then dropped it would be worse
+than not offering it."
+  (git-launch-op m "fetch" (append ["fetch"] (transient/ed-transient-args m))))

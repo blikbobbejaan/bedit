@@ -94,13 +94,14 @@ src/complete.blsp           completion-at-point (the in-buffer Tab popup)
 src/lsp.blsp                LSP client — completion, goto-def/references, hover, rename, format, imenu
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/completion.blsp         shared fuzzy ranking + vertical-menu renderer (complete + minibuffer)
+src/fileperm.blsp           the `ls -l` permission string (dired + minibuffer marginalia)
 src/plume.blsp              the minibuffer completion UI — list + marginalia (our Vertico/Marginalia)
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
 src/projects.blsp           project root + file walk (find-file-in-project)
 src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)
-src/git.blsp                git porcelain: C-x g status buffer, diff/log/commit, C-x v = vc-diff
+src/git*.blsp               git porcelain (Magit): C-x g status buffer, diff/log/commit, C-x v = vc-diff
 src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
 src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model

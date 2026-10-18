@@ -1,0 +1,331 @@
+(defmodule gitcommit
+  "Committing (`c`): an editable *git-commit* message buffer with the staged diff beside
+it, run OFF the loop (a pre-commit hook can take as long as a test suite), a failed commit
+keeping its draft, and M-p / M-n through the messages committed before. Extend, amend,
+reword (the last commit, or an earlier one by rebase), and fixup / squash commits aimed at
+an earlier commit."
+  (:use editor/keymap :only [keymap-bind]) ; the *git-commit* keymap below
+  (:use editor/layers :only [register-type-layers]) ; its buffer type
+  (:use model) ; message / ed-current-buf / ed-set-buf
+  (:use pool) ; ed-show-named / ed-kill-buffer-named
+  (:use commands) ; cmd-kill-buffer
+  (:use interactive) ; defcommand
+  (:use transient) ; ed-transient-open / ed-transient-args — the commit menu's flags
+  (:use editor/buffer) ; buffer-text / replace-region
+  (:use gitcore)
+  (:use gitpick) ; git-pick-commit
+  (:use gitview) ; git-show-revision / git-show-diff — what the message is about
+  (:use gitsequence) ; git-reword-at / git-autosquash — rewriting an earlier commit
+  (:use gitstatus)) ; git-refresh
+
+;; ---- commit (an editable message buffer; C-c C-c / C-c C-k) -----------------
+;; The message buffer is where the commit is decided, so it shows what is being committed:
+;; the staged diff opens beside it. The commit itself runs OFF the loop — a pre-commit hook
+;; can take as long as a test suite, and it used to freeze the editor for all of it — and a
+;; commit that fails keeps its message: `c c` again starts from the draft, not from nothing.
+;; M-p / M-n in the buffer walk the messages you committed before (Magit's message ring).
+
+(def *git-message-ring-max* 32)
+
+(defn- git-commit-message (text)
+  "The commit message from the *git-commit* buffer text — comment lines (leading `#`) dropped
+and the rest trimmed."
+  (string/trim (string/join (seq/reject (string/split text "\n")
+                              (fn (l) (string/starts-with? (string/triml l) "#")))
+                 "\n")))
+
+(defn- git-message-end (text)
+  "Where the message in *git-commit*'s `text` ends: at the `# ` help block under it, else
+at the end — what M-p swaps and C-c C-s signs above."
+  (let (at (index-of text "\n# ")) (if (< at 0) (string/length text) at)))
+
+(defn- git-commit-help (kind)
+  "The comment block under a message: what C-c C-c will do, and the keys."
+  (str "\n# "
+    (case kind
+      :amend "Amending the last commit — C-c C-c rewrites it."
+      :reword "Rewording the last commit — only its message changes; what is staged stays staged."
+      :reword-at "Rewording an earlier commit — C-c C-c rebases to rewrite its message."
+      "C-c C-c commits what is staged.")
+    "\n# C-c C-k cancels · M-p / M-n earlier messages · C-c C-s sign off\n# Lines starting with # are ignored."))
+
+(defn- git-open-commit (m root kind text)
+  "Open *git-commit* for `kind` (`:commit`, `:amend`, `:reword`) with `text` above the help,
+and the diff it is about beside it — what is staged, or for a reword the commit itself."
+  (let (m1 (ed-show-named
+             (assoc m
+               :git-root root
+               :git-commit-kind kind
+               :git-ring-at nil
+               ;; the menu's flags, carried to `cmd-git-commit-finish` — the commit
+               ;; happens in another command, after the message buffer, so the
+               ;; arguments have to survive the round trip on the model
+               :git-commit-args (transient/ed-transient-args m))
+             "*git-commit*"
+             (str text (git-commit-help kind))
+             :git-commit))
+    (case kind
+      :reword m1
+      :reword-at (git-show-revision m1 root (:git-reword-target m) :display)
+      (git-show-diff m1
+        root
+        (if (= kind :amend) ["--cached" "HEAD^"] ["--cached"])
+        :staged :display))))
+
+(defcommand cmd-git-commit
+  (m key)
+  "Commit what is staged (c c): a message buffer, with the staged diff beside it. With
+nothing staged it offers to stage every tracked change first, as Magit does, rather than
+failing at the end."
+  (let (root (git-resolve-root m))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (and (= 0 (:exit (git-git root ["diff" "--cached" "--quiet"])))
+        (not (includes? (transient/ed-transient-args m) "--allow-empty"))
+        (not (includes? (transient/ed-transient-args m) "--all")))
+        (git-confirm m
+          "Nothing is staged. Stage every tracked change and commit it?"
+          (fn (mm)
+            (let ([m1 r] (git-run (assoc mm :git-root root) ["add" "-u"]))
+              (if (= (:exit r) 0)
+                (git-open-commit m1 root :commit (or (:git-commit-draft m1) ""))
+                (git-report-cmd m1 "add -u" r)))))
+      :else (git-open-commit m root :commit (or (:git-commit-draft m) "")))))
+
+(defn- git-last-message (root)
+  "HEAD's message, or nil before the first commit."
+  (let (r (git-git root ["log" "-1" "--format=%B"]))
+    (if (= (:exit r) 0) (string/trim (:stdout r "")) nil)))
+
+(defcommand cmd-git-commit-amend
+  (m key)
+  "Amend the last commit (c a): its message to edit, what is staged added to it."
+  (let (root (git-resolve-root m)
+        msg (if (nil? root) nil (git-last-message root)))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (nil? msg) (message m "no commits yet to amend")
+      :else (git-open-commit m root :amend msg))))
+
+(defcommand cmd-git-commit-reword
+  (m key)
+  "Reword the last commit (c w): change its message and nothing else — what is staged
+stays staged (`--only`)."
+  (let (root (git-resolve-root m)
+        msg (if (nil? root) nil (git-last-message root)))
+    (cond
+      (nil? root) (message m "not in a git repository")
+      (nil? msg) (message m "no commits yet to reword")
+      :else (git-open-commit m root :reword msg))))
+
+(defn- git-remember-message (m msg)
+  "`m` with `msg` at the head of the message ring."
+  (assoc m
+    :git-message-ring
+      (into []
+        (take (cons msg (seq/reject (or (:git-message-ring m) []) (fn (x) (= x msg))))
+          *git-message-ring-max*))))
+
+(defn- git-commit-landed (m r)
+  "The `then` of a launched commit: on success forget the draft and refresh; on failure
+keep it, so the next `c c` starts from what was written."
+  (if (= (:exit r) 0)
+    (git-refresh-if-open (dissoc m :git-commit-draft) r)
+    m))
+
+(def- git-commit-runs
+  ;; How each kind of message buffer commits: the flags, and the verb its outcome is
+  ;; reported as. `:reword-at` is absent — an EARLIER commit is reworded by a rebase.
+  {:commit {:verb "commit" :flags []}
+   :amend {:verb "amend" :flags ["--amend"]}
+   :reword {:verb "reword" :flags ["--amend" "--only"]}})
+
+(defn- git-close-commit (m key beside)
+  "Close *git-commit* and the buffer shown `beside` it (*git-diff* / *git-revision*),
+forgetting the commit being written."
+  (let (m1 (cmd-kill-buffer (dissoc m
+                              :git-commit-kind :git-commit-args :git-ring-at :git-reword-target)
+             key))
+    (if (nil? (ed-buffer-index-by-name m1 beside)) m1 (pool/ed-kill-buffer-named m1 beside))))
+
+(defcommand cmd-git-commit-finish
+  (m key)
+  "Commit with this buffer's message (C-c C-c) — off the loop, because a pre-commit hook
+can take as long as it likes."
+  (let (root (:git-root m)
+        msg (git-commit-message (buffer-text (ed-current-buf m)))
+        kind (or (:git-commit-kind m) :commit))
+    (cond
+      (nil? root) (message m "no git repo")
+      (= msg "") (message m "empty commit message — aborted")
+      (= kind :reword-at)
+        (git-reword-at (git-remember-message (git-close-commit m key "*git-revision*") msg)
+          root
+          (:git-reword-target m)
+          msg)
+      :else
+        (let (run (get git-commit-runs kind (:commit git-commit-runs))
+              m1 (git-close-commit m key "*git-diff*"))
+          (git-launch-op (git-remember-message (assoc m1 :git-commit-draft msg :git-root root) msg)
+            (:verb run)
+            (append git-no-editor ["commit" "-m" msg] (:flags run) (or (:git-commit-args m) []))
+            git-commit-landed)))))
+
+(defcommand cmd-git-commit-abort
+  (m key)
+  "Abort the commit and close the message buffer (C-c C-k). What was written is kept as the
+draft the next `c c` starts from."
+  (let (msg (git-commit-message (buffer-text (ed-current-buf m)))
+        m1 (git-close-commit m key "*git-diff*"))
+    (message (if (= msg "") m1 (assoc m1 :git-commit-draft msg)) "commit aborted")))
+
+(defn- git-ring-step (m delta)
+  "Replace the message in *git-commit* with the ring's entry `delta` away from the current one."
+  (let (ring (or (:git-message-ring m) [])
+        at (:git-ring-at m)
+        next (if (nil? at) (if (> delta 0) 0 nil) (+ at delta)))
+    (cond
+      (empty? ring) (message m "no earlier messages")
+      (or (nil? next) (< next 0)) (message m "at the newest message")
+      (>= next (count ring)) (message m "at the oldest message")
+      :else
+        (let (b (ed-current-buf m)
+              text (buffer-text b)
+              help (string/substring text (git-message-end text) (string/length text)))
+          (assoc (ed-set-buf m
+                   (goto-char (replace-region b 0 (buffer-length b) (str (nth ring next) help)) 0))
+            :git-ring-at next)))))
+
+(defcommand cmd-git-commit-prev-message
+  (m key)
+  "The message committed before this one (M-p)."
+  (git-ring-step m 1))
+(defcommand cmd-git-commit-next-message
+  (m key)
+  "The message committed after this one (M-n)."
+  (git-ring-step m -1))
+
+(defcommand cmd-git-commit-signoff
+  (m key)
+  "Add a `Signed-off-by:` trailer with your name and email (C-c C-s)."
+  (let (root (:git-root m)
+        name (git-output root ["config" "user.name"])
+        email (git-output root ["config" "user.email"])
+        b (ed-current-buf m)
+        text (buffer-text b)
+        at (git-message-end text)
+        body (string/trimr (string/substring text 0 at))
+        trailer (str "Signed-off-by: " name " <" email ">"))
+    (if (includes? body trailer)
+      (message m "already signed off")
+      (ed-set-buf m
+        (replace-region b 0 at (str body (if (includes? body "\n\n") "\n" "\n\n") trailer))))))
+
+(defn- git-aimed-commit (m verb flag instant?)
+  "Commit what is staged as a `flag` (`--fixup` / `--squash`) of a commit you pick — the one
+at point first — then, `instant?`, fold it in."
+  (git-pick-commit m
+    (str verb " commit: ")
+    (fn (mm target)
+      (let (root (git-resolve-root mm)
+            [m1 r] (git-run (assoc mm :git-root root)
+                     (append git-no-editor
+                       ["commit" "--no-edit" (str flag "=" target)]
+                       (transient/ed-transient-args m))))
+        (cond
+          (not (= (:exit r) 0)) (git-report-cmd m1 (str "commit " flag) r)
+          instant? (git-autosquash m1 target)
+          :else (git-refresh (git-report-cmd m1 (str "commit " flag) r)))))))
+
+(defcommand cmd-git-commit-fixup
+  (m key)
+  "A fixup of an earlier commit (c f)."
+  (git-aimed-commit m "Fixup" "--fixup" false))
+(defcommand cmd-git-commit-squash
+  (m key)
+  "A squash into an earlier commit (c s)."
+  (git-aimed-commit m "Squash into" "--squash" false))
+(defcommand cmd-git-commit-instant-fixup
+  (m key)
+  "Fix up an earlier commit and fold it in now (c F)."
+  (git-aimed-commit m "Fixup (instantly)" "--fixup" true))
+(defcommand cmd-git-commit-instant-squash
+  (m key)
+  "Squash into an earlier commit and fold it in now (c S)."
+  (git-aimed-commit m "Squash (instantly) into" "--squash" true))
+
+;; ---- the commit MENU (c) -------------------------------------------------------
+;; `--no-verify` is the flag you want at the exact moment you cannot remember how to pass
+;; it, because a hook is refusing a commit you need to make.
+
+(def git-commit-transient
+  {:name 'git-commit
+   :title "Commit"
+   :groups [{:title "Arguments"
+             :suffixes [["-a" :switch "--all" "stage every tracked change first"]
+                         ["-e" :switch "--allow-empty" "allow an empty commit"]
+                         ["-n" :switch "--no-verify" "skip the pre-commit hooks"]
+                         ["-s" :switch "--signoff" "add a Signed-off-by line"]
+                         ["-S" :switch "--gpg-sign" "sign it"]
+                         ["-R" :switch "--reset-author" "claim authorship, reset the date"]
+                         ["=A" :option "--author=" "author" {:prompt "Author (Name <email>)"}]]}
+             {:title "Create"
+              :suffixes [["c" 'gitcommit/cmd-git-commit "commit"]]}
+             {:title "Edit HEAD"
+              :suffixes [["e"
+                           'gitcommit/cmd-git-commit-extend
+                           "extend — add what is staged, keep the message"]
+                          ["w" 'gitcommit/cmd-git-commit-reword "reword — the message only"]
+                          ["a" 'gitcommit/cmd-git-commit-amend "amend — both"]]}
+             {:title "Edit an earlier commit"
+              :suffixes [["f" 'gitcommit/cmd-git-commit-fixup "fixup"]
+                          ["s" 'gitcommit/cmd-git-commit-squash "squash"]
+                          ["F" 'gitcommit/cmd-git-commit-instant-fixup "fixup, and fold it in now"]
+                          ["S"
+                            'gitcommit/cmd-git-commit-instant-squash "squash, and fold it in now"]]}]})
+
+(defcommand cmd-git-commit-menu
+  (m key)
+  "The commit menu (c)."
+  (transient/ed-transient-open m git-commit-transient))
+
+(defcommand cmd-git-commit-extend
+  (m key)
+  "Add the staged changes to the last commit WITHOUT opening its message (c e) — Magit's
+`--amend --no-edit`, the one you want when you forgot a file."
+  (git-do m
+    "commit --amend --no-edit"
+    (append git-no-editor ["commit" "--amend" "--no-edit"] (transient/ed-transient-args m))))
+
+(defcommand cmd-git-rebase-reword-commit
+  (m key)
+  "Reword an earlier commit (r w): its message opens in *git-commit*; C-c C-c rewrites it
+in place, and nothing else about the history changes."
+  (let (root (git-resolve-root m))
+    (git-pick-commit m
+      "Reword commit: "
+      (fn (mm c)
+        (let (msg (git-output root ["log" "-1" "--format=%B" c]))
+          (git-open-commit (assoc mm :git-reword-target c) root :reword-at msg))))))
+
+;; *git-commit* — EDITABLE (you type the message); no read-only hook. C-c C-c / C-c C-k,
+;; M-p / M-n through the messages committed before, C-c C-s to sign off.
+(def git-commit-keymap
+  (-> {}
+    (keymap-bind [:ctrl-c :ctrl-c] 'gitcommit/cmd-git-commit-finish)
+    (keymap-bind [:ctrl-c :ctrl-k] 'gitcommit/cmd-git-commit-abort)
+    (keymap-bind [:ctrl-c :ctrl-s] 'gitcommit/cmd-git-commit-signoff)
+    (keymap-bind [:alt-p] 'gitcommit/cmd-git-commit-prev-message)
+    (keymap-bind [:alt-n] 'gitcommit/cmd-git-commit-next-message)))
+
+(def git-commit-mode-layer
+  {:name 'git-commit
+   :keymap gitcommit/git-commit-keymap
+   :no-line-numbers true
+   ;; the summary line over 50 columns, the blank after it, the comments — the gitcommit
+   ;; language mode's lexer, which knows all three
+   :fontify 'editor/configs/gitcommit-spans
+   :commands '("git-commit-finish" "git-commit-abort"
+                "git-commit-signoff" "git-commit-prev-message" "git-commit-next-message")})
+
+(register-type-layers :git-commit (list 'gitcommit/git-commit-mode-layer 'modes/text-mode-layer))

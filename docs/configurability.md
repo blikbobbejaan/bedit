@@ -96,7 +96,7 @@ the model scope.
 
 The **only** missing primitive is an Emacs `kbd`-style **string parser**
 (`"C-c C-e"` → `[:ctrl-x :ctrl-e]`). Tellingly, the *label* half already exists
-(`model/ed-key-label`), but in the editor, not in `std/editor/keymap` where its inverse
+(`keyhelp/ed-key-label`), but in the editor, not in `std/editor/keymap` where its inverse
 belongs. Put both `key-describe` / `key-parse` in `std/editor/keymap` — and the
 "best-guess chord encoding" caveats littering `keymaps.blsp` (`(keyword "alt-%")`, …)
 go away.

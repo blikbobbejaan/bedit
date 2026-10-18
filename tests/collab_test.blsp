@@ -13,6 +13,7 @@
   (:use model)
   (:use editor/buffer)
   (:use test)
+  (:use editor/buffer-registry) ; registry-start / -share / -watch — the daemon's mirrored registry
   (:use-internals input))
 
 ;; Seed a model's selected-pane cursor to `pt` (window-local) so cursor-independence is testable.
@@ -59,21 +60,24 @@
   (ct-settle proc)
   (receive ([:buffer-updated ^proc v view _] [v (ct-view-text view)]) (after 0 :none)))
 
-;; The registry's own barrier: `collab-registry-share` is a synchronous call, so its
-;; reply proves the registry has drained everything already in its mailbox — including
-;; a mirror push a buffer process sent before we asked.
-(defn ct-registry-settle (reg path text name) (collab-registry-share reg path text name))
+;; The registry's own barrier: `registry-share` is a synchronous call, so its reply
+;; proves the registry has drained everything already in its mailbox — including a
+;; mirror push a buffer process sent before we asked.
+(defn ct-registry-settle (reg path) (registry-share reg "settle" "" {:file path}))
 
 ;; The one event no round-trip of ours can order: the runtime's `[:down]` reaches the
-;; registry independently, so the respawn may not have happened yet. Poll for it (bounded)
-;; instead of sleeping a guess — this returns the instant the registry has respawned, and
-;; still yields the dead pid if it never does, so the caller's assertion fails honestly.
-(defn ct-await-respawn (reg path text name dead n)
-  (let (p (collab-registry-share reg path text name))
-    (cond
-      (not (= p dead)) p
-      (<= n 0) p
-      :else (do (sleep 2) (ct-await-respawn reg path text name dead (dec n))))))
+;; registry independently. A WATCHER is told the moment it respawns
+;; (`[:registry-added key …]`, after the `[:registry-removed key :died]`) — so wait on
+;; that notice rather than polling; `:none` if it never comes, so the caller's
+;; assertion fails honestly. The caller watches AFTER the first share, so the next
+;; added-notice for `key` is the respawn.
+(defn ct-await-respawn (key)
+  (receive ([:registry-added ^key _ pid _] pid) (after 2000 :none)))
+
+;; A test's share must reach a registry that is up: nil (no answer) is a failure here,
+;; not the graceful local fallback the editor takes.
+(defn ct-share (reg buf)
+  (or (collab-registry-share reg buf) (error "ct-share: the registry did not answer")))
 
 ;; THE [:down] for `pid` specifically — earlier tests' stopped-but-still-monitored
 ;; procs can leave stale corpse messages queued; skip (consume) any that aren't ours.
@@ -343,18 +347,17 @@
       (stop-buffer proc)))
 
   (test "registry: one buffer process per file, whoever asks first wins the content"
-    (let (reg (collab-registry-start)
-          a (collab-registry-share reg "/tmp/cl-reg.txt" "hi" "f.txt")
-          b (collab-registry-share reg "/tmp/cl-reg.txt" "STALE" "f.txt")
-          c (collab-registry-share reg "/tmp/cl-reg2.txt" "yo" "g.txt"))
+    (let (reg (registry-start {:mirror true})
+          a (ct-share reg (make-buffer "hi" "f.txt" "/tmp/cl-reg.txt"))
+          b (ct-share reg (make-buffer "STALE" "f.txt" "/tmp/cl-reg.txt"))
+          c (ct-share reg (make-buffer "yo" "g.txt" "/tmp/cl-reg2.txt")))
       (is (= a b))
       (is (not (= a c)))
       (assert= (buffer-query b buffer-text) "hi")
-      (stop-buffer a)
-      (stop-buffer c)))
+      (registry-stop reg)))
 
   (test "autoshare: visiting a file buffer in a registry session links its slot"
-    (let (reg (collab-registry-start)
+    (let (reg (registry-start {:mirror true})
           m (assoc (ed-init (make-buffer "hello" "n.txt" "/tmp/cl-auto.txt")) :collab-reg reg)
           m1 (collab-autoshare m))
       (is (collab-shared? m1 0))
@@ -364,40 +367,47 @@
       (is (nil? (get-in (collab-autoshare (assoc (ed-init (make-buffer "s")) :collab-reg reg))
                   [:hosted 0])))
       (ct-drain-seed (get-in m1 [:hosted 0 :proc]))
-      (stop-buffer (get-in m1 [:hosted 0 :proc]))))
+      (registry-stop reg)))
 
   (test "the registry respawns a died buffer from its text MIRROR (post-seed edits kept)"
-    (let (reg (collab-registry-start)
-          p1 (collab-registry-share reg "/tmp/cl-rr.txt" "seed" "rr.txt"))
+    (let (reg (registry-start {:mirror true})
+          p1 (ct-share reg (make-buffer "seed" "rr.txt" "/tmp/cl-rr.txt")))
+      (registry-watch reg (self))
       (buffer-splice p1 4 4 "+more" :someone) ; a post-seed edit the mirror must track
       (assert= (buffer-query p1 buffer-text) "seed+more")
       ;; the query above proves p1 SENT its mirror push; this call proves the registry
       ;; folded it — two barriers, no guessed delay
-      (ct-registry-settle reg "/tmp/cl-rr.txt" "seed" "rr.txt")
+      (ct-registry-settle reg "/tmp/cl-rr.txt")
       (exit p1 :kill)
-      (let (p2 (ct-await-respawn reg "/tmp/cl-rr.txt" "stale-local" "rr.txt" p1 100))
+      (let (p2 (ct-await-respawn "/tmp/cl-rr.txt"))
+        (is (pid? p2))
         (is (not (= p1 p2)))
+        ;; a re-asker with a stale copy lands on the respawn
+        (assert= (ct-share reg (make-buffer "stale-local" "rr.txt" "/tmp/cl-rr.txt"))
+          p2)
         (assert= (buffer-query p2 buffer-text) "seed+more")) ; the MIRROR, not the re-asker's text
-      (collab-registry-stop reg)))
+      (registry-stop reg)))
 
   (test "a shared slot whose process died reshares onto the registry's respawn (ed--ev-down)"
-    (let (reg (collab-registry-start)
+    (let (reg (registry-start {:mirror true})
           m0 (assoc (ed-init (make-buffer "doc" "rs.txt" "/tmp/cl-rs.txt")) :collab-reg reg)
           m1 (collab-autoshare m0)
           p1 (get-in m1 [:hosted 0 :proc]))
+      (registry-watch reg (self))
       (ct-drain-seed p1)
       (exit p1 :kill)
       ;; wait for the registry to have respawned (it learns from its own [:down], which
       ;; nothing we send can be ordered against) — then the fold below re-links onto it
-      (ct-await-respawn reg "/tmp/cl-rs.txt" "doc" "rs.txt" p1 100)
-      (let (down (ct-await-down p1)
+      (let (respawned (ct-await-respawn "/tmp/cl-rs.txt")
+            down (ct-await-down p1)
             _ (is (not (= down :none))) ; the [:down …] for the killed process arrived
             m2 (input/ed-ev-down m1 (if (= down :none) [:down nil p1 :timeout] down) 24 80 24)
             p2 (get-in m2 [:hosted 0 :proc]))
         (is (not (= p1 p2)))
+        (assert= p2 respawned)
         (is (collab-shared? m2 0)) ; re-linked as SHARED, not local
         (assert= (buffer-query p2 buffer-text) "doc"))
-      (collab-registry-stop reg)))
+      (registry-stop reg)))
 
   (test "presence migrates: switching buffers withdraws the markers from the buffer left"
     (let (procA (spawn-buffer (make-buffer "aaa" "a.txt"))

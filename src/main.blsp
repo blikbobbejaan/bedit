@@ -33,9 +33,21 @@ other pane, C-x 0/1 close panes, C-x l toggles line numbers (per pane), Ctrl+whe
 only (M-x preset-select for a whole named window setup) / plain wheel scrolls; C-x C-e evals the form before point; C-x C-s
 saves; C-x C-c / Esc / the window close button quits."
   (:use editor/ui) ; gui-display + the ui-run loop
+  (:use keyhelp) ; key / command labels, where-is, docstrings
   (:use model) ; ed-init
   (:use view) ; ed-view
   (:use input) ; ed-update
+  (:use eval-commands) ; loaded with the image: C-x C-e and M-x eval-region / eval-buffer
+  (:use shell-command) ; loaded with the image: M-! / M-| (C-u M-| must be prefix-consuming from the start)
+  ;; the idle-beat jobs and event handlers that must be live from the first event: each
+  ;; module registers its rows when it loads (`model/register-idle-job`,
+  ;; `model/register-event-handler`), so loading it here is all that wires it in — neither
+  ;; the model nor the dispatcher names them
+  (:use diagcheck) ; the advisory check (and its sandbox session client)
+  (:use eldoc) ; the eldoc hint, the signature-due test, the completion preview
+  (:use treewarm) ; a large tree-sitter buffer's parse, warmed off the loop
+  (:use autosave) ; `#file#` sidecars + auto-revert
+  (:use lsp-commands) ; LSP autostart / text push / signature, and the `:lsp-…` events
   (:use projects) ; project-root — the current project shown on the model
   (:use config) ; init-config / window-mode — the user init file (~/.config/bedit/init.blsp)
   (:use theme) ; apply-syntax-theme! — the editor's :syntax/* palette (src/theme.blsp)
@@ -48,13 +60,13 @@ saves; C-x C-c / Esc / the window close button quits."
 (def *welcome-template*
   ;; The keys are named as COMMANDS (`\\[…]`) rather than spelled out: this is the
   ;; first text a new user reads, and under the vim profile the Emacs spellings were
-  ;; simply false (there isn't even an M-x). `model/ed-substitute-command-keys`
+  ;; simply false (there isn't even an M-x). `keyhelp/ed-substitute-command-keys`
   ;; renders it against the live keymap at startup, so it follows a rebinding too.
-  "hello — a tiny Emacs-style editor on the rope buffer framework.\n\nType to edit · \\[commands/cmd-find-file] open · \\[commands/cmd-switch-buffer] switch buffer · \\[commands/cmd-undo] undo · \\[commands/cmd-eval-last-sexp] eval\n\\[commands/cmd-set-mark] set mark · \\[commands/cmd-kill-region]/\\[commands/cmd-copy-region]/\\[commands/cmd-yank] kill/copy/yank · \\[commands/cmd-save] save · \\[commands/cmd-quit] quit\n\n➜ New to bedit? Click here: the interactive bedit tutorial · \\[tutor/cmd-tutorial]\n➜ Just the language? the Brood playground · \\[playground/cmd-brood-playground]\n")
+  "hello — a tiny Emacs-style editor on the rope buffer framework.\n\nType to edit · \\[commands/cmd-find-file] open · \\[commands/cmd-switch-buffer] switch buffer · \\[commands/cmd-undo] undo · \\[eval-commands/cmd-eval-last-sexp] eval\n\\[commands/cmd-set-mark] set mark · \\[commands/cmd-kill-region]/\\[commands/cmd-copy-region]/\\[commands/cmd-yank] kill/copy/yank · \\[commands/cmd-save] save · \\[commands/cmd-quit] quit\n\n➜ New to bedit? Click here: the interactive bedit tutorial · \\[tutor/cmd-tutorial]\n➜ Just the language? the Brood playground · \\[playground/cmd-brood-playground]\n")
 
 (defn welcome-text (profile cfg)
   "The startup scratch's text with every key rendered for `profile`'s real bindings
-(`model/ed-substitute-command-keys`). The editor always *starts* in the emacs
+(`keyhelp/ed-substitute-command-keys`). The editor always *starts* in the emacs
 profile — there is no startup profile setting in `init.blsp` today — so `main`
 passes `:emacs`; if one is added, pass it here and the text follows.
 
@@ -104,6 +116,152 @@ Prerequisite: `:editor` must already be registered (see `main`). Reused by tests
                 :restart :permanent})
     {:name :editor-sup :strategy :one-for-one}))
 
+(defn- launch-project (file directory?)
+  "The project the editor opens on (matches find-file): when opened with a file, ITS project
+(nearest ancestor with a marker), not the cwd's; a directory argument's own project. Falls
+back to the cwd's project (or none) for a scratch session or a file outside any project."
+  (or (cond
+        (nil? file) nil
+        directory? (project-root (path/absolute file))
+        :else (project-root (path/dirname (path/absolute file))))
+    (project-root (file/cwd))))
+
+(defn- launch-buffer (file directory? project cfg)
+  "The buffer the editor opens on: the file, or — for a scratch session, or behind a
+directory's dired listing — the welcome scratch. That is typed :welcome: an ordinary editable
+buffer whose mode adds one thing, the tutorial/playground lines are clickable links
+(modes.blsp); `cfg`'s :welcome replaces the template text when set."
+  (if (and file (not directory?))
+    (assoc (find-file-buffer file) :name (file-display-name file project))
+    (editor/layers/set-buffer-type (make-buffer (welcome-text :emacs cfg)) :welcome)))
+
+(defn- live-model (buf project disp cfg)
+  "The model the live window starts from. `config/apply-to-model` seeds the init-file's
+model-level settings (hl-line on by default, the caret shape) — the same call
+`cmd-reload-config` reuses live. The rest are live-editor-only flags that pure-model tests
+(via `ed-init`) omit."
+  (config/apply-to-model
+    (assoc (ed-init buf)
+      :project-root project
+      ;; mirror kills/copies to the OS clipboard and yank from it (commands/
+      ;; ed-push-kill + ed-adopt-clipboard). On only for the live editor — pure
+      ;; model tests build via `ed-init` without it, so they never touch the
+      ;; process-global OS clipboard (which would make them order-dependent).
+      :os-clipboard true
+      ;; remember opened files (recentf) so find-file floats the last-used entries
+      ;; to the top of a directory listing; off in tests so they don't touch the
+      ;; on-disk cache (~/.cache/brood/recent-files.blsp).
+      :recent-files true
+      ;; the native GUI frontend is active (main always runs `gui-display`), so the
+      ;; view may use sub-cell `frect` rendering — rounded floating cards, etc. Pure
+      ;; tests / a `*term-display*` run build via `ed-init` without it, so they get
+      ;; the cell-quantised fallback (a plain `rect`) and stay frontend-agnostic.
+      :gui true
+      ;; the window id, so key-repeat can poll `gui/held-key` as the source of
+      ;; truth for a held key (stops repeat the instant the key is up, even if a
+      ;; key-up event is missed — see input/ed-still-held?).
+      :window (:window disp))
+    cfg))
+
+(defn- configure-window (cfg disp)
+  "Give the window its look: the base cell font, the inset, the background, the init file's
+text settings and syntax palette, and its window mode. Each `gui-only` is a no-op without a
+GUI build."
+  (gui-only gui/font *font*) ; base window font
+  (gui-only gui/inset *inset*) ; breathing room around the grid
+  (gui-only gui/bg *base*) ; clear/inset-margin fill follows the theme bg
+  (config/apply-window! cfg) ; init.blsp's :text-aa / :line-height
+  (apply-syntax-theme!) ; soft-RGB syntax colours (the :syntax/* registry) to match the chrome
+  ;; Apply the user init file's window mode. :maximized fills the screen but keeps
+  ;; the title bar (gui/maximize); :fullscreen is borderless/no-title (gui/fullscreen).
+  (case (window-mode cfg)
+    :maximized (gui-only gui/maximize (:window disp) true)
+    :fullscreen (gui-only gui/fullscreen (:window disp) true)
+    nil))
+
+(defn- start-editor-logging (cfg)
+  "Route the logger into the editor: a `process-backend` to the editor (ui-run) process
+sends each formatted line as `[:io/write s]`, which `ed-update` folds into *Messages*. Async +
+safe — the editor never blocks on a log, and the one logger process serialises writes.
+Registers the editor pid as `:editor` (so any process can `(send (whereis :editor) [:io/write
+\"…\"])`) *before* `start-logging`, which supervises the logger and addresses the editor by
+that name — so a killed logger restarts and the fresh one still streams here. Then surfaces
+the init.blsp problems the type checker can't see (it's read as data): a typo'd config value
+lands in *Messages* at startup."
+  (proc/register :editor (self))
+  (start-logging)
+  (log/info "bedit started")
+  (doseq (w (config-warnings cfg)) (log/warn w)))
+
+(defn- load-packages-later ()
+  "Deferred package loading, spawned in parallel with the first rendered frame so the editor
+opens fast. The feature modules themselves (git, lsp, web, gitdiff, proctree, debugger,
+testrun, apprun, themes, tutor) load with the project image and auto-load on first qualified
+reference at their call sites — no explicit preload needed; every call site stays guarded
+with `(bound? 'ns/fn)`."
+  (spawn
+    (fn ()
+      ;; Wait for the editor to render its first frame and for JIT to warm up before the
+      ;; package scan, to avoid compile-lock contention that makes the first second of
+      ;; scrolling sluggish.
+      (receive (after 1200 nil))
+      ;; Fold in USER-installed `:enhances bedit` packages (theme plugins today) from
+      ;; ~/.config/bedit/packages — the package manager's install dir (M-x package-list),
+      ;; NOT the project's build _deps. Register their contributions into the global
+      ;; registries so M-x theme-select lists them. Deferred so a plugin's disk read never
+      ;; slows the first frame; the theme registry is process-global, so registering here
+      ;; (not in the model) is enough — a later theme-select sees them.
+      (let (loaded (packages/load-installed!))
+        (when (not (empty? loaded))
+          (log/info (str "packages: loaded " (count loaded) " — " (string/join loaded ", "))))))))
+
+(defn- run-window (file)
+  "Open the local window on `file` (nil for a scratch session) and run the `ui-run` loop."
+  (let (cfg (init-config) ; ~/.config/bedit/init.blsp (created on first launch)
+        ;; Tree-sitter grammars the runtime was not built with, from
+        ;; `~/.config/bedit/grammars`. On the STARTUP path rather than beside the mode
+        ;; definitions, because loading one registers it in the runtime and a module's
+        ;; top-level forms do not necessarily run when the program does — an image
+        ;; restores the bindings without replaying the side effects that made them.
+        ;; `M-x reload-grammars` re-runs this after you rebuild one.
+        _grammars (grammars/load-user-grammars)
+        ;; `bedit .` / `bedit some/dir` — open dired, not a text file
+        directory? (and file (file/dir? file))
+        project (launch-project file directory?)
+        ;; discover + remember on launch, so `C-x p p` lists it immediately
+        _ (when project (remember-project! project))
+        ;; the native window (a {:enter :leave :size :draw :poll :window} map). `:app-id`
+        ;; is how the desktop identifies it as *this* app — without it the window matches
+        ;; no installed .desktop entry and GNOME paints its generic fallback icon
+        ;; (config/*app-id*, assets/README.md). `:title` is only the pre-first-event
+        ;; placeholder; `input` sets the real one (`ed-window-title`) from then on.
+        disp (gui-display {:app-id *app-id* :title *app-name*})
+        started (live-model (launch-buffer file directory? project cfg) project disp cfg)
+        ;; A directory argument (`bedit .`) opens its dired listing over the scratch buffer.
+        ;; dired lives in `commands`; the qualified `dired/ed-show-dired` call auto-loads it.
+        m (if directory? (dired/ed-show-dired started (path/absolute file)) started))
+    (configure-window cfg disp)
+    (remember-project! (:project-root m)) ; discovered on launch → known for C-x p p
+    (start-editor-logging cfg)
+    (load-packages-later)
+    ;; THE FLIP (docs/actor-architecture.md): every pool buffer in the live window is
+    ;; backed by its own process — `hosted/hosted-reconcile` at the loop tail hosts
+    ;; each slot as it appears (files, *Messages*, dired, occur — no call-site
+    ;; cooperation). Tests/headless models never set this flag, so the pure suite
+    ;; stays pure.
+    ;; …and named in the buffer registry (`frames/frames-registry-start`), so a second
+    ;; frame (C-x 5 2) links its slots to the same processes (docs/frames-plan.md).
+    ;; Record the type setup the window was just given (`*font*` above, plus the
+    ;; config's line height) on the model. The window has no getter for any of it, so
+    ;; this is what lets Ctrl+wheel step from the real size and `M-x preset-save` name
+    ;; what you are actually looking at (src/appearance.blsp) instead of a guess.
+    (ui-run (frames/frames-registry-start (appearance/apply! (assoc m :host-buffers? true)
+                                            {:family (:family *font*)
+                                             :height (:height *font*)
+                                             :line-height (or (:line-height cfg)
+                                                            config/*line-height-default*)}))
+      ed-view ed-update disp)))
+
 (defn main (& args)
   "Open the editor in a native window. With a `file` argument (`nest run <path>`)
 it edits that file — reading it if it exists, else starting an unsaved buffer backed
@@ -127,142 +285,9 @@ the first non-flag token, and remote mode is detected from `(argv)`.
 `--version` / `-V` prints the one-line version stamp (`src/about.blsp`) and exits without
 opening a display — as does the runtime's own reserved `--brood-build-info` on a release
 bundle, which prints the same facts plus the build id and features."
-  (let (file (remote/remote-positional args))
-    (cond
-      ;; `--version` answers and exits without touching the display — see
-      ;; `about/version-arg?` for why that ordering is the point, not a detail.
-      (about/version-arg? args) (do (io/puts (about/version-line)) 0)
-      (remote/remote-main? args) (remote/remote-main args)
-      else
-        (let (cfg (init-config) ; ~/.config/bedit/init.blsp (created on first launch)
-              ;; Tree-sitter grammars the runtime was not built with, from
-              ;; `~/.config/bedit/grammars`. On the STARTUP path rather than beside the mode
-              ;; definitions, because loading one registers it in the runtime and a module's
-              ;; top-level forms do not necessarily run when the program does — an image
-              ;; restores the bindings without replaying the side effects that made them.
-              ;; `M-x reload-grammars` re-runs this after you rebuild one.
-              _grammars (modes/load-user-grammars)
-              ;; Project discovery on launch (matches find-file): when opened with a file,
-              ;; resolve and adopt ITS project (nearest ancestor with a marker), not the cwd's —
-              ;; and remember it, so `C-x p p` lists it immediately. Falls back to the cwd's
-              ;; project (or none) for a scratch session or a file outside any project.
-              is-dir (and file (file/dir? file)) ; `bedit .` / `bedit some/dir` — open dired, not a text file
-              proj (cond
-                     (nil? file) (project-root (file/cwd))
-                     is-dir (or (project-root (path/absolute file)) (project-root (file/cwd)))
-                     :else
-                       (or (project-root (path/dirname (path/absolute file)))
-                         (project-root (file/cwd))))
-              _ (when proj (remember-project! proj)) ; discover + remember on launch (file's/dir's project, else cwd's)
-              ;; the welcome scratch is typed :welcome — an ordinary editable buffer whose
-              ;; mode adds one thing: the tutorial/playground lines are clickable links
-              ;; (modes.blsp); `cfg`'s :welcome replaces the template text when set
-              buf (cond
-                    (nil? file)
-                      (editor/layers/set-buffer-type (make-buffer (welcome-text :emacs cfg))
-                        :welcome)
-                    is-dir
-                      (editor/layers/set-buffer-type (make-buffer (welcome-text :emacs cfg))
-                        :welcome) ; a scratch behind the dired listing
-                    :else (assoc (find-file-buffer file) :name (file-display-name file proj)))
-              ;; the native window (a {:enter :leave :size :draw :poll :window} map). `:app-id`
-              ;; is how the desktop identifies it as *this* app — without it the window matches
-              ;; no installed .desktop entry and GNOME paints its generic fallback icon
-              ;; (config/*app-id*, assets/README.md). `:title` is only the pre-first-event
-              ;; placeholder; `input` sets the real one (`ed-window-title`) from then on.
-              disp (gui-display {:app-id *app-id* :title *app-name*})
-              ;; `config/apply-to-model` seeds the init-file's model-level settings (hl-line on
-              ;; by default, the caret shape) — the same call `cmd-reload-config` reuses live.
-              ;; The rest are live-editor-only flags that pure-model tests (via `ed-init`) omit.
-              m0 (config/apply-to-model
-                   (assoc (ed-init buf)
-                     :project-root proj
-                     ;; mirror kills/copies to the OS clipboard and yank from it (commands/
-                     ;; ed-push-kill + ed-adopt-clipboard). On only for the live editor — pure
-                     ;; model tests build via `ed-init` without it, so they never touch the
-                     ;; process-global OS clipboard (which would make them order-dependent).
-                     :os-clipboard true
-                     ;; remember opened files (recentf) so find-file floats the last-used entries
-                     ;; to the top of a directory listing; off in tests so they don't touch the
-                     ;; on-disk cache (~/.cache/brood/recent-files.blsp).
-                     :recent-files true
-                     ;; the native GUI frontend is active (main always runs `gui-display`), so the
-                     ;; view may use sub-cell `frect` rendering — rounded floating cards, etc. Pure
-                     ;; tests / a `*term-display*` run build via `ed-init` without it, so they get
-                     ;; the cell-quantised fallback (a plain `rect`) and stay frontend-agnostic.
-                     :gui true
-                     ;; the window id, so key-repeat can poll `gui/held-key` as the source of
-                     ;; truth for a held key (stops repeat the instant the key is up, even if a
-                     ;; key-up event is missed — see input/ed-still-held?).
-                     :window (:window disp))
-                   cfg)
-              ;; A directory argument (`bedit .`) opens its dired listing over the scratch buffer.
-              ;; dired lives in `commands`; the qualified `dired/ed-show-dired` call auto-loads it.
-              m (if is-dir
-                  (dired/ed-show-dired m0 (path/absolute file))
-                  m0))
-          (gui-only gui/font *font*) ; base window font; no-op without a GUI build
-          (gui-only gui/inset *inset*) ; breathing room around the grid; no-op without GUI
-          (gui-only gui/bg *base*) ; clear/inset-margin fill follows the theme bg; no-op without GUI
-          (config/apply-window! cfg) ; init.blsp's :text-aa / :line-height; no-op without GUI
-          (apply-syntax-theme!) ; soft-RGB syntax colours (the :syntax/* registry) to match the chrome
-          ;; Apply the user init file's window mode. :maximized fills the screen but keeps
-          ;; the title bar (gui/maximize); :fullscreen is borderless/no-title (gui/fullscreen).
-          ;; Both are no-ops/throw without a GUI build — hence the try.
-          (let (mode (window-mode cfg)
-                win (:window disp))
-            (cond
-              (= mode :maximized) (gui-only gui/maximize win true)
-              (= mode :fullscreen) (gui-only gui/fullscreen win true)
-              :else nil))
-          (remember-project! (:project-root m)) ; discovered on launch → known for C-x p p
-          ;; Route the logger into the editor: a `process-backend` to the editor (ui-run)
-          ;; process sends each formatted line as `[:io/write s]`, which `ed-update` folds
-          ;; into *Messages*. Async + safe — the editor never blocks on a log, and the one
-          ;; logger process serialises writes. Register the editor pid as `:editor` (so any
-          ;; process can `(send (whereis :editor) [:io/write "…"])`) *before* `start-logging`,
-          ;; which supervises the logger and addresses the editor by that name — so a killed
-          ;; logger restarts and the fresh one still streams here (see `start-logging`).
-          (proc/register :editor (self))
-          (start-logging)
-          (log/info "bedit started")
-          ;; Surface init.blsp problems the type checker can't see (it's read as data):
-          ;; a typo'd config value lands in *Messages* at startup.
-          (doseq (w (config-warnings cfg)) (log/warn w))
-          ;; Deferred package loading, spawned in parallel with the first rendered frame
-          ;; so the editor opens fast. The feature modules themselves (git, lsp, web,
-          ;; gitdiff, proctree, debugger, testrun, apprun, themes, tutor) load with the
-          ;; project image and auto-load on first qualified reference at their call sites —
-          ;; no explicit preload needed; every call site stays guarded with `(bound? 'ns/fn)`.
-          (spawn
-            (fn ()
-              ;; Wait for the editor to render its first frame and for JIT to warm up
-              ;; before the package scan, to avoid compile-lock contention that makes the
-              ;; first second of scrolling sluggish.
-              (receive (after 1200 nil))
-              ;; Fold in USER-installed `:enhances bedit` packages (theme plugins today) from
-              ;; ~/.config/bedit/packages — the package manager's install dir (M-x package-list),
-              ;; NOT the project's build _deps. Register their contributions into the global
-              ;; registries so M-x theme-select lists them. Deferred so a plugin's disk read
-              ;; never slows the first frame; the theme registry is process-global, so
-              ;; registering here (not in the model) is enough — a later theme-select sees them.
-              (let (loaded (packages/load-installed!))
-                (when (not (empty? loaded))
-                  (log/info (str "packages: loaded " (count loaded) " — " (string/join loaded ", ")))))))
-          ;; THE FLIP (docs/actor-architecture.md): every pool buffer in the live window is
-          ;; backed by its own process — `hosted/hosted-reconcile` at the loop tail hosts
-          ;; each slot as it appears (files, *Messages*, dired, occur — no call-site
-          ;; cooperation). Tests/headless models never set this flag, so the pure suite
-          ;; stays pure.
-          ;; …and named in the buffer registry (`frames/frames-registry-start`), so a second
-          ;; frame (C-x 5 2) links its slots to the same processes (docs/frames-plan.md).
-          ;; Record the type setup the window was just given (`*font*` above, plus the
-          ;; config's line height) on the model. The window has no getter for any of it, so
-          ;; this is what lets Ctrl+wheel step from the real size and `M-x preset-save` name
-          ;; what you are actually looking at (src/appearance.blsp) instead of a guess.
-          (ui-run (frames/frames-registry-start (appearance/apply! (assoc m :host-buffers? true)
-                                                  {:family (:family *font*)
-                                                   :height (:height *font*)
-                                                   :line-height (or (:line-height cfg)
-                                                                  config/*line-height-default*)}))
-            ed-view ed-update disp)))))
+  (cond
+    ;; `--version` answers and exits without touching the display — see
+    ;; `about/version-arg?` for why that ordering is the point, not a detail.
+    (about/version-arg? args) (do (io/puts (about/version-line)) 0)
+    (remote/remote-main? args) (remote/remote-main args)
+    else (run-window (remote/remote-positional args))))

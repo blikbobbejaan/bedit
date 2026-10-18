@@ -14,15 +14,16 @@ markers keyed by the session pid (edit-adjusted inside the buffer process; clean
 by it when you die), the `:participants` name registry and its quiet tags
 (`:tag-ttl`), join/leave echoes, `share-follow`/`share-mirror`, presence migration on
 buffer switch (`collab-sync-point`), and the per-daemon FILE REGISTRY that auto-shares
-every file anyone visits (`collab-autoshare`) — respawning died buffer processes from
-its own text mirror (`collab-registry-loop`), with subscribers resharing onto the
+every file anyone visits (`collab-autoshare`) — respawning died buffer processes from a
+text mirror (std `editor/buffer-registry` started `{:mirror true}`), with subscribers resharing onto the
 respawn (`collab-reshare`). Deferred to v2: a real sequence CRDT for
 offline/high-latency divergence (`docs/remote-multiplayer-plan.md`, Open)."
   (:use editor/buffer) ; spawn/subscribe/buffer-edit/replace-region/make-buffer …
-  (:use editor/buffer-client) ; the protocol's client half: link-init/-propagate/-fold,
-  ; text-splice, view-parts (ADR-134 — extracted from here)
+  (:use editor/buffer-client) ; view-parts — the protocol's push normalizer (ADR-134)
+  (:use editor/buffer-registry) ; registry-share — the daemon's file -> process directory
   (:use hosted) ; ed-host-slot / ed-unhost-slot / hosted-apply-content —
   ; the content machinery (collab = its presence layer)
+  (:use scroll) ; ed-scroll / ed-max-top / ed-wrap? — keeping point on screen
   (:use model)) ; ed-init / ed-current-buf / ed-set-buf / ed-buf-at / ed-stamp …
 ;; ---- the model <-> shared-process link --------------------------------------
 ;; A slot's `:hosted` record IS a buffer-client *link* (`{:proc :me :version :pending}`)
@@ -106,144 +107,79 @@ re-entering the buffer re-announces."
             (assoc (:hosted m)
               j (merge sh {:sent-point nil :sent-mark nil :sent-top nil})))))))
 
+(defn- collab-sync-marker (m i sent-key marker value)
+  "Bring our presence `marker` on slot `i`'s process to `value` when it differs from what
+we last sent (`sent-key` on the slot): a nil `value` deletes the marker, any other moves
+it — a structured delta, no text on the wire. Returns the model with the new stamp."
+  (let (link (get-in m [:hosted i])
+        me (:me link))
+    (cond
+      (= value (get link sent-key)) m
+      (nil? value)
+        (do
+          (buffer-edit (:proc link) (fn (b) (buffer-marker-delete b marker)) me)
+          (assoc-in m [:hosted i sent-key] nil))
+      :else
+        (do
+          (buffer-marker-move (:proc link) marker value me)
+          (assoc-in m [:hosted i sent-key] value)))))
+
+(defn- collab-migrate-presence (m i)
+  "Note `i` as the slot we are active on, withdrawing presence from the previous one
+only when ARRIVING at another shared slot (a real migration). Glancing at *Messages* /
+*git-status* keeps your caret parked at its last shared spot — followers stay put
+instead of being dropped, and the other side isn't spammed with left/joined echoes for
+every status peek."
+  (let (previous (:collab-active m))
+    (assoc (if (and previous (not (= previous i)) (collab-shared? m previous) (collab-shared? m i))
+             (collab-withdraw-presence m previous)
+             m)
+      :collab-active i)))
+
+(defn- collab-top-offset (m)
+  "The current window's top line as a char offset — what our `[me :top]` viewport marker
+carries, edit-adjusted like any marker."
+  (let (buffer (ed-current-buf m)
+        top-line (math/min (ed-current-top m) (dec (buffer-line-count buffer))))
+    (text/line->char (buffer-rope buffer) (math/max 0 top-line))))
+
 (defn collab-sync-point (m)
   "After an event folds: keep this participant's presence honest on the buffer they're
 IN — the cursor marker when point moved, the `[me :mark]` selection anchor while a
 region is active (deleted when it drops), and the `[me :top]` viewport marker (the
 top line's char offset — edit-adjusted like any marker) when the view scrolled, which
 is what a `share-mirror` reproduces. Switching buffers first withdraws presence from
-the buffer left behind (`collab-withdraw-presence`). Marker moves are structured
+the buffer left behind (`collab-migrate-presence`). Marker moves are structured
 deltas — no text on the wire. A no-op on unshared buffers and unmoved state, so the
 every-event path pays nothing."
   (let (i (ed-current-index m)
-        prev (:collab-active m)
-        ;; withdraw from the old slot only when ARRIVING at another shared one (a real
-        ;; migration). Glancing at *Messages* / *git-status* keeps your caret parked at
-        ;; its last shared spot — followers stay put instead of being dropped, and the
-        ;; other side isn't spammed with left/joined echoes for every status peek.
-        m0 (assoc (if (and prev (not (= prev i)) (collab-shared? m prev) (collab-shared? m i))
-                    (collab-withdraw-presence m prev)
-                    m)
-             :collab-active i)
-        sh (get-in m0 [:hosted i]))
-    (if (not (collab-shared? m0 i))
-      ; presence lives on SHARED slots only — a merely
-      m0 ; hosted local buffer gets no cursor markers
-      (let (me (:me sh)
-            buf (ed-current-buf m0)
-            pt (buffer-point buf)
-            mk (buffer-mark buf)
-            topline (math/min (ed-current-top m0) (dec (buffer-line-count buf)))
-            top-off (text/line->char (buffer-rope buf) (math/max 0 topline))
-            m1 (if (or (nil? me) (= pt (:sent-point sh)))
-                 m0
-                 (do
-                   (buffer-marker-move (:proc sh) me pt me)
-                   (assoc-in m0 [:hosted i :sent-point] pt)))
-            m2 (cond
-                 (nil? me) m1
-                 (= mk (get-in m1 [:hosted i :sent-mark])) m1
-                 (nil? mk)
-                   (do
-                     (buffer-edit (:proc sh) (fn (b) (buffer-marker-delete b [me :mark])) me)
-                     (assoc-in m1 [:hosted i :sent-mark] nil))
-                 :else
-                   (do
-                     (buffer-marker-move (:proc sh) [me :mark] mk me)
-                     (assoc-in m1 [:hosted i :sent-mark] mk))))
-        (if (or (nil? me) (= top-off (get-in m2 [:hosted i :sent-top])))
-          m2
-          (do
-            (buffer-marker-move (:proc sh) [me :top] top-off me)
-            (assoc-in m2 [:hosted i :sent-top] top-off)))))))
+        moved (collab-migrate-presence m i)
+        me (get-in moved [:hosted i :me]))
+    ;; presence lives on SHARED slots only — a merely hosted local buffer gets no
+    ;; cursor markers
+    (if (or (not (collab-shared? moved i)) (nil? me))
+      moved
+      (let (buffer (ed-current-buf moved))
+        (-> moved
+          (collab-sync-marker i :sent-point me (buffer-point buffer))
+          (collab-sync-marker i :sent-mark [me :mark] (buffer-mark buffer))
+          (collab-sync-marker i :sent-top [me :top] (collab-top-offset moved)))))))
 
 ;; ---- the shared-buffer registry: every file, one process ---------------------
-;; One registry process per collab daemon: the first session to open a file spawns
-;; its buffer process; everyone after gets the same pid. So EVERY file buffer anyone
-;; visits is collaborative — not just the file the daemon was launched on — which is
-;; what lets `share-follow` track a participant across buffers.
+;; One registry per collab daemon (`:collab-reg`, std `editor/buffer-registry` started
+;; `{:mirror true}`): the first session to open a file spawns its buffer process;
+;; everyone after gets the same pid. So EVERY file buffer anyone visits is
+;; collaborative — not just the file the daemon was launched on — which is what lets
+;; `share-follow` track a participant across buffers. The MIRROR is what lets it
+;; respawn a died process from current content rather than dropping it: the shared
+;; document outlives both its process and any one session's copy.
 
-(defn- collab-registry-entry-by-proc (procs pid)
-  "The `[path entry]` whose `:proc` is `pid`, or nil."
-  (seq/find (%map-pairs procs) (fn (kv) (= (:proc (second kv)) pid))))
-
-(defn- collab-registry-spawn (procs path text name)
-  "Spawn (or respawn) `path`'s buffer process from `text`, monitored and mirrored:
-the registry subscribes itself (`buffer-text` projection) and keeps a per-path TEXT
-MIRROR folded from the pushes (`link-fold` + `text-apply-splice` — the same std
-client every other holder uses), so a died process can be respawned from current
-content, not the text it was first shared with. Returns the updated `procs`."
-  (let (bp (spawn-buffer (make-buffer text name path)))
-    (monitor bp)
-    (subscribe-buffer bp buffer-text)
-    (assoc procs path {:proc bp :name name :link (link-init bp (self)) :text text})))
-
-(defn- collab-registry-loop (procs)
-  ;; procs: {path {:proc <pid> :name <str> :link <buffer-client link> :text <mirror>}}
-  (receive
-    ([:share path text name from r] (let (existing (get procs path))
-                                      (if existing
-                                        (do
-                                          (send from [:reply r (:proc existing)])
-                                          (collab-registry-loop procs))
-                                        (let (np (collab-registry-spawn procs path text name))
-                                          (send from [:reply r (get-in np [path :proc])])
-                                          (collab-registry-loop np)))))
-    ;; a mirror push from one of our buffers: fold it into that path's text mirror
-    ([:buffer-updated bp v view o] (let (hit (collab-registry-entry-by-proc procs bp))
-                                     (if (nil? hit)
-                                       (collab-registry-loop procs)
-                                       (let ([path e] hit
-                                             [link action] (link-fold (:link e) v view o)
-                                             text (cond
-                                                    (and (vector? action)
-                                                      (= (first action) :splice))
-                                                      (text-apply-splice (:text e) (second action))
-                                                    (and (vector? action) (= (first action) :text))
-                                                      (second action)
-                                                    :else (:text e)))
-                                         (collab-registry-loop (assoc procs
-                                                                 path
-                                                                   (merge e {:link link :text text})))))))
-    ;; one of our buffer processes died: respawn it from the mirror. The shared
-    ;; document survives its process — subscribers notice their own [:down] and
-    ;; re-share, landing on the fresh pid (collab-reshare), seed-synced to the mirror.
-    ([:down _ pid _] (let (hit (collab-registry-entry-by-proc procs pid))
-                       (if (nil? hit)
-                         (collab-registry-loop procs)
-                         (let ([path e] hit)
-                           (collab-registry-loop (collab-registry-spawn (dissoc procs path)
-                                                   path
-                                                   (:text e)
-                                                   (:name e)))))))
-    ;; share-session-stop: end every buffer process this registry spawned, then this loop
-    ([:stop-all from r] (do
-                          (doseq (kv (%map-pairs procs)) (stop-buffer (:proc (second kv))))
-                          (send from [:reply r (count procs)])))
-    (_ (collab-registry-loop procs))))
-
-(defn collab-registry-start ()
-  "Spawn the daemon's file → buffer-process registry; its pid rides every session
-model as `:collab-reg`."
-  ;; every session asks it synchronously: a breakpoint must never park it (brood's
-  ;; `proc/flag :no-break`), or each of them would freeze
-  (spawn (do (proc/flag :no-break true) (collab-registry-loop {}))))
-
-(defn collab-registry-stop (reg)
-  "End the registry AND every buffer process it spawned (the whole shared document
-set) — `share-session-stop`'s teardown. Synchronous; the count of processes stopped,
-or `:no-reply` when the registry is already gone."
-  (let (r (ref))
-    (send reg [:stop-all (self) r])
-    (receive ([:reply ^r n] n) (after 2000 :no-reply))))
-
-(defn collab-registry-share (reg path text name)
-  "The ONE buffer process for `path` — spawned from `text`/`name` on the first ask;
-later askers get the existing process (their local copy then syncs from its seed
-push). Synchronous; nil if the registry doesn't answer."
-  (let (r (ref))
-    (send reg [:share path text name (self) r])
-    (receive ([:reply ^r bp] bp) (after 2000 nil))))
+(defn collab-registry-share (reg buf)
+  "The ONE buffer process for file buffer `buf` — spawned from its text on the first
+ask; later askers get the existing process (their local copy then syncs from its seed
+push). Synchronous; nil if the registry doesn't answer within 2s (the host went away)."
+  (let (bp (registry-share reg (buffer-name buf) (buffer-text buf) {:file (buffer-file buf)}))
+    (if (pid? bp) bp nil)))
 
 (defn collab-autoshare (m)
   "Share the CURRENT buffer the moment it's visited: when this session belongs to a
@@ -258,7 +194,7 @@ collaborative; ordinary editors (no `:collab-reg`) never do anything here."
         buf (ed-current-buf m))
     (if (or (nil? reg) (collab-shared? m i) (nil? (buffer-file buf)))
       m
-      (let (bp (collab-registry-share reg (buffer-file buf) (buffer-text buf) (buffer-name buf)))
+      (let (bp (collab-registry-share reg buf))
         (if (nil? bp)
           ;; the registry didn't answer (host gone?) — disable sharing for this
           ;; session rather than stalling 2s on every subsequent file visit
@@ -278,7 +214,7 @@ cache, so editing never stops — the graceful end of a collab session."
         buf (ed-buf-at m i)
         m1 (assoc m :hosted (dissoc (:hosted m) i))
         bp (if (and reg (buffer-file buf))
-             (collab-registry-share reg (buffer-file buf) (buffer-text buf) (buffer-name buf))
+             (collab-registry-share reg buf)
              nil))
     (if (nil? bp)
       (message (ed-host-slot m1 i)
@@ -425,16 +361,73 @@ beyond that is vanishingly rare. Unchanged sets echo nothing."
       (not (empty? left)) (message m (str (get names (first left) "guest") " left"))
       :else m)))
 
+(defn- collab-partition-presence (raw me)
+  "Split a view's raw presence map into `{:cursors :marks :tops}`, each keyed by pid and
+each for the OTHER participants only (never `me`): a plain pid key is a cursor, a
+`[pid :mark]` key a mark anchor and a `[pid :top]` key a viewport top."
+  (fold (%map-pairs raw)
+    {:cursors {} :marks {} :tops {}}
+    (fn (acc kv)
+      (let ([k v] kv
+            owner (if (vector? k) (first k) k))
+        (cond
+          (= owner me) acc
+          (not (vector? k)) (update acc :cursors assoc k v)
+          (= (nth k 1 nil) :mark) (update acc :marks assoc owner v)
+          (= (nth k 1 nil) :top) (update acc :tops assoc owner v)
+          :else acc)))))
+
+(defn- collab-rearm-tags (ttl old-cursors cursors)
+  "Re-arm the name tag of every participant whose caret appeared or moved since
+`old-cursors`, for a few blink beats (`collab-decay-tags` ticks them down) — quiet
+presence."
+  (fold (%map-pairs cursors)
+    ttl
+    (fn (acc kv)
+      (if (= (get old-cursors (first kv)) (second kv)) acc (assoc acc (first kv) 6)))))
+
+(defn- collab-fold-presence (m i link view)
+  "Land a push's PRESENCE on slot `i`: other participants' cursors/marks/viewports (own
+pid excluded), re-armed name tags, and the churn echo — suppressed on the seed, since
+finding people already here isn't news the same way. `link` is the slot as it was
+BEFORE the push folded: its cursors, names and version are what changed from."
+  (let (parts (view-parts view)
+        names (:names parts)
+        {:keys [cursors marks tops]} (collab-partition-presence (:cursors parts) (:me link))
+        old-cursors (or (:cursors link) {})
+        seed? (= (or (:version link) -1) -1)
+        echoed (if seed?
+                 m
+                 (collab-presence-echo m old-cursors cursors (merge (or (:names link) {}) names))))
+    (assoc-in echoed
+      [:hosted i]
+      (merge (get-in echoed [:hosted i])
+        {:cursors cursors
+         :marks marks
+         :tops tops
+         :tag-ttl (collab-rearm-tags (or (:tag-ttl link) {}) old-cursors cursors)
+         :names names}))))
+
+(defn- collab-follow-vanished (m old-cursors)
+  "Break the follow when the one we follow vanished from EVERY shared buffer — they're
+gone (a buffer switch just moves their marker to another slot, which keeps it). Only
+asked of a participant `old-cursors` showed on the slot that was just updated."
+  (let (followed (:follow m))
+    (if (and followed
+          (contains? old-cursors (:pid followed))
+          (nil? (collab-slot-of m (:pid followed))))
+      (collab-unfollow m (str (:name followed) " left — stopped following"))
+      m)))
+
 (defn ed-apply-buffer-update (m proc version view &optional origin)
   "Fold a `[:buffer-updated proc version view origin]` push into the model: the
 CONTENT (stale drop, echo suppression, foreign-splice transform over our in-flight
 edits, ambiguous-collision resync, full-text rebuild) is `hosted-apply-content` — the
 hosted machinery every process-backed buffer shares — and the PRESENCE layer (this
-module's own) folds around it: other participants' cursors/marks/viewports land on
-the slot (own pid excluded), name tags re-arm on movement (`:tag-ttl`, decayed by
-`collab-decay-tags`), churn is echoed (`collab-presence-echo` — suppressed on the
-seed: finding people already here isn't news the same way), and a followed
-participant vanishing from every shared slot breaks the follow.
+module's own, `collab-fold-presence`) folds around it: other participants'
+cursors/marks/viewports land on the slot, name tags re-arm on movement (`:tag-ttl`,
+decayed by `collab-decay-tags`), churn is echoed (`collab-presence-echo`), and a
+followed participant vanishing from every shared slot breaks the follow.
 
 Every pane's window-local point is untouched — it lives on the pane, not the buffer —
 so cursors stay independent and simply clamp into the new text on render. Ignores a
@@ -442,66 +435,12 @@ stale/duplicate `version`; a no-op when no slot links to `proc`."
   (let (i (hosted-slot-for-proc m proc))
     (if (nil? i)
       m
-      (let (sh (get-in m [:hosted i]) ; the PRE-fold slot: old cursors/names/seed?
-            [mc status] (hosted-apply-content m i version view origin))
+      (let (link (get-in m [:hosted i])
+            [content status] (hosted-apply-content m i version view origin))
         (if (= status :stale)
           m
-          (let (vp (view-parts view)
-                raw (:cursors vp)
-                names (:names vp)
-                me (:me sh)
-                ;; plain pid keys are cursors; [pid :mark] anchors; [pid :top] viewport tops
-                cursors (fold (%map-pairs raw)
-                          {}
-                          (fn (acc kv)
-                            (if (vector? (first kv)) acc (assoc acc (first kv) (second kv)))))
-                marks (fold (%map-pairs raw)
-                        {}
-                        (fn (acc kv)
-                          (let (k (first kv))
-                            (if (and (vector? k) (= (nth k 1 nil) :mark) (not (= (first k) me)))
-                              (assoc acc (first k) (second kv))
-                              acc))))
-                tops (fold (%map-pairs raw)
-                       {}
-                       (fn (acc kv)
-                         (let (k (first kv))
-                           (if (and (vector? k) (= (nth k 1 nil) :top) (not (= (first k) me)))
-                             (assoc acc (first k) (second kv))
-                             acc))))
-                others (if (nil? me) cursors (dissoc cursors me))
-                seed? (= (or (:version sh) -1) -1)
-                old-cursors (or (:cursors sh) {})
-                ;; a caret that appeared or moved re-arms its owner's name tag for a few
-                ;; blink beats (`collab-decay-tags` ticks them down) — quiet presence
-                ttl (fold (%map-pairs others)
-                      (or (:tag-ttl sh) {})
-                      (fn (acc kv)
-                        (if (= (get old-cursors (first kv)) (second kv))
-                          acc
-                          (assoc acc (first kv) 6))))
-                m1 (if seed?
-                     mc
-                     (collab-presence-echo mc
-                       old-cursors
-                       others
-                       (merge (or (:names sh) {}) names)))
-                m2 (assoc m1
-                     :hosted
-                       (assoc (:hosted m1)
-                         i
-                           (merge (get-in m1 [:hosted i])
-                             {:cursors others
-                              :marks marks
-                              :tops tops
-                              :tag-ttl ttl
-                              :names names})))
-                ;; the one we were following vanished from EVERY shared buffer → they're
-                ;; gone (a buffer switch just moves their marker to another slot — kept)
-                f (:follow m2))
-            (if (and f (contains? old-cursors (:pid f)) (nil? (collab-slot-of m2 (:pid f))))
-              (collab-unfollow m2 (str (:name f) " left — stopped following"))
-              m2)))))))
+          (collab-follow-vanished (collab-fold-presence content i link view)
+            (or (:cursors link) {})))))))
 
 (defn collab-unshare (m i)
   "Drop the shared link on pool slot `i`: withdraw our presence (delete our cursor marker
@@ -522,3 +461,30 @@ A no-op when the slot isn't shared."
                 :participants (dissoc (:participants b {}) me)))
             me))
         (ed-unhost-slot m i)))))
+
+;; ---- the mode-line chip ------------------------------------------------------
+
+(defn- presence-label (m pane)
+  "The modeline presence chip for a SHARED buffer: who else is here, by name, plus the
+follow target while following ('shared: alice, bob → alice'). \"\" on an unshared
+buffer, so the segment is dropped — gated on the slot's `:collab?` flag, NOT mere
+hostedness: under the every-buffer flip every live slot is process-backed, but only
+collab-shared ones have presence. A registry-hosted slot (`:registry?` — a buffer shared
+with another FRAME of this editor) is not a collaboration: no chip."
+  (let (bi (get-in pane [:payload :buffer])
+        sh (get-in m [:hosted bi]))
+    (if (nil? (:collab? sh))
+      ""
+      (let (names (or (:names sh) {})
+            cursors (or (:cursors sh) {})
+            who (map (%map-pairs cursors) (fn (kv) (get names (first kv) "guest")))
+            f (:follow m))
+        (str "  —  shared: "
+          (if (empty? who) "just you" (string/join who ", "))
+          (if f (str " → " (:name f)) ""))))))
+
+(defn presence-segment (m pane buf)
+  "The presence chip on the selected pane's bar (the label bakes its own separator)."
+  (statusbar/seg :presence (presence-label m pane)))
+
+(statusbar/register-modeline-segment :presence 40 'collab/presence-segment)

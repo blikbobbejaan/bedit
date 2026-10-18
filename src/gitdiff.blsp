@@ -4,11 +4,16 @@ HEAD), painted as a coloured bar in the left of the line-number gutter. The per-
 is computed by `git diff --no-index` of the buffer's text against the HEAD blob and cached on
 the buffer under `:git-line-status` (a `{0-based-line -> :added|:modified|:deleted}` map), so
 the gutter cell — which sees only the buffer — can paint it without the model. The model-level
-recompute (off the loop, re-armed on edit/save) lives in `model/ed-launch-gitdiff`.
+recompute (off the loop, re-armed on edit/save) is `ed-launch-gitdiff`, below: an idle-beat job
+this module registers when it loads (`model/register-idle-job`). The module is deferred: the
+gutter paint (`modes/line-number-cell`) loads it, and until something has there are no bars to
+recompute — what the `bound?` guard in the model used to say.
 
 `gitdiff-head-text` / `gitdiff-status-map` shell out to git (a subprocess each) and are
 unit-tested against real git without the editor (tests/gitdiff_test.blsp)."
-  (:use editor/buffer)) ; buffer-file / buffer-text
+  (:use editor/buffer) ; buffer-file / buffer-text
+  (:use model) ; ed-current-buf / ed-set-buf / ed-buf-at / ed-headless? / the registries
+  (:use task)) ; task — the diff runs off the loop
 ;; `theme` (a project source module, loaded with the image) provides the *green* /
 ;; *yellow* / *red* dynamic-var colour globals this file reads bare.
 ;; ---- faces + glyphs ---------------------------------------------------------
@@ -129,7 +134,7 @@ process-local). The editor folds the result onto the buffer's `:git-line-status`
 the file isn't tracked / not in a repo (so the gutter shows the bar column but no colours).
 A fileless buffer is returned unchanged (no status key — never gets a diff gutter). The
 synchronous wrapper over `gitdiff-status`, used on the headless path; the live editor runs
-`gitdiff-status` off the loop (see `model/ed-launch-gitdiff`)."
+`gitdiff-status` off the loop (see `ed-launch-gitdiff`)."
   (let (path (buffer-file buf))
     (if (nil? path)
       buf
@@ -138,3 +143,99 @@ synchronous wrapper over `gitdiff-status`, used on the headless path; the live e
       ;; moment a line is inserted rather than drawing every bar one line off
       (editor/buffer/annotate buf
         :git-line-status (gitdiff-status path (buffer-text buf))))))
+
+;; ---- diff-hl annotation, off the loop (mirrors the diagnostics pair) ---------
+;; Diffing a buffer against its HEAD blob is `std/diff` over the whole file. On a large
+;; file that is seconds of work — far too slow for the per-event loop (it once wedged the
+;; whole editor on a 3000-line file: the single ui-run process never returned, so no key,
+;; not even C-g, could be processed). So the diff runs in a spawned task, exactly like the
+;; advisory diagnostics check: launch on the idle beat, fold the result back on its reply.
+
+(defn ed-gitdiff-stale? (m)
+  "True when the current buffer wants a diff-hl recompute: diff-hl is on (`:diff-hl?`,
+default true), it's a file buffer, and its **rope differs from the one the cached gutter was
+computed for** — its first view (no annotation at all), or any edit since. An O(1)
+rope-handle compare (`annotation`'s `:stale?`), so plain motion costs nothing but a text change
+re-arms the diff, so the change bars follow edits instead of freezing at their old lines until
+a save (the 'bars drift the further down you scroll' symptom). No size cap — the recompute
+runs OFF the loop (`ed-launch-gitdiff`), so a large file no longer blocks it."
+  (and (:diff-hl? m true)
+    (let (b (ed-current-buf m))
+      (and (buffer-file b)
+        (let (a (editor/buffer/annotation b :git-line-status))
+          (or (nil? a) (:stale? a)))))))
+
+(defn ed-launch-gitdiff (m)
+  "Recompute the current buffer's diff-hl gutter when stale, OFF THE LOOP — mirroring
+`ed-launch-diag`. `git show HEAD:file` + `git diff` is tens of ms on a normal file but scales
+with the file size (~45ms on an 848KB / 12k-line doc, seconds on a huge one) — too much for the
+per-event loop, which once wedged the whole editor on a large file — so it runs in a spawned
+task (std/task): record the task handle on `:gitdiff-proc` and the rope it is diffing on
+`:gitdiff-checking`, so a stale reply can't clobber a newer cache. Fires on the idle beat, gated
+on an in-flight check. Headless (no `:editor`) → synchronous fallback.
+
+(An earlier async version was blamed for a frozen gutter but later exonerated — the real bug
+was the idle beat suppressed by a stuck `:held-key`, cac0ce3; the task-reply contract is pinned
+by tests/gitdiff_async_test.blsp's last describe. Async is restored here because sync scales
+with file size and blocks the loop — the very failure the user hit on a 12k-line file.)"
+  (cond
+    (not (ed-gitdiff-stale? m)) m
+    (:gitdiff-proc m) m
+    (ed-headless?) (ed-set-buf m (gitdiff-annotate (ed-current-buf m)))
+    :else
+      (let (b (ed-current-buf m)
+            path (buffer-file b))
+        (if (nil? path)
+          m ; `ed-gitdiff-stale?` already said it is a file buffer; this says so to the checker
+          (let (text (buffer-text b)
+                job (task (fn () (gitdiff-status path text))))
+            (assoc m :gitdiff-proc job :gitdiff-checking (buffer-rope b)))))))
+
+(sig ed-apply-gitdiff (model any -> model))
+(defn ed-apply-gitdiff (m result)
+  "Fold a finished diff-hl compute's `result` (the `{0-based-line -> status}` map; nil/() on
+error/timeout) into the buffer it was diffed for — located by the rope it carried
+(`:gitdiff-checking`), so a buffer switch mid-flight still stamps the RIGHT buffer — with the
+rope + line count, and clear the in-flight handle. A buffer edited since the launch has no
+matching rope, so its stale result is dropped and `ed-gitdiff-stale?` re-fires next idle tick.
+Mirrors `ed-apply-diag`."
+  (let (rope (:gitdiff-checking m)
+        m1 (dissoc m :gitdiff-proc :gitdiff-checking)
+        idx (seq/index-where (:buffers m1) (fn (b) (= (buffer-rope b) rope))))
+    (if (< idx 0)
+      m1
+      ;; stamp the result onto the buffer we diffed (found BY ROPE, so a mid-flight
+      ;; buffer switch still lands on the right one)
+      (update m1
+        :buffers assoc
+        idx
+        (editor/buffer/annotate (ed-buf-at m1 idx) :git-line-status (or result {}))))))
+
+(defn ed-quit-gitdiff (m)
+  "C-g killed a diff-hl recompute (`:on-quit`): forget the rope it was diffing, and re-stamp
+the current buffer's bars against its CURRENT text, so the idle beat treats the gutter as
+current and does not relaunch the diff just killed (keeping any existing bars; none if there
+were none). It re-arms on the next edit, because that is what makes the annotation stale
+again."
+  (let (b (ed-current-buf m))
+    ;; `:value`, NOT `annotation-value`: the current-only accessor returns nil exactly when
+    ;; a line was inserted (which is why a diff was in flight), so it would DISCARD the bars
+    ;; this exists to keep.
+    (dissoc (ed-set-buf m
+              (editor/buffer/annotate b
+                :git-line-status (or (:value (editor/buffer/annotation b :git-line-status)) {})))
+      :gitdiff-checking)))
+
+;; ---- registration ---------------------------------------------------------------
+
+(register-task-reply :gitdiff-proc
+  'gitdiff/ed-apply-gitdiff
+  '()
+  nil
+  {:cancel-on-quit? true :on-quit 'gitdiff/ed-quit-gitdiff})
+
+;; NOT held-key-gated, and also run on the blink tick: a missed key-up can leave `:held-key`
+;; stuck, which would otherwise suppress the idle beat and freeze the gutter — the blink
+;; tick fires whenever the editor is idle, so it keeps the bars current regardless
+(register-idle-job :gitdiff
+  {:order 80 :run 'gitdiff/ed-launch-gitdiff :stale? 'gitdiff/ed-gitdiff-stale? :on-blink? true})

@@ -23,8 +23,12 @@ Structure mirrors `lsp.blsp`: a dedicated **shell process** (`bshell-loop`, per 
 owns the child `proc` (and runs Brood eval in its own image, off the editor loop). It
 receives `[:bshell-run line]`, runs it, and forwards each chunk as a `bshell-output-event`
 / the exit as a `bshell-done-event` (keyed by buffer name; each folds itself in — `UiEvent`)."
+  (:use editor/keymap :only [keymap-bind]) ; the mode keymap below
+  (:use editor/layers :only [register-type-layers]) ; the buffer type below
+  (:use scroll) ; ed-scroll / ed-max-top / ed-wrap? — keeping point on screen
   (:use model) ; ed-buffer-index-by-name / ed-scroll / ed-stamp / ed-log-buffer / ed-set-buf
-  (:use commands) ; ed-open-buffer / ed-select / ed-project-root + the editing commands wrapped
+  (:use pool) ; ed-open-buffer / ed-select / ed-project-root — the shell buffer and where it runs
+  (:use commands) ; the editing commands the input region wraps (C-a, DEL, ↑/↓ …)
   (:use projects) ; editor-state-dir + the shared persist-read / persist-write! layer
   (:use interactive) ; defcommand — define + register the M-x commands
   (:use eval-command) ; eval-source — a line starting with `(` is evaluated as Brood (REPL)
@@ -174,7 +178,9 @@ terminal buffer (term.blsp), under a pty and a real emulator."
     ([:bshell-interrupt] (do
                            (when (:proc state) (os/signal (:proc state) :int))
                            (bshell-loop state)))
-    ([:shutdown] (do (when (:proc state) (os/close (:proc state))) :bshell-stopped))))
+    ([:shutdown] (do
+                   (when (:proc state) (procstream/close-quietly (:proc state) "bshell"))
+                   :bshell-stopped))))
 
 (defn bshell-connect (buffer root)
   "Spawn the shell process for `buffer` rooted at `root`; returns its pid (stored on that
@@ -259,17 +265,11 @@ starting at the new end (`:input-start`, on the buffer)."
   (bshell-prompt (or (bshell-bufget m nm :dir) ".")))
 
 ;; ---- the inbound async events (UiEvent records — see model.blsp) ------------
-;; The impls delegate to the named `ed-ev-*` fns so redefining one hot-swaps the
-;; live editor (the impl body's global call resolves late, like a keymap binding).
+;; Each folds through its named `ed-ev-*` fn (`model/defuievent`), so redefining one
+;; hot-swaps the live editor (the impl's global call resolves late, like a keymap binding).
 
-(defrecord bshell-output-event (buffer text)) ; a chunk of shell/eval output
-(defrecord bshell-done-event (buffer code)) ; the command's exit (nil = killed)
-(impl UiEvent
-  bshell-output-event
-  (ui-event-fold [e m textrows cols rows] (ed-ev-bshell-output m e textrows cols rows)))
-(impl UiEvent
-  bshell-done-event
-  (ui-event-fold [e m textrows cols rows] (ed-ev-bshell-done m e textrows cols rows)))
+(defuievent bshell-output-event (buffer text) ed-ev-bshell-output) ; a chunk of shell/eval output
+(defuievent bshell-done-event (buffer code) ed-ev-bshell-done) ; the command's exit (nil = killed)
 
 (defn ed-ev-bshell-output (m event textrows cols rows)
   "A `bshell-output-event` from the shell process → append the (ANSI-stripped) chunk to
@@ -298,10 +298,11 @@ shell idle and reset *its* input region to the new end (all per-buffer)."
 ;; `text -> [start end face]` (ascending, non-overlapping) over the buffer. The `:fontify`
 ;; service only gets the text (not the buffer), so the prompt is detected *from the text*:
 ;; the buffer's first line is its prompt (each project's is its own), so this is per-buffer
-;; correct without any global state.
+;; correct without any global state. The faces are theme chrome (`theme/defchrome`), so
+;; M-x theme-select repaints a shell with everything else.
 
-(def bshell-face-prompt {:fg "#a6e3a1" :bold true}) ; the bash-like prompt
-(def bshell-face-error {:fg "#f38ba8"}) ; an [exit N] / error: line
+(theme/defchrome bshell-face-prompt {:fg *green* :bold true}) ; the bash-like prompt
+(theme/defchrome bshell-face-error {:fg *red*}) ; an [exit N] / error: line
 (defn- bshell-detect-prompt (text)
   "The shell's prompt, detected from `text`: the buffer's first prompt is `<dir> $ `, so it's
 the text up to and including the first `\" $ \"`. `\"\"` when there's none. Per-buffer (each
@@ -382,7 +383,7 @@ input form (buffer coordinates), so output brackets never match. Nil outside the
 form (reusing brood-mode's eldoc), or nil when point isn't in a form's input."
   (let (isp (bshell-input-span text))
     (if (and isp (>= pos (first isp)) (bshell-input-form? isp))
-      (modes/brood-eldoc (second isp) (- pos (first isp)))
+      (brood-mode/brood-eldoc (second isp) (- pos (first isp)))
       nil)))
 
 ;; ---- input-region boundary (the prompt + output are not editable) -----------
@@ -391,8 +392,8 @@ form (reusing brood-mode's eldoc), or nil when point isn't in a form's input."
 ;; point in the output *above* the input line stays free (so you can read/select it).
 
 (defn- bshell-cur-istart (m)
-  "The current buffer's input start (`:input-start`), or 0."
-  (or (:input-start (ed-current-buf m)) 0))
+  "The current buffer's input start — `input-region`'s, clamped into the buffer."
+  (first (input-region (ed-current-buf m))))
 
 (defcommand cmd-bshell-beginning-of-input
   (m key)
@@ -435,7 +436,7 @@ output freely; only *typing* position is constrained. A no-op in any other buffe
   (let (b (ed-current-buf m))
     (if (not (input-region? b))
       m
-      (let (istart (or (:input-start b) 0)
+      (let (istart (first (input-region b))
             line-start (bshell-input-line-start (buffer-text b) istart))
         ;; Only the prompt PORTION of the input line is out of bounds: point in the
         ;; output above it stays put, so the scrollback keeps its own cursor.
@@ -462,34 +463,54 @@ clamped out of the prompt rather than the keystroke undone, so `m-before` is unu
   "The model with field `k`=`v` set on the *current* buffer."
   (ed-set-buf m (assoc (ed-current-buf m) k v)))
 
-(defn bshell-remember (m line)
-  "Record submitted `line` in the current buffer's history (skipping an immediate duplicate),
-persist it, and reset that buffer's browse cursor — so the next ↑ starts from the newest."
+(defn remember-input (m line)
+  "Record submitted `line` in the current buffer's in-memory history (skipping an immediate
+duplicate) and reset that buffer's browse cursor — so the next ↑ starts from the newest.
+Nothing is persisted: a line-mode terminal (iex, nest repl) keeps its own history this
+way, out of the SHELL's history file."
   (let (h (bshell-history m)
         n (count h)
         h2 (if (and (> n 0) (= (nth h (dec n)) line)) h (into h [line])))
-    (bshell-save-history h2)
     (ed-set-buf m
       (assoc (ed-current-buf m) :bshell-history h2 :bshell-hist-idx nil :bshell-draft nil))))
 
+(defn bshell-remember (m line)
+  "Record submitted shell `line` in the current buffer's history (`remember-input`) and
+persist that history to the shell's history file."
+  (let (remembered (remember-input m line))
+    (bshell-save-history (bshell-history remembered))
+    remembered))
+
+(defn input-region (b)
+  "`[start end]` of buffer `b`'s input region — CLAMPED into the buffer. A kill that
+reached above `:input-start` (click up into the scrollback, then C-k: the layers bind
+Backspace, not every kill) leaves the field past the end of the rope, and indexing off it
+would throw. With no `:input-start` the region is empty, at the end. The one reader of the
+field, for the shell and a line-mode terminal alike."
+  (let (end (buffer-length b))
+    [(math/min (or (:input-start b) end) end) end]))
+(sig input-region (buffer -> (tuple int int)))
+
+(defn input-text (b)
+  "The text of buffer `b`'s input region (from the clamped input start to the end)."
+  (let ([start end] (input-region b)) (string/substring (buffer-text b) start end)))
+(sig input-text (buffer -> string))
+
 (defn- bshell-set-input (m s)
-  "Replace the input region `[input-start, end]` of the current bshell buffer with `s`,
-point at the end."
+  "Replace the input region of the current buffer with `s`, point at the end."
   (let (b (ed-current-buf m)
-        istart (or (:input-start b) 0))
-    (ed-set-buf m (end-of-buffer (replace-region b istart (buffer-length b) s)))))
+        [start end] (input-region b))
+    (ed-set-buf m (end-of-buffer (replace-region b start end s)))))
 
 (defn- bshell-in-output? (m)
   "Whether point is above the input line (in the read-only output) — where ↑/↓ should move
 by line to read output, not browse history."
   (let (b (ed-current-buf m))
-    (< (buffer-point b) (bshell-input-line-start (buffer-text b) (or (:input-start b) 0)))))
+    (< (buffer-point b) (bshell-input-line-start (buffer-text b) (bshell-cur-istart m)))))
 
 (defn- bshell-input-text (m)
   "The current input region's text (from the input start to the buffer end)."
-  (let (b (ed-current-buf m)
-        t (buffer-text b))
-    (string/substring t (or (:input-start b) 0) (string/length t))))
+  (input-text (ed-current-buf m)))
 
 (defn- bshell-line-nav? (m)
   "Whether ↑/↓ should move by line instead of browsing history: point is in the output
@@ -508,11 +529,7 @@ the live input as the slot past the newest). Above the input line, an ordinary m
         m
         (let (b (ed-current-buf m)
               idx (:bshell-hist-idx b)
-              istart (or (:input-start b) 0)
-              text (buffer-text b)
-              draft (if (nil? idx)
-                      (string/substring text istart (string/length text))
-                      (:bshell-draft b))
+              draft (if (nil? idx) (input-text b) (:bshell-draft b))
               new-idx (if (nil? idx) (dec n) (math/max 0 (dec idx))))
           (bshell-set-input (bshell-cur-set (bshell-cur-set m :bshell-hist-idx new-idx)
                               :bshell-draft draft)
@@ -580,11 +597,11 @@ line (the REPL), else **filenames** under that shell's directory. `nil` in any o
       nil
       (let (text (buffer-text buf)
             p (buffer-point buf)
-            istart (or (:input-start buf) 0))
+            istart (first (input-region buf)))
         (if (< p istart)
           nil
           (if (string/starts-with? (string/triml (string/substring text istart p)) "(")
-            (modes/brood-complete-at text p) ; REPL: live Brood globals
+            (brood-mode/brood-complete-at text p) ; REPL: live Brood globals
             (let (start (math/max istart (bshell-token-start text p))
                   tok (string/substring text start p))
               [start tok (bshell-path-candidates tok (or (:dir buf) "."))])))))))
@@ -634,9 +651,7 @@ is sent to this shell's process. Ignored in a non-bshell buffer or while a comma
     (if (or (not (bshell-buffer? b)) (:bshell-running b))
       m
       (let (nm (buffer-name b)
-            text (buffer-text b)
-            start (math/min (or (:input-start b) (string/length text)) (string/length text))
-            line (string/trimr (string/substring text start (string/length text))))
+            line (string/trimr (input-text b)))
         (cond
           (string/blank? line) (bshell-emit-prompt m nm (bshell-prompt-for m nm))
           ;; an unclosed Brood form → newline at point, keep editing (don't submit)
@@ -660,3 +675,39 @@ compilers), and its exit is reported as usual. Says so when nothing is running."
       (not (bshell-buffer? b)) m
       (not (and (:bshell-running b) (:bshell-proc b))) (message m "no command running")
       :else (do (bshell-interrupt (:bshell-proc b)) (message m "interrupted")))))
+
+;; bshell-mode: the project shell + Brood REPL (`C-x p e`, see src/bshell.blsp), stacked
+;; on text-mode. RET runs the current input line; Tab completes (filenames for a command,
+;; Brood globals for a `(`-form — `bshell/bshell-complete-source`); `:fontify` colours the
+;; prompt + error lines. C-a/Home, C-b/Left and Backspace are wrapped so editing can't
+;; cross left of the prompt into the read-only prompt/output. Everything else (self-insert,
+;; other motion/kill) falls through to text-mode + the global profile.
+(def bshell-mode-layer
+  {:name 'bshell
+   :doc "A shell / REPL buffer: input at the prompt, history on the arrows."
+   :keymap (-> {}
+             (keymap-bind [:enter] 'bshell/cmd-bshell-send)
+             (keymap-bind [:tab] 'complete-at-point/cmd-complete)
+             (keymap-bind [:ctrl-a] 'bshell/cmd-bshell-beginning-of-input)
+             (keymap-bind [:home] 'bshell/cmd-bshell-beginning-of-input)
+             (keymap-bind [:ctrl-b] 'bshell/cmd-bshell-backward-char)
+             (keymap-bind [:left] 'bshell/cmd-bshell-backward-char)
+             (keymap-bind [:backspace] 'bshell/cmd-bshell-delete-backward)
+             ;; ↑/↓ (and C-p/C-n) recall command history, like the Brood REPL
+             (keymap-bind [:up] 'bshell/cmd-bshell-previous-history)
+             (keymap-bind [:ctrl-p] 'bshell/cmd-bshell-previous-history)
+             (keymap-bind [:down] 'bshell/cmd-bshell-next-history)
+             (keymap-bind [:ctrl-n] 'bshell/cmd-bshell-next-history)
+             ;; C-r searches command history (a filterable minibuffer list)
+             (keymap-bind [:ctrl-r] 'bshell/cmd-bshell-history-search)
+             ;; C-c C-c interrupts the running command (comint-interrupt-subjob)
+             (keymap-bind [:ctrl-c :ctrl-c] 'bshell/cmd-bshell-interrupt))
+   ;; Brood services scoped to the input form: syntax colours, bracket matching, eldoc hints
+   :fontify 'bshell/bshell-fontify
+   :bracket-match 'bshell/bshell-bracket-match
+   :eldoc 'bshell/bshell-eldoc
+   ;; after every key, keep point out of the read-only prompt (layers §7)
+   :post-key 'bshell/bshell-post-key
+   ;; killing the buffer stops the shell worker + its child (layers :on-close)
+   :hooks {:on-close '(bshell/bshell-on-close)}})
+(register-type-layers :bshell (list 'bshell/bshell-mode-layer 'modes/text-mode-layer))

@@ -23,12 +23,11 @@ with the native list): `-` on the first show, a real rate on every `g` after.
 Sorted by that rate, then by reductions — a runaway process sorts itself to the top, where
 in pid order it would be one of four hundred rows."
   (:use model) ; message / ed-current-buf / ed-headless? / ed-buffer-index-by-name
-  (:use commands) ; ed-show-named — the view buffers
+  (:use pool) ; ed-show-named — the view buffers
   (:use process-list) ; ed-rate-procs — the shared snapshot rating
   (:use interactive) ; defcommand — M-x beam-processes
   (:use editor/buffer) ; buffer-line-at / buffer-current-line — the row under point
   (:use editor/keymap) ; keymap-bind — the buffer's own keys
-  (:use editor/layers) ; register-type-layers
   (:use elixir-sandbox)) ; elixir-start / elixir-observe / elixir-available?
 ;; modes and projects are referenced qualified below — each `mod/name` auto-loads its module.
 
@@ -258,11 +257,11 @@ was for, so the reply fills the right buffer and can be told from the playground
 
 Answers the model unchanged when the session is not running — the reply would never come,
 and a request recorded as pending that cannot be answered is a buffer that never refreshes."
-  (let (id (sandbox/sandbox-next-id m)
+  (let (id (session/next-id m)
         sent (elixir-observe id (get-in *views* [view :what] "processes")))
     (if (not sent)
       m
-      (assoc-in (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :pending] id)
+      (assoc-in (assoc-in (session/ids-used m (inc id)) [*state-key* :pending] id)
         [*state-key* :view]
         view))))
 
@@ -359,7 +358,16 @@ firing while you were somewhere else entirely, and only one of those should move
       :ets (show m (ets-text rows))
       m)))
 
-;; ---- the session client hooks (registered in `sandbox-events/*clients*`) ----------------
+;; ---- the session client hooks (registered with `sandbox-events`) ------------------------
+;; *BEAM Processes* shares the playground's agent rather than starting a second one: the
+;; point of observing from inside the node is that it is the node your application is
+;; running in, and a second child would be a second VM with nothing in it. Registering is
+;; also what loads `sandbox-events`, so its impls are in place before a view starts a session.
+(sandbox-events/register-client {:session :elixir-sandbox
+                                 :live? 'beam/beam-live-buffer?
+                                 :ready 'beam/beam-ready
+                                 :reply 'beam/beam-reply
+                                 :down 'beam/beam-down})
 
 (defn beam-ready (m gen banner)
   "The agent announced itself: ask it what is running, so a buffer opened during a compile
@@ -473,11 +481,10 @@ production node after a crash is worse than making you ask twice."
 (def beam-menu-layer
   {:name 'beam-menu
    :keymap beam/beam-menu-keymap
-   :commands '("beam-refresh" "beam-auto-refresh" "beam-kill")
+   :commands (modes/layer-commands beam/beam-menu-keymap)
    :no-line-numbers true})
 
-(register-type-layers :beam-menu
-  (list 'beam/beam-menu-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+(modes/register-special-type :beam-menu 'beam/beam-menu-layer)
 
 ;; The other two views get `g` but not `k`: a supervision tree and a table list are things
 ;; to READ, and killing a supervised process from a tree view would be asking the
@@ -490,14 +497,12 @@ production node after a crash is worse than making you ask twice."
 (def beam-read-layer
   {:name 'beam-read
    :keymap beam/beam-read-keymap
-   :commands '("beam-refresh" "beam-auto-refresh")
+   :commands (modes/layer-commands beam/beam-read-keymap)
    :no-line-numbers true})
 
-(register-type-layers :beam-apps-menu
-  (list 'beam/beam-read-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+(modes/register-special-type :beam-apps-menu 'beam/beam-read-layer)
 
-(register-type-layers :beam-ets-menu
-  (list 'beam/beam-read-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+(modes/register-special-type :beam-ets-menu 'beam/beam-read-layer)
 
 (defn beam-kill-expr (pid)
   "The expression that kills the process a row names.
@@ -530,7 +535,7 @@ observations.
 Shown at once rather than when the reply lands: a command that waited would block the
 editor for as long as a cold `mix` compile takes, and the buffer saying it is waiting is a
 better answer than the editor appearing to have ignored the key."
-  (let (root (or (:project-root m) (projects/project-root (file/cwd)))
+  (let (root (projects/root-of m)
         spec (get *views* view)
         missing (missing-tool root))
     (cond
@@ -539,7 +544,6 @@ better answer than the editor appearing to have ignored the key."
         (message m (str (get spec :buffer) " needs a running editor to receive the node's reply"))
       else
         (do
-          (sandbox-events/ensure) ; the UiEvent impls live there; loading it IS registering them
           (elixir-start root)
           (message (beam-request (ed-show-named m (get spec :buffer) waiting (get spec :type)) view)
             (str "asking the node…"))))))
@@ -608,11 +612,11 @@ the playground beside it would be a second, quieter API to audit."
       ;; say "killed …" whether or not anything died — and the first version of this
       ;; command could not kill anything at all, because the expression it sent was
       ;; malformed and nothing was listening for the error it came back with.
-      (let (id (sandbox/sandbox-next-id m)
+      (let (id (session/next-id m)
             sent (elixir-eval id (beam-kill-expr pid) 5000))
         (if (not sent)
           (message m "the node is not running")
-          (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :killing] [id pid])
+          (message (assoc-in (session/ids-used m (inc id)) [*state-key* :killing] [id pid])
             (str "killing " pid "…")))))))
 
 ;; ---- attaching to a node that is already running ----------------------------------------
@@ -720,12 +724,12 @@ process — into the queue of things waiting for you."
   (get-in m [*state-key* :stream]))
 
 (defn- beam-ask-trace (m spec mode)
-  (let (id (sandbox/sandbox-next-id m)
+  (let (id (session/next-id m)
         stream (inc id)
         sent (elixir-sandbox/elixir-trace id stream spec mode))
     (if (not sent)
       (message m "the node is not running — M-x beam-processes starts one")
-      (message (assoc-in (assoc-in (sandbox/sandbox-ids-used m (+ id 2)) [*state-key* :tracing] id)
+      (message (assoc-in (assoc-in (session/ids-used m (+ id 2)) [*state-key* :tracing] id)
                  [*state-key* :stream]
                  stream)
         (str (if (= mode "break") "breaking on " "tracing ") spec "…")))))
@@ -793,11 +797,11 @@ it, which is most of what a stack trace is for."
   "Stop tracing (M-x beam-untrace). Anything already stopped stays stopped — resume it from
 *BEAM Debug* — because dropping the trace is not the same as letting those processes go,
 and guessing which you meant would be the wrong kind of helpful."
-  (let (id (sandbox/sandbox-next-id m)
+  (let (id (session/next-id m)
         sent (elixir-sandbox/elixir-untrace id))
     (if (not sent)
       (message m "the node is not running")
-      (message (assoc-in (sandbox/sandbox-ids-used m (inc id)) [*state-key* :stream] nil)
+      (message (assoc-in (session/ids-used m (inc id)) [*state-key* :stream] nil)
         "stopped tracing"))))
 
 (defcommand cmd-beam-resume
@@ -806,13 +810,13 @@ and guessing which you meant would be the wrong kind of helpful."
   (let (pid (beam-pid-at-point m))
     (if (nil? pid)
       (message m "not on a stopped process")
-      (let (id (sandbox/sandbox-next-id m)
+      (let (id (session/next-id m)
             sent (elixir-sandbox/elixir-resume id pid)
             left (seq/reject (get-in m [*state-key* :stopped] '())
                    (fn (s) (= (get s :pid) pid))))
         (if (not sent)
           (message m "the node is not running")
-          (message (ed-show-named (assoc-in (sandbox/sandbox-ids-used m (inc id))
+          (message (ed-show-named (assoc-in (session/ids-used m (inc id))
                                     [*state-key* :stopped]
                                     left)
                      *debug-buffer*
@@ -825,7 +829,7 @@ and guessing which you meant would be the wrong kind of helpful."
 (def beam-spy-layer
   {:name 'beam-spy
    :keymap beam/beam-spy-keymap
-   :commands '("beam-untrace")
+   :commands (modes/layer-commands beam/beam-spy-keymap)
    :no-line-numbers true})
 
 (def beam-debug-keymap
@@ -836,11 +840,9 @@ and guessing which you meant would be the wrong kind of helpful."
 (def beam-debug-layer
   {:name 'beam-debug
    :keymap beam/beam-debug-keymap
-   :commands '("beam-resume" "beam-refresh")
+   :commands (modes/layer-commands beam/beam-debug-keymap)
    :no-line-numbers true})
 
-(register-type-layers :beam-spy-menu
-  (list 'beam/beam-spy-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+(modes/register-special-type :beam-spy-menu 'beam/beam-spy-layer)
 
-(register-type-layers :beam-debug-menu
-  (list 'beam/beam-debug-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+(modes/register-special-type :beam-debug-menu 'beam/beam-debug-layer)

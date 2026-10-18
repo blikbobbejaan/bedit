@@ -68,6 +68,25 @@ emits were once the event vocabulary stopped being per-session."
   (when (= kind :ready) (forget-script path))
   (session-emit sink kind payload gen name))
 
+;; ---- the request-id space --------------------------------------------------------
+;; One counter for EVERY session, kept on the model. A fact about the sessions together
+;; rather than about any one backend, which is why it lives here and not in `sandbox`
+;; (where it started, back when the Brood sandbox was the only session there was).
+
+(defn next-id (m)
+  "The next request id to put on the wire, from the model. ONE counter for every session,
+because a reply is matched by id alone: the tutorial, the playground, the diagnostics
+check, the Elixir session and the warm test runs are clients of different children, and a
+counter each had them all minting `1`, `2`, `3` — so a reply fanned out to every client was
+accepted by whichever one's pending entry it hit first. A tutorial box could be handed the
+playground's answer."
+  (get-in m [:sessions :next-id] 1))
+
+(defn ids-used (m id)
+  "Record `id` as the next unused request id — what a client that minted some writes
+back. Paired with [[next-id]] so no client spells the key."
+  (assoc-in m [:sessions :next-id] id))
+
 ;; ---- the client API ------------------------------------------------------------
 ;; Thin over `evalsession`, and thin on purpose: what these add is that a caller names a
 ;; SESSION rather than repeating the shape of one. A backend module keeps only the verbs
@@ -111,3 +130,84 @@ does on its own."
 (defn shutdown (name)
   "Kill the child and stop the worker. A no-op when it is not running."
   (editor/evalsession/session-shutdown name))
+
+;; ---- a live-evaluating client's lifecycle ------------------------------------------
+;; The tutorial and the playgrounds keep the same two facts about their session in their
+;; own slot of the model — which child generation they trust, and whether it is up — and
+;; narrated its going away in the same four-way rule, with only the wording theirs. One
+;; spelling each, here, beside the request ids they already share.
+
+(defn client-ready (m key gen)
+  "Record in client slot `key` that the session's child `gen` announced itself: the
+generation its replies must carry from now on, and that it is up. What each client clears
+besides (its own record of what the session holds) is the client's."
+  (update m key merge {:sandbox-gen gen :sandbox-ready true}))
+
+(defn client-down (m key live? code says)
+  "The child went away and somebody still wants a session — letting it go for good is
+`sandbox-events`' call, the only place that can see whether EVERY client is gone. Marks
+client slot `key` not ready, then narrates by `code` when `(live? m)` says this client is
+still on screen (otherwise it is not ours to narrate — another client may have caused it):
+
+  `:gave-up` / `:spawn-failed`  the worker already stopped itself — `says`' entry of that
+                                name, which should say how to retry
+  anything else                 an ordinary restart — `says`' `:restarting`"
+  (let (m1 (update m key merge {:sandbox-ready false}))
+    (cond
+      (not (live? m1)) m1
+      (= code :gave-up) (message m1 (:gave-up says))
+      (= code :spawn-failed) (message m1 (:spawn-failed says))
+      else (message m1 (:restarting says)))))
+;; Both sigs are for the checker as much as the contract: merging into a slot named by a
+;; key PARAMETER reads as `vector | map` without one, and that union flows into every
+;; `model`-taking call downstream (and so for [[client-unpend]] and the two beside it, below).
+(sig client-ready (model keyword any -> model))
+(sig client-down (model keyword any any map -> model))
+
+;; ---- a live-evaluating client's request book ---------------------------------------
+;; Each client books what it sent under `[key :pending]` — `{id -> request}` — and the two
+;; ends of a request's life are the same for all of them: a launch writes back what it
+;; sent, and a reply is let through, or dropped, by the same rule. The tutorial kept its
+;; own copy of that rule beside the playground's, and the two drifted: a straggler from a
+;; superseded child was unpended on one side and left IN FLIGHT forever on the other.
+
+(defn client-unpend (m key id)
+  "Forget request `id` in client slot `key` — it has been answered, or it never will be."
+  (update m key update :pending dissoc id))
+
+(defn client-sent (m key next-id pending)
+  "What a launch writes back: `next-id` as the next unused request id, and `pending` as
+client slot `key`'s request book."
+  (update (ids-used m next-id) key merge {:pending pending}))
+
+;; check-allow: `land` is the client's own fold, so the checker cannot see what that branch
+;; returns; every client's is a `(model request reply) -> model` (ADR-341's `:trusted`).
+(check-allow :trusted
+  (sig client-reply (model keyword map any string any -> model))
+  (defn client-reply (m key reply gen label land)
+    "Fold one reply for client slot `key`, or drop it — the rule every live-evaluating client
+shares. A reply whose id the client never booked is another client's (the fan-out's no-op).
+One stamped by a superseded child generation is a straggler: dropped, logged under `label`,
+and UNPENDED — it is the last thing that will ever be said about that request (its child is
+gone), and an entry left behind keeps its form IN FLIGHT as far as the next launch is
+concerned, and a form whose answer is coming is never re-sent. It never came, and the
+`⋯ evaluating…` note sat there until that form's own text changed.
+
+Anything else is unpended and handed to `land` — `(m request reply) -> model` — which decides
+whether the form it answers still holds the text that was sent."
+    (let (id (get reply :id)
+          request (get-in m [key :pending id])
+          trusted (get-in m [key :sandbox-gen]))
+      (cond
+        (nil? request) m
+        (not (= gen trusted))
+        ;; Logged, never silent: a dropped reply leaves its form blank, and "the note never
+        ;; came" is indistinguishable from "nothing was sent" without this line.
+          (do
+            (log/warn (str label
+                        ": reply " id " dropped — generation " gen " is not the session's " trusted))
+            (client-unpend m key id))
+        else (land (client-unpend m key id) request reply)))))
+;; Like the two above, these sigs keep a key PARAMETER's slot reading as a model.
+(sig client-unpend (model keyword any -> model))
+(sig client-sent (model keyword int map -> model))

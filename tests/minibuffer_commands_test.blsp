@@ -5,9 +5,11 @@
 ;; model helpers below are repeated in each file so a standalone `nest check` of a
 ;; single file still resolves them.
 (defmodule minibuffer-commands-test
+  (:use keyhelp) ; key / command labels, where-is, docstrings
   (:use model)
   (:use input)
   (:use view)
+  (:use pool)
   (:use-internals commands)
   (:use-internals lsp-commands) ; imenu and the edit application — split out of commands (X1)
   (:use main)
@@ -243,9 +245,9 @@
       (is (includes? txt "1: foo"))
       (is (includes? txt "3: foobar"))))
   (test "ed--leading-int parses a result row's source line"
-    (assert= (commands/ed-leading-int "12: some text") 12)
-    (assert= (commands/ed-leading-int "header line") nil))
-  (test "M-s o builds an *Occur* buffer; RET jumps to the source line"
+    (assert= (pool/ed-leading-int "12: some text") 12)
+    (assert= (pool/ed-leading-int "header line") nil))
+  (test "M-s o builds an *Occur* buffer; RET visits the source line in another pane"
     (let (m (m-of "alpha\nbeta\ngamma\nbeta two")
           op (cmd-occur m nil)
           shown (ed-update (assoc op
@@ -254,10 +256,12 @@
                                  :edit (ed-mb-set-text (:edit (:minibuffer op)) "gamma")))
                   :enter 80 24))
       (assert= (buffer-name (cur shown)) "*Occur*")
+      ;; the row's location rides on the buffer, naming its source — not on the model
+      (assert= (get (:line-links (cur shown)) 1) {:buffer "*scratch*" :line 3})
       ;; put point on the "3: gamma" row, then RET jumps back to the source at line 3
       (let (pos (index-of (buffer-text (cur shown)) "3: gamma" 0)
             on-row (ed-set-buf shown (goto-char (cur shown) pos))
-            jumped (cmd-occur-jump on-row nil))
+            jumped (cmd-visit-location on-row nil))
         (assert= (buffer-name (cur jumped)) "*scratch*")
         (assert= (buffer-current-line (cur jumped)) 2))))) ; line 3 → 0-based index 2
 (describe "editor keyboard macros (C-x ( / ) / e)"
@@ -387,6 +391,19 @@
             "model any → model  ·  "))
       ;; a name that is no command annotates as nothing
       (assert= (plume/plume-annotation {:category :command} "no-such-command-xyz") "")))
+  ;; `ed-key-table` is memoised on the keymap — a rebinding is a new keymap, so it must show
+  (test "the inverted key table follows a rebinding"
+    (let (km (editor/layers/scope-keymap (list (ed-current-buf (m-of "x")) (m-of "x")))
+          before (ed-key-table km)
+          rebound (ed-key-table (editor/keymap/keymap-bind km [:f12] 'commands/cmd-memo-probe-xyz)))
+      (is (nil? (get before "cmd-memo-probe-xyz")))
+      (assert= (get rebound "cmd-memo-probe-xyz") [:f12])))
+  ;; a QUALIFIED command with no docstring is just nil — not a retry under `commands/`
+  ;; that raises (that raise cost ~9 ms a row in M-x's marginalia, every frame)
+  (test "a doc-less qualified command has no doc"
+    (is (nil? (ed-doc 'bedit/commands/cmd-backward-char)))
+    (is (string? (ed-doc 'bedit/commands/cmd-find-file)))
+    (is (string? (ed-doc 'cmd-find-file)))) ; a bare name still resolves under commands/
   (test "the M-x prompt declares the :command category with the keys already inverted"
     ;; `:anno-keys`, not `:anno-keymap`: the marginalia is drawn per visible row per frame,
     ;; and asking the keymap there walked the whole map twice a row (48 ms a keystroke)
@@ -397,7 +414,7 @@
       ;; fifteen rows, so the rows label their own
       (assert= [:ctrl-x :ctrl-f] (get (:anno-keys mb) "cmd-find-file"))))
   (test "C-h f describes a command by name from the registry"
-    (let (m (cmd-describe-function (m-of "x") nil)
+    (let (m (help/cmd-describe-function (m-of "x") nil)
           done (ed-update (assoc m
                             :minibuffer
                               (assoc (:minibuffer m)
@@ -618,3 +635,74 @@
           after (press m [(keyword "alt->")]))
       (is (not (nil? (:minibuffer after))))
       (assert= (mb-text (:minibuffer after)) ""))))
+
+(describe "the list-motion vocabulary"
+  (test "each motion key names its motion; any other key names none"
+    (assert= (editor/list-motion/motion-of :ctrl-n) :next)
+    (assert= (editor/list-motion/motion-of :down) :next)
+    (assert= (editor/list-motion/motion-of :ctrl-p) :previous)
+    (assert= (editor/list-motion/motion-of :up) :previous)
+    (assert= (editor/list-motion/motion-of (keyword "alt-<")) :first)
+    (assert= (editor/list-motion/motion-of (keyword "alt->")) :last)
+    (is (nil? (editor/list-motion/motion-of "n"))))
+
+  (test "next and previous wrap; first and last are the ends"
+    (assert= (editor/list-motion/motion-index 0 3 :next) 1)
+    (assert= (editor/list-motion/motion-index 2 3 :next) 0)
+    (assert= (editor/list-motion/motion-index 0 3 :previous) 2)
+    (assert= (editor/list-motion/motion-index 2 3 :first) 0)
+    (assert= (editor/list-motion/motion-index 0 3 :last) 2))
+
+  (test "a selection left past the end of a shrunk list still moves onto it"
+    (assert= (editor/list-motion/motion-index 7 3 :next) 2)
+    (assert= (editor/list-motion/motion-index 7 3 :previous) 0)))
+
+(describe "post-step hooks"
+  (test "a registered hook runs on every event, in its order"
+    (register-post-step :test-probe-late {:order 1001 :run 'minibuffer-commands-test/probe-late})
+    (register-post-step :test-probe-early {:order 1000 :run 'minibuffer-commands-test/probe-early})
+    (let (stepped (ed-run-post-steps (m-of "x")))
+      (registry/remove! :model/post-steps :test-probe-late)
+      (registry/remove! :model/post-steps :test-probe-early)
+      (assert= (:probe-trail stepped) [:early :late])))
+
+  (test "a hook whose module never loaded is skipped"
+    (register-post-step :test-unloaded {:order 1002 :run 'no-such-module/refresh})
+    (let (m (m-of "x")
+          stepped (ed-run-post-steps m))
+      (registry/remove! :model/post-steps :test-unloaded)
+      (assert= (buffer-text (cur stepped)) "x"))))
+
+(defn probe-early (m) (assoc m :probe-trail (conj (or (:probe-trail m) []) :early)))
+(defn probe-late (m) (assoc m :probe-trail (conj (or (:probe-trail m) []) :late)))
+
+;; M-x memoises its sorted candidate list (`ed-mx-command-names`) on values that are the
+;; same objects while nothing changes. These pin that it is still exactly the old
+;; computation, and that a newly registered command is not hidden by the memo.
+(describe "M-x candidates are memoised without going stale"
+  (defn mx-naive (buf)
+    ;; the computation the memo replaced, verbatim
+    (let (owned (into #{} (ed-all-layer-commands)))
+      (sort (append (seq/reject (interactive/command-names) (fn (n) (contains? owned n)))
+              (apply append (ed-active-mode-commands buf))))))
+  (defn mx-names (m)
+    (ed-mx-command-names (interactive/command-names)
+      (ed-all-layer-commands)
+      (ed-active-mode-commands (cur m))))
+
+  (test "the memoised list is the unmemoised one, in a plain and in a mode buffer"
+    (let (plain (m-of "x")
+          brood (ed-init (make-buffer "(def x 1)" "x.blsp" "x.blsp")))
+      (assert= (mx-names plain) (mx-naive (cur plain)))
+      (assert= (mx-names brood) (mx-naive (cur brood)))
+      ;; asked twice with nothing changed, it answers the very list it stored
+      (assert= (mx-names plain) (mx-names plain))))
+
+  (test "a command registered after a first M-x appears on the next"
+    (let (m (m-of "x"))
+      (mx-names m)
+      (interactive/register-command 'cmd-mx-memo-probe (fn (mm key) mm))
+      (is (includes? (mx-names m) "mx-memo-probe"))
+      (registry/remove! :interactive/commands "mx-memo-probe")
+      (registry/remove! :interactive/command-syms "mx-memo-probe")
+      (refute (includes? (mx-names m) "mx-memo-probe")))))

@@ -1,0 +1,192 @@
+(defmodule scroll
+  "Keeping point on screen: the vertical clamp (`ed-scroll` — Emacs `scroll-margin` +
+`scroll-conservatively`), its horizontal analogue for long unwrapped lines
+(`ed-scroll-horizontal`), the bottom-of-buffer bound (`ed-max-top`), whether a buffer
+wraps (`ed-wrap?`) or otherwise lays out row-wise, and the snap that ends a fractional
+glide on a whole line (`ed-settle-scroll`).
+
+All `model -> model` over the selected pane's `:top` / `:hscroll`: the model owns the panes
+and the setters (`ed-set-top`), this owns the POLICY of where they should sit, which is
+what the dispatcher, the panes and the view each ask."
+  (:use editor/buffer) ; buffer-line-count / buffer-current-line / buffer-column / buffer-line-at
+  (:use editor/pane) ; pane-update-selected — write the selected pane's `:hscroll`
+  (:use model) ; ed-current-buf / ed-current-top / ed-set-top / ed-map-panes / ed-mode-service / restriction
+  (:use wrap)) ; line-segments / row-of / row-count — a wrapped buffer's rows, for the scroll clamp
+
+;; ---- scroll settling: a glide ends on a whole line --------------------------
+;; A trackpad step or a wheel notch's kinetic glide (the runtime's fractional deltas)
+;; leaves a pane resting between lines — `:scroll-frac` ≠ 0 — which is fine while it
+;; moves and wrong once it stops: the click→line mapping reads `top`, the cursor sits
+;; half a cell off, and a screen row shows most of the line BELOW the one point is on.
+;; Emacs's pixel scrolling snaps to the nearest line when the gesture ends; so does this,
+;; on the `:scroll-settle` idle one-shot `model/ed-sync-timers` arms whenever a pane holds
+;; a fraction (`model/ed-any-pane-fractional?`).
+
+(defn ed-settle-scroll (m)
+  "Every pane snapped onto a whole line: a fraction of half a line or more advances `top`\n(clamped to the buffer), less falls back; `:scroll-frac` is 0 everywhere after."
+  (ed-map-panes m
+    (fn (w)
+      (let (frac (or (:scroll-frac w) 0.0))
+        (if (<= frac 0.001)
+          w
+          (let (buf (ed-buf-at m (:buffer w))
+                top (or (:top w) 0)
+                snapped (if (>= frac 0.5) (inc top) top))
+            (assoc w
+              :top (if buf (math/min snapped (math/max top (ed-max-top buf 1))) snapped)
+              :scroll-frac 0.0)))))))
+
+;; ---- scrolling --------------------------------------------------------------
+
+(def *scroll-margin* 4) ; Emacs `scroll-margin`: lines of context kept above/below point
+(sig ed-margin (int -> int))
+(defn ed-margin (textrows)
+  "The effective scroll margin for a `textrows`-tall viewport: `*scroll-margin*`, capped
+below half the viewport (so a tall margin in a short pane can't exceed what fits)."
+  (math/max 0 (math/min *scroll-margin* (math/quot (dec textrows) 2))))
+
+(sig ed-max-top (buffer int &optional (or nil int) -> int))
+(defn ed-max-top (buf textrows &optional (w nil))
+  "The largest scroll offset that still fills a `textrows`-tall viewport — the last
+line sits on the bottom row. Beyond this there'd be blank space past end-of-buffer, so
+scrolling clamps here (and the bottom margin relaxes near EOF, as in Emacs). For a
+wrapped buffer (`ed-wrap?`) given its text width `w`, the last line's LAST row sits on
+the bottom row — a wrapped line takes several, so the top can be higher than the line
+count says; without `w` the line arithmetic stands (a caller with no width to measure at)."
+  (if (and w (> w 0) (ed-wrap? buf))
+    (let (last (dec (buffer-line-count buf))
+          segs (wrap/line-segments buf last w))
+      (ed-wrap-top-for buf last (dec (count segs)) w textrows 0))
+    (math/max 0 (- (buffer-line-count buf) textrows))))
+
+(sig ed-wrap? (buffer -> bool))
+(defn ed-wrap? (buf)
+  "Whether `buf` wraps long lines visually (`visual-line-mode`, M-x visual-line-mode):
+a long line takes as many screen rows as it needs instead of scrolling sideways. Per
+buffer, as in Emacs: the buffer's own `:visual-line` when it has been toggled, else the
+mode's `:visual-line` facet (markdown wraps by default). The break rule is
+`wrap/segments`."
+  (let (own (:visual-line buf))
+    (if (nil? own) (= true (ed-mode-service buf :visual-line)) (= true own))))
+
+(defn ed-row-wise? (buf inlays)
+  "Whether `buf`'s rows on screen stop being one per line, in order, from the top — so what
+is visible has to be COUNTED in a row table (`wrap/rows-from`) rather than read off as
+`top + k`. Two things do that: WRAPPING (`ed-wrap?`, a long line takes several rows) and
+INLAY rows (`inlays`, from `results/inlay-lines` — derived text on a row of its own above
+a line). The one rule the scroll clamp (`ed-scroll`), the pane's row table
+(`panes/ed-pane-rows`) and the point-follows-view step (`input/ed-point-into-view`) share:
+when they disagreed, an inlay pushed the last line off the bottom while the cursor step
+still counted it as shown."
+  (or (ed-wrap? buf) (not (empty? inlays))))
+
+(sig ed-wrap-top-for (buffer int int int int int &optional map -> int))
+(defn- ed-wrap-top-for (buf line seg-row w budget floor &optional (inlays {}))
+  "The highest scroll top that still shows point's row within `budget` rows from the top:
+from `line` (whose rows through point's, `seg-row + 1`, are already spent) walk up a line
+at a time while the line above fits — never above `floor`. Tail-recursive over the lines
+above.
+
+A line above point costs its wrapped segments PLUS its inlay rows: both occupy rows, and a
+walk that counted only the segments would stop one line too high for every inlay it passed."
+  (let (step (fn (t used)
+               (if (<= t floor)
+                 t
+                 (let (above (+ (count (wrap/line-segments buf (dec t) w))
+                               (count (get (or inlays {}) (dec t) []))))
+                   (if (> (+ used above) budget)
+                     t
+                     (step (dec t) (+ used above)))))))
+    (step line (inc seg-row))))
+
+(sig ed-scroll (model int -> model))
+(defn ed-scroll (m textrows)
+  "Adjust the selected pane's `:top` so point keeps `*scroll-margin*` lines of context
+above and below it within a `textrows`-tall viewport — scrolling only as far as needed
+(Emacs `scroll-margin` + `scroll-conservatively`: never recenter, just enough). Clamped
+so it never scrolls past end-of-buffer (no blank void below the last line); near the
+edges the margin is whatever the buffer allows. A wrapped buffer (`ed-wrap?`) counts
+ROWS below the top, not lines — a long line above point takes several — against the
+text width the loop last stored (`:view-cols`); the margin above stays in lines. Pure."
+  (let (buf (ed-current-buf m)
+        line (buffer-current-line buf)
+        top (ed-current-top m)
+        mgn (ed-margin textrows)
+        ;; a narrowed pane scrolls only within its restriction — first line `rtop`, and a
+        ;; top no further than shows the last restricted line on the bottom row; a wide pane
+        ;; gets `[0 .. ed-max-top]`, exactly as before (the restriction range is the whole
+        ;; buffer then, so these reduce to the old bounds).
+        restrict (ed-selected-restrict m)
+        [rtop rbot] (if restrict (ed-restrict-lines buf restrict) [0 (dec (buffer-line-count buf))])
+        mintop rtop
+        w (or (:view-cols m) 0)
+        inlays (results/inlay-lines buf)
+        wrap? (and (> w 0) (ed-row-wise? buf inlays))
+        ;; row-wise: the top that puts the last (restricted) line's last row on the bottom row
+        maxtop (math/max rtop
+                 (if wrap?
+                   (ed-wrap-top-for buf
+                     rbot
+                     (dec (count (wrap/line-segments buf rbot w)))
+                     w
+                     textrows
+                     rtop
+                     inlays)
+                   (math/min (ed-max-top buf textrows) (math/max 0 (- (inc rbot) textrows)))))
+        lo (+ top mgn) ; first comfortable line (margin below top)
+        hi (- (+ top textrows) 1 mgn) ; last comfortable line (margin above bottom)
+        want (cond
+               (< line lo) (- line mgn)
+               (not wrap?) (if (> line hi) (+ (- line textrows) 1 mgn) top)
+               else
+               ;; point's row below the top: the rows of the lines above it plus its
+               ;; own segment; past the comfortable last row, raise the top just enough
+                 (let (seg-row (wrap/row-of (wrap/line-segments buf line w) (buffer-column buf))
+                       r (+ (wrap/row-count buf top line w inlays) seg-row))
+                   (if (> r (- textrows 1 mgn))
+                     (math/max top
+                       (ed-wrap-top-for buf line seg-row w (- textrows mgn) mintop inlays))
+                     top))))
+    (ed-set-top m (math/max mintop (math/min maxtop want)))))
+
+;; ---- horizontal scroll (long lines, no wrap): keep point's column in view ----
+(def *hscroll-margin* 8) ; columns of context kept left/right of point
+(sig ed-current-hscroll (map -> int))
+(defn ed-current-hscroll (m)
+  "The selected pane's horizontal scroll offset (leftmost visible char column), 0 if unset."
+  (let (h (:hscroll (ed-current-pane m)))
+    (if (int? h) (math/max 0 h) 0)))
+
+(sig ed-set-hscroll (model int -> model))
+(defn ed-set-hscroll (m n)
+  "The model with the selected pane's `:hscroll` set to `n` (clamped non-negative)."
+  (assoc m :layout (pane-update-selected (:layout m) (fn (w) (assoc w :hscroll (math/max 0 n))))))
+
+(sig ed-scroll-horizontal (model int -> model))
+(defn ed-scroll-horizontal (m cols)
+  "Adjust the selected pane's `:hscroll` so point's column stays within the `cols`-wide
+text area, keeping `*hscroll-margin*` columns of slack — the horizontal analogue of
+`ed-scroll`, so a long line scrolls sideways to follow point instead of clipping.
+
+`:hscroll` is a CHARACTER offset into the line (where the view starts slicing), but the pane
+is `cols` display CELLS wide, so the decision is made in cells — measured as the view lays
+the line out, tabs expanded — and the new origin converted back with `width->index`. It
+compared characters to cells, and a line of leading tabs (a Makefile, Go) put point ninety
+cells in while its column read twenty: no scroll, and the cursor painted off-screen."
+  (let (buf (ed-current-buf m)
+        col (buffer-column buf)
+        hs (ed-current-hscroll m)
+        line (ed-strip-newline (buffer-line-at buf (buffer-current-line buf)))
+        cell-of (fn (i)
+                  (string/display-width (string/substring line 0 (math/min i (string/length line)))))
+        pcell (cell-of col)
+        hcell (cell-of hs)
+        mgn (math/max 0 (math/min *hscroll-margin* (math/quot (dec cols) 2))))
+    (cond
+      ;; a wrapped buffer never scrolls sideways: its long lines take more rows instead
+      (ed-wrap? buf) (if (= hs 0) m (ed-set-hscroll m 0))
+      (< (- pcell hcell) mgn)
+        (ed-set-hscroll m (string/width->index line (math/max 0 (- pcell mgn))))
+      (> (- pcell hcell) (- cols 1 mgn))
+        (ed-set-hscroll m (string/width->index line (math/max 0 (+ (- pcell cols) 1 mgn))))
+      else m)))

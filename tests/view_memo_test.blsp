@@ -11,6 +11,7 @@
   (:use model)
   (:use view)
   (:use editor/buffer)
+  (:use-internals input) ; ed-ensure-layers — a buffer needs its mode layers to paint
   (:use test))
 ;; `*ui-memo*` (the previous turn's fragment table) is earmuffed, so it is ambient rather
 ;; than namespaced — `view`'s own `(:use editor/ui)` is what puts it in the image.
@@ -60,11 +61,22 @@
       (is (not (= (vm-deps before [:line 0 1]) (vm-deps after [:line 0 1]))))
       (is (not (= (vm-deps before [:line 0 2]) (vm-deps after [:line 0 2]))))))
   (test "a row's deps carry only its own overrides, never the whole pane's"
+    ;; rebased to the row's first character (offset 4 is line 1's first): a row's deps are
+    ;; its content, so the same override on a line that moved still compares equal
     (let (buf (make-buffer "aaa\nbbb\nccc")
           face {:bg "#f00"}
           markers (vm-markers buf {1 (list [4 face])} {}))
-      (is (not (includes? (vm-deps markers [:line 0 0]) (list [4 face]))))
-      (is (includes? (vm-deps markers [:line 0 1]) (list [4 face])))))
+      (is (not (includes? (vm-deps markers [:line 0 0]) (list [0 face]))))
+      (is (includes? (vm-deps markers [:line 0 1]) (list [0 face])))))
+  (test "a row whose text and faces are unchanged keeps its deps when an edit shifts it"
+    ;; typing on line 0 moves every later line's offsets; the rows below must still hit
+    (let (before-buf (make-buffer "aaa\nbbb\nccc")
+          after-buf (make-buffer "aaaX\nbbb\nccc")
+          before (vm-markers before-buf {} {})
+          after (vm-markers after-buf {} (vm-table before)))
+      (is (not (= (vm-deps before [:line 0 0]) (vm-deps after [:line 0 0]))))
+      (assert= (vm-deps before [:line 0 1]) (vm-deps after [:line 0 1]))
+      (assert= (vm-deps before [:line 0 2]) (vm-deps after [:line 0 2]))))
 
   (test "an empty override list on a line leaves that row with none"
     (let (buf (make-buffer "aaa\nbbb")
@@ -126,3 +138,149 @@
           by-line (view/ed-spans-by-line buf spans 9990 9999))
       (assert= (count by-line) 10)
       (assert= (get by-line 9990) (list [19980 19981 {:fg :red}])))))
+
+;; ---- the pane and body fragments around the rows ------------------------------------
+;; Each pane's non-blinking layers are one memoised fragment, its text body another inside
+;; it, the rows inside that (`ed-pane-layers`, `ed-pane-text-ops`). Two things must hold:
+;; a fragment reused whole still hands its INNER fragments to the next turn (or the turn
+;; after a hit would find no rows and repaint them all), and no transition paints a stale
+;; frame — the frame drawn with the previous turn's table equals the one drawn fresh. A dep
+;; left out of either fragment fails the second.
+
+(def- vm-cols 100)
+(def- vm-rows 24)
+
+(defn- vm-text ()
+  (string/join
+    (map (range 60)
+      (fn (i)
+        (cond
+          (= 0 (math/mod i 3)) (str "(defn f-" i " (x) (+ x " i "))")
+          ;; long enough to wrap, and to scroll sideways
+          (= 4 i) (str "  ;; " (string/repeat "wide " 40))
+          :else (str "  ;; line " i))))
+    "\n"))
+
+(defn- vm-model ()
+  "A brood-mode model — syntax spans, the bracket pair and diagnostic underlines all paint."
+  (input/ed-ensure-layers (ed-init (editor/layers/set-buffer-type (make-buffer (vm-text)
+                                                                    "memo.blsp")
+                                     :brood))))
+
+(defn- vm-press (m keys) (fold keys m (fn (acc k) (input/ed-update acc k vm-cols vm-rows))))
+
+(defn- vm-harvest (m table)
+  "`[frame next-table]` for `m` drawn with the previous turn's `table` in scope."
+  (editor/ui/ui-harvest (binding (*ui-memo* table) (ed-view m vm-cols vm-rows))))
+
+(defn- vm-steady-table (m)
+  "The table after two turns on `m` — the second all hits, so its entries are what a HIT
+handed on."
+  (second (vm-harvest m (second (vm-harvest m {})))))
+
+(defn- vm-stale? (before after)
+  "Whether `after`, drawn with `before`'s steady table, differs from `after` drawn fresh."
+  (not (= (first (vm-harvest after (vm-steady-table before))) (ed-view after vm-cols vm-rows))))
+
+(describe "the pane and body fragments"
+  (test "a turn where every fragment hits hands the rows inside them to the next table"
+    (let (m (vm-model)
+          table (vm-steady-table m)
+          kinds (into #{} (map (keys table) first)))
+      (is (contains? kinds :pane))
+      (is (contains? kinds :body))
+      (is (contains? kinds :line))))
+  (test "an all-hit turn paints the frame a fresh render does"
+    (let (m (vm-model))
+      (assert= (first (vm-harvest m (vm-steady-table m))) (ed-view m vm-cols vm-rows))))
+  (test "no transition paints a stale frame"
+    (let (m (vm-model)
+          marked (vm-press m [(keyword "ctrl- ") :ctrl-n :ctrl-n])
+          split (vm-press m [:ctrl-x "3"])
+          mid (vm-press m [:ctrl-n :ctrl-n :ctrl-n :ctrl-n :ctrl-n :ctrl-n])
+          plain (input/ed-ensure-layers (ed-init (make-buffer (vm-text) "memo.txt")))
+          transitions [["C-n" m (vm-press m [:ctrl-n])]
+                        ["C-v" m (vm-press m [:ctrl-v])]
+                        ["typing" m (vm-press m [:ctrl-n :ctrl-e "x" "("])]
+                        ["region grows" marked (vm-press marked [:ctrl-n :ctrl-f])]
+                        ["region cancelled" marked (vm-press marked [:ctrl-g])]
+                        ["cursor blink" m (vm-press m [[:timer :cursor-blink]])]
+                        ["isearch" m (vm-press m [:ctrl-s "f" "-"])]
+                        ["split" m split]
+                        ["type beside an idle pane" split (vm-press split ["z"])]
+                        ["switch panes" split (vm-press split [:ctrl-x "o"])]
+                        ["wrap on"
+                          m
+                          (ed-set-buf-at m
+                            (ed-current-index m)
+                            (assoc (ed-current-buf m) :visual-line true))]
+                        ["terminal" m (dissoc m :gui)]
+                        ;; one dep alone: the viewport, the side scroll, the spans (a buffer-only
+                        ;; write: `ed-set-buf` would also move the pane's cached point)
+                        ["top only" mid (dissoc (ed-set-top mid 2) :_lc)]
+                        ["typing without a mode" plain (vm-press plain [:ctrl-e "x"])]
+                        ["hscroll only" m (dissoc (scroll/ed-set-hscroll m 4) :_lc)]
+                        ["spans only"
+                          m
+                          (ed-set-buf-at m
+                            (ed-current-index m)
+                            (assoc (ed-current-buf m) :face-spans [[0 40 {:fg "#ff0000"}]]))]
+                        ["diagnostics arrive"
+                          m
+                          (ed-set-diagnostics m
+                            [{:line 3 :col 2 :message "boom"}]
+                            (buffer-rope (ed-current-buf m))
+                            "elsewhere")]
+                        ["overlay"
+                          m
+                          (assoc m :overlays [{:start 10 :end 30 :face {:bg "#123456"}}])]])
+      ;; the names of the stale ones, so a failure says which transition it was
+      (assert= []
+        (into []
+          (seq/keep transitions (fn ([name before after]) (when (vm-stale? before after) name))))))))
+
+(describe "the pane and body fragments across a resize"
+  (test "a narrower window drawn with the wider one's table paints the fresh frame"
+    ;; the pane keeps its origin and loses columns: only the WIDTH tells the fragments apart
+    (let (m (vm-model)
+          table (vm-steady-table m)
+          narrow (- vm-cols 30))
+      (assert= (ed-view m narrow vm-rows)
+        (first (editor/ui/ui-harvest (binding (*ui-memo* table)
+                                       (ed-view (dissoc m :_lc) narrow vm-rows))))))))
+
+(describe "the pane fragment's model-side deps, each moved alone"
+  (test "no change to what a pane reads from the model paints a stale frame"
+    (let (m (vm-press (vm-model) [:ctrl-n :ctrl-n :ctrl-n :ctrl-n :ctrl-n :ctrl-n]))
+      (let (pane (first (:panes (panes/ed-body-layout m vm-cols vm-rows)))
+            path (:path pane)
+            id (get-in pane [:payload :buffer])
+            rope (buffer-rope (ed-current-buf m))
+            ;; findings named for ANOTHER buffer leave this one un-annotated, so only the
+            ;; model's `:diag-rope` / `:diag-by-line` move
+            diagnosed (ed-set-diagnostics m [{:line 8 :col 2 :message "boom"}] rope "elsewhere")
+            shared (assoc-in m
+                     [:hosted id]
+                     {:cursors {:p1 120} :names {:p1 "ann"} :tag-ttl {:p1 3}})
+            spans (get-in m [:span-cache path])
+            gutter (get-in m [:gutter-cache path])
+            transitions [["diagnostics" m diagnosed]
+                          ["diag-rope only" diagnosed (assoc diagnosed :diag-rope nil)]
+                          ["diag-by-line only" (assoc diagnosed :diag-by-line {}) diagnosed]
+                          ["hl-line" m (assoc m :hl-line (not (:hl-line m)))]
+                          ["link hover" m (assoc m :link-hover {:buffer id :line 8})]
+                          ["remote caret" m shared]
+                          ["remote caret, gui" shared (assoc shared :gui true)]
+                          ["span-cache entry"
+                            m
+                            (assoc-in m
+                              [:span-cache path]
+                              (assoc spans :spans [[0 400 {:fg "#ff0000"}]]))]
+                          ["gutter-cache entry"
+                            m
+                            (assoc-in m
+                              [:gutter-cache path]
+                              (assoc gutter :cells (into [] (reverse (:cells gutter)))))]])
+        (assert= []
+          (into []
+            (seq/keep transitions (fn ([name before after]) (when (vm-stale? before after) name)))))))))

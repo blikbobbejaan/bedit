@@ -1,0 +1,381 @@
+(defmodule gitsection
+  "What every git SECTION buffer shares — *git-status* and every view (`gitview`): the
+section builders for files, hunks and commits, the `:section-faces` service that colours a
+line by what it IS, parsing `git log` into commit rows, what is at point (the row, the
+file, the hunk, the commit, the ref), and the keymap every one of them starts from
+(Magit's `magit-mode-map`)."
+  (:use editor/keymap :only [keymap-bind]) ; the common keymap
+  (:use editor/section) ; section — the trees (brood ADR-388)
+  (:use sectionbuf) ; the section buffer: rows, folding, n/p, what is at point
+  (:use gitcore)) ; git-git / the faces
+;; the colour-coded file-status labels — a legend at a glance, reusing the diff-hl palette
+;; (modified yellow, added green, deleted red, rename/copy blue, untracked dim). Keyed by the
+;; human label `git-entry-label` emits, so the fontify colours just that word.
+(def- git-label-faces
+  {"modified" git-face-unstaged
+   "new file" git-face-add
+   "deleted" git-face-del
+   "renamed" git-face-hunk
+   "copied" git-face-hunk
+   "conflict" git-face-del
+   "untracked" git-face-untracked
+   ;; how a conflict happened (`git-conflict-labels`) — all red, because every one of them
+   ;; is the same instruction: this file is not going anywhere until you decide
+   "both modified" git-face-del
+   "both added" git-face-del
+   "both deleted" git-face-del
+   "added by us" git-face-del
+   "added by them" git-face-del
+   "deleted by us" git-face-del
+   "deleted by them" git-face-del
+   "unmerged" git-face-del})
+
+;; ---- the status buffer is a SECTION TREE ---------------------------------------
+;; Magit's layout, and Magit's density: a heading per section with its count, one line per
+;; file with its state word, the hunks under a file when it is opened, a blank line between
+;; top-level sections and nowhere else. It used to be text with a parallel vector of per-line
+;; maps on the MODEL, two blank lines between sections and every line indented so a text-only
+;; fontifier could tell a diff line from a file line. Now it is a `std/editor/section` tree
+;; shown through `sectionbuf`: the rows live on the buffer, the faces come from what each
+;; line IS (`git-section-faces`), and TAB, n/p, ^, M-n/M-p and 1-4 are the shared ones.
+;;
+;; The pieces, all pure: `git-status-tree` builds the tree from a collection
+;; (`git-collect-status`, the subprocesses, run in a task), and the section VALUES are what
+;; commands act on — a file `{:path :orig-path :section :x :y}`, a hunk `{:path :section
+;; :file :hunk}` (the parsed `std/diff` file and hunk, so a patch is `diff/hunk-patch` and a
+;; line range is `diff/hunk-select`), a commit `{:hash :subject :refs}`, a stash `{:ref}`.
+
+(def git-list-sections
+  ;; The four sections a working-tree FILE can be in, as section types.
+  #{:unmerged :untracked :unstaged :staged})
+
+(def- git-conflict-labels
+  ;; How a conflict happened, by its two status letters `XY` — which is what decides how to
+  ;; resolve it. `both modified` takes an edit; `deleted by them` takes a decision about
+  ;; whether the file should exist at all, and no amount of editing the working copy
+  ;; expresses it.
+  {"UU" "both modified"
+   "AA" "both added"
+   "DD" "both deleted"
+   "AU" "added by us"
+   "UA" "added by them"
+   "DU" "deleted by us"
+   "UD" "deleted by them"})
+
+(def- git-staged-labels
+  ;; A staged change's state word, by the index letter `X`
+  {"M" "modified" "A" "new file" "D" "deleted" "R" "renamed" "C" "copied" "T" "typechange"})
+
+(def- git-unstaged-labels
+  ;; An unstaged change's state word, by the work-tree letter `Y`
+  {"M" "modified" "D" "deleted" "T" "typechange" "U" "conflict"})
+
+(defn git-entry-label (e section)
+  "A human-readable status label for `e` in `section`, matching Magit's file-status display
+— the raw `XY` letters when Magit has no word for them."
+  (let (letters (str (:x e) (:y e)))
+    (case section
+      :unmerged (get git-conflict-labels letters "unmerged")
+      :untracked "untracked"
+      :staged (get git-staged-labels (:x e) letters)
+      (get git-unstaged-labels (:y e) letters))))
+
+(def- git-label-width 11) ; Magit's column: "modified   " — the widest common label and two spaces
+(defn git-file-line (label path orig-path)
+  "A file heading: the state word `label` padded to Magit's column, then the path — `old ->
+new` for a rename (`orig-path` non-nil). One builder for the status and every diff view, so
+the column cannot drift between them; a nil `label` is the path alone."
+  (let (shown (if orig-path (str orig-path " -> " path) path))
+    (if (nil? label)
+      shown
+      (str label (string/pad-right "" (math/max 2 (- git-label-width (string/length label)))) shown))))
+
+(defn git-hunk-sections (path lst file)
+  "The hunk sections of one parsed `std/diff` file: each `@@` header a heading, its lines
+the body. Keyed by position and header, so a re-render keeps a folded hunk folded."
+  (let (hunks (:hunks file))
+    (map (range (count hunks))
+      (fn (i)
+        (let (h (nth hunks i))
+          (section :hunk
+            {:path path :section lst :file file :hunk h}
+            (:header h)
+            (:lines h)
+            {:key (str i " " (:header h))}))))))
+
+(defn git-hunk-patch (hunk)
+  "The patch that applies a hunk value `{:file :hunk}` on its own."
+  (diff/hunk-patch (:file hunk) (:hunk hunk)))
+
+(defn git-lines-patch (hunk lines reverse?)
+  "The patch of hunk value `hunk` cut down to the body `lines` (0-based, any order) it
+spans — Magit's line-level staging, `diff/hunk-select` with `reverse?` for a patch applied
+in reverse — or nil when there are no lines or they select no change. What `s` / `u` / `k`
+in the status and `a` / `v` in a view do with a region."
+  (if (empty? lines)
+    nil
+    (let (lo (reduce lines math/min)
+          hi (reduce lines math/max)
+          cut (if (and (int? lo) (int? hi))
+                (diff/hunk-select (:hunk hunk) lo (inc hi) reverse?)
+                nil))
+      (if (nil? cut) nil (diff/hunk-patch (:file hunk) cut)))))
+
+(defn git-refs-text (refs)
+  "A commit's decorations as Magit shows them after the hash, or empty."
+  (if (or (nil? refs) (= refs "")) "" (str "(" refs ") ")))
+
+(defn git-commit-section (c &optional (opts {}))
+  "The section for commit `c` (`{:hash :subject :refs}`): `hash (refs) subject`, the value
+the commit itself — what RET shows, `A` cherry-picks, `X` resets to."
+  (section :commit
+    c
+    (str (:hash c) " " (git-refs-text (:refs c)) (:subject c ""))
+    (or (:children opts) [])
+    {:key (:hash c)}))
+
+;; ---- faces: what a line IS, not what it looks like ------------------------------
+;; One service for every git section buffer (status, log, commit, diff, blame, refs): the
+;; row says what the line is, so a `-` at the start of a diff line and a `-` at the start of
+;; a commit subject are never confused, and nothing has to be indented to be told apart.
+
+(defn git-diff-line-face (line)
+  "The face of one diff BODY line by its first character, or nil for context."
+  (cond
+    (string/starts-with? line "+") git-face-add
+    (string/starts-with? line "-") git-face-del
+    (string/starts-with? line "\\") git-face-meta
+    :else nil))
+
+(defn- git-heading-count-spans (line)
+  "A section heading `Title (N)`: the title in the section face, the count dim."
+  (let (i (index-of line " ("))
+    (if (< i 0)
+      (list [0 (string/length line) git-face-section])
+      (list [0 i git-face-section] [(inc i) (string/length line) git-face-meta]))))
+
+(defn- git-label-spans (line face)
+  "A header line `Label:  ref  rest`: the label dim, the ref (to the next space) coloured
+by `face`."
+  (let (colon (index-of line ":")
+        start (let (j (seq/index-where (range (inc colon) (string/length line))
+                        (fn (k) (not (= (string/char-at line k) " ")))))
+                (if (< j 0) (string/length line) (+ colon 1 j)))
+        sp (index-of (string/substring line start (string/length line)) " ")
+        end (if (< sp 0) (string/length line) (+ start sp)))
+    (list [0 (inc colon) git-face-meta] [start end face])))
+
+(defn- git-file-heading-spans (line value)
+  "A file heading: the state word in its colour; an untracked path dim."
+  (let (section (:section value))
+    (if (= section :untracked)
+      (list [0 (string/length line) git-face-untracked])
+      (let (sep (index-of line "  ")
+            word (if (< sep 0) line (string/substring line 0 sep))
+            face (get git-label-faces (string/trim word)))
+        (if (nil? face) '() (list [0 (string/length word) face]))))))
+
+(defn- git-commit-heading-spans (line value)
+  "A commit heading: the graph drawing dim (a log's `--graph`), the hash, the refs in
+parentheses in the branch face, and the author-and-age margin dim."
+  (let (g (string/length (str (:graph value "")))
+        h (string/length (str (:hash value "")))
+        refs (git-refs-text (:refs value))
+        margin (:margin-at value))
+    (append (if (> g 0) (list [0 g git-face-meta]) '())
+      (list [g (+ g h) git-face-hash])
+      (if (= refs "") '() (list [(+ g h 1) (+ g h (string/length refs)) git-face-branch-remote]))
+      (if (int? margin) (list [margin (string/length line) git-face-meta]) '()))))
+
+(defn- git-whole-heading-face (type)
+  "The face of a heading of `type` that is coloured whole, or nil for one coloured in parts.
+A `case` rather than a map: the faces are re-derived on a theme switch (`theme/defchrome`),
+and a map built at load time would keep the colours of the theme it was built under."
+  (case type
+    :sequencer git-face-unstaged
+    :hunk git-face-hunk
+    :diff-file git-face-file
+    :note git-face-note
+    :message git-face-summary
+    :meta git-face-meta
+    nil))
+
+(defn- git-heading-spans (type value line)
+  "The faces of a heading coloured in PARTS — a count, a label, a hash — by what its `type`
+says the parts are."
+  (if (or (contains? git-list-sections type)
+        (includes? [:unpushed :unpulled :stashes :recent :section :refs-group] type))
+    (git-heading-count-spans line)
+    (case type
+      :branch
+        (git-label-spans line (if (:local? value) git-face-branch-local git-face-branch-remote))
+      :tag (git-label-spans line git-face-hash)
+      :file (git-file-heading-spans line value)
+      :commit (git-commit-heading-spans line value)
+      :stash (list [0 (string/length (:ref value "")) git-face-hash])
+      :ref
+        (list [0
+                (string/length (:name value ""))
+                (if (:remote? value) git-face-branch-remote git-face-branch-local)])
+      :blame
+        (let (hash-end (string/length (:hash value "")))
+          (list [0 hash-end git-face-hash] [(inc hash-end) (string/length line) git-face-meta]))
+      '())))
+
+(defn git-section-faces (row line)
+  "The `:section-faces` service shared by every git section buffer: the faces of `line`,
+which is what `row` says it is."
+  (let (type (:type row)
+        whole (git-whole-heading-face type))
+    (cond
+      ;; a body line: a diff line in a hunk or a commit body, else a plain line
+      (not (:heading? row))
+        (git-whole-line 0
+          line
+          (cond
+            (or (= type :hunk) (= type :file) (= type :diff)) (git-diff-line-face line)
+            ;; a --graph line with no commit on it, and a commit header's fields
+            (or (= type :log) (= type :meta)) git-face-meta
+            :else nil))
+      (not (nil? whole)) (git-whole-line 0 line whole)
+      :else (git-heading-spans type (:value row) line))))
+
+;; ---- commit rows, for every section buffer that lists commits -------------------
+
+(def git-log-format
+  ;; hash, decorations, subject, author, relative date — NUL-separated, so a subject with
+  ;; any character in it survives. `%D` is the decoration without its parentheses.
+  "--format=%h%x00%D%x00%s%x00%an%x00%ar")
+
+(defn git-parse-log (stdout)
+  "Parse `git log` output in `git-log-format` into `({:hash :refs :subject :author :date})`.
+A `--graph` log interleaves graph-only lines; a line without the NUL fields keeps its text
+as `:graph` and no hash."
+  (map (seq/reject (string/split (or stdout "") "\n") empty?)
+    (fn (line)
+      (let (parts (string/split line (string/int->char 0)))
+        (if (< (count parts) 5)
+          {:graph line}
+          (let (lead (nth parts 0)
+                ;; with --graph the hash field carries the graph drawing in front of it
+                sp (string/last-index-of lead " ")
+                hash (if (< sp 0) lead (string/substring lead (inc sp) (string/length lead)))
+                graph (if (< sp 0) "" (string/substring lead 0 (inc sp))))
+            {:hash hash
+             :graph graph
+             :refs (nth parts 1)
+             :subject (nth parts 2)
+             :author (nth parts 3)
+             :date (nth parts 4)}))))))
+
+(defn git-log-commits (root args)
+  "Run `git log` with `args` in `git-log-format` and parse it, `()` when it fails."
+  (let (r (git-git root (append ["log" git-log-format] args)))
+    (if (= (:exit r) 0) (seq/filter (git-parse-log (:stdout r "")) :hash) '())))
+
+;; ---- what is at point ------------------------------------------------------------
+
+(defn git-row-at (m)
+  "The section row on point's line in the current git buffer, or nil."
+  (sectionbuf/sb-at m))
+
+(defn git-file-at (m)
+  "The file value `{:path :orig-path :section …}` at point — on its heading or anywhere in
+its hunks — or nil."
+  (let (r (sectionbuf/sb-ancestor m :file)) (if (nil? r) nil (:value r))))
+
+(defn git-hunk-at (m)
+  "The hunk value `{:path :section :file :hunk}` at point, or nil."
+  (let (r (sectionbuf/sb-ancestor m :hunk)) (if (nil? r) nil (:value r))))
+
+;; ---- the commit and the ref at point ----------------------------------------
+
+(defn git-commit-at-point (m)
+  "The revision at point in any git buffer, or nil: a commit (a status section, a log line),
+a stash, a blame chunk, a branch or ref, or — in a commit buffer — the commit it shows.
+What `A`, `V`, `X`, `r i`, `c f` and `d c` offer first."
+  (let (row (git-row-at m)
+        v (if (nil? row) nil (:value row)))
+    (case (if (nil? row) nil (:type row))
+      :commit (:hash v)
+      :stash (:ref v)
+      :blame (:full v)
+      :branch (:name v)
+      :ref (:name v)
+      :tag (:name v)
+      (get (sectionbuf/sb-ctx m) :rev))))
+
+(defn git-ref-at-point (m)
+  "The branch, remote branch or tag at point, or nil — what `b b`, `b k` and `m m` offer
+first."
+  (let (row (git-row-at m))
+    (if (and row (includes? [:branch :ref :tag] (:type row))) (:name (:value row)) nil)))
+
+;; ---- the keymap every git section buffer starts from ------------------------------
+;; Every git SECTION buffer shares one keymap — Magit's `magit-mode-map`: the section keys
+;; (TAB, n/p, ^, M-n/M-p, 1-4, M-w) from `sectionbuf`, and every menu on the letter Magit
+;; gives it, so `A` cherry-picks the commit under point whether that commit is in the status
+;; buffer, a log, or the commit you are reading. Each buffer type adds what is its own on top.
+
+(defn git-common-keymap ()
+  "The keys every git section buffer has."
+  (-> {}
+    (keymap-bind [:tab] 'sectionbuf/cmd-section-toggle) ; TAB — fold / unfold the section at point
+    (keymap-bind ["n"] 'sectionbuf/cmd-section-next) ; n / p — the next / previous section
+    (keymap-bind ["p"] 'sectionbuf/cmd-section-prev)
+    (keymap-bind ["^"] 'sectionbuf/cmd-section-up) ; ^ — the parent section
+    (keymap-bind [:alt-n] 'sectionbuf/cmd-section-next-sibling) ; M-n / M-p — sibling sections
+    (keymap-bind [:alt-p] 'sectionbuf/cmd-section-prev-sibling)
+    (keymap-bind ["1"] 'sectionbuf/cmd-section-level-1) ; 1-4 — show the tree to a depth
+    (keymap-bind ["2"] 'sectionbuf/cmd-section-level-2)
+    (keymap-bind ["3"] 'sectionbuf/cmd-section-level-3)
+    (keymap-bind ["4"] 'sectionbuf/cmd-section-level-4)
+    (keymap-bind [:alt-w] 'sectionbuf/cmd-section-copy) ; M-w — copy the hash / path at point
+    (keymap-bind [:enter] 'gitstatus/cmd-git-visit) ; RET — go to the line, the file, the commit
+    (keymap-bind ["g"] 'gitstatus/cmd-git-refresh)
+    (keymap-bind ["q"] 'gitcore/cmd-git-quit)
+    (keymap-bind ["$"] 'gitcore/cmd-git-process) ; $ — what git actually ran (Magit's process buffer)
+    (keymap-bind ["?"] 'git/cmd-git-dispatch) ; ? / h — every menu, from one key
+    (keymap-bind ["h"] 'git/cmd-git-dispatch)
+    (keymap-bind ["!"] 'git/cmd-git-run-command) ; ! — run a git command the menus lack
+    ;; acting on what is at point — a hunk, a file, a list — wherever it is shown
+    (keymap-bind ["s"] 'gitstatus/cmd-git-stage) ; s / u / k — stage, unstage, discard (region = lines)
+    (keymap-bind ["u"] 'gitstatus/cmd-git-unstage)
+    (keymap-bind ["k"] 'gitstatus/cmd-git-discard)
+    (keymap-bind ["S"] 'gitstatus/cmd-git-stage-all)
+    (keymap-bind ["U"] 'gitstatus/cmd-git-unstage-all)
+    (keymap-bind ["a"] 'gitview/cmd-git-apply) ; a — apply the hunk / stash / commit at point
+    (keymap-bind ["v"] 'gitview/cmd-git-reverse) ; v — reverse it in the work tree
+    (keymap-bind ["e"] 'gitstatus/cmd-git-resolve-in-file) ; e — open a conflicted file at its conflict
+    (keymap-bind ["K"] 'git/cmd-git-untrack) ; K — stop tracking the file at point
+    (keymap-bind ["R"] 'git/cmd-git-rename-file) ; R — git mv the file at point
+    ;; The MENU keys, Magit's letters. Each opens a transient rather than running something:
+    ;; the flags live in the menu (src/transient.blsp), and a bare key that pushed or reset
+    ;; without showing you what it was about to do is the thing these replace.
+    (keymap-bind ["c"] 'gitcommit/cmd-git-commit-menu) ; c — commit
+    (keymap-bind ["b"] 'gitrefs/cmd-git-branch-menu) ; b — branch
+    (keymap-bind ["d"] 'git/cmd-git-diff-menu) ; d — diff
+    (keymap-bind ["l"] 'git/cmd-git-log-menu) ; l — log
+    (keymap-bind ["P"] 'gitremote/cmd-git-push-menu) ; P — push
+    (keymap-bind ["F"] 'gitremote/cmd-git-pull-menu) ; F — pull
+    (keymap-bind ["f"] 'gitremote/cmd-git-fetch-menu) ; f — fetch
+    (keymap-bind ["M"] 'gitremote/cmd-git-remote-menu) ; M — remote
+    (keymap-bind ["z"] 'gitrefs/cmd-git-stash-menu) ; z — stash
+    (keymap-bind ["m"] 'gitsequence/cmd-git-merge-menu) ; m — merge
+    (keymap-bind ["r"] 'gitsequence/cmd-git-rebase-menu) ; r — rebase (and the way out of one)
+    (keymap-bind ["A"] 'gitsequence/cmd-git-cherry-pick-menu) ; A — cherry-pick
+    (keymap-bind ["V"] 'gitsequence/cmd-git-revert-menu) ; V — revert
+    (keymap-bind ["X"] 'gitrefs/cmd-git-reset-menu) ; X — reset
+    (keymap-bind ["t"] 'gitrefs/cmd-git-tag-menu) ; t — tag
+    (keymap-bind ["B"] 'gitsequence/cmd-git-bisect-menu) ; B — bisect
+    (keymap-bind ["%"] 'git/cmd-git-worktree-menu) ; % — worktrees
+    (keymap-bind ["W"] 'git/cmd-git-patch-menu) ; W — format patches
+    (keymap-bind ["w"] 'git/cmd-git-apply-menu) ; w — apply patches
+    (keymap-bind ["o"] 'git/cmd-git-submodule-menu) ; o — submodules
+    (keymap-bind ["T"] 'git/cmd-git-notes-menu) ; T — notes
+    (keymap-bind ["i"] 'git/cmd-git-ignore-menu) ; i — ignore a file
+    (keymap-bind ["y"] 'gitview/cmd-git-refs) ; y — every branch and tag
+    (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
+    (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)
+    (keymap-bind [:down] 'commands/cmd-next-line)
+    (keymap-bind [:up] 'commands/cmd-previous-line)))

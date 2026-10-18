@@ -1,10 +1,14 @@
-;; Diff-hl recomputes on the idle beat (model/ed-launch-gitdiff, synchronous) and C-g
+;; Diff-hl recomputes on the idle beat (gitdiff/ed-launch-gitdiff, synchronous) and C-g
 ;; (commands/cmd-keyboard-quit) cancels every background worker — the fix for the editor
 ;; wedging on a large file's full-buffer diff. These cover the pure model-side staleness,
 ;; the rope-guarded result fold, the universal cancel, and (last describe) the task-reply
 ;; contract itself — proof the async plumbing the June-16 revert blamed was never broken;
 ;; the live gutter is exercised by hand against a real repo.
 (defmodule gitdiff-async-test
+  (:use gitdiff) ; ed-gitdiff-stale? / ed-launch-gitdiff
+  (:use diagcheck) ; ed-launch-diag
+  (:use eldoc) ; loaded for its task row: C-g cancels an eldoc lookup
+  (:use eval-commands) ; loaded for its task row: C-g cancels a C-x C-e eval
   (:use model)
   (:use-internals input)
   (:use-internals panes) ; ed--gutter-key — the gutter cache key (cache-invalidation regression)
@@ -16,6 +20,16 @@
 ;; `cancel-task` just `send`s it a cancel message (a harmless no-op here).
 (defn- gd-handle () (spawn (receive (:never nil))))
 (defn- gd-file-model (text) (ed-init (make-buffer text "f.txt" "/tmp/f.txt")))
+;; A handle that reports the FIRST message it gets back to the test, then exits. Sending it
+;; `:barrier` after C-g is the barrier: messages from one sender arrive in order, so if the
+;; first thing it saw was `:barrier`, C-g sent it nothing (no cancel) — no timeout needed.
+(defn- gd-spy-handle ()
+  (let (test-pid (self))
+    (spawn (receive (msg (send test-pid [:gd-spy-first msg]))))))
+(defn- gd-spy-first (handle)
+  (send handle :barrier)
+  (receive ([:gd-spy-first msg] msg)))
+(defn- gd-no-fold (m result) m)
 
 (describe "diff-hl staleness (ed-gitdiff-stale?)"
   (test "a fresh file buffer with no cached rope is stale"
@@ -41,19 +55,19 @@
   (test "a file buffer reserves the change-bar column whether or not the diff has landed"
     (let (b0 (make-buffer "a\nb\nc" "f.txt" "/tmp/f.txt")
           ;; width must be identical before the async diff lands (nil status) and after
-          before (modes/line-number-width b0)
-          after (modes/line-number-width (editor/buffer/annotate b0 :git-line-status {0 :modified})))
+          before (gutter/line-number-width b0)
+          after (gutter/line-number-width (editor/buffer/annotate b0 :git-line-status {0 :modified})))
       (assert= before after)))
   (test "a fileless buffer reserves no change-bar column (one narrower)"
-    (let (file (modes/line-number-width (make-buffer "a\nb" "f" "/tmp/f"))
-          fileless (modes/line-number-width (make-buffer "a\nb")))
+    (let (file (gutter/line-number-width (make-buffer "a\nb" "f" "/tmp/f"))
+          fileless (gutter/line-number-width (make-buffer "a\nb")))
       (assert= 1 (- file fileless)))))
 
 (describe "diff-hl bars hide while positionally stale (never drawn on the wrong line)"
   (test "the change bar shows while the annotation is positionally current"
     (let (b (editor/buffer/annotate (make-buffer "a\nb\nc" "f.txt" "/tmp/f.txt")
               :git-line-status {0 :modified})
-          cell (modes/line-number-cell b 0 (modes/line-number-width b)))
+          cell (gutter/line-number-cell b 0 (gutter/line-number-width b)))
       (assert= :bar (nth (first cell) 0)))) ; [:bar colour] is the change-bar chunk
   (test "the bar blanks once a line was inserted since the diff (positional currency)"
     ;; annotate at 3 lines, then insert one: the line->status map would now point at the
@@ -62,7 +76,7 @@
                                  :git-line-status {0 :modified})
                       0)
               "\n")
-          cell (modes/line-number-cell b 0 (modes/line-number-width b)))
+          cell (gutter/line-number-cell b 0 (gutter/line-number-width b)))
       (assert= " " (nth (first cell) 0))))) ; blank, not a stale-positioned bar
 (describe "diff-hl recompute (ed-launch-gitdiff — synchronous, runs on the idle beat)"
   (test "recomputing a stale file buffer stamps the rope + line count (no longer stale)"
@@ -92,31 +106,66 @@
       (is (ed-gitdiff-stale? m)) ; was stale
       (is (not (ed-gitdiff-stale? m1)))))) ; the blink recomputed it
 (describe "keyboard-quit cancels all background workers"
-  (test "C-g clears the eval / diagnostics / diff-hl handles and their checking ropes"
+  (test "C-g clears the eval / diagnostics / diff-hl / eldoc handles and their checking state"
     (let (m (gd-file-model "a\nb\nc")
           m1 (assoc m
                :eval-proc (gd-handle)
                :diag-proc (gd-handle)
                :gitdiff-proc (gd-handle)
+               :eldoc-proc (gd-handle)
                :diag-checking :r
                :gitdiff-checking :r
+               :eldoc-checking {:pt 0 :rope :r}
                :pending {:x 1}
                :prefix-arg {:count 4 :raw true})
           m2 (cmd-keyboard-quit m1 :ctrl-g))
       (is (nil? (:eval-proc m2)))
       (is (nil? (:diag-proc m2)))
       (is (nil? (:gitdiff-proc m2)))
+      (is (nil? (:eldoc-proc m2)))
       (is (nil? (:diag-checking m2)))
       (is (nil? (:gitdiff-checking m2)))
+      (is (nil? (:eldoc-checking m2)))
       (is (nil? (:pending m2)))
       (is (nil? (:prefix-arg m2)))
       (assert= "quit — interrupted background work" (:echo m2))))
+  (test "each formerly hard-coded job alone is cancelled and announced"
+    (doseq (slot [:eval-proc :diag-proc :gitdiff-proc :eldoc-proc])
+      (let (m2 (cmd-keyboard-quit (assoc (gd-file-model "a\nb\nc") slot (gd-handle)) :ctrl-g))
+        (is (nil? (get m2 slot)))
+        (assert= "quit — interrupted background work" (:echo m2)))))
+  (test "a checking flag without its handle in flight is left alone, as before"
+    ;; the hook is the cancelled job's clean-up, not a sweep — nothing ran, nothing to undo
+    (let (m2 (cmd-keyboard-quit (assoc (gd-file-model "a") :diag-checking :r) :ctrl-g))
+      (assert= :r (:diag-checking m2))
+      (assert= "quit" (:echo m2))))
   (test "a cancelled diff-hl gets an empty status so it doesn't immediately relaunch"
     (let (m (gd-file-model "a\nb\nc")
           m1 (assoc m :gitdiff-proc (gd-handle) :gitdiff-checking (buffer-rope (ed-current-buf m)))
           m2 (cmd-keyboard-quit m1 :ctrl-g))
       (assert= {} (editor/buffer/annotation-value (ed-current-buf m2) :git-line-status))
       (is (not (ed-gitdiff-stale? m2)))))
+  (test "an opted-in job's task is sent the cancel, not just forgotten"
+    (let (handle (gd-spy-handle)
+          _ (cmd-keyboard-quit (assoc (gd-file-model "a") :eval-proc handle) :ctrl-g))
+      (assert= :task--cancel (gd-spy-first handle))))
+  (test "a registered job that did not opt in survives C-g"
+    (register-task-reply :quit-test-upkeep-proc 'gitdiff-async-test/gd-no-fold nil nil)
+    (let (handle (gd-spy-handle)
+          m2 (cmd-keyboard-quit (assoc (gd-file-model "a") :quit-test-upkeep-proc handle) :ctrl-g))
+      (assert= handle (:quit-test-upkeep-proc m2))
+      (assert= :barrier (gd-spy-first handle)) ; never sent a cancel
+      (assert= "quit" (:echo m2))))
+  (test "a job whose module is not loaded still has its slot freed, its hook skipped"
+    (register-task-reply :quit-test-unloaded-proc
+      'quit-test-never-loaded/ed-apply
+      nil
+      nil
+      {:cancel-on-quit? true :on-quit 'quit-test-never-loaded/ed-quit})
+    (let (m2 (cmd-keyboard-quit (assoc (gd-file-model "a") :quit-test-unloaded-proc (gd-handle))
+               :ctrl-g))
+      (is (nil? (:quit-test-unloaded-proc m2)))
+      (assert= "quit — interrupted background work" (:echo m2))))
   (test "C-g with nothing in flight just quits (region cleared, plain message)"
     (let (m2 (cmd-keyboard-quit (gd-file-model "a\nb\nc") :ctrl-g))
       (assert= "quit" (:echo m2))
@@ -172,23 +221,23 @@
       (is (nil? (:diagnostics m2)))))) ; the stale result did not fold
 ;; ---- REGRESSION: the gutter cache must not outlive a mark's staleness ------------
 ;; The margin dims a verdict once the text differs from the run that produced it. That
-;; dimming is computed by `modes/gutter-mark-for`, but the screen shows CACHED cells
+;; dimming is computed by `gutter/gutter-mark-for`, but the screen shows CACHED cells
 ;; (`panes/ed--gutter-cells`), so the cache key has to change when staleness does.
 ;; An annotation's own stamp is frozen at annotation time, so the key needs the live
 ;; rope; without it the bright ✓ stayed on screen forever on a non-file buffer.
 
 (defn gak (buf gw)
   "The gutter cache key for `buf` — the context read from the buffer, as a live pane does."
-  (panes/ed-gutter-key buf gw (modes/gutter-ctx buf)))
+  (panes/ed-gutter-key buf gw (gutter/gutter-ctx buf)))
 
 (describe "gutter cache invalidation vs mark staleness"
   (test "an edit that dims a verdict also changes the gutter cache key"
     (let (b0 (editor/buffer/annotate (make-buffer "a\nb\nc") :test-marks {0 true})
           b1 (insert (goto-char b0 0) "x") ; same line count, text differs
-          gw (modes/line-number-width b0))
+          gw (gutter/line-number-width b0))
       ;; the mark itself dims…
-      (assert= modes/gutter-face-test-pass (second (modes/gutter-mark-for b0 0)))
-      (assert= modes/gutter-face-test-stale (second (modes/gutter-mark-for b1 0)))
+      (assert= gutter/gutter-face-test-pass (second (gutter/gutter-mark-for b0 0)))
+      (assert= gutter/gutter-face-test-stale (second (gutter/gutter-mark-for b1 0)))
       ;; …and the cache is forced to ask again
       (is (not (= (gak b0 gw) (gak b1 gw))))))
 
@@ -199,13 +248,13 @@
     (let (b0 (editor/buffer/annotate (make-buffer "a\nb\nc") :test-marks {0 true})
           b1 (insert (goto-char b0 0) "x")
           b2 (insert (goto-char b1 0) "y") ; still stale, still 3 lines
-          gw (modes/line-number-width b0))
-      (assert= modes/gutter-face-test-stale (second (modes/gutter-mark-for b2 0)))
+          gw (gutter/line-number-width b0))
+      (assert= gutter/gutter-face-test-stale (second (gutter/gutter-mark-for b2 0)))
       (assert= (gak b1 gw) (gak b2 gw))))
 
   (test "the key is stable when nothing relevant changed (the cache still works)"
     (let (b (editor/buffer/annotate (make-buffer "a\nb\nc") :test-marks {0 true})
-          gw (modes/line-number-width b))
+          gw (gutter/line-number-width b))
       (assert= (gak b gw) (gak b gw))
       ;; moving point is not a text change: the cells stay valid
       (assert= (gak b gw) (gak (goto-char b 2) gw)))))

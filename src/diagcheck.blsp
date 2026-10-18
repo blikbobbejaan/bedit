@@ -1,0 +1,179 @@
+(defmodule diagcheck
+  "The advisory diagnostics CHECK: the buffer mode's `:diagnostics` service (brood-mode →
+the type checker), run off the loop on the idle beat and folded into the model's
+diagnostics cache (`model/ed-set-diagnostics`) when it lands.
+
+A brood buffer's check runs in the sandbox child rooted in its project (`:check-remote`),
+the way a language server checks its language; anything else, or a project whose child
+cannot boot, checks in an in-image task. Headless, it checks synchronously.
+
+Everything the editor core needs to know about it is registered at load: the idle-beat job
+(`model/register-idle-job`), the task-reply fold (`model/register-task-reply`) and the
+sandbox session client (`sandbox-events/register-client`) — so neither the model nor the
+dispatcher names it, and the session router has no row seeded on its behalf."
+  (:use editor/buffer) ; buffer-text / buffer-rope / buffer-name
+  (:use model) ; ed-current-buf / ed-mode-service / ed-set-diagnostics / ed-headless? / the registries
+  (:use task)) ; task — run the in-image check off the loop
+;; sandbox, sandbox-events, session and projects are referenced qualified below.
+
+;; ---- diagnostics cache (async, recomputed only when the text changes) -------
+;; A full advisory type-check is O(buffer) — hundreds of ms on a large file — far too
+;; heavy for the loop. Two things keep it off the critical path: (1) staleness is keyed
+;; on the buffer's ROPE HANDLE (an edit mints a fresh rope; movement keeps it), an O(1)
+;; check rather than a whole-buffer text compare, so movement never even materialises
+;; the text; (2) the check itself runs in a SPAWNED PROCESS (std/task) and its result is
+;; folded back through `ed-update` as a `[:task-done …]` event, so the editor stays live
+;; while the checker runs. Without a live `:editor` process (tests / headless) it falls
+;; back to a synchronous check. The check is the buffer mode's `:diagnostics` service
+;; (brood-mode → the in-process type checker); buffers whose mode offers none never pay.
+
+(defn ed-refresh-diagnostics (m)
+  "The model with `:diagnostics` (a list of `{:line :col :message}`) + `:diag-rope`
+refreshed iff the current buffer has a `:diagnostics` service and its rope changed since
+the last check; otherwise `m` unchanged. Synchronous — the core the async path and the
+tests share."
+  (let (buf (ed-current-buf m)
+        svc (ed-mode-service buf :diagnostics)
+        rope (buffer-rope buf))
+    (if (or (nil? svc) (= rope (:diag-rope m)))
+      m
+      (ed-set-diagnostics m (svc (buffer-text buf)) rope))))
+
+;; How long a sandboxed check may run before the child answers `:timeout` (and the
+;; next idle beat re-sends). A large file's check is hundreds of ms; a project's first
+;; check also loads its modules in the child.
+(def *diag-check-timeout-ms* 20000)
+
+(defn ed-launch-diag (m)
+  "Start the deferred diagnostics check. A no-op when nothing is stale or a check is
+already in flight (`:diag-proc` — an in-image task — or `:diag-req`, a sandbox
+request). Headless (no `:editor`) → synchronous (`ed-refresh-diagnostics`).
+
+A mode marked `:check-remote` (brood-mode) is checked in the SANDBOX CHILD, the way
+an LSP server checks its language: `sandbox-check` sends the text as a `:check`
+request to a child rooted in the buffer's project (`sandbox-start root` — it is
+re-rooted when the project changes), whose checker resolves that project's modules
+in its own image; the reply folds back through `sandbox-events` as this module's
+`:reply` client. Nothing of the project is ever loaded into the editor. When the
+sandbox cannot take the request (no runtime to spawn), the check falls back to the
+in-image task, which sees only the editor's own image."
+  (let (buf (ed-current-buf m)
+        svc (ed-mode-service buf :diagnostics))
+    (cond
+      (or (nil? svc) (not (ed-diag-stale? m))) m
+      (:diag-proc m) m
+      ;; a sandbox check in flight — unless it is overdue (a worker that was shutting
+      ;; down took the request and never answered): forget it and send again
+      (and (:diag-req m) (< (- (os/now) (or (:diag-sent m) 0)) (+ *diag-check-timeout-ms* 5000))) m
+      (ed-headless?) (ed-refresh-diagnostics m)
+      :else
+        (let (text (buffer-text buf)
+              rope (buffer-rope buf)
+              ;; the sandbox is off for this model once its worker gave up (`:diag-sandbox-off`,
+              ;; set by the down hook): from then on the in-image task checks, so a project
+              ;; whose child cannot boot is not respawned on every idle beat
+              remote? (and (ed-mode-service buf :check-remote) (not (:diag-sandbox-off m)))
+              id (session/next-id m)
+              sent? (and remote?
+                      (do
+                        ;; the CURRENT buffer's project, resolved live from its directory —
+                        ;; `:project-root` is the last visit's, which another project's
+                        ;; buffer switched to by C-x b must not inherit
+                        (sandbox/sandbox-check-start (or (projects/project-root (ed-buffer-dir buf))
+                                                       (:project-root m)
+                                                       (sandbox/sandbox-projectless-root)))
+                        (sandbox/sandbox-check id text *diag-check-timeout-ms*))))
+          (if sent?
+            (assoc (session/ids-used m (inc id))
+              :diag-req id
+              :diag-sent (os/now)
+              :diag-checking rope
+              :diag-checking-buf (buffer-name buf))
+            (let (job (task (fn () (svc text))))
+              (assoc m :diag-proc job :diag-checking rope :diag-checking-buf (buffer-name buf))))))))
+
+;; ---- the sandbox's diagnostics client (registered with `sandbox-events` below) ----
+
+(defn ed-diag-client-live? (m)
+  "Somebody still wants the sandbox for checks: the current buffer's mode checks remotely."
+  (not (nil? (ed-mode-service (ed-current-buf m) :check-remote))))
+
+(defn ed-diag-sandbox-ready (m gen banner)
+  "The child came up (or back): nothing to do — a queued check flushes on its own."
+  m)
+
+(defn ed-diag-sandbox-reply (m reply gen)
+  "Fold a sandbox reply: ours iff its `:id` is the check in flight (`:diag-req`) — then
+its `:diagnostics` (or `()` for a timeout / a checker error, so the next idle beat
+re-sends) become the cache, against the rope they were computed for. Any other id
+is another client's, untouched."
+  (if (and (:diag-req m) (= (get reply :id) (:diag-req m)))
+    (if (get reply :ok)
+      (dissoc (ed-apply-diag m (or (get reply :diagnostics) '())) :diag-req)
+      ;; a timeout (the child was re-rooted or reset mid-check, or a first check that
+      ;; loaded a large project overran) or a checker error: keep the old cache and
+      ;; leave `:diag-rope` as it was, so the buffer stays stale and the next idle beat
+      ;; sends again — `ed-apply-diag` would record the rope as checked
+      (dissoc (dissoc m :diag-req :diag-checking) :diag-checking-buf))
+    m))
+
+(defn ed-diag-sandbox-down (m code)
+  "The child went away: forget the check in flight (the worker answered it `:timeout`
+or never will), so the next idle beat re-sends. A worker that GAVE UP (`:gave-up` —
+the child died three times in a row, e.g. a project whose manifest it cannot load —
+or `:spawn-failed`) turns the sandbox off for this model's checks (`:diag-sandbox-off`):
+they run in-image from then on rather than respawning a doomed child on every idle beat."
+  (let (m1 (dissoc (dissoc m :diag-req :diag-checking) :diag-checking-buf))
+    (if (or (= code :gave-up) (= code :spawn-failed)) (assoc m1 :diag-sandbox-off true) m1)))
+
+(sig ed-apply-diag (model any -> model))
+(defn ed-apply-diag (m result)
+  "Fold a finished diagnostics check's `result` (its `[:task-done …]` value, `()` if it
+errored / timed out) into the model: store it against the rope it was computed for
+(`:diag-checking` → `:diag-rope`) and clear the in-flight handle. `ed-diag-stale?` then
+re-fires iff the buffer moved on while the check ran, so the next idle tick relaunches."
+  (assoc (ed-set-diagnostics m (or result '()) (:diag-checking m) (:diag-checking-buf m))
+    :diag-proc nil
+    :diag-checking nil
+    :diag-checking-buf nil))
+
+(defn ed-diag-stale? (m)
+  "True if the current buffer offers a `:diagnostics` service and its rope differs from
+`:diag-rope` (the rope the cached `:diagnostics` were computed from) — i.e. a recheck is
+due. An O(1) rope-handle compare, not a whole-buffer text compare, so movement (which
+keeps the rope) costs nothing. Buffers whose mode offers no service are never stale."
+  (let (buf (ed-current-buf m))
+    (and (ed-mode-service buf :diagnostics)
+      (not (= (buffer-rope buf) (:diag-rope m))))))
+
+(defn ed-run-diag (m)
+  "Launch the deferred diagnostics check (async via `ed-launch-diag` when an `:editor`
+process is live, synchronous otherwise) — a no-op when not stale or one is in flight.
+What the `:idle-recompute` timer (ADR-102) runs once the debounce window has elapsed."
+  (ed-launch-diag m))
+
+(defn ed-quit-diag (m)
+  "C-g killed a diagnostics check (`:on-quit`): forget the rope it was checking. The cache
+stays stale, so the check runs again once typing settles."
+  (dissoc m :diag-checking))
+
+;; ---- registration: what the editor core calls, named by symbol ----------------
+
+(register-task-reply :diag-proc
+  'diagcheck/ed-apply-diag
+  '()
+  nil
+  {:cancel-on-quit? true :on-quit 'diagcheck/ed-quit-diag})
+
+(register-idle-job :diagnostics
+  {:order 60 :run 'diagcheck/ed-run-diag :stale? 'diagcheck/ed-diag-stale? :held-key-gated? true})
+
+;; a brood buffer's checks are `:check` requests to a child rooted in the buffer's project —
+;; its OWN session, so checking a project file never re-roots the playground's child.
+;; Registering is also what loads `sandbox-events`, so its impls are in place before the
+;; first check can be sent.
+(sandbox-events/register-client {:session :sandbox-check
+                                 :live? 'diagcheck/ed-diag-client-live?
+                                 :ready 'diagcheck/ed-diag-sandbox-ready
+                                 :reply 'diagcheck/ed-diag-sandbox-reply
+                                 :down 'diagcheck/ed-diag-sandbox-down})

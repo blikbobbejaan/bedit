@@ -1,0 +1,114 @@
+(defmodule autosave
+  "Files and the disk between saves: Emacs's `#file#` auto-save sidecars, written on the
+idle beat for every modified file buffer and removed by a real save, and auto-revert — a
+buffer whose file another writer changed is reloaded when it has no unsaved changes, and
+warned about once when it does (`cmd-save` then asks before overwriting).
+
+Policy over the pool, run on the idle beat (`input/ed-timer-fire`) so it costs a keystroke
+nothing; the knowledge of \"changed since we last agreed\" lives in `std/editor/buffer`."
+  (:use editor/buffer) ; buffer-file / buffer-modified? / find-file-buffer / buffer-file-changed?
+  (:use model)) ; ed-buf-at / ed-set-buf-at / ed-map-panes / message — the pool it walks
+
+;; ---- auto-save --------------------------------------------------------------
+;; On the idle beat, write `#filename#` sidecar files for modified file-backed
+;; buffers. `cmd-save` clears the sidecar on a real save (`delete-file`).
+
+(def *auto-save-interval-ms* 30000)
+
+(defn ed-auto-save-path (path)
+  "The auto-save sidecar path: `#basename#` in the same directory as `path`."
+  (path/join (path/dirname path) (str "#" (path/basename path) "#")))
+
+(defn ed-remove-auto-save (path)
+  "Delete `path`'s `#basename#` sidecar, if there is one — what a successful write of the
+file does (`C-x C-s`, `C-x C-w`), since the sidecar's text is now on disk. A nil `path` (a
+fileless buffer) is a no-op; a sidecar that cannot be removed is logged, never raised —
+the save itself succeeded."
+  (let (sidecar (when path (ed-auto-save-path path)))
+    (when (and sidecar (file/exists? sidecar))
+      (try
+        (file/rm sidecar)
+        (catch e (log/warn (str "could not remove auto-save " sidecar ": " (error-message e))))))))
+
+(defn ed-auto-save! (m)
+  "Write `#filename#` sidecars for all modified file-backed buffers, throttled to
+once per `*auto-save-interval-ms*`. Returns the model with `:auto-saved-at` updated."
+  (let (now-ms (os/now)
+        last (or (:auto-saved-at m) 0))
+    (if (< (- now-ms last) *auto-save-interval-ms*)
+      m
+      (do
+        (doseq (buf (:buffers m))
+          (let (path (buffer-file buf))
+            (when (and path (buffer-modified? buf))
+              (try
+                (file/spit (ed-auto-save-path path) (buffer-text buf))
+                (catch e (log/warn (str "auto-save of " path " failed: " (error-message e))))))))
+        (assoc m :auto-saved-at now-ms)))))
+
+(defn ed-revert-at (m i)
+  "Re-read pool buffer `i` from its file, discarding its unsaved changes: the buffer
+keeps its name, mode (`:layers`) and dir, every pane on it keeps its point (clamped to
+the new length), undo history resets. The shared core of `M-x revert-buffer` (the
+current buffer) and the idle beat's auto-revert (any buffer another writer changed).
+Raises if the file cannot be read — the callers report."
+  (let (b (ed-buf-at m i)
+        f (or (buffer-file b) (error "revert: buffer " (buffer-name b) " has no file"))
+        fresh (find-file-buffer f)
+        len (buffer-length fresh)
+        ;; Carry the original buffer's MODE (`:layers`) + dir onto the reverted buffer.
+        ;; The line-number / diff-hl gutter, highlighting and eldoc are all `:layers`
+        ;; mode services — a bare `find-file-buffer` has none (they're seeded lazily on
+        ;; the next dispatch), so without this the gutter vanishes until the next
+        ;; keystroke re-inits them. diff-hl re-arms on its own (fresh has no
+        ;; `:git-status-rope`, so it recomputes against the new content on the idle beat).
+        reverted (goto-char (assoc fresh :name (buffer-name b) :layers (:layers b) :dir (:dir b))
+                   (math/min (buffer-point b) len)))
+    (ed-map-panes (ed-set-buf-at m i reverted)
+      (fn (w)
+        (if (and (= (:buffer w) i) (not (nil? (:point w))))
+          (assoc w :point (math/min (:point w) len) :mark nil)
+          w)))))
+;; ---- files that change under the editor ------------------------------------
+;; Another writer — a formatter, `git checkout`, a build step, a colleague's editor —
+;; rewrites a file this editor has open. Emacs's answer is two-fold: `auto-revert` reloads
+;; a buffer with no unsaved changes, and a buffer WITH changes is protected: the save
+;; asks before overwriting the other writer's work. The knowledge of "changed since we
+;; last agreed" lives in `std/editor/buffer` (`:file-mtime`, `buffer-file-changed?`);
+;; this is the policy over it, run on the idle beat so it costs a keystroke nothing.
+
+(sig ed-revert-changed-files (model -> model))
+(defn ed-revert-changed-files (m)
+  "For every file buffer whose file was written since it last agreed with the buffer
+(`buffer-file-changed?`): a buffer with NO unsaved changes is reverted in place (Emacs
+`global-auto-revert-mode`) with a note in the echo area; one WITH unsaved changes is left
+alone and warned about once per on-disk version (`:disk-warned` remembers the mtime told
+about), since `cmd-save` will ask before overwriting. A revert that fails (the file
+unreadable now) is logged and skipped. Runs on the idle beat."
+  (fold (range (count (:buffers m)))
+    m
+    (fn (acc i)
+      (let (b (ed-buf-at acc i)
+            f (buffer-file b))
+        (if (or (nil? f) (not (buffer-file-changed? b)))
+          acc
+          (let (now (file/mtime f))
+            (cond
+              (not (buffer-modified? b))
+                (try
+                  (message (ed-revert-at acc i) (str "reverted " f " (changed on disk)"))
+                  (catch e
+                    (do
+                      (log/warn (str "auto-revert of " f " failed: " (error-message e)))
+                      acc)))
+              (= (:disk-warned b) now) acc
+              else
+                (message (assoc acc :buffers (assoc (:buffers acc) i (assoc b :disk-warned now)))
+                  (str f " changed on disk — save will ask; M-x revert-buffer to reload")))))))))
+
+;; ---- registration: both ride the idle beat, after the launches ----------------------
+;; Neither arms the beat (no `:stale?`) — an edit does, and the sidecars and the disk check
+;; follow it once typing settles: the sidecar is written, then files another writer changed
+;; are reverted (the clean ones) or warned about (the rest).
+(register-idle-job :auto-save {:order 110 :run 'autosave/ed-auto-save!})
+(register-idle-job :auto-revert {:order 120 :run 'autosave/ed-revert-changed-files})

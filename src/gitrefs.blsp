@@ -1,0 +1,415 @@
+(defmodule gitrefs
+  "Names for commits and moving them: branches (`b`), tags (`t`), stashes (`z`) and reset
+(`X`). Each is a transient of flags; the ones that can lose work (`reset --hard`, deleting
+a branch merged nowhere, dropping a stash) ask first, naming what goes."
+  (:use model) ; message / ed-current-buf
+  (:use pool) ; ed-name-prompt
+  (:use interactive) ; defcommand
+  (:use transient) ; ed-transient-open / ed-transient-args
+  (:use editor/buffer) ; buffer-file
+  (:use gitcore)
+  (:use gitsection) ; git-row-at / git-file-at / git-ref-at-point
+  (:use gitpick) ; git-prompt / git-with-ref / git-with-name / git-on-commit
+  (:use gitview) ; git-show-revision — z v shows a stash
+  (:use gitstatus)) ; git-refresh / git-stash-drop-ref
+
+;; ---- stash (z) ---------------------------------------------------------------
+;; A stash is something you act on in place: `a` / `A` / `k` on a stash in *git-status*,
+;; or `z a` / `z p` / `z k` from anywhere, which offer the stash at point first and the
+;; newest otherwise — the old `z p` could only ever pop the newest.
+
+(defcommand cmd-git-stash
+  (m key)
+  "Stash working-tree changes (z z) — `git stash push`, with the stash menu's arguments
+(`--include-untracked`, `--keep-index`). Refreshes status on success."
+  (git-do m "stash" (append ["stash" "push"] (transient/ed-transient-args m))))
+
+(defcommand cmd-git-stash-index
+  (m key)
+  "Stash only what is staged (z i), leaving the rest of the work tree alone."
+  (git-do m "stash --staged" (append ["stash" "push" "--staged"] (transient/ed-transient-args m))))
+
+(defcommand cmd-git-stash-worktree
+  (m key)
+  "Stash only what is NOT staged (z w): the index is kept, and so is the work tree's copy of it."
+  (git-do m
+    "stash --keep-index"
+    (append ["stash" "push" "--keep-index"] (transient/ed-transient-args m))))
+
+(defn- git-stash-at-point (m)
+  "The stash ref at point (`stash@{2}`), or nil."
+  (let (row (git-row-at m))
+    (if (and row (= (:type row) :stash)) (:ref (:value row)) nil)))
+
+(defn- git-with-stash (m prompt then)
+  "Prompt for a stash — the one at point first, else the newest — and hand its ref to `then`."
+  (git-prompt m
+    {:prompt prompt
+     :candidates (fn (root) (map (git-stashes root) :hash))
+     :here (fn (_root) (git-stash-at-point m))
+     :none "there are no stashes"
+     :blank "no stash chosen"
+     :then then}))
+
+(defcommand cmd-git-stash-apply
+  (m key)
+  "Apply a stash, keeping it (z a, or a on a stash)."
+  (git-with-stash m "Apply stash: " (fn (mm ref) (git-do mm "stash apply" ["stash" "apply" ref]))))
+
+(defcommand cmd-git-stash-pop
+  (m key)
+  "Apply a stash and drop it (z p, or A on a stash)."
+  (git-with-stash m "Pop stash: " (fn (mm ref) (git-do mm "stash pop" ["stash" "pop" ref]))))
+
+(defcommand cmd-git-stash-drop
+  (m key)
+  "Drop a stash (z k, or k on a stash), after a question."
+  (git-with-stash m "Drop stash: " git-stash-drop-ref))
+
+(defcommand cmd-git-stash-show
+  (m key)
+  "Show a stash's change as a commit (z v, or RET on a stash)."
+  (git-with-stash m "Show stash: " (fn (mm ref) (git-show-revision mm (git-resolve-root mm) ref))))
+
+(defcommand cmd-git-stash-branch
+  (m key)
+  "Make a branch from a stash (z b): check out the commit it was made on, apply it there,
+and drop it — the way back when a stash no longer applies where you are."
+  (git-with-stash m
+    "Branch from stash: "
+    (fn (mm ref)
+      (assoc mm
+        :minibuffer
+          (pool/ed-name-prompt "New branch name: "
+            '()
+            (fn (m2 name)
+              (if (string/blank? name)
+                (message m2 "a branch needs a name")
+                (git-do m2 "stash branch" ["stash" "branch" (string/trim name) ref]))))))))
+
+;; ---- branches (b) ------------------------------------------------------------
+;; Magit's branch menu, less the configuration sub-menu: check out (a REMOTE branch is
+;; checked out as a local branch tracking it — checking out `origin/x` detached HEAD before),
+;; create from a starting point, spin off, rename, set the upstream, reset, delete.
+
+(defn- git-local-branch? (root name)
+  "Whether `name` is a local branch."
+  (= 0 (:exit (git-git root ["show-ref" "--verify" "--quiet" (str "refs/heads/" name)]))))
+
+(defn git-checkout-args (root ref)
+  "The argv that checks out `ref`: a local branch as it is; a remote branch as the local
+branch of the same name — made to track it when there is none yet; anything else (a tag, a
+hash) as it is, which detaches HEAD, as asked."
+  (let (split (git-split-remote-branch root ref))
+    (cond
+      (nil? split) ["checkout" ref]
+      (git-local-branch? root (second split)) ["checkout" (second split)]
+      :else ["checkout" "--track" ref])))
+
+(defcommand cmd-git-checkout
+  (m key)
+  "Check out a branch (b b) — the one at point first. A remote branch becomes a local one
+tracking it."
+  (git-with-ref m
+    "Checkout: "
+    :branches (fn (mm ref) (git-do mm "checkout" (git-checkout-args (git-resolve-root mm) ref)))))
+
+(defcommand cmd-git-checkout-local
+  (m key)
+  "Check out a remote branch as a local branch tracking it (b l)."
+  (git-with-ref m
+    "Checkout remote branch as local: "
+    :remote (fn (mm ref) (git-do mm "checkout" (git-checkout-args (git-resolve-root mm) ref)))))
+
+(defcommand cmd-git-create-branch
+  (m key)
+  "Create a branch and check it out (b c): its name, then where it starts."
+  (git-with-name m
+    "New branch: "
+    (fn (mm name)
+      (git-with-start mm
+        (str "Start " name " at: ")
+        (fn (m2 start) (git-do m2 "checkout -b" ["checkout" "-b" name start]))))))
+
+(defcommand cmd-git-branch-create-only
+  (m key)
+  "Create a branch without checking it out (b n)."
+  (git-with-name m
+    "New branch: "
+    (fn (mm name)
+      (git-with-start mm
+        (str "Start " name " at: ")
+        (fn (m2 start) (git-do m2 "branch" ["branch" name start]))))))
+
+(defcommand cmd-git-branch-spinoff
+  (m key)
+  "Spin off a branch (b s): move the current branch's unpushed commits onto a new branch
+and put the current one back where its upstream is — for when you started work on `main`
+that should have been a branch."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (old (git-current-branch root)
+            up (git-upstream root))
+        (git-with-name m
+          "Spin off to new branch: "
+          (fn (mm name)
+            (let ([m1 r] (git-run (assoc mm :git-root root) ["checkout" "-b" name]))
+              (cond
+                (not (= (:exit r) 0)) (git-report-cmd m1 "checkout -b" r)
+                (or (nil? old) (nil? up)) (git-refresh m1)
+                :else (git-do m1 "branch -f" ["branch" "-f" old up])))))))))
+
+(defcommand cmd-git-branch-rename
+  (m key)
+  "Rename a branch (b m) — the one at point, or the current one."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (let (old (or (git-ref-at-point m) (git-current-branch root)))
+        (git-with-name m
+          (str "Rename " old " to: ")
+          (fn (mm name) (git-do mm "branch -m" ["branch" "-m" old name])))))))
+
+(defcommand cmd-git-branch-upstream
+  (m key)
+  "Set the current branch's upstream (b u) to a remote branch you pick."
+  (git-with-ref m
+    "Upstream: "
+    :branches (fn (mm ref) (git-do mm "branch --set-upstream-to" ["branch" (str "--set-upstream-to=" ref)]))))
+
+(defcommand cmd-git-branch-reset
+  (m key)
+  "Point a branch at another commit (b x). The current branch is reset --hard, after a
+question that says what goes; any other is moved with `branch -f`."
+  (let (root (git-resolve-root m))
+    (git-with-ref m
+      "Reset branch: "
+      :local (fn (mm branch)
+        (git-with-start mm
+          (str "Reset " branch " to: ")
+          (fn (m2 target)
+            (if (= branch (git-current-branch root))
+              (git-confirm m2
+                (str "Reset " branch " --hard to " target ", losing every uncommitted change?")
+                (fn (m3) (git-do m3 "reset --hard" ["reset" "--hard" target])))
+              (git-do m2 "branch -f" ["branch" "-f" branch target]))))))))
+
+(defn- git-delete-local-branch (m root ref)
+  "`git branch -d ref`; when git refuses because its commits are merged nowhere else, the
+refusal becomes a question naming the loss, and yes is `-D`."
+  (let ([m1 r] (git-run (assoc m :git-root root) ["branch" "-d" ref]))
+    (cond
+      (= (:exit r) 0) (git-refresh (message m1 (str "deleted " ref)))
+      (includes? (:stderr r "") "not fully merged")
+        (git-confirm m1
+          (str ref " has commits merged nowhere else. Delete it anyway, losing them?")
+          (fn (m2) (git-do m2 "branch -D" ["branch" "-D" ref])))
+      :else (git-report-cmd m1 "branch -d" r))))
+
+(defn- git-delete-remote-branch (m remote branch)
+  "Delete `branch` ON `remote` (`push --delete`), after a question."
+  (git-confirm m
+    (str "Delete " branch " on " remote "?")
+    (fn (m2) (git-launch-op m2 "push --delete" ["push" remote "--delete" branch]))))
+
+(defcommand cmd-git-branch-delete
+  (m key)
+  "Delete a branch (b k) — the one at point first. A local branch goes with `-d`, which
+refuses one whose commits are merged nowhere; that refusal is then offered as a question,
+naming the loss. A remote branch is deleted ON the remote, after a question."
+  (let (root (git-resolve-root m))
+    (git-with-ref m
+      "Delete branch: "
+      :branches (fn (mm ref)
+        (let (split (git-split-remote-branch root ref))
+          (if (and split (not (git-local-branch? root ref)))
+            (git-delete-remote-branch mm (first split) (second split))
+            (git-delete-local-branch mm root ref)))))))
+
+;; ---- tags (t) ----------------------------------------------------------------
+
+(def git-tag-transient
+  {:name 'git-tag
+   :title "Tag"
+   :groups [{:title "Arguments"
+             :suffixes [["-a" :switch "--annotate" "annotated"]
+                         ["-f" :switch "--force" "replace an existing tag"]
+                         ["-s" :switch "--sign" "signed"]
+                         ["=m" :option "--message=" "message" {:prompt "Tag message"}]]}
+             {:title "Tag"
+              :suffixes [["t" 'gitrefs/cmd-git-tag-create "create"]
+                          ["k" 'gitrefs/cmd-git-tag-delete "delete"]
+                          ["p" 'gitremote/cmd-git-push-tag "push one"]
+                          ["l" 'gitview/cmd-git-refs "list (with branches)"]]}]})
+
+(defcommand cmd-git-tag-menu
+  (m key)
+  "The tag menu (t)."
+  (transient/ed-transient-open m git-tag-transient))
+
+(defn- git-tag-args (args name target)
+  "The argv that tags `target` as `name` with the menu's `args` — and, for an annotated or
+signed tag the menu gave no message, the name as its message: without one git opens an
+editor nobody can see."
+  (let (annotated? (or (includes? args "--annotate") (includes? args "--sign"))
+        message? (any? args (fn (a) (string/starts-with? a "--message="))))
+    (append ["tag"]
+      args
+      (if (and annotated? (not message?)) [(str "--message=" name)] [])
+      [name target])))
+
+(defcommand cmd-git-tag-create
+  (m key)
+  "Create a tag (t t): its name, then the commit it names — the one at point first."
+  (let (args (transient/ed-transient-args m))
+    (git-with-name m
+      "Tag name: "
+      (fn (mm name)
+        (git-with-start mm
+          (str "Tag " name " at: ")
+          (fn (m2 target) (git-do m2 "tag" (git-tag-args args name target))))))))
+
+(defcommand cmd-git-tag-delete
+  (m key)
+  "Delete a tag, completing over the repo's tags."
+  (git-with-ref m
+    "Delete tag: "
+    :tags (fn (mm tag)
+      (git-confirm mm (str "Delete tag " tag "?") (fn (m2) (git-do m2 "tag -d" ["tag" "-d" tag]))))))
+
+;; ---- reset (X) ---------------------------------------------------------------
+;; The one that can destroy work, so `--hard` is the only command in the porcelain that both
+;; asks first AND says in the prompt what will be lost.
+
+(defcommand cmd-git-reset-soft
+  (m key)
+  "Move HEAD to a commit, keeping the index and the working tree (X s)."
+  (git-on-commit m "Reset --soft to: " "reset --soft" (fn (commit) ["reset" "--soft" commit])))
+
+(defcommand cmd-git-reset-mixed
+  (m key)
+  "Move HEAD to a commit and reset the index, keeping the working tree (X m)."
+  (git-on-commit m "Reset --mixed to: " "reset" (fn (commit) ["reset" "--mixed" commit])))
+
+(defcommand cmd-git-reset-hard
+  (m key)
+  "Move HEAD to a commit and throw away the index AND the working tree (X h). Asks first,
+naming what goes."
+  (git-on-commit m
+    "Reset --hard to: "
+    "reset --hard"
+    (fn (commit) ["reset" "--hard" commit])
+    (fn (commit) (str "Reset --hard to " commit ", losing every uncommitted change?"))))
+
+(defcommand cmd-git-reset-keep
+  (m key)
+  "Move HEAD to a commit, keeping uncommitted changes — refusing if any would be lost (X k)."
+  (git-on-commit m "Reset --keep to: " "reset --keep" (fn (commit) ["reset" "--keep" commit])))
+
+(defcommand cmd-git-reset-index
+  (m key)
+  "Make the index match a commit, leaving HEAD and the work tree alone (X i)."
+  (git-on-commit m "Reset the index to: " "reset index" (fn (commit) ["reset" commit "--" "."])))
+
+(defcommand cmd-git-reset-worktree
+  (m key)
+  "Make the work tree match a commit, leaving HEAD and the index alone (X w), after a
+question — every uncommitted edit to a tracked file goes."
+  (git-on-commit m
+    "Reset the work tree to: "
+    "checkout worktree"
+    (fn (commit) ["checkout" commit "--" "."])
+    (fn (commit) (str "Overwrite every tracked file with its content at " commit "?"))))
+
+(defcommand cmd-git-reset-file
+  (m key)
+  "Put one file back as it was at a commit (X f) — the file at point or this buffer's file."
+  (let (root (git-resolve-root m)
+        f (git-file-at m)
+        file (buffer-file (ed-current-buf m))
+        path (cond
+               (not (nil? f)) (:path f)
+               (and root file (string/starts-with? file (str root "/")))
+                 (string/substring file (inc (string/length root)) (string/length file))
+               :else nil))
+    (if (nil? path)
+      (message m "no file here")
+      (git-on-commit m
+        (str "Reset " path " to: ")
+        "checkout file"
+        (fn (commit) ["checkout" commit "--" path])))))
+
+(def git-reset-transient
+  {:name 'git-reset
+   :title "Reset"
+   :groups [{:title "Reset HEAD to a commit"
+             :suffixes [["m"
+                          'gitrefs/cmd-git-reset-mixed
+                          "--mixed  reset the index, keep the working tree"]
+                         ["s"
+                           'gitrefs/cmd-git-reset-soft
+                           "--soft   keep the index and the working tree"]
+                         ["h"
+                           'gitrefs/cmd-git-reset-hard "--hard   throw away everything uncommitted"]
+                         ["k"
+                           'gitrefs/cmd-git-reset-keep
+                           "--keep   keep uncommitted changes, refuse to lose any"]]}
+             {:title "Reset without moving HEAD"
+              :suffixes [["i" 'gitrefs/cmd-git-reset-index "the index"]
+                          ["w" 'gitrefs/cmd-git-reset-worktree "the work tree"]
+                          ["f" 'gitrefs/cmd-git-reset-file "a file"]]}]})
+
+(defcommand cmd-git-reset-menu
+  (m key)
+  "The reset menu (X). The three modes are spelled out with what each keeps, because
+nobody remembers which of soft and mixed touches the index."
+  (transient/ed-transient-open m git-reset-transient))
+
+;; ---- the stash MENU (z) ------------------------------------------------------
+
+(def git-stash-transient
+  {:name 'git-stash
+   :title "Stash"
+   :groups [{:title "Arguments"
+             :suffixes [["-u" :switch "--include-untracked" "untracked files too"]
+                         ["-a" :switch "--all" "ignored files too"]]}
+             {:title "Stash"
+              :suffixes [["z" 'gitrefs/cmd-git-stash "everything"]
+                          ["i" 'gitrefs/cmd-git-stash-index "the index"]
+                          ["w" 'gitrefs/cmd-git-stash-worktree "the work tree"]]}
+             {:title "Use a stash"
+              :suffixes [["a" 'gitrefs/cmd-git-stash-apply "apply"]
+                          ["p" 'gitrefs/cmd-git-stash-pop "pop"]
+                          ["v" 'gitrefs/cmd-git-stash-show "show"]
+                          ["b" 'gitrefs/cmd-git-stash-branch "branch from it"]
+                          ["k" 'gitrefs/cmd-git-stash-drop "drop"]]}]})
+
+(defcommand cmd-git-stash-menu
+  (m key)
+  "The stash menu (z)."
+  (transient/ed-transient-open m git-stash-transient))
+
+;; ---- the branch MENU (b) -----------------------------------------------------
+
+(def git-branch-transient
+  {:name 'git-branch
+   :title "Branch"
+   :groups [{:title "Checkout"
+             :suffixes [["b" 'gitrefs/cmd-git-checkout "a branch or revision"]
+                         ["l" 'gitrefs/cmd-git-checkout-local "a remote branch, as local"]
+                         ["c" 'gitrefs/cmd-git-create-branch "a new branch"]]}
+             {:title "Create"
+              :suffixes [["n" 'gitrefs/cmd-git-branch-create-only "a new branch, staying here"]
+                          ["s" 'gitrefs/cmd-git-branch-spinoff "spin off unpushed work"]]}
+             {:title "Do"
+              :suffixes [["u" 'gitrefs/cmd-git-branch-upstream "set the upstream"]
+                          ["m" 'gitrefs/cmd-git-branch-rename "rename"]
+                          ["x" 'gitrefs/cmd-git-branch-reset "reset"]
+                          ["k" 'gitrefs/cmd-git-branch-delete "delete"]
+                          ["y" 'gitview/cmd-git-refs "list every branch"]]}]})
+
+(defcommand cmd-git-branch-menu
+  (m key)
+  "The branch menu (b)."
+  (transient/ed-transient-open m git-branch-transient))

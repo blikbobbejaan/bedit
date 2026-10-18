@@ -16,7 +16,8 @@ The look follows `docs/ui-chrome.md`: a hovered interactive segment lightens one
 step (a rounded pill in the GUI, a flat band in the terminal) — surfaces + hairlines, never
 a shadow. Every `def` is live-redefinable (ricing)."
   (:use editor/display) ; text / rect / zone / card-pill / tooltip
-  (:use theme)) ; the bar + hover + tooltip faces
+  (:use theme) ; the bar + hover + tooltip faces
+  (:use memo)) ; defmemo — the chips' rank order, sorted once per registration
 ;; ---- a segment --------------------------------------------------------------
 
 (defn seg (id text &optional (opts {}))
@@ -92,18 +93,69 @@ GUI-only; the terminal uses a flat bg band. Returns [border-frect fill-frect]."
        (+ *sb-hover-radius* b))
       (frect x y w h face-modeline-hover 1.0 *sb-hover-radius*)]))
 
-(defn- sb-seg-text-ops (label tcol row face hov? gui?)
-  "The highlight + text ops for one segment's `label` at column `tcol`, where `face` is the
-segment's fully-resolved face (the bar's face with the segment's own overrides merged in). A
-hovered segment gets a **bordered, inset block** behind it — Emacs `mouse-face` with a crisp
-edge (`sb-hover-block`, `docs/ui-chrome.md`). In the GUI the block is a bordered `frect` pair
-and the text draws **fg-only** over it (a square text bg would cover the block); in the
-terminal the text carries the highlight bg itself (no border — else the bar bg it inherited)."
-  (let (tw (string/display-width label))
-    (if gui?
-      (append (if hov? (sb-hover-block tcol row tw) [])
-        [(text row tcol label (dissoc face :bg))])
-      [(text row tcol label (if hov? (merge face face-modeline-hover) face))])))
+(defn- sb-fit (s room)
+  "`[clipped width]`: `s` cut to `room` display cells (`sb-clip`) and the cells it then
+takes. One width measure when it fits — every segment's separator and label used to be
+measured three or four times over (to clip, to place, to zone, to size its hover block)."
+  (let (width (string/display-width s))
+    (if (<= width (math/max 0 room))
+      [s width]
+      (let (clipped (sb-clip s room)) [clipped (string/display-width clipped)]))))
+
+(defn- sb-push-text-ops (ops label tw tcol row face fg-face hov? gui?)
+  "The highlight + text ops for one segment's `label` (`tw` cells wide) at column `tcol`,
+consed onto the REVERSED op accumulator `ops`. `face` is the segment's fully-resolved face
+(the bar's face with the segment's own overrides merged in) and `fg-face` the same without
+its `:bg`. A hovered segment gets a **bordered, inset block** behind it — Emacs
+`mouse-face` with a crisp edge (`sb-hover-block`, `docs/ui-chrome.md`). In the GUI the block
+is a bordered `frect` pair and the text draws **fg-only** over it (a square text bg would
+cover the block); in the terminal the text carries the highlight bg itself (no border — else
+the bar bg it inherited)."
+  (if gui?
+    (let (under (if hov?
+                  (let ([border fill] (sb-hover-block tcol row tw)) (cons fill (cons border ops)))
+                  ops))
+      (cons (text row tcol label fg-face) under))
+    (cons (text row tcol label (if hov? (into face face-modeline-hover) face)) ops)))
+
+(sig sb-segment-push
+  ((tuple int list list) map int int map map any (or bool nil) -> (tuple int list list)))
+(defn- sb-segment-push (acc s right row base-face base-fg hovered-id gui?)
+  "The layout accumulator `acc` — `[end ops zones]`, the column the next segment starts at
+and the ops and zones so far, both REVERSED — with segment `s` laid on a bar ending before
+column `right`: its separator then its text in the segment's face (the bar's fg+bg, then the
+segment's own overrides), on the hover highlight when it is the hovered interactive one, and
+its zone over the text cells when it is interactive. `base-fg` is `base-face` without its
+`:bg`, worked out once per bar.
+
+Consed straight onto the accumulator rather than returned as per-segment lists the caller
+splices: a mode line is laid again on every motion (line:col changes), and the two `append`s
+and the `merge` + `dissoc` per segment were most of it — each a variadic prelude call with a
+fixed cost of microseconds, on ten segments, before a single op was built."
+  (let ([scol acc-ops acc-zones] acc
+        [sep sep-w] (sb-fit (or (:sep s) "") (- right scol))
+        tcol (+ scol sep-w)
+        [label tw] (sb-fit (:text s) (- right tcol))
+        interactive? (seg-interactive? s)
+        own (:face s)
+        ;; a segment with no face of its own takes the bar's as it is — no merge
+        face (if (nil? own) base-face (into base-face own))
+        fg-face (cond
+                  (not gui?) face
+                  (nil? own) base-fg
+                  :else (dissoc face :bg))
+        ops (if (= sep "") acc-ops (cons (text row scol sep base-face) acc-ops)))
+    [(+ tcol tw)
+      (sb-push-text-ops ops
+        label
+        tw
+        tcol
+        row
+        face
+        fg-face
+        (and (= (:id s) hovered-id) interactive?)
+        gui?)
+      (if interactive? (cons (zone [tcol row tw 1] (:id s) (:cursor s)) acc-zones) acc-zones)]))
 
 ;; `gui?` arrives as `(:gui m)` — nil in a terminal model — so the optional admits nil; as a
 ;; plain `bool` the runtime contract (ADR-380, on by default under `nest test`) refused
@@ -112,34 +164,22 @@ terminal the text carries the highlight bg itself (no border — else the bar bg
 (defn statusbar-layout (segments x row w base-face hovered-id &optional (gui? false))
   "Lay `segments` left-to-right from column `x` on `row`, across a `w`-wide bar filled in
 `base-face`. Returns `{:ops <render ops> :zones <interaction zones>}`: a full-width bar fill,
-then each segment (its `:sep`, then its `:text` in the segment's face), with the segment
-whose id is `hovered-id` — when interactive — sitting on a subtle hover highlight. Each
-interactive segment gets a `zone` over its text cells (id = the segment's id), so the mouse
-handler hit-tests hover/click against exactly the drawn glyphs. `gui?` picks the rounded pill
-over the flat terminal band. Text past the bar's right edge is clipped, never wrapped."
-  (let (acc (fold segments
-              {:col x :ops [] :zones []}
-              (fn (a s)
-                (let (scol (:col a)
-                      sep (sb-clip (or (:sep s) "") (math/max 0 (- (+ x w) scol)))
-                      tcol (+ scol (string/display-width sep))
-                      avail (math/max 0 (- (+ x w) tcol))
-                      label (sb-clip (:text s) avail)
-                      face (merge base-face (or (:face s) {})) ; inherit the bar's fg+bg, then override
-                      hov? (and (= (:id s) hovered-id) (seg-interactive? s))
-                      sep-ops (if (= sep "") [] [(text row scol sep base-face)])
-                      zone-ops (if (seg-interactive? s)
-                                 [(zone [tcol row (string/display-width label) 1]
-                                    (:id s)
-                                    (:cursor s))]
-                                 []))
-                  {:col (+ tcol (string/display-width label))
-                   :ops (append (:ops a)
-                          sep-ops
-                          (sb-seg-text-ops label tcol row face hov? gui?))
-                   :zones (append (:zones a) zone-ops)}))))
-    {:ops (cons (rect row x w 1 base-face) (:ops acc))
-     :zones (:zones acc)}))
+then each segment (`sb-segment-push`: its `:sep`, then its `:text` in the segment's face),
+with the segment whose id is `hovered-id` — when interactive — sitting on a subtle hover
+highlight. Each interactive segment gets a `zone` over its text cells (id = the segment's
+id), so the mouse handler hit-tests hover/click against exactly the drawn glyphs. `gui?`
+picks the rounded pill over the flat terminal band. Text past the bar's right edge is
+clipped, never wrapped."
+  (if (empty? segments)
+    {:ops (list (rect row x w 1 base-face)) :zones []}
+    ;; the ops and zones are consed onto REVERSED accumulators and reversed once: appending
+    ;; each segment's onto everything laid so far re-copied the whole bar per segment
+    (let (right (+ x w)
+          base-fg (dissoc base-face :bg)
+          laid (fold segments
+                 [x (list (rect row x w 1 base-face)) '()]
+                 (fn (acc s) (sb-segment-push acc s right row base-face base-fg hovered-id gui?))))
+      {:ops (reverse (second laid)) :zones (reverse (nth laid 2))})))
 
 ;; ---- the hover tooltip ------------------------------------------------------
 
@@ -165,3 +205,43 @@ no hovered segment or it has no tooltip. Drawn via `display/tooltip` — the one
         rows
         gui?
         {:border face-tooltip-border}))))
+
+;; ---- the feature chips: a registry, so the view names no feature ------------
+;; The selected pane's bar carries chips that belong to features — the running app, the
+;; attached node, a shared buffer's presence, the findings count. The view used to build
+;; each one by name, which made the pure view import half the editor to draw one row. A
+;; feature now REGISTERS its chip when its module loads, the same shape as
+;; `model/register-timer-client`: a module nobody has loaded is not on the bar, which is
+;; also what every one of those chips did before (each read model state only its own
+;; module ever sets).
+
+;; chip id -> `{:rank n :segment sym}`, in a `std/registry` (brood ADR-412).
+
+(defn register-modeline-segment (id rank segment)
+  "Put a feature's chip on the selected pane's mode line. `segment` names a `(m pane buf)
+-> seg or nil` function (a symbol, resolved late, so a redefinition hot-swaps); a nil, or
+a segment whose text is `\"\"`, shows nothing. `rank` orders the chips left to right among
+themselves and the view's own (`view/ed-statusbar-segments` documents the ranks it uses).
+Called when the feature's module loads; registering `id` again replaces it."
+  (registry/put! :statusbar/segments id {:rank rank :segment segment}))
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; the store only ever holds what the body below built, a list of entries.
+(check-allow :trusted
+  (defmemo modeline-chip-order 1 (entries)
+    "The registry's chip `entries` (`{id -> {:rank :segment}}`) as a list in rank order.
+Remembered on the registry's own map, which only a registration replaces: the bar is drawn
+every frame, and sorting the same handful of chips every time cost more than building them."
+    (sort-by (vals entries) :rank)))
+
+(defn modeline-registered-segments (m pane buf)
+  "The registered chips for `pane` as `{:rank :segment}` entries in rank order, each segment
+built now — possibly nil (the caller drops the empty ones). A chip whose function is no
+longer bound is skipped rather than raised on: the bar is drawn every frame."
+  (seq/keep (modeline-chip-order (registry/entries :statusbar/segments))
+    (fn (entry)
+      (let (sym (:segment entry))
+        ;; resolved and called once the `bound?` test has passed — `call-if-bound` would ask
+        ;; `bound?` again and spread the arguments through `apply`, per chip, per frame
+        (when (bound? sym)
+          {:rank (:rank entry) :segment ((reflect/eval sym) m pane buf)})))))

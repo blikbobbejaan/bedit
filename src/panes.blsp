@@ -6,6 +6,7 @@ not model field access: it reads the model's `:layout`/`:dragging` and the pool 
 `model/ed-buf-at`) and returns an updated model. The body rect is everything above the
 bottom echo row; both the view (`view/ed-view`) and mouse hit-testing lay the tree out
 over it, so screen coordinates line up. Pure (data→data)."
+  (:use scroll) ; ed-scroll / ed-max-top / ed-wrap? — keeping point on screen
   (:use model) ; ed-buf-at — the pool lookup ed-scroll-pane needs
   (:use editor/buffer) ; buffer-line-count (scroll clamp)
   (:use editor/highlight) ; shift-spans — re-base windowed fontify spans to absolute coords
@@ -38,7 +39,7 @@ it). Used by the view and by mouse hit-testing, so a click maps to the pane the 
 `:gutter-width` service (so a text/brood buffer shows line numbers without a toggle),
 unless the mode opts out with `:no-line-numbers` (special buffers like *git-status*,
 which want no gutter by default the way Magit has none). C-x l still forces it back on."
-  (let (ln (get-in pane [:payload :line-numbers]))
+  (let (ln (get (:payload pane) :line-numbers))
     (cond
       (not (nil? ln)) ln
       (ed-mode-service buf :no-line-numbers) false
@@ -65,7 +66,17 @@ the pair every caller actually wants. Five sites asked the two questions in that
 order (the pane geometry here, the body ops and the mouse map in `view`), and the shown?
 half is the one easy to forget: a gutter width counted for a pane that shows no gutter
 shifts every column in it."
-  (ed-gutter-width buf (ed-gutter-shown? buf pane)))
+  ;; `ed-gutter-shown?` then `ed-gutter-width` spelled out, so the `:gutter-width` service is
+  ;; looked up ONCE: this runs several times a frame per pane, and a mode-service lookup
+  ;; resolves every layer of the buffer's stack each time
+  (let (ln (get (:payload pane) :line-numbers)
+        gwfn (ed-mode-service buf :gutter-width)
+        shown? (cond
+                 (not (nil? ln)) ln
+                 (ed-mode-service buf :no-line-numbers) false
+                 :else (not (nil? gwfn)))
+        w (when (and shown? gwfn) (gwfn buf)))
+    (if (int? w) w 0)))
 
 (defn ed-selected-text-rows (m cols rows)
   "The text height of the *selected* pane in BUFFER lines — its rect height less the
@@ -75,6 +86,10 @@ scrolling and paging use, so they're correct inside a split and when zoomed. At 
         sel (ed-selected-pane panes))
     (math/max 1 (ed-pane-vrows sel (ed-pane-buf m sel)))))
 
+;; The payload reads below are `(get (:payload pane) k)`, not `(get-in pane [:payload k])`:
+;; the same lookup without std's generic path walk, and each runs several times per pane
+;; per frame.
+
 (sig ed-pane-top (pane buffer -> int))
 (defn ed-pane-top (pane buf)
   "The pane's scroll offset, clamped into `buf` — never negative, never past the last
@@ -82,10 +97,10 @@ line. A pane's `:top` can outlive the buffer it points at (a `C-x k` remap re-po
 pane to a shorter buffer keeping its scroll; a shared buffer edited shorter in another
 pane), and an out-of-range `top` would index past EOF and crash the whole renderer.
 Emacs likewise pins scroll at the last line, so clamping here is the right behaviour."
-  (let (top (get-in pane [:payload :top])
+  (let (top (get (:payload pane) :top)
         raw (math/max 0
               (math/min (if (int? top) top 0) (dec (buffer-line-count buf))))
-        restrict (get-in pane [:payload :restrict]))
+        restrict (get (:payload pane) :restrict))
     (if (nil? restrict)
       raw
       (let ([rtop rbot] (ed-restrict-lines buf restrict)) (math/max rtop (math/min rbot raw))))))
@@ -95,7 +110,7 @@ Emacs likewise pins scroll at the last line, so clamping here is the right behav
   "The pane's horizontal scroll offset (leftmost visible char column), 0 if unset."
   ;; the payload is `any` (editor/pane), so what comes out is whatever was put in: the
   ;; guard is what makes the declared `int` a fact rather than a claim, here and below
-  (let (h (get-in pane [:payload :hscroll]))
+  (let (h (get (:payload pane) :hscroll))
     (if (int? h) (math/max 0 h) 0)))
 
 (defn ed-pane-scroll-frac (pane)
@@ -104,7 +119,7 @@ boundary, > 0 = content is shifted up by `frac × cell_h` pixels (from trackpad 
   ;; `number?` BEFORE the range test, not after: `>=` raises on a non-number, so a payload
   ;; carrying anything else here crashed the renderer rather than falling back — the same
   ;; `any` payload the reads above guard, and this one was reading it unguarded
-  (let (f (get-in pane [:payload :scroll-frac]))
+  (let (f (get (:payload pane) :scroll-frac))
     (if (and (number? f) (>= f 0.0) (< f 1.0)) f 0.0)))
 
 ;; ---- screen row → buffer line: ONE owner ----------------------------------------
@@ -160,7 +175,7 @@ must not load the preset registry to answer for a pane with no zoom."
   ;; wrong number.
   ;; the test is inline, not a `let`-bound boolean: the checker narrows on the guard
   ;; itself, so through a bound name the declared `vector` goes back to being trusted
-  (let (ratio (get-in pane [:payload :zoom :ratio]))
+  (let (ratio (get (get (:payload pane) :zoom) :ratio))
     (if (and (vector? ratio)
           (= 2 (count ratio))
           (number? (first ratio))
@@ -444,6 +459,14 @@ A window holding a line past `*fontify-line-cap*` takes the per-line path instea
     (let ([src base] (ed-window-src buf restart lo hi))
       (shift-spans (fontify src) base))))
 
+(defn- ed-band-hits? (entry buf top vrows)
+  "The O(1) half of `ed-band-covers?`: `entry` was lexed from this very rope and its band
+contains the viewport."
+  (and entry
+    (= (:rope entry) (buffer-rope buf))
+    (<= (:blo entry) top)
+    (>= (:bhi entry) (math/min (buffer-line-count buf) (+ top vrows)))))
+
 (defn- ed-band-covers? (entry buf top vrows restart)
   "True if cached span `entry` still serves a pane showing `buf` at scroll `top` over
 `vrows` rows: its `[blo bhi)` line band contains the viewport (clamped to EOF, since the
@@ -512,11 +535,15 @@ markup is gone — serves those instead: absolute already, valid as long as the 
       static static
       (nil? fontify) nil
       else
-        (let (entry (get-in m [:span-cache (:path pane)])
-              restart (ed-mode-service buf :fontify-restart))
-          (if (ed-band-covers? entry buf top vrows restart)
+        (let (entry (get-in m [:span-cache (:path pane)]))
+          ;; the common frame — same rope, viewport inside the band — answers before the
+          ;; `:fontify-restart` lookup, which only the off-band-edit revalidation reads
+          (if (ed-band-hits? entry buf top vrows)
             (:spans entry)
-            (ed-window-spans buf fontify restart top (+ top vrows) (ed-fontify-clip pane)))))))
+            (let (restart (ed-mode-service buf :fontify-restart))
+              (if (ed-band-covers? entry buf top vrows restart)
+                (:spans entry)
+                (ed-window-spans buf fontify restart top (+ top vrows) (ed-fontify-clip pane)))))))))
 
 (sig ed-layout-now (model -> (or nil layout)))
 (defn ed-layout-now (m)
@@ -534,7 +561,6 @@ it has — without being handed the window size: the layout is recomputed over t
 both dimensions, so `ed-update` doesn't pay for two independent layout traversals."
   (let (panes (:panes (ed-body-layout m cols rows))
         sel (ed-selected-pane panes)
-        buf (ed-pane-buf m sel)
         buf (ed-pane-buf m sel))
     [(math/max 1 (ed-pane-vrows sel buf)) (ed-pane-text-cols sel buf)]))
 
@@ -550,7 +576,7 @@ both dimensions, so `ed-update` doesn't pay for two independent layout traversal
   "Everything a single line's gutter cell depends on BESIDES its line number. Two buffers
 producing equal keys produce equal cells for the same line: the number column is a function
 of `gw` / line-count / file-backing (a file buffer prepends the diff bar), and everything
-else the cell reads is the gutter CONTEXT `ctx` (`modes/gutter-ctx`) — the change-bar map
+else the cell reads is the gutter CONTEXT `ctx` (`gutter/gutter-ctx`) — the change-bar map
 and each margin mark's value paired with whether it is stale.
 
 `ctx`, not the buffer's ROPE. The rope was here because a mark dims once the text moves past
@@ -571,7 +597,7 @@ to EOF), as a vector in line order — the expensive per-line work the cache hol
 the cells its window shares with this one — a scroll recomputes only the lines that
 slid into view, not the whole column.
 
-`ctx` is the gutter context the cells read (`modes/gutter-ctx`), bound for the whole column
+`ctx` is the gutter context the cells read (`gutter/gutter-ctx`), bound for the whole column
 — the buffer's marks and change bars are a fact about the BUFFER, and asking them per line
 allocated a map and counted the buffer's lines some three hundred times per rebuild."
   (let (last-line (math/min (dec (buffer-line-count buf)) (dec (+ top vh)))
@@ -587,6 +613,11 @@ allocated a map and counted the buffer's lines some three hundred times per rebu
                 (nth ocells oi)
                 (cell buf line gw)))))))))
 
+(defn- ed-gutter-entry-serves? (entry key top vh)
+  "True if cached gutter `entry` still serves a pane: same content key (`ed-gutter-key`) and
+the same window `[top, top+vh)`."
+  (and entry (= (:key entry) key) (= (:top entry) top) (= (:vh entry) vh)))
+
 (defn ed-pane-gutter-cells (m pane buf top vh gw)
   "The gutter cells for `pane`'s viewport — from the model's `:gutter-cache` when its
 content key and window still match, else freshly computed (the cold/uncovered fallback;
@@ -596,13 +627,52 @@ mode offers none."
     (if (or (<= gw 0) (nil? cell))
       nil
       (let (entry (get-in m [:gutter-cache (:path pane)])
-            ctx (modes/gutter-ctx buf))
-        (if (and entry
-              (= (:top entry) top)
-              (= (:vh entry) vh)
-              (= (:key entry) (ed-gutter-key buf gw ctx)))
+            ctx (gutter/gutter-ctx buf))
+        (if (ed-gutter-entry-serves? entry (ed-gutter-key buf gw ctx) top vh)
           (:cells entry)
           (ed-gutter-cells buf cell top vh gw nil ctx))))))
+
+(defn- ed-refreshed-span-entry (old pane buf)
+  "`pane`'s `:span-cache` entry this frame: `old` while its band still covers the viewport
+(`ed-band-covers?`), else a freshly lexed band (`ed-band-for`) — nil when the buffer's mode
+does not fontify."
+  (let (fontify (ed-mode-service buf :fontify))
+    (when fontify
+      (let (top (ed-pane-top pane buf)
+            vrows (ed-pane-vrows pane buf))
+        ;; as `ed-pane-spans`: the unchanged band is recognised before the restart lookup
+        (if (ed-band-hits? old buf top vrows)
+          old
+          (let (restart (ed-mode-service buf :fontify-restart))
+            (if (ed-band-covers? old buf top vrows restart)
+              old
+              (ed-band-for buf fontify restart top vrows (ed-fontify-clip pane)))))))))
+
+(defn- ed-refreshed-gutter-entry (old pane buf)
+  "`pane`'s `:gutter-cache` entry this frame: `old` while it still serves the pane
+(`ed-gutter-entry-serves?`), else rebuilt — reusing `old`'s cells for the lines both windows
+show when only the window moved (`ed-gutter-cells`). Nil when the gutter is hidden or the
+mode offers none."
+  (let (cell (ed-mode-service buf :gutter-cell)
+        gw (ed-pane-gutter-width buf pane))
+    (when (and (> gw 0) cell)
+      (let (top (ed-pane-top pane buf)
+            vh (ed-pane-vrows pane buf)
+            ctx (gutter/gutter-ctx buf)
+            key (ed-gutter-key buf gw ctx))
+        (if (ed-gutter-entry-serves? old key top vh)
+          old
+          ;; content key matches but the window moved: shift — reuse the overlapping
+          ;; lines' cells, compute the rest
+          {:key key
+           :top top
+           :vh vh
+           :cells (ed-gutter-cells buf cell top vh gw (if (and old (= (:key old) key)) old nil) ctx)})))))
+
+(defn- ed-assoc-present (cache key entry)
+  "`cache` with `entry` stored under `key` — unless there is no entry, which is how a pane
+that no longer needs one drops out of the rebuilt cache."
+  (if (nil? entry) cache (assoc cache key entry)))
 
 (defn ed-refresh-spans (m cols rows)
   "Refresh the fontify `:span-cache` (and the `:gutter-cache`) for every visible pane —
@@ -618,63 +688,20 @@ fresh each call — reusing a still-valid entry from the old cache, and GC'ing p
 closed (a stale pane path never accumulates). Run by `input/ed-update` after each event so the
 pure `view` just reads the result; also caches the layout as `:_lc`."
   (let (layout (ed-body-layout m cols rows)
-        panes (:panes layout)
-        old (or (:span-cache m) {})
-        oldg (or (:gutter-cache m) {})
-        caches (fold panes
-                 [{} {}]
-                 (fn (acc pane)
-                   (let ([sc gc] acc
-                         key (:path pane)
-                         buf (ed-buf-at m (get-in pane [:payload :buffer]))
-                         fontify (ed-mode-service buf :fontify)
-                         sc2 (if (nil? fontify)
-                               sc
-                               (let (top (ed-pane-top pane buf)
-                                     vrows (ed-pane-vrows pane buf)
-                                     restart (ed-mode-service buf :fontify-restart)
-                                     entry (get old key))
-                                 (assoc sc
-                                   key
-                                     (if (ed-band-covers? entry buf top vrows restart)
-                                       entry
-                                       (ed-band-for buf
-                                         fontify
-                                         restart
-                                         top
-                                         vrows
-                                         (ed-fontify-clip pane))))))
-                         cell (ed-mode-service buf :gutter-cell)
-                         gw (ed-pane-gutter-width buf pane)
-                         gc2 (if (or (<= gw 0) (nil? cell))
-                               gc
-                               (let (top (ed-pane-top pane buf)
-                                     vh (ed-pane-vrows pane buf)
-                                     gctx (modes/gutter-ctx buf)
-                                     gkey (ed-gutter-key buf gw gctx)
-                                     gentry (get oldg key)
-                                     same? (and gentry (= (:key gentry) gkey)))
-                                 (assoc gc
-                                   key
-                                     (if (and same? (= (:top gentry) top) (= (:vh gentry) vh))
-                                       gentry
-                                       ;; content key matches but the window moved: shift —
-                                       ;; reuse the overlapping lines' cells, compute the rest
-                                       {:key gkey
-                                        :top top
-                                        :vh vh
-                                        :cells (ed-gutter-cells buf
-                                                 cell
-                                                 top
-                                                 vh
-                                                 gw
-                                                 (if same? gentry nil)
-                                                 gctx)})))))
-                     [sc2 gc2]))))
-    (assoc m
-      :span-cache (first caches)
-      :gutter-cache (second caches)
-      :_lc [cols rows layout])))
+        old-spans (or (:span-cache m) {})
+        old-gutters (or (:gutter-cache m) {})
+        [spans gutters] (fold (:panes layout)
+                          [{} {}]
+                          (fn ([spans gutters] pane)
+                            (let (path (:path pane)
+                                  buf (ed-buf-at m (get-in pane [:payload :buffer])))
+                              [(ed-assoc-present spans
+                                 path
+                                 (ed-refreshed-span-entry (get old-spans path) pane buf))
+                                (ed-assoc-present gutters
+                                  path
+                                  (ed-refreshed-gutter-entry (get old-gutters path) pane buf))]))))
+    (assoc m :span-cache spans :gutter-cache gutters :_lc [cols rows layout])))
 
 ;; ---- mouse: select / move-point / scrollbar / drag-resize -------------------
 
@@ -759,11 +786,11 @@ With no such service the click falls through to the old clamped point move."
         vcol (math/floor (/ (math/max 0 (- col px)) rw))
         gutter-line (when (and (> gw 0) (< vcol gw)) (ed-pane-line-at-clamped pane buf row))
         ;; A click on a MARKED line acts on the mark — resolved through the same table that
-        ;; painted it (`modes/gutter-click-for`), so the margin cannot show one thing and do
+        ;; painted it (`gutter/gutter-click-for`), so the margin cannot show one thing and do
         ;; another. A line with no mark, or a mark that claims no click, falls through to
         ;; the mode's `:gutter-click` below, which is how a click on bare margin SETS a
         ;; breakpoint rather than only clearing one.
-        mark-click (when gutter-line (modes/gutter-click-for buf gutter-line))
+        mark-click (when gutter-line (gutter/gutter-click-for buf gutter-line))
         ;; a click in the gutter columns routes to the mode's `:gutter-click`, but
         ;; ONLY when the mode defines one — otherwise it falls through to a normal
         ;; text click (a gutterless-service buffer must still select from column 0).
@@ -1052,78 +1079,95 @@ text under the pointer."
       at
       [(nth input 3) (nth input 4)])))
 
+(defn- ed-end-drags (m)
+  "The model with every editor drag over — divider, scrollbar and text selection."
+  (dissoc m :dragging :sb-drag :text-drag))
+
+(defn- ed-mouse-to-program (m action cols rows row col)
+  "The model after a terminal buffer's program took a mouse event (`m` is what
+`term/term-mouse` answered): a press into a program still selects its pane, and a release
+still ends the editor's own drags."
+  (case action
+    :press (ed-select-pane-at m cols rows row col)
+    :release (ed-end-drags m)
+    m))
+
+(defn- ed-expand-click (m clicks)
+  "A double / triple click (the trailing count, ADR-102) expands the selection to the word /
+line at point — but only for a text-area click, which is the one that armed `:text-drag`."
+  (if (and (:text-drag m) (>= clicks 2))
+    (ed-set-buf m
+      (let (buf (ed-current-buf m))
+        (if (>= clicks 3) (ed-select-line buf) (ed-select-word buf))))
+    m))
+
+(defn- ed-left-drag (m row col at)
+  "A left-button drag: scroll the grabbed scrollbar, extend the text selection, or resize the
+dragged divider."
+  (cond
+    (:sb-drag m) (ed-scrollbar-drag m row col)
+    (:text-drag m) (ed-text-drag m (first at) (second at))
+    else (ed-mouse-drag m row col)))
+
+(def- ed-wheel-directions
+  ;; a wheel event's action -> which way it turns: toward the top of the buffer is 1
+  {:scroll-up 1 :scroll-down -1})
+
+(defn- ed-wheel-zoom (m pane direction delta)
+  "Ctrl+wheel zooms the PANE under the pointer, a pixel per notch — this pane only; the
+window's font is untouched, so the grid never changes under the gesture and nothing else on
+screen moves. `appearance/zoom-step` accumulates the same float `delta` the scroll path reads
+and steps once a notch's worth has arrived. The delta is in LINE units: a notch is not one
+event and not one line — the runtime spreads it over a decaying stream summing to ~3 lines —
+so the conversion to pixels lives in `appearance`, which knows that ratio. An event with no
+delta (a terminal, an older test) is read as one whole notch. Deferred-loaded, the keymap
+idiom, so this core file does not link the preset registry. Shift is ignored: there is one
+zoom now."
+  (cond
+    (not (bound? 'appearance/zoom-step)) m
+    (nil? delta) ((reflect/eval 'appearance/zoom-notch) m pane direction)
+    :else ((reflect/eval 'appearance/zoom-step) m pane (* direction delta))))
+
+(defn- ed-wheel-scroll (m pane direction delta)
+  "A plain wheel scrolls the pane under the pointer. `delta` is the scroll in line units
+(float, from the Brood runtime) — a trackpad step, or one tick of a wheel notch's kinetic
+glide (the runtime turns a notch into an impulse that decays over ~half a second, so the
+wheel scrolls as smoothly as the trackpad). Any delta takes the smooth path: a whole line or
+more per tick (a spun wheel) advances `:top` and keeps the remainder. Absent (old tests /
+terminal) → the legacy `*wheel-lines*` snap."
+  (if (nil? delta)
+    (ed-scroll-pane m pane (if (> direction 0) (- *wheel-lines*) *wheel-lines*))
+    (ed-smooth-scroll-pane m pane (* (- direction) delta))))
+
 (defn ed-mouse (m input cols rows)
   "Fold a `[:mouse action button row col mods]` event into the model: left-press
 selects a pane and moves point to the click (starting a text selection), begins a divider
 drag, or grabs a scrollbar; `:drag` extends the text selection (`:text-drag`), resizes the
 dragged divider, or scrolls the grabbed scrollbar; `:release` ends any drag; **Ctrl+wheel
 zooms** and a **plain wheel scrolls** the pane
-**under the pointer** (`appearance/zoom-step` / `ed-scroll-pane`), never the active pane. Fields are read positionally (`nth`), not by a fixed-length vector
+**under the pointer** (`ed-wheel-zoom` / `ed-wheel-scroll`), never the active pane. Fields are read positionally (`nth`), not by a fixed-length vector
 pattern, so the trailing `mods` element (and any future addition) can't silently
 break the match. A wheel notch off every pane is ignored."
   (let (action (nth input 1)
-        button (nth input 2)
+        left? (= (nth input 2) :left)
         row (nth input 3)
         col (nth input 4)
         at (ed-mouse-at input)
-        mods (nth input 5 [])
         hovered (ed-pane-at m cols rows row col)
+        direction (get ed-wheel-directions action)
         ;; a terminal buffer's program may own the pointer (term/term-mouse decides — the
         ;; type check is inline so no other buffer loads term.blsp)
         programs (and hovered
                    (= (:type (ed-pane-buf m hovered)) :term)
                    (term/term-mouse m hovered input)))
     (cond
-      ;; a press into a program still selects its pane; a release still ends the editor's
-      ;; own drags
-      (and programs (= action :press)) (ed-select-pane-at programs cols rows row col)
-      (and programs (= action :release)) (dissoc programs :dragging :sb-drag :text-drag)
-      programs programs
-      ;; A left-press moves point (`ed-mouse-press`); a double/triple-click (the trailing
-      ;; count, ADR-102) then expands the selection to the word / line at point — but only
-      ;; for a text-area click, which is the one that armed `:text-drag`.
-      (and (= action :press) (= button :left))
-        (let (count (nth input 6 1)
-              pressed (ed-mouse-press m cols rows row col at))
-          (if (and (:text-drag pressed) (>= count 2))
-            (ed-set-buf pressed
-              (let (buf (ed-current-buf pressed))
-                (if (>= count 3) (ed-select-line buf) (ed-select-word buf))))
-            pressed))
-      (and (= action :drag) (= button :left))
-        (cond
-          (:sb-drag m) (ed-scrollbar-drag m row col)
-          (:text-drag m) (ed-text-drag m (first at) (second at))
-          else (ed-mouse-drag m row col))
-      (= action :release) (dissoc m :dragging :sb-drag :text-drag)
-      (nil? hovered) m
-      ;; Ctrl+wheel zooms the PANE under the pointer, a pixel per notch — this pane only;
-      ;; the window's font is untouched, so the grid never
-      ;; changes under the gesture and nothing else on screen moves. `appearance/zoom-step`
-      ;; accumulates the same float delta the scroll path below reads and steps once a
-      ;; notch's worth has arrived. Deferred-loaded, the keymap idiom, so this core file
-      ;; does not link the preset registry. Shift is ignored: there is one zoom now.
-      (and (or (= action :scroll-up) (= action :scroll-down)) (includes? mods :ctrl))
-      ;; The 7th element is the kinetic delta in LINE units. A notch is not one event and
-      ;; not one line — the runtime spreads it over a decaying stream summing to ~3 lines
-      ;; — so the conversion to pixels lives in `appearance`, which knows that ratio. An
-      ;; event with no delta (a terminal, an older test) is read as one whole notch.
-        (let (dy (nth input 6 nil)
-              dir (if (= action :scroll-up) 1 -1))
-          (cond
-            (not (bound? 'appearance/zoom-step)) m
-            (nil? dy) ((reflect/eval 'appearance/zoom-notch) m hovered dir)
-            :else ((reflect/eval 'appearance/zoom-step) m hovered (* dir dy))))
-      ;; 7th element: scroll delta in line units (float, from the Brood runtime) — a
-      ;; trackpad step, or one tick of a wheel notch's kinetic glide (the runtime turns a
-      ;; notch into an impulse that decays over ~half a second, so the wheel scrolls as
-      ;; smoothly as the trackpad). Any delta takes the smooth path: a whole line or more
-      ;; per tick (a spun wheel) advances `:top` and keeps the remainder. Absent (old
-      ;; tests / terminal) → legacy *wheel-lines* snap.
-      (or (= action :scroll-up) (= action :scroll-down))
-        (let (dy-raw (nth input 6 nil)
-              up? (= action :scroll-up))
-          (if (nil? dy-raw)
-            (ed-scroll-pane m hovered (if up? (- *wheel-lines*) *wheel-lines*))
-            (ed-smooth-scroll-pane m hovered (if up? (- dy-raw) dy-raw))))
-      else m)))
+      programs (ed-mouse-to-program programs action cols rows row col)
+      ;; a left-press moves point (`ed-mouse-press`), then a multi-click expands it
+      (and left? (= action :press))
+        (ed-expand-click (ed-mouse-press m cols rows row col at) (nth input 6 1))
+      (and left? (= action :drag)) (ed-left-drag m row col at)
+      (= action :release) (ed-end-drags m)
+      (or (nil? hovered) (nil? direction)) m
+      ;; the 7th element is the wheel's delta in line units
+      (includes? (nth input 5 []) :ctrl) (ed-wheel-zoom m hovered direction (nth input 6 nil))
+      else (ed-wheel-scroll m hovered direction (nth input 6 nil)))))

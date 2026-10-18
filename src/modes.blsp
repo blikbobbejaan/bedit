@@ -11,336 +11,24 @@ on, while a plain buffer stays in `text-mode`.
 explicit `:type`. Its keymap holds the editor's bindings — data, built with
 `keymap-bind` (which nests prefix sub-keymaps for chords like `C-x C-e`); command
 values are quoted, fully-qualified symbols resolved with `(reflect/eval sym)` at dispatch,
-so redefining a command or rebinding a key hot-swaps behaviour live."
+so redefining a command or rebinding a key hot-swaps behaviour live.
+
+This module is the mode INFRASTRUCTURE — text-mode, the shared `prog` base and the two
+registration helpers every language mode goes through (`register-language-mode`,
+`register-prog-mode`) — plus the generic read-only buffer modes (special, help, occur,
+dired, …). The languages live beside it: `brood-mode` (src/brood-mode.blsp), the other
+Lisps (src/lisp-modes.blsp), the tree-sitter and config-format modes
+(src/languages.blsp); the line-number gutter they all draw is `gutter`
+(src/gutter.blsp)."
   (:use editor/layers)
   (:use editor/keymap)
-  (:use editor/highlight) ; brood-mode's language services reuse the pure analysis here
-  ;; NB: `editor/treesit` is required below, never `:use`d — it shares names with `sexp`
-  ;; (`point-down`, `point-defun-start`, …) and two `:use`s of one name is a load error
-  ;; (E0099). Everything here calls it qualified, which only needs the module loaded.
-  (:use theme) ; face-gutter-line — the dim line-number colour (src/theme.blsp)
-  (:use sexp)) ; the CST queries the brood-mode indenter is computed over
-;; regex (file-type trigger), editor/highlight, editor/markdown, editor/dotenv,
-;; editor/dockerfile, editor/treesit (fontify services + structural motions),
-;; editor/buffer (line-count gutter) and model (ed-mode-service) are referenced qualified
-;; below — each `mod/name` auto-loads its module.
+  (:use theme)) ; *blue* — the welcome links (src/theme.blsp)
+;; regex (file-type trigger), editor/markdown, editor/highlight and model are referenced
+;; qualified below — each `mod/name` auto-loads its module.
 ;; The universal keybindings (the old `global` layer) moved to `keymaps` (src/keymaps.blsp):
 ;; they're now a keybinding *profile* on the MODEL scope, not a system layer pinned to
 ;; every buffer, so a second profile (vim) can replace them. This module keeps the
-;; per-buffer *mode* layers (text/brood/markdown/…) — language + mode-specific keys.
-
-;; ---- the line-number gutter, as a mode service -----------------------------
-;; A *gutter* is generic per-line margin content a layer contributes via two facets
-;; `ed-mode-service` looks up: `:gutter-width` (columns to reserve, given the buffer)
-;; and `:gutter-cell` (`[text face]` for a 0-based line, given the buffer + width).
-;; Both renderers consume it without naming "line numbers" — the view paints the cells
-;; left of the text (src/view.blsp), the web mirror materialises them into its snapshot
-;; (src/web.blsp). line-numbers is the first such gutter; a future diagnostics/git
-;; gutter is the same two functions registered on a layer. Lives on text-mode (the
-;; shared base), so plain *and* brood buffers get it (brood stacks text-mode beneath).
-
-(theme/defchrome gutter-face-line-number face-gutter-line) ; the dim line-number colour (theme)
-(def line-number-min-digits 3) ; reserve at least this many digit columns so the gutter
-; doesn't widen (and shift the text right) as a buffer grows
-; past 99 lines — Emacs's `display-line-numbers-width`. Three,
-; not four: four held a column for the 1000th line of a file
-; that has 200, and the reserve is paid on EVERY line of every
-; buffer. A file that does cross 999 widens once and stays.
-
-(def line-number-right-margin 3) ; blank columns between the line number and the text. THREE,
-; because the MIDDLE one is the margin mark's own column
-; (`gutter-annotate` draws a breakpoint ●, a test ✓/✗ or a
-; diagnostic ⚠ there, shaving it off the number chunk so the
-; numbers never move) and a mark wants a gap on BOTH sides.
-; At two it had the column against the text, so `defmodule`
-; read as `✗defmodule` — the glyph looked like the first
-; character of the line rather than a mark about it. At one
-; it lands flush against the digit instead — `9✓`. The
-; outer two are the gutter→text gap proper; the recessed
-; surface stops short of it (`*gutter-edit-margin*`) so it
-; reads light.
-
-(def line-number-bar-width 1) ; columns reserved for the diff-hl change bar (file buffers only)
-(sig line-number-width (buffer -> int))
-(defn line-number-width (buf)
-  "The `:gutter-width` for line numbers: the last line number's digit count (but at least
-`line-number-min-digits`, so the gutter stays put as the buffer crosses 99/999 lines) +
-`line-number-right-margin` blank columns of gutter→text gap, plus 1 more for the diff-hl
-change bar on a **file buffer**. The bar column is keyed on the buffer being file-backed —
-*not* on `:git-line-status` being populated yet — so the gutter width is stable from the
-moment the file opens: it doesn't narrow then re-widen when the async diff lands (or when a
-save drops the cached annotation)."
-  (+ (if (nil? (editor/buffer/buffer-file buf)) 0 modes/line-number-bar-width)
-    modes/line-number-right-margin ; gutter→text gap
-    (math/max modes/line-number-min-digits
-      (string/length (str (editor/buffer/buffer-line-count buf))))))
-
-;; ---- margin marks (breakpoints + test verdicts) ------------------------------
-;; Per-line marks other features annotate ONTO the buffer (the gitdiff trick — a
-;; gutter cell sees only the buffer, no model): `:debug-break-lines {line true}` from
-;; the margin-click breakpoint (debugger), `:test-marks {line passed?}` from a test
-;; run (testrun). Each carries the line count at annotation time and is drawn only
-;; while positionally current (`:git-status-lines`' discipline); a test verdict on a
-;; MODIFIED buffer dims — it predates your edit.
-
-(theme/defchrome gutter-face-breakpoint {:fg *red* :bold true})
-(theme/defchrome gutter-face-test-pass {:fg *green*})
-(theme/defchrome gutter-face-test-fail {:fg *red* :bold true})
-(theme/defchrome gutter-face-test-stale {:fg *overlay0*})
-(theme/defchrome gutter-face-warn {:fg *yellow*}) ; an advisory type warning (⚠)
-(theme/defchrome gutter-face-describe-mixed {:fg *yellow* :bold true}) ; some passed, some failed
-(theme/defchrome gutter-face-describe-partial {:fg *blue*}) ; only some of the block's tests ran
-(defn describe-rollup-mark (tally stale)
-  "The `[glyph face]` for a `(describe …)` rollup `tally` (`{:pass :fail :skip
-:total}`): ✓ when every test in the block ran and passed, `◐` on any failure, `◔`
-when only some of the block's tests ran (a line-filtered single-test run). `stale`
-dims all three."
-  (let (ran (+ (:pass tally) (:fail tally) (:skip tally))
-        total (:total tally))
-    (cond
-      (> (:fail tally) 0)
-        ["◐" (if stale modes/gutter-face-test-stale modes/gutter-face-describe-mixed)]
-      (and (> total 0) (< ran total))
-        ["◔" (if stale modes/gutter-face-test-stale modes/gutter-face-describe-partial)]
-      else ["✓" (if stale modes/gutter-face-test-stale modes/gutter-face-test-pass)])))
-
-(defn- mark-line-keyed (value line)
-  ;; `{:at <what the annotation holds for `line`>}`, or nil when it holds nothing there.
-  ;; WRAPPED, not returned bare: a failing test's verdict is `false`, which is a mark and
-  ;; not an absence — returning it raw made `✗` vanish from the margin. The currency and
-  ;; staleness that used to ride along come from the source's annotation, read once per
-  ;; buffer (`gutter-marks-ctx`) rather than once per line per source.
-  (when (contains? value line) {:at (get value line)}))
-
-(defn- mark-line-at (value line buf)
-  ;; The DEFAULT `:lookup` of a `gutter-mark-sources` row: the annotation is a
-  ;; `{line -> mark}` map and the line is the key. Four of the five sources are that, and
-  ;; spelling it out per row was four copies of the one line that must stay wrapped (see
-  ;; `mark-line-keyed`). A row only names a `:lookup` when it reads something else — the
-  ;; end-of-line note, which asks the BUFFER.
-  (mark-line-keyed value line))
-
-(defn- mark-eol-note (buf line)
-  ;; The eol-note anchored on `line` (notes are keyed by owner, with `:line` inside —
-  ;; a handful per buffer, so a scan is right). See `results/eol-notes`.
-  ;; A `:hint` note is skipped: it is a derived TYPE sitting at the code it describes, not a
-  ;; verdict about a line, and a `·` beside every typed form is margin noise. Of the rest —
-  ;; a line can carry more than one — the first in reading order glyphs the margin, which is
-  ;; all one cell can say.
-  (let (hit (first (seq/filter (results/notes-on-line buf line) (fn (n) (not (= (:kind n) :hint))))))
-    (when hit {:at hit})))
-
-(defn- mark-verdict-glyph (verdict stale)
-  ;; a test verdict: pass / fail / skipped, dimmed when it predates the text
-  (cond
-    (= verdict :skipped) ["·" modes/gutter-face-test-stale]
-    stale [(if verdict "✓" "✗") modes/gutter-face-test-stale]
-    verdict ["✓" modes/gutter-face-test-pass]
-    else ["✗" modes/gutter-face-test-fail]))
-
-(defn- mark-note-glyph (note stale)
-  ;; an eol note: a result ·, a pass ✓, a failure ✗, work in flight ⋯ — the glyph from
-  ;; `results/note-glyph`, which is where every renderer gets it. The ⋯ takes the
-  ;; dim face deliberately — grey reads as "pending", and it must NOT take the
-  ;; pass/fail colours, which would look like a verdict that has already landed.
-  (let (kind (if (:warn note) :warn (:kind note))
-        glyph (results/note-glyph note))
-    (cond
-      ;; a warning is about the code as WRITTEN, so an edit doesn't make it stale in the
-      ;; way a result is — it's recomputed on every launch
-      (= kind :warn) [glyph modes/gutter-face-warn]
-      (results/note-pending? kind) [glyph modes/gutter-face-test-stale]
-      ;; a form that cannot parse yet: the ✗ without the verdict colour
-      (= kind :broken) [glyph modes/gutter-face-test-stale]
-      stale [glyph modes/gutter-face-test-stale]
-      (= kind :pass) [glyph modes/gutter-face-test-pass]
-      (= kind :fail) [glyph modes/gutter-face-test-fail]
-      else [glyph modes/gutter-face-test-stale])))
-
-(defn- mark-diagnostic-glyph (ds stale)
-  ;; the checker's / the language server's findings on a line: ✗ for something that will
-  ;; not compile, ⚠ for an advisory. Worst-first, because one cell can only say one thing
-  ;; and an error outranks a warning about the same line.
-  (let (error? (any? ds results/diagnostic-error?))
-    (cond
-      stale [(if error? "✗" "⚠") modes/gutter-face-test-stale]
-      error? ["✗" modes/gutter-face-test-fail]
-      else ["⚠" modes/gutter-face-warn])))
-
-(def gutter-mark-sources
-  ;; The margin's sources in PRECEDENCE order. Each is
-  ;; `{:annotation :lookup :glyph :on-click}`: `:annotation` is the buffer annotation the
-  ;; source reads, `:lookup` answers `{:at <hit>}` for one line (`(value line buf)`, nil
-  ;; when that line has none — WRAPPED, since a hit can legitimately BE `false`: that is a
-  ;; FAILING test's verdict) and DEFAULTS to `mark-line-at`, the `{line -> mark}` read
-  ;; every source but the end-of-line note wants; `:glyph` turns it into `[text face]`,
-  ;; and `:on-click` is the
-  ;; command symbol a CLICK on that mark runs. Adding a source (an inline eval result, an
-  ;; LSP hint) is one row here, not another branch that re-implements the staleness dance.
-  ;;
-  ;; Naming the ANNOTATION rather than hiding it inside a reader is what lets the column be
-  ;; built with five annotation reads instead of five per line — see `gutter-marks-ctx`.
-  ;;
-  ;; The click lives beside the glyph deliberately: the margin shows one mark per line,
-  ;; and resolving the click through the same table is what makes pressing it do the thing
-  ;; you can see. A row with no `:on-click` leaves the click to the mode's own
-  ;; `:gutter-click` — as does a line with no mark at all, which is how a breakpoint gets
-  ;; SET on a bare line rather than only cleared from a marked one.
-  [{:annotation :debug-break-lines
-    :glyph (fn (_ _) ["●" modes/gutter-face-breakpoint])
-    :on-click nil}
-    ; brood-mode's `:gutter-click` toggles it — setting and clearing are one command
-    {:annotation :test-marks
-     :glyph (fn (verdict stale) (mark-verdict-glyph verdict stale))
-     :on-click nil}
-    {:annotation :describe-marks
-     :glyph (fn (tally stale) (describe-rollup-mark tally stale))
-     :on-click nil}
-    {:annotation :eol-notes
-     :lookup (fn (_ line buf) (mark-eol-note buf line))
-     :glyph (fn (note stale) (mark-note-glyph note stale))
-     :on-click nil}
-    ;; last: a line that already carries a verdict keeps it. A playground form that RAISED
-    ;; says ✗ about what it did, which outranks an advisory about what it might do.
-    {:annotation :diagnostic-lines
-     :glyph (fn (ds stale) (mark-diagnostic-glyph ds stale))
-     :on-click 'diagnostics/open-from-margin}])
-
-;; ---- the gutter context: the buffer's answers, read once per COLUMN --------
-;; `editor/buffer/annotation` allocates a `{:value :current? :stale?}` map and calls
-;; `buffer-line-count` on every call, and every mark source asked it PER LINE — as did the
-;; change bar. A 49-row gutter therefore did ~300 of each, per rebuild, and a rebuild was
-;; every keystroke: the cache key carried the live rope, because a mark dims once the text
-;; moves past it. Together that was ~2 ms of a 5.5 ms typing turn, spent asking the same six
-;; questions forty-nine times over.
-;;
-;; The answers are per BUFFER, not per line, so they are read once into a context and the
-;; per-line work becomes a map lookup. The context travels on a dynvar rather than through
-;; `:gutter-cell`'s arguments because the column is built through a MODE SERVICE, whose
-;; contract is `(buf line gw)` and is not this concern's to widen; each reader falls back to
-;; asking the buffer itself when no column is being built (a click, a test).
-;;
-;; It is also the cache KEY (`panes/ed-gutter-key`), which is the other half of the fix: a
-;; mark's staleness is a BOOLEAN that flips once, so keying on it rebuilds the column on the
-;; first keystroke after a test run and reuses it on every one after — where keying on the
-;; rope rebuilt on all of them.
-
-(defdyn *gutter-ctx* nil)
-;; The gutter context in force while a column is built — nil outside one.
-
-(defn gutter-ctx (buf)
-  "Everything a gutter cell reads about the BUFFER rather than about its line, read once:
-`:bars` — the diff-hl change-bar map, only while positionally current — and `:marks`, each
-`gutter-mark-sources` row's annotation as `{:value :stale?}` (nil where the source has
-nothing, or where lines have shifted and it would now point at the wrong ones)."
-  {:bars (editor/buffer/annotation-value buf :git-line-status)
-   :marks (into []
-            (map gutter-mark-sources
-              (fn (source)
-                (let (a (editor/buffer/annotation buf (:annotation source)))
-                  ;; An EMPTY annotation is recorded as absent, not as an empty-and-stale one.
-                  ;; It marks no line, so its staleness cannot change a single cell — but it
-                  ;; flips on every edit, and this context is the cache key, so leaving it in
-                  ;; rebuilt the whole column on every keystroke over a clean file. (A checker
-                  ;; that finds nothing still stamps `:diagnostic-lines {}`, which is exactly
-                  ;; the common case.)
-                  (when (and a (:current? a) (not (empty? (:value a))))
-                    {:value (:value a) :stale? (:stale? a)})))))})
-
-(defn gutter-bars (buf)
-  "The change-bar map for `buf` — from the column's context when one is in force."
-  (let (ctx *gutter-ctx*)
-    (if ctx (:bars ctx) (editor/buffer/annotation-value buf :git-line-status))))
-
-(defn- gutter-hit (buf line)
-  ;; `[source {:at :stale?}]` for the first source with something to say about `line`, or
-  ;; nil. Reads the column's context when one is in force, else builds one for this line —
-  ;; so a single-line caller (a click, a test) needs no ceremony.
-  (let (ctx (:marks (or *gutter-ctx* (gutter-ctx buf))))
-    (first (seq/keep (range (count gutter-mark-sources))
-             (fn (i)
-               (let (ann (nth ctx i))
-                 (when ann
-                   (let (source (nth gutter-mark-sources i)
-                         found ((:lookup source mark-line-at) (:value ann) line buf))
-                     (when found [source {:at (:at found) :stale? (:stale? ann)}])))))))))
-
-(defn gutter-mark-for (buf line)
-  "The `[glyph face]` margin mark for `line`, or nil: the first source in
-`gutter-mark-sources` that has something to say — a breakpoint ●, a per-test verdict
-✓/✗/·, a `(describe …)` rollup ✓/◐/◔, an end-of-line note's ·/✓/✗/⋯, or a diagnostic's
-⚠/✗.
-
-Every source is a buffer ANNOTATION (`std/editor/buffer`), so all of them share one
-discipline instead of five copies of it: a mark blanks entirely once lines have
-shifted (it would point at the wrong line) and DIMS while the text differs from what
-produced it (an edit dims a verdict; undoing back restores it). That is also why the
-model's diagnostics are stamped onto the buffer to get here — the gutter's cell cache is
-keyed on the buffer, so model state cannot reach it and would go stale unnoticed if it
-did."
-  (let (hit (gutter-hit buf line))
-    (when hit (let ([source found] hit) ((:glyph source) (:at found) (:stale? found))))))
-
-(defn gutter-click-for (buf line)
-  "The command symbol — `(m line) -> m` — that a margin click on `line` should run, or nil
-to leave the click to the mode's own `:gutter-click`.
-
-The mark you clicked decides, through the SAME table that painted it, so the margin cannot
-show one thing and do another. Only a marked line claims a click: an unmarked one still
-reaches the mode, which is what lets a click on empty margin set a breakpoint."
-  (let (hit (gutter-hit buf line))
-    (when hit (:on-click (first hit)))))
-
-(defn gutter-annotate (buf line cell)
-  "Overlay the line's margin mark (if any) on a gutter `cell` — the mark takes the MIDDLE
-of the gutter→text gap columns, so the numbers never move and the glyph keeps a blank on
-each side. `cell` is one `[text face]` chunk or a list of them; returns the same shape
-family (a chunk list when marked).
-
-The blank AFTER the mark is what stops it reading as the first character of the line:
-`✗defmodule` is a typo, `✗ defmodule` is a mark about a line."
-  (let (mark (gutter-mark-for buf line))
-    (if (nil? mark)
-      cell
-      (let (chunks (if (string? (first cell)) (list cell) cell)
-            lead (take chunks (dec (count chunks)))
-            [text face] (last chunks)
-            n (string/length text)
-            keep (math/max 0 (- n 2))
-            shaved (string/substring text 0 keep)
-            trail (string/substring text keep (math/max keep (dec n))))
-        (append lead (list [shaved face] mark [trail face]))))))
-
-(sig line-number-cell (buffer int int -> any))
-(defn line-number-cell (buf line gw)
-  "The `:gutter-cell` for 0-based `line`: its 1-based number right-aligned + a trailing
-space, in the dim line-number face. A **file buffer** prepends a coloured change bar chunk
-(diff-hl), and any margin mark (a breakpoint ●, a test ✓/✗ — `gutter-mark-for`) overlays
-the trailing gap column. Keyed on file-backing to match `line-number-width`, so the cell
-and the reserved width agree.
-
-The bar is drawn only while the cached `:git-line-status` annotation is **positionally
-current** (`annotation-value` — the line count still matches what it was computed for). The moment
-a line is inserted/deleted the cached line→status map is shifted, so every bar below the edit
-would land on the wrong line; we blank the bars until the idle recompute lands a fresh map
-(rather than draw them too high/low). A within-line edit keeps the line count, so its bars stay."
-  (gutter-annotate buf
-    line
-    (if (nil? (editor/buffer/buffer-file buf))
-      ;; number right-aligned in the digit columns, then `line-number-right-margin` trailing
-      ;; spaces (string/pad-right to the full width) — the gutter→text gap.
-      [(string/pad-right (string/pad-left (str (inc line)) (- gw modes/line-number-right-margin))
-         gw)
-        modes/gutter-face-line-number]
-      (let (bars (gutter-bars buf)
-            status (when bars (get bars line)))
-        ;; a file buffer's bar takes column 0; the number chunk fills the remaining `gw-1`,
-        ;; again with `line-number-right-margin` trailing spaces before the text.
-        (list (gitdiff/bar-chunk status)
-          [(string/pad-right (string/pad-left (str (inc line))
-                               (- gw modes/line-number-bar-width modes/line-number-right-margin))
-             (- gw modes/line-number-bar-width))
-            modes/gutter-face-line-number])))))
+;; per-buffer *mode* layers (text/markdown/special/…) — mode-specific keys.
 
 ;; text-mode is the visible default major: it names the mode for plain buffers (its
 ;; bindings are the global layer's) and carries the line-number gutter service. It's
@@ -349,8 +37,8 @@ would land on the wrong line; we blank the bars until the idle recompute lands a
   {:name 'text
    :doc "Ordinary text: the movement, editing and selection every buffer has."
    :keymap {}
-   :gutter-width 'modes/line-number-width
-   :gutter-cell 'modes/line-number-cell})
+   :gutter-width 'gutter/line-number-width
+   :gutter-cell 'gutter/line-number-cell})
 (register-type-layers :fundamental (list 'modes/text-mode-layer))
 
 ;; welcome-mode: the startup scratch (`main/*welcome*`). An ordinary EDITABLE text
@@ -391,80 +79,6 @@ or nil for a plain line."
 
 (register-type-layers :welcome (list 'modes/welcome-mode-layer 'modes/text-mode-layer))
 
-;; bshell-mode: the project shell + Brood REPL (`C-x p e`, see src/bshell.blsp), stacked
-;; on text-mode. RET runs the current input line; Tab completes (filenames for a command,
-;; Brood globals for a `(`-form — `bshell/bshell-complete-source`); `:fontify` colours the
-;; prompt + error lines. C-a/Home, C-b/Left and Backspace are wrapped so editing can't
-;; cross left of the prompt into the read-only prompt/output. Everything else (self-insert,
-;; other motion/kill) falls through to text-mode + the global profile.
-(def bshell-mode-layer
-  {:name 'bshell
-   :doc "A shell / REPL buffer: input at the prompt, history on the arrows."
-   :keymap (-> {}
-             (keymap-bind [:enter] 'bshell/cmd-bshell-send)
-             (keymap-bind [:tab] 'complete-at-point/cmd-complete)
-             (keymap-bind [:ctrl-a] 'bshell/cmd-bshell-beginning-of-input)
-             (keymap-bind [:home] 'bshell/cmd-bshell-beginning-of-input)
-             (keymap-bind [:ctrl-b] 'bshell/cmd-bshell-backward-char)
-             (keymap-bind [:left] 'bshell/cmd-bshell-backward-char)
-             (keymap-bind [:backspace] 'bshell/cmd-bshell-delete-backward)
-             ;; ↑/↓ (and C-p/C-n) recall command history, like the Brood REPL
-             (keymap-bind [:up] 'bshell/cmd-bshell-previous-history)
-             (keymap-bind [:ctrl-p] 'bshell/cmd-bshell-previous-history)
-             (keymap-bind [:down] 'bshell/cmd-bshell-next-history)
-             (keymap-bind [:ctrl-n] 'bshell/cmd-bshell-next-history)
-             ;; C-r searches command history (a filterable minibuffer list)
-             (keymap-bind [:ctrl-r] 'bshell/cmd-bshell-history-search)
-             ;; C-c C-c interrupts the running command (comint-interrupt-subjob)
-             (keymap-bind [:ctrl-c :ctrl-c] 'bshell/cmd-bshell-interrupt))
-   ;; Brood services scoped to the input form: syntax colours, bracket matching, eldoc hints
-   :fontify 'bshell/bshell-fontify
-   :bracket-match 'bshell/bshell-bracket-match
-   :eldoc 'bshell/bshell-eldoc
-   ;; after every key, keep point out of the read-only prompt (layers §7)
-   :post-key 'bshell/bshell-post-key
-   ;; killing the buffer stops the shell worker + its child (layers :on-close)
-   :hooks {:on-close '(bshell/bshell-on-close)}})
-(register-type-layers :bshell (list 'modes/bshell-mode-layer 'modes/text-mode-layer))
-
-;; term-mode: a full-screen program under a real terminal emulator (M-x term, M-x claude —
-;; src/term.blsp). Its keys never reach a keymap: `input/term-overlay` hands every key but
-;; C-x to the program, so the layer is the buffer's IDENTITY — no gutter (a terminal has
-;; none, and the vt is sized to the pane's full width), the one editor binding a terminal
-;; needs (C-y pastes, as in vterm — the program never wanted a ^Y), and the hook that stops the program with the buffer. Not stacked on text-mode.
-(def term-mode-layer
-  {:name 'term
-   :doc "A terminal: every key goes to the program; C-x is still yours, C-y pastes, C-x c is C-c. In line mode RET sends the line."
-   :keymap (-> {}
-             (keymap-bind [:ctrl-y] 'term/cmd-term-paste)
-             ;; the two modes (Emacs term: C-c C-j line, C-c C-k char); reachable from char
-             ;; mode as C-x c C-j, since C-c itself belongs to the program there
-             (keymap-bind [:ctrl-c :ctrl-j] 'term/cmd-term-line-mode)
-             (keymap-bind [:ctrl-c :ctrl-k] 'term/cmd-term-char-mode)
-             ;; LINE mode only (in char mode the overlay owns these keys before any keymap):
-             ;; RET sends the input region; the history and boundary keys are bshell's, over
-             ;; the same `:input-start` field
-             (keymap-bind [:enter] 'term/cmd-term-send-line)
-             (keymap-bind [:ctrl-a] 'bshell/cmd-bshell-beginning-of-input)
-             (keymap-bind [:home] 'bshell/cmd-bshell-beginning-of-input)
-             (keymap-bind [:ctrl-b] 'bshell/cmd-bshell-backward-char)
-             (keymap-bind [:left] 'bshell/cmd-bshell-backward-char)
-             (keymap-bind [:backspace] 'bshell/cmd-bshell-delete-backward)
-             (keymap-bind [:up] 'bshell/cmd-bshell-previous-history)
-             (keymap-bind [:ctrl-p] 'bshell/cmd-bshell-previous-history)
-             (keymap-bind [:down] 'bshell/cmd-bshell-next-history)
-             (keymap-bind [:ctrl-n] 'bshell/cmd-bshell-next-history)
-             (keymap-bind [:ctrl-r] 'bshell/cmd-bshell-history-search)
-             ;; the two keys kept from the program, sent as themselves
-             (keymap-bind [:ctrl-x :ctrl-x] 'term/cmd-term-send-literal)
-             (keymap-bind [:ctrl-x :ctrl-y] 'term/cmd-term-send-literal)
-             ;; the editor's C-c map, under a key the program does not own
-             (keymap-bind [:ctrl-x "c"] 'term/cmd-term-editor-c-c))
-   ;; line mode: point never enters the program's prompt (the shell's guard, same field)
-   :post-key 'bshell/bshell-post-key
-   :modeline 'term/term-modeline
-   :hooks {:on-close '(term/term-on-close)}})
-(register-type-layers :term (list 'modes/term-mode-layer))
 ;; `M-x claude` has no key of its own, so no keymap declares it; declare it here, like
 ;; markdown-preview, or the name would exist only once something else had loaded term
 (interactive/register-deferred 'term/cmd-claude)
@@ -480,6 +94,38 @@ text-mode]` (head = higher precedence) and route the layer's `:file-pattern` reg
 that type. The shared shape every fontify/structural language mode registers through —
 brood, markdown, env, docker, ruby, elixir; a future json-/python-mode is one more call."
   (modes-register-with-layers layer-ref type (list layer-ref 'modes/text-mode-layer)))
+
+;; ---- the special buffer TYPE: one feature layer over special-mode over text-mode ----
+;; Every generated report (*Debug*, *Run*, *Packages*, the BEAM views, dired, …) used to
+;; spell out the same stack by hand, and its layer's `:commands` repeated its keymap's
+;; command names by hand too. `:commands` is what M-x offers ONLY in that buffer (and
+;; subtracts from the global set — `model/ed-all-layer-commands`), so a hand list that
+;; drifted from the keymap silently moved commands in or out of M-x. Both are derived now.
+
+(defn layer-commands (keymap &optional (options {}))
+  "The M-x names a mode layer claims for `keymap` (its `:commands` facet): every command
+the keymap binds, named as M-x names it (`interactive/command-friendly-name` of the
+symbol's last segment, `dired/cmd-dired-up` → `\"dired-up\"`), sorted. `options` makes a
+deliberate difference explicit — `:extra`, names claimed though no key here runs them;
+`:except`, names bound here but left in the GLOBAL M-x set (a shared motion such as
+`next-line`, which claiming would hide from every other buffer).
+
+    (modes/layer-commands {\"g\" 'beam/cmd-beam-refresh})   → (\"beam-refresh\")"
+  (let ({:keys [extra except]} options
+        bound (map (or (editor/keymap/keymap-commands keymap) '())
+                (fn (sym)
+                  (interactive/command-friendly-name (last (string/split (->string sym) "/")))))
+        dropped (into #{} (or except '())))
+    (sort (seq/distinct (append (seq/reject bound (fn (nm) (contains? dropped nm))) (or extra '()))))))
+
+(defn register-special-type (type & layer-refs)
+  "Bind buffer `type` to `layer-refs` (highest precedence first) stacked over
+`special-mode-layer` (read-only, no gutter, `q` buries) over `text-mode-layer` (so motion
+still walks the rows) — the shape every generated report buffer has.
+
+    (register-special-type :run-log 'apprun/run-log-mode-layer 'results/location-jump-layer)"
+  (register-type-layers type
+    (append layer-refs (list 'modes/special-mode-layer 'modes/text-mode-layer))))
 
 ;; ---- the shared `prog` base: structural navigation every code mode inherits -----
 ;; The `C-M-f/b/u/d/a` motions are identical across languages — only the *parser* differs.
@@ -530,137 +176,6 @@ brood, markdown, env, docker, ruby, elixir; a future json-/python-mode is one mo
                 "forward-list" "backward-list" "up-list" "backward-up-list" "down-list"
                 "beginning-of-defun" "end-of-defun" "kill-sexp" "backward-kill-sexp" "indent-sexp")})
 
-(defmacro deflanguage (name spec)
-  "Declare a tree-sitter language mode from ONE spec, and register it.
-
-    (deflanguage elixir
-      {:lang :elixir
-       :pattern \"[.](ex|exs)$\"
-       :faces elixir-face-table
-       :indent elixir-indent-spec
-       :heredocs *elixir-heredocs*
-       :comment \"# \"})
-
-Every language used to spell out the same five definitions — a `-fontify`, a
-`-fontify-restart`, an `-indent`, a layer naming all three, and the registration — of
-which only the tables differed. Three copies is where a language quietly gets less than
-the others: the mode was the place a service could be forgotten, and a forgotten service
-is invisible until someone presses the key. Here a language supplies DATA and gets the
-whole service set, or fails at load saying which part is missing.
-
-The services are generated as named globals rather than closures because
-`model/ed-mode-service` resolves a service SYMBOL late (`reflect/eval`) — which is what
-lets a redefined fontify take effect on the next frame without reloading the mode. A
-closure in the layer would be resolved once and frozen.
-
-`:format` is the language's formatter as a command vector — `[\"mix\" \"format\"]`, to which
-the file path is appended. It becomes the `:format-command` service that `M-x
-format-buffer` and format-on-save consult, so neither names a language.
-
-`:heredocs` is optional and produces the `:fontify-restart` a windowed fontify uses;
-`:restart` names one directly when the rule is more than counting paired markers (Ruby
-must also notice `=begin`). A language with neither declines to restart, which is a fact
-about the language — `editor/treesit/language-contract` says which services are required
-and which are optional.
-
-The generated one is `<name>-heredoc-restart`, not `<name>-fontify-restart`: the obvious
-name is the one a language with a CUSTOM restart has already used, and generating it
-silently replaced Ruby's — which then answered \"restart anywhere\" and coloured the prose
-inside its `=begin` blocks as code. A generated definition must not be able to take a
-hand-written name."
-  (let (base (->string name)
-        fontify (symbol (str base "-fontify"))
-        restart (symbol (str base "-heredoc-restart"))
-        indent (symbol (str base "-indent"))
-        layer (symbol (str base "-mode-layer"))
-        fontify-ref (symbol (str "modes/" base "-fontify"))
-        restart-ref (symbol (str "modes/" base "-heredoc-restart"))
-        indent-ref (symbol (str "modes/" base "-indent"))
-        layer-ref (symbol (str "modes/" base "-mode-layer")))
-    `(do
-       (defn ~fontify (text)
-         (editor/treesit/fontify text (get ~spec :lang) (get ~spec :faces)))
-       (defn ~indent (text bol)
-         (editor/treesit/indent-column text (get ~spec :lang) bol (get ~spec :indent)))
-       (defn ~restart (src pos)
-         (let (hd (get ~spec :heredocs))
-           (if (nil? hd) pos (editor/treesit/column0-restart src pos hd))))
-       (def ~layer
-         (modes/language-layer '~name ~spec '~fontify-ref '~indent-ref '~restart-ref))
-       (register-prog-mode '~layer-ref (get ~spec :lang)))))
-
-(defn language-layer (name spec fontify-ref indent-ref restart-ref)
-  "The mode layer for a `deflanguage`, checked against `editor/treesit/language-contract`.
-
-Raises on an incomplete language rather than registering one. A mode missing `:indent`
-would register happily and simply do nothing on RET — a failure that surfaces as a key
-which feels broken, in one language, much later."
-  (let (layer {:name name
-               :parser :tree-sitter
-               :ts-lang (get spec :lang)
-               :file-pattern (get spec :pattern)
-               :fontify fontify-ref
-               :indent indent-ref
-               ;; `:restart` names its own when the rule is more than counting paired
-               ;; markers (Ruby must also see `=begin`); `:heredocs` gets the derived
-               ;; one; a language with neither declines, which is a fact about the
-               ;; language rather than a hole in the mode.
-               :fontify-restart (or (get spec :restart)
-                                  (when (get spec :heredocs) restart-ref))
-               :comment-syntax (get spec :comment)
-               ;; The language's own formatter, as `[prog arg …]` with the file appended
-               ;; — `mix format <file>`. A service like any other, so `M-x format-buffer`
-               ;; and format-on-save ask the BUFFER what formats it and never name a
-               ;; language. Absent for a language with no formatter, which is a fact
-               ;; about the language.
-               :format-command (get spec :format)}
-        gaps (editor/treesit/missing-services layer))
-    (when (not (empty? gaps))
-      (error "deflanguage " name ": missing required service(s) " (->string gaps)))
-    layer))
-
-(defmacro deflisp (name spec)
-  "Declare an s-expression language mode from ONE spec, and register it — the sibling of
-`deflanguage` for the OTHER parser family.
-
-    (deflisp elisp
-      {:pattern \"[.]el$\"
-       :specials elisp-special-forms
-       :comment \";; \"})
-
-A Lisp needs no grammar. `brood-mode` was never tree-sitter-backed: structural motion
-comes from `std/sexp`, which is delimiter matching and knows nothing of any dialect, and
-`editor/highlight` is a generic Lisp lexer — parens, `;` comments, `\"` strings, numbers —
-with exactly one dialect-specific decision, whether a head symbol is a special form. So a
-second Lisp is that set plus a file pattern.
-
-`commands/ed-structural` picks its backend by the presence of `:ts-lang`; a mode without
-one gets the sexp motions, which is why every `C-M-*` key works here without being
-mentioned.
-
-Indentation defaults to Brood's (`modes/brood-indent`): body +2, `let`-family bindings
-aligned. A dialect that indents differently supplies `:indent` — elisp does, because
-Emacs aligns a plain call's arguments under the first argument where Brood indents +2,
-and a config file is full of exactly that."
-  (let (base (->string name)
-        fontify (symbol (str base "-fontify"))
-        layer (symbol (str base "-mode-layer"))
-        fontify-ref (symbol (str "modes/" base "-fontify"))
-        layer-ref (symbol (str "modes/" base "-mode-layer")))
-    `(do
-       (defn ~fontify (text)
-         (editor/highlight/highlight-spans text (get ~spec :specials)))
-       (def ~layer
-         {:name '~name
-          :parser :sexp
-          :file-pattern (get ~spec :pattern)
-          :fontify '~fontify-ref
-          :fontify-restart 'editor/highlight/safe-restart
-          :bracket-match 'editor/highlight/bracket-match
-          :indent (get ~spec :indent 'modes/brood-indent)
-          :comment-syntax (get ~spec :comment)})
-       (register-prog-mode '~layer-ref (get ~spec :lang (keyword '~name))))))
-
 (defn register-prog-mode (layer-ref type)
   "Like `register-language-mode`, but for a **code** mode: it stacks the shared
 `prog-mode-layer` (the `C-M-*` structural motions) between the language layer and text-mode,
@@ -668,340 +183,6 @@ so every code language inherits the same navigation keys and overrides only its 
   (modes-register-with-layers layer-ref
     type
     (list layer-ref 'modes/prog-mode-layer 'modes/text-mode-layer)))
-
-;; ---- brood-mode: Brood (.blsp) source, stacked on prog + text-mode -----------------
-;; Structural s-expression navigation (`std/sexp`, via the `commands/cmd-*-sexp`
-;; wrappers) layered ON TOP of text-mode — so a `.blsp` buffer keeps every
-;; text-mode motion/edit binding and *gains* `C-M-f/b/u/d/a`. The trigger lives on
-;; the mode as a **regex** (`:file-pattern`), matched with `std/regex`; edit that
-;; one string to change which files get brood-mode.
-
-(def brood-keymap
-  ;; The structural motions/kills/marks come from the shared `prog-mode-layer`;
-  ;; brood-keymap adds only what is specific to Brood *source* — the paredit delimiter
-  ;; edits (incl. C-M-t transpose) and the sexp-aware C-k, all of which manipulate
-  ;; parentheses and so mean nothing over a tree-sitter tree.
-  (-> {}
-    ;; paredit-style structural editing. Chord encodings are best-guesses (the
-    ;; shifted-Ctrl ones especially — see ROADMAP "Loose ends"); all reachable via M-x
-    ;; (slurp-forward, …) and rebindable live. C-M-s for splice since M-s is the search
-    ;; prefix; M-r shadows move-to-window-line in .blsp, exactly as paredit-mode does.
-    (keymap-bind [(keyword "ctrl-)")] 'commands/cmd-slurp-forward) ; C-)
-    (keymap-bind [(keyword "ctrl-}")] 'commands/cmd-barf-forward) ; C-}
-    (keymap-bind [(keyword "ctrl-(")] 'commands/cmd-slurp-backward) ; C-(
-    (keymap-bind [(keyword "ctrl-{")] 'commands/cmd-barf-backward) ; C-{
-    (keymap-bind [:alt-r] 'commands/cmd-raise-sexp) ; M-r
-    (keymap-bind [(keyword "alt-(")] 'commands/cmd-wrap-round) ; M-(
-    (keymap-bind [:ctrl-meta-s] 'commands/cmd-splice-sexp) ; C-M-s
-    (keymap-bind [:ctrl-meta-t] 'commands/cmd-transpose-sexps) ; C-M-t
-    (keymap-bind [:ctrl-k] 'commands/cmd-sexp-kill) ; C-k (sexp-aware)
-    ;; A closer that is already there is stepped over rather than typed twice — Emacs's
-    ;; `electric-pair-mode` skip (`commands/cmd-close-delimiter`). Here rather than on
-    ;; `prog-structural-keymap` because the scan reads BROOD syntax: `;` starts a comment,
-    ;; which in Ruby is a statement separator.
-    (keymap-bind [")"] 'commands/cmd-close-delimiter)
-    (keymap-bind ["]"] 'commands/cmd-close-delimiter)
-    (keymap-bind ["}"] 'commands/cmd-close-delimiter)
-    ;; …and an opener wraps an active region, or (electric-pair-mode, default on) types
-    ;; its pair; a backspace between an empty pair takes both. `M-x electric-pair-mode`
-    ;; toggles the electric half — the region wrap has one meaning and is always on.
-    (keymap-bind ["("] 'commands/cmd-open-delimiter)
-    (keymap-bind ["["] 'commands/cmd-open-delimiter)
-    (keymap-bind ["{"] 'commands/cmd-open-delimiter)
-    ;; `"` is a self-closing pair: it opens a string and lands you inside, and typed at a
-    ;; closing `"` steps over it. (`'` is NOT bound — it is Brood's quote operator.)
-    (keymap-bind ["\""] 'commands/cmd-open-delimiter)
-    (keymap-bind [:backspace] 'commands/cmd-electric-backspace)))
-;; ---- brood-mode language services -------------------------------------------
-;; The four facets `ed-mode-service` (src/model.blsp) looks up. Each is a thin
-;; adapter over `std/highlight.blsp`'s pure analysis (the REPL's editor uses the
-;; same module) plus the live image — so the editor's view/completion gain
-;; highlighting, bracket-matching, eldoc, and symbol completion for `.blsp` buffers
-;; without the generic view ever naming Brood. A future json-/python-mode registers
-;; the same facets with its own functions.
-
-(defn- brood-arglist-of (callee)
-  "The arglist of the function/macro named by string `callee`, resolved in the live
-image, or nil if it isn't a bound symbol. (Mirrors `lineedit-arglist-of`.)"
-  ;; `callee` is a token at point, not necessarily readable or a function — no arglist is the answer
-  (check-allow :discarded-catch
-    (try
-      (let (sym (reflect/read-string callee))
-        (if (and (symbol? sym) (bound? sym)) (arglist (reflect/eval sym)) nil))
-      (catch e nil))))
-
-(defn- brood-doc-block (name)
-  ;; `name`'s documentation as pane lines — its arglist, its checker signature, its
-  ;; docstring — or nil when nothing is bound under it. `doc`/`arglist` take the function
-  ;; VALUE, so the symbol is resolved in the live image first, exactly as the eldoc service
-  ;; does; anything unbound (a local, a typo, a name this session has not defined yet)
-  ;; answers nil rather than an empty heading.
-  ;; `name` is a token at point: unreadable, unbound, or a value with no arglist/doc/sig — each nil is an answer
-  (check-allow :discarded-catch
-    (try
-      (let (sym (reflect/read-string name))
-        (when (and (symbol? sym) (bound? sym))
-          (let (v (reflect/eval sym)
-                args (check-allow :discarded-catch (try (arglist v) (catch _ nil)))
-                text (check-allow :discarded-catch (try (doc v) (catch _ nil)))
-                sig (check-allow :discarded-catch (try (reflect/type-signature sym) (catch _ nil))))
-            (append (list (if (nil? args)
-                            name
-                            (str "("
-                              name
-                              (if (empty? args) "" (str " " (string/join (map args str) " ")))
-                              ")")))
-              (if (nil? sig) '() (list (str "  : " sig)))
-              (if (nil? text) '() (cons "" (string/split text "\n")))))))
-      (catch _ nil))))
-
-(defn brood-doc-at (text pos)
-  "The brood-mode `:doc-at` service: what the cursor is pointing at, as pane lines — the
-symbol under it, else the head of the call it is inside, with that name's arglist, checker
-signature and docstring. Nil when neither names anything bound.
-
-Falling back to the enclosing call is what makes it useful without aiming: a cursor resting
-anywhere in `(map xs f)` documents `map`, which is what you wanted to know from the position
-you were already in. The symbol under the cursor wins, so pointing AT `f` documents `f`.
-
-One step further out when the enclosing form is not a call — `(map [1 2 |3] f)` is inside a
-vector whose head is `1`, and answering nothing there would make the middle of a literal a
-dead spot in an otherwise live pane."
-  (let (call-doc (fn (at)
-                   (when (>= at 0)
-                     (let (c (enclosing-call text at)) (when c (brood-doc-block (first c)))))))
-    (or (let (here (symbol-at text pos)) (when here (brood-doc-block (second here))))
-      (call-doc pos)
-      (call-doc (enclosing-open text pos)))))
-
-(defn brood-eldoc (text pos)
-  "The brood-mode `:eldoc` service: a `\"(callee arg…)\"` signature string for the call
-enclosing offset `pos` in `text` (`enclosing-call` + the live arglist), or nil when
-the cursor isn't in a call whose head is a bound function/macro."
-  (let (call (enclosing-call text pos))
-    (if (nil? call)
-      nil
-      (let ([callee argi] call
-            args (brood-arglist-of callee))
-        (if (nil? args)
-          nil
-          (str "(" callee (if (empty? args) "" (str " " (string/join (map args str) " "))) ")"))))))
-
-(defn brood-complete-at (text pos)
-  "The brood-mode `:complete-at` service: `[start prefix candidates]` for offset `pos`
-— the symbol prefix at point (`symbol-prefix-at`) and the live global names that
-start with it (the same source as the REPL's Tab completion). `complete` adapts this
-pure `(text pos)` service into one source and merges it with the buffer-word source."
-  (let ([start prefix] (symbol-prefix-at text pos))
-    [start
-      prefix
-      (if (= prefix "")
-        '()
-        (sort (seq/filter (map (reflect/global-names) str) (fn (s) (string/starts-with? s prefix)))))]))
-
-;; ---- brood-mode indentation (the :indent service) ---------------------------
-;; Indentation that matches `nest format` (the canonical Brood style, std/format),
-;; computed purely over the CST (`std/sexp`). The rule the formatter uses: a broken
-;; form's body indents **+2** from its open delimiter — for BOTH calls and special
-;; forms (a form's header count only changes which args ride the head line, never
-;; the body column). The two exceptions align under the first element instead:
-;; **maps** and the **bindings list** of a let-family form (`let`/`let*`/`binding`/…).
-
-(def- brood-pair-binding-heads
-  ;; let-family heads whose first argument (the bindings list) aligns its pairs
-  ;; under the opening element — mirrors std/format's `*format-pair-bindings*`.
-  (list "let" "let*" "letrec" "binding" "dotimes" "dolist" "loop"))
-
-;; check-allow: a CST node's `:start`/`:end` are declared optional on the record, but a node
-;; that reached here came from a match on the tree, where both are set
-(check-allow :type-mismatch
-  (defn- brood-head-text (text node)
-    "The source spelling of CST `node` in `text` — a list's head."
-    (string/substring text (:start node) (:end node))))
-
-(defn- brood-binding-list? (text tr enc)
-  "True if `enc` is the bindings list of a let-family form: its parent's head is a
-pair-binding form and `enc` is that parent's first argument."
-  (let (parent (enclosing tr (:start enc)))
-    (and (not (= parent enc))
-      (= (:kind parent) :list)
-      (let (pk (forms-of parent))
-        (and (>= (count pk) 2)
-          (includes? brood-pair-binding-heads (brood-head-text text (first pk)))
-          (= (:start (second pk)) (:start enc)))))))
-
-(sig brood-first-elem-col (string any int -> int))
-(defn- brood-first-elem-col (text enc opencol)
-  "The column to align `enc`'s contents under — its first element's column, or
-`opencol + 1` when it's empty."
-  (let (kids (forms-of enc))
-    (if (empty? kids) (+ opencol 1) (model/ed-column-at text (:start (first kids))))))
-
-(defn- brood-label? (text node)
-  "True when CST `node` is a label — a bare symbol ending in `:` (`next:`), the
-convention `std/format`'s `label-node?` lays an asm listing out by."
-  (and (= (:kind node) :symbol)
-    (let (t (brood-head-text text node))
-      (and (> (string/length t) 1) (string/ends-with? t ":")))))
-
-(defn- brood-labelled? (text enc)
-  "True when list `enc`'s body (its forms after the head) holds a label."
-  (and (= (:kind enc) :list) (any? (rest (forms-of enc)) (fn (k) (brood-label? text k)))))
-
-(defn- brood-skip-indent (text j n)
-  "The first non-blank offset at or after `j` in `text` (`n` its length)."
-  (if (and (< j n) (includes? " \t" (string/char-at text j))) (brood-skip-indent text (inc j) n) j))
-(sig brood-skip-indent (string int int -> int))
-
-(defn- brood-token-end (text j n)
-  "The offset just past the token starting at `j`: up to whitespace or a bracket."
-  (if (and (< j n) (not (includes? " \t\n()[]{}" (string/char-at text j))))
-    (brood-token-end text (inc j) n)
-    j))
-(sig brood-token-end (string int int -> int))
-
-(defn- brood-label-line? (text bol)
-  "True when the line at `bol` begins (after indentation) with a label token."
-  (let (n (string/length text)
-        i (brood-skip-indent text bol n)
-        e (brood-token-end text i n))
-    (and (> e (inc i)) (= (string/char-at text (dec e)) ":"))))
-
-(sig brood-indent (string int -> int))
-(defn brood-indent (text bol)
-  "The brood-mode `:indent` service: the indent column for the line starting at
-offset `bol`, matching `nest format`. Top level → 0; a **map** or a **let-family
-bindings list** aligns its contents under the first element; every other form
-indents its body **+2** from the open delimiter. (Multi-line strings aren't
-special-cased.)"
-  ;; Parse only [defun-start, bol): the indent column depends solely on what's open
-  ;; BEFORE the line, so the CST never needs the buffer past it — O(enclosing defun),
-  ;; not O(buffer) (a full-buffer `tree` made every RET on a large file a ~14ms pause).
-  ;; `scan-form-start` (the native string/comment-aware beginning-of-defun behind
-  ;; `sexp/narrow` and `highlight/safe-restart`) finds the window start. It is
-  ;; depth-tracked, so the start may be an INDENTED top-level open (a form inside a
-  ;; tutorial box margin, a mis-indented file) — back the slice up to that line's
-  ;; start so columns inside the slice equal columns in `text`.
-  ;; The slice ends at `bol`, so the enclosing form is typically unclosed and its
-  ;; CST node runs to the slice end — a strict `enclosing` at the end would miss it
-  ;; and return root; probe just inside instead (the char there is `bol`'s newline,
-  ;; inside the same open forms).
-  ;; The slice runs to the END of the enclosing top-level form (`scan-form-end`), not
-  ;; just to `bol`: a labelled body (`asm` listings, see std/format's `label-node?`)
-  ;; is one whose items include a label ANYWHERE, so the rule needs the whole form —
-  ;; still O(enclosing defun), never O(buffer).
-  (let (fstart (reflect/scan-form-start text bol) ; clamps internally; 0 on an empty text
-        start (model/ed-line-start-offset text fstart)
-        n (- bol start))
-    (if (<= n 0)
-      0 ; bol at a top-level form start (or an empty buffer) — top level
-      ;; an UNCLOSED form (a `)` deleted above) ends at the buffer's end, so the slice is
-      ;; capped a few thousand chars past the line — a label further away than that is
-      ;; not seen (plain +2 there), and no keystroke parses the whole buffer
-      (let (fend (math/min (math/max bol (reflect/scan-form-end text fstart 1)) (+ bol 4000))
-            sub (string/substring text start fend)
-            tr (tree sub)
-            enc (enclosing tr (dec n))
-            kind (:kind enc))
-        (if (= kind :root)
-          0
-          (let (opencol (model/ed-column-at sub (:start enc)))
-            (cond
-              (or (= kind :map) (brood-binding-list? sub tr enc))
-                (brood-first-elem-col sub enc opencol)
-              ;; a labelled body: labels at +2, everything else at +4 — the line being
-              ;; indented is a label when its first token ends in `:`
-              (brood-labelled? sub enc)
-                (if (brood-label-line? text bol) (+ opencol 2) (+ opencol 4))
-              else (+ opencol 2))))))))
-
-(defn brood-diagnostics (text)
-  "The brood-mode `:diagnostics` service: the advisory type-checker's warnings for
-buffer `text`, each `{:line :col :message}` (1-based positions), via the in-process
-`check-string-structured` (same image — no LSP wire needed for Brood). `()` while the
-buffer doesn't parse, so a live recheck never errors mid-edit."
-  (or (reflect/check-string-structured text) '()))
-
-(def brood-mode-layer
-  {:name 'brood
-   :doc "Brood source: sexp motion, eval (C-x C-e), the checker and its gutter marks."
-   :parser :brood
-   ;; diagnostics run in the sandbox child, rooted in the buffer's project (model/ed-launch-diag)
-   :check-remote true
-   :file-pattern "\\.blsp$"
-   :keymap modes/brood-keymap
-   :commands '("mark-sexp" "slurp-forward"
-                "barf-forward" "slurp-backward" "barf-backward" "raise-sexp" "splice-sexp"
-                "wrap-round" "transpose-sexps" "sexp-kill" "eval-last-sexp" "eval-region"
-                "eval-buffer")
-   :fontify 'editor/highlight/highlight-spans
-   :fontify-restart 'editor/highlight/safe-restart
-   :bracket-match 'editor/highlight/bracket-match
-   :eldoc 'modes/brood-eldoc
-   :doc-at 'modes/brood-doc-at
-   :complete-at 'modes/brood-complete-at
-   :indent 'modes/brood-indent
-   :diagnostics 'modes/brood-diagnostics
-   ;; margin click = breakpoint toggle on the clicked definition (debugger is
-   ;; deferred; the service symbol resolves on first use, like every service)
-   :gutter-click 'debugger/brood-gutter-click
-   :comment-syntax ";; "})
-
-;; .blsp files → the :brood type; :brood stacks brood-mode over text-mode (head =
-;; higher precedence), and the file trigger is the mode's own :file-pattern regex.
-(register-prog-mode 'modes/brood-mode-layer :brood)
-
-;; ---- wos-mode: wos kernel source (.wos), stacked on prog + text-mode --------
-;;
-;; `.wos` files are the kernel language of `broodlang/wos` — s-expressions read by
-;; Brood's reader and compiled by a different compiler into machine code (wos
-;; D-032: same reader, different semantics).
-;;
-;; That split is exactly the split between what this mode keeps and what it drops.
-;; The STRUCTURAL half of brood-mode is right here, because the structure IS
-;; Brood's: paredit, sexp motion, bracket matching, indentation, `;;` comments.
-;; The SEMANTIC half is wrong, because the semantics are not: `var`, `loop` and
-;; `out8` are not Brood functions, so eldoc, doc-at, completion and the checker
-;; would each answer confidently about a language this buffer is not written in —
-;; and `eval-last-sexp` would evaluate kernel source as a Brood expression.
-;;
-;; So: no `:eldoc`, `:doc-at`, `:complete-at`, `:diagnostics`, `:check-remote` or
-;; `:gutter-click`, and no `eval-*` in `:commands`. A mode that answers nothing is
-;; better than one that answers about the wrong language.
-
-;; The heads that colour as keywords in a `.wos` buffer: wos's statements and
-;; expression forms, not Brood's special forms. `highlight-spans` takes the set as
-;; an argument precisely so another dialect can be taught to colour without
-;; another highlighter — this is that, and all of it.
-;; (Plain `def` takes no docstring, so this is a comment.)
-(def wos-specials
-  (fold ["program"
-          "var" "set" "loop" "break" "when-zero" "out8" "halt" "data" "const" "addr" "load8" "asciz"
-          "ascii" "align" "space"]
-    {}
-    (fn (acc name) (assoc acc name true))))
-
-(defn wos-fontify (text)
-  "wos-mode's `:fontify` — the shared lexer with wos's keyword set."
-  (editor/highlight/highlight-spans text wos-specials))
-
-(def wos-mode-layer
-  {:name 'wos
-   ;; the s-expression parser, which is the half that IS shared
-   :parser :brood
-   :file-pattern "\\.wos$"
-   :keymap modes/brood-keymap
-   ;; the structural edits, and nothing that evaluates
-   :commands '("mark-sexp" "slurp-forward"
-                "barf-forward" "slurp-backward" "barf-backward" "raise-sexp" "splice-sexp"
-                "wrap-round" "transpose-sexps" "sexp-kill")
-   :fontify 'modes/wos-fontify
-   :fontify-restart 'editor/highlight/safe-restart
-   :bracket-match 'editor/highlight/bracket-match
-   :indent 'modes/brood-indent
-   :comment-syntax ";; "})
-
-(register-prog-mode 'modes/wos-mode-layer :wos)
 
 ;; ---- markdown-mode: Markdown (.md) source, stacked on text-mode -------------
 ;; The second language mode, and the proof the editor is language-agnostic: a `.md`
@@ -1042,7 +223,7 @@ buffer doesn't parse, so a live recheck never errors mid-edit."
 (interactive/register-deferred 'mdpreview/cmd-markdown-preview)
 ;; `$` lives in a MODE keymap, and only the PROFILE keymaps are harvested for M-x
 ;; (`keymaps`), so `M-x git-process` would not exist until something had loaded git
-(interactive/register-deferred 'git/cmd-git-process)
+(interactive/register-deferred 'gitcore/cmd-git-process)
 ;; and the git commands a Magit user reaches for by NAME from any buffer: making a repo,
 ;; cloning one, and the views that have no global key
 (interactive/register-deferred 'git/cmd-git-init)
@@ -1064,554 +245,7 @@ buffer doesn't parse, so a live recheck never errors mid-edit."
 ;; its faces served from the buffer's `:face-spans` data rather than a `:fontify` lexer.
 (def markdown-preview-layer {:name 'markdown-preview :no-line-numbers true})
 
-(register-type-layers :markdown-preview
-  (list 'modes/markdown-preview-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; ---- env-mode / docker-mode: more fontify-only language layers --------------
-;; Two more language modes built the same way as markdown-mode — a layer whose only
-;; service is a `:fontify` span fn from a pure std module (editor/dotenv, editor/
-;; dockerfile). `.env` files and Dockerfiles keep every text-mode binding and gain
-;; syntax colouring. The `:file-pattern` is matched against the file's basename, so a
-;; bare `Dockerfile` / `.env` (no extension) triggers; both restart at the viewport's own
-;; line (`editor/highlight/line-restart`: line-oriented, no cross-line lexer state, so the
-;; 200-line backscan above the band is never lexed).
-
-(def env-mode-layer
-  {:name 'env
-   ;; .env and its variants (.env.local, .env.production, …); the leading-dot name
-   ;; carries no extension, so anchor on `.env` with an optional `.suffix`.
-   :file-pattern "(^|/)\\.env(\\.[^/]+)?$"
-   :fontify 'editor/dotenv/env-spans
-   :fontify-restart 'editor/highlight/line-restart})
-
-(register-language-mode 'modes/env-mode-layer :env)
-
-;; ---- shell-mode: sh / bash / zsh scripts -----------------------------------------
-;; `std/editor/shell` lexes per line (comments, strings, `$` expansions, keywords,
-;; builtins, function names). A script is recognised by its extension or its name
-;; (`.sh`, `.bashrc`, …) OR by its `#!` line (`register-interpreter-type`, the Emacs
-;; `interpreter-mode-alist`) — so `run`, `deploy`, `configure` with `#!/usr/bin/env bash`
-;; on top get the mode with no extension at all.
-
-(def shell-mode-layer
-  {:name 'shell
-   :file-pattern "[.](sh|bash|zsh|ksh|dash)$|(^|/)[.]?(bashrc|bash_profile|bash_aliases|bash_login|bash_logout|zshrc|zshenv|zprofile|zlogin|profile|xprofile|xinitrc)$|(^|/)PKGBUILD$"
-   :fontify 'editor/shell/shell-spans
-   :fontify-restart 'editor/highlight/line-restart
-   :comment "# "})
-
-(register-language-mode 'modes/shell-mode-layer :shell)
-(doseq (i ["sh" "bash" "zsh" "ksh" "dash" "ash" "busybox"])
-  (register-interpreter-type i :shell))
-
-(def docker-mode-layer
-  {:name 'docker
-   ;; `Dockerfile`, `Dockerfile.dev`, `*.dockerfile`, and Podman's `Containerfile`.
-   :file-pattern "(^|/)(Dockerfile|Containerfile)([.][^/]+)?$|[.]dockerfile$"
-   :fontify 'editor/dockerfile/dockerfile-spans
-   :fontify-restart 'editor/highlight/line-restart})
-
-(register-language-mode 'modes/docker-mode-layer :docker)
-
-;; ---- grammars the runtime was not built with --------------------------------
-;; `%tree-sitter-load-grammar` is the mechanism; WHERE grammars live is policy, and this is
-;; the policy: `~/.config/bedit/grammars/libtree-sitter-<lang>.so`. Drop one there and its
-;; mode below works with no rebuild of the editor or the runtime — which is the whole point
-;; of loading at runtime, and the difference between adding a language and shipping one.
-;;
-;; Tried once per language at load time, and silent when the file is absent: a language whose
-;; grammar IS built in needs nothing here, and a missing grammar is not an error — its mode
-;; simply has no parser, and `tree-sitter-parse` says so if a buffer of that type is opened.
-;; A grammar that is present but broken is worth a line in *Messages*, since the user put it
-;; there on purpose.
-
-(defn ts-grammar-path (lang)
-  "Where a runtime-loaded grammar for `lang` lives: `<config>/grammars/libtree-sitter-<lang>.so`."
-  (path/join (config/config-dir) "grammars" (str "libtree-sitter-" (->string lang) ".so")))
-
-(defn ts-load-grammar (lang)
-  "Load `lang`'s grammar from the user's grammar directory if it is there; nil otherwise.
-Returns its ABI version on success."
-  (let (p (ts-grammar-path lang))
-    (when (file/exists? p)
-      (check-allow :discarded-catch
-        (try
-          (%tree-sitter-load-grammar p lang)
-          (catch e (do (log/warn (str "modes: " p ": " (error-message e))) nil)))))))
-
-(defn ts-grammar-dir () (path/join (config/config-dir) "grammars"))
-
-(defn load-user-grammars ()
-  "Load every grammar in the user's grammar directory — `libtree-sitter-<lang>.so` registers
-under `<lang>`. Returns the languages loaded.
-
-**Called from startup, never at module load time.** A grammar registers in the RUNTIME (it is
-a dlopen and a pointer in a Rust table), and a module's top-level forms do not necessarily run
-when the program does: materialise an image and the bindings are restored while the side
-effects that produced them are not. A `(ts-load-grammar :python)` beside the mode definition
-therefore worked in a bare run and left `tree-sitter-parse` reporting no grammar under an
-image — silently, since a mode with no parser simply does not colour. Anything that reaches
-outside the image belongs on the startup path, where it runs every launch.
-
-Scanning the directory rather than consulting a list is what makes adding a language one
-edit: drop the library in, add the mode's three definitions, and nothing has to name it
-twice."
-  (let (dir (ts-grammar-dir))
-    (if (not (file/dir? dir))
-      '()
-      (seq/keep (or (file/list-files dir) '())
-        (fn (name)
-          (when (and (string/starts-with? name "libtree-sitter-") (string/ends-with? name ".so"))
-            (let (lang (keyword (string/substring name
-                                  (string/length "libtree-sitter-")
-                                  (- (string/length name) (string/length ".so")))))
-              (when (ts-load-grammar lang) lang))))))))
-
-;; ---- ruby-mode / elixir-mode: tree-sitter-backed language modes -------------
-;; The first modes whose parser is NOT Brood's reader: a `.rb`/`.ex` buffer gets
-;; syntax colouring AND structural navigation from a tree-sitter grammar
-;; (`tree-sitter-parse`), via `std/editor/treesit` — the foreign-language analogue
-;; of brood-mode's `highlight`+`sexp`. The proof of ROADMAP §C: because the
-;; builtin yields the SAME positioned-node shape Brood's reader does, the editor's
-;; `:fontify` service and the `C-M-f/b/u/d/a` structural commands run over a Ruby
-;; or Elixir tree unchanged — the modes are pure data (a face table + a `:ts-lang`
-;; + a layer), and now an indent spec: `editor/treesit/indent-column` walks the tree and each
-;; language names the node kinds that open a level (`modes/elixir-indent-spec`).
-;;
-;; `:fontify-restart` says where the windowed lead-in may be CUT. Without one the mode
-;; parses the whole lead-in every keystroke — 245 lines for a 44-row viewport, five times
-;; what is on screen, and 18 ms of a 25 ms keystroke on a 10k-line file. Elixir has one
-;; (`editor/treesit/column0-restart`, guarded on heredoc parity — see there); Ruby does NOT,
-;; deliberately: its heredoc terminator is arbitrary text (`<<~EOS`), so there is no paired
-;; marker to count and no way to tell a column-0 line inside one from a real top-level form.
-;; Guessing there would colour prose as code; Ruby keeps the lead-in until its own guard
-;; exists.
-
-;; (The `C-M-*` structural motions come from the shared `prog-mode-layer` above — ruby and
-;; elixir stack it via `register-prog-mode`, and the commands dispatch on `:ts-lang`.)
-
-;; Per-language kind→face tables name only the *named* nodes to colour; keywords
-;; (anonymous alphabetic tokens — `def`/`end`/`do`/`fn`/…) come free via
-;; passed straight to `editor/treesit/fontify`. Refine one by inspecting `(%tree-sitter-parse …)`.
-;; ---- indentation for the tree-sitter modes ----------------------------------
-;; `editor/treesit/indent-column` is the mechanism (walk the tree, count enclosing blocks);
-;; these four entries are the whole per-language policy. The kinds were read off real parses
-;; rather than guessed, and each spec is checked line-for-line against hand-written source —
-;; every line of a sample module must re-indent to the column it already has.
-;;
-;; `:dedent-levels` differs because the grammars do: Elixir's `do_block` spans its own `end`,
-;; so a closing line measured at the line start is still inside the block and backs out one;
-;; Ruby's `body_statement` stops before `end`, so the closer is already outside and backs out
-;; none.
-
-(def elixir-indent-spec
-  {:width 2
-   :blocks #{:do_block :body} ; `do … end`, and a `->` clause's body
-   ;; The bracketed openers — a multi-line list/map/tuple/binary/`fn` indents its
-   ;; contents exactly as a block does, but must NOT indent its own opening line, which
-   ;; is what `:brackets` means. `:arguments` is deliberately absent: Elixir does not add
-   ;; a level for a call's argument list when the last argument is an `fn`, which is the
-   ;; common shape (`Enum.reduce(xs, %{}, fn … end)`), and counting it put every such
-   ;; clause one level too deep.
-   :brackets #{:anonymous_function :list :map :tuple :bitstring}
-   ;; keywords only; the closing delimiters decide for themselves
-   :dedent #{"end" "else" "catch" "rescue" "after"}
-   :dedent-levels 1})
-
-(def ruby-indent-spec
-  {:width 2
-   ;; a method/class body, an if/else arm, and a BRACE block's body — `{ |x| … }` spanning
-   ;; lines indents its contents like any block, and `:block_body` is the kind the grammar
-   ;; gives it. Without it every multi-line `{ |t| … }` body sat a level too shallow, which
-   ;; is 44 of the 46 lines the Ruby stdlib disagreed with.
-   :blocks #{:body_statement :then :else :block_body}
-   ;; the bracketed openers, which must not indent their own opening line
-   :brackets #{:array :hash :argument_list}
-   ;; Per token, because the grammar disagrees per token: a `body_statement` stops before
-   ;; its `end`, so `end` is already outside it and backs out nothing — but it SPANS its
-   ;; own `ensure`/`rescue`/`else`, so those must back out one. A single `:dedent-levels`
-   ;; cannot say both, and with one number Ruby's `ensure` sat a level too deep in every
-   ;; method that had one.
-   ;; Read off the grammar, one token at a time, against the Ruby stdlib:
-   ;;   `end`                a `body_statement` stops before it, so it is already outside
-   ;;   `}` `]` `)`          the bracket they close still encloses them, so back out one
-   ;;   `else` `elsif` `when`  the `then`/`else` arm ends before the keyword — already out
-   ;;   `rescue` `ensure`    children of the `body_statement`, which SPANS them
-   ;; Keywords only — a closing delimiter decides for itself (see `ts-dedent-levels`),
-   ;; because the same `}` closes a hash whose node encloses the closing line AND a
-   ;; `{ |x| … }` block whose body ended before it. Read off the grammar, one token at a
-   ;; time, against the Ruby stdlib:
-   ;;   `end`                  a `body_statement` stops before it — already outside
-   ;;   `else` `elsif` `when`  the arm ends before the keyword — already outside
-   ;;   `rescue` `ensure`      children of the `body_statement`, which SPANS them
-   :dedent {"end" 0 "else" 0 "elsif" 0 "when" 0 "rescue" 1 "ensure" 1}})
-
-(def ruby-face-table
-  {:comment :syntax/comment
-   :string :syntax/string
-   :heredoc_body :syntax/string
-   :regex :syntax/string
-   :simple_symbol :syntax/special
-   :hash_key_symbol :syntax/special
-   :delimited_symbol :syntax/special
-   :integer :syntax/number
-   :float :syntax/number
-   :constant :syntax/special
-   :instance_variable :syntax/function
-   :global_variable :syntax/function
-   :class_variable :syntax/function})
-
-;; ---- ruby's fontify restart ---------------------------------------------------
-;; Elixir decides restart safety by counting PAIRED heredoc markers; Ruby has no pair to
-;; count — `<<~EOS` ends at a line holding whatever identifier the opener named. So Ruby
-;; asks a weaker question with a safe answer: is there any heredoc opener, or any `=begin`
-;; block comment, above the candidate at all? If so it declines and keeps the full lead-in,
-;; which is exactly today's behaviour. Over-declining costs speed in files that open a
-;; heredoc near the viewport and nothing else; guessing would colour heredoc prose as code.
-;;
-;; Bare `<<EOS` is recognised by the uppercase/underscore that conventionally follows,
-;; because `<<` alone is `Array#<<` and left-shift — searching for it would decline
-;; everywhere and buy nothing.
-
-(defn- ruby-upper? (c)
-  ;; an uppercase ASCII letter, tested by case-folding (Brood's `<` is numeric-only)
-  (and (not (= (string/upper c) (string/lower c))) (= c (string/upper c))))
-
-(sig ruby-heredoc-open-at? (string int -> bool))
-(defn- ruby-heredoc-open-at? (src i)
-  ;; `i` is the offset of a `<<` — does it open a heredoc rather than shift or append?
-  (let (j (+ i 2))
-    (and (< j (string/length src))
-      (let (c (string/char-at src j))
-        (or (= c "~") (= c "-") (= c "'") (= c "\"") (= c "_") (ruby-upper? c))))))
-
-(defn- ruby-heredoc-above? (src upto from)
-  ;; any heredoc opener in `src` before `upto`
-  (let (i (index-of src "<<" from))
-    (cond
-      (or (< i 0) (>= i upto)) false
-      (ruby-heredoc-open-at? src i) true
-      else (ruby-heredoc-above? src upto (+ i 2)))))
-
-(defn- ruby-block-comment-above? (src upto)
-  ;; `=begin` / `=end` are column-0 only, so a newline-prefixed match (or offset 0) is one
-  (or (string/starts-with? src "=begin")
-    (let (i (index-of src "\n=begin")) (and (>= i 0) (< i upto)))))
-
-(defn ruby-fontify-restart (src pos)
-  "Ruby's `:fontify-restart`: the previous column-0 line, unless a heredoc or `=begin` block
-opens above it in this window — in which case keep the whole lead-in, as before."
-  (let (candidate (editor/treesit/column0-before src pos))
-    (if (or (ruby-heredoc-above? src candidate 0) (ruby-block-comment-above? src candidate))
-      0
-      candidate)))
-
-(deflanguage ruby
-  {:lang :ruby
-   :pattern "\\.rb$"
-   :faces modes/ruby-face-table
-   :indent modes/ruby-indent-spec
-   ;; its own: a heredoc terminator is arbitrary text, and `=begin` blocks count too
-   :restart 'modes/ruby-fontify-restart
-   ;; the community standard, and what a Ruby project has if it has anything
-   :format ["rubocop" "-a" "--stderr" "--format" "quiet"]
-   :comment "# "})
-
-;; Elixir: def/defmodule are macros (parsed as calls, not keywords), so they
-;; aren't keyword-coloured — `do`/`end`/`fn`/`when`/… are. Atoms and module
-;; aliases read as `:special`.
-(def elixir-face-table
-  {:comment :syntax/comment
-   :string :syntax/string
-   :charlist :syntax/string
-   :sigil :syntax/string
-   :integer :syntax/number
-   :float :syntax/number
-   :atom :syntax/special
-   :alias :syntax/special
-   :keyword :syntax/special})
-
-;; Elixir's paired multi-line string markers — what the restart counts to decide whether a
-;; column-0 line is real code or prose inside an `@moduledoc`.
-(def *elixir-heredocs* ["\"\"\"" "'''"])
-
-(deflanguage elixir
-  {:lang :elixir
-   :pattern "\\.(ex|exs)$"
-   :faces modes/elixir-face-table
-   :indent modes/elixir-indent-spec
-   :heredocs modes/*elixir-heredocs*
-   :format ["mix" "format"]
-   :comment "# "})
-
-;; ---- python-mode: a language the runtime was never built with ---------------
-;; The proof that a language is a data entry rather than a build: nothing in Brood knows
-;; Python. Drop `libtree-sitter-python.so` into `~/.config/bedit/grammars/` and everything
-;; below — colouring, the `C-M-*` structural motions, indentation — comes from these three
-;; definitions. Without the grammar the mode still registers and simply cannot parse.
-;;
-;; Python indents by four, and every level is the same `:block` node, so it needs no dedent
-;; set at all: `else:` sits in the `if`'s own block chain, not inside the arm it follows.
-(def python-face-table
-  {:comment :syntax/comment
-   :string :syntax/string
-   :string_content :syntax/string
-   :integer :syntax/number
-   :float :syntax/number
-   :true :syntax/special
-   :false :syntax/special
-   :none :syntax/special})
-
-(def python-indent-spec
-  {:width 4
-   :blocks #{:block} ; every suite is a `block`; `else:` sits in the `if`'s own chain
-   ;; the bracketed literals and call arguments — a multi-line one indents (or aligns)
-   ;; its contents, and must not indent its own opening line
-   :brackets #{:list :dictionary :set :tuple :argument_list :parameters :parenthesized_expression}
-   ;; Nothing to declare: `else:`/`elif:`/`except:` are children of the statement rather
-   ;; than of its block, so they already measure at the outer level, and the closing
-   ;; delimiters decide for themselves.
-   :dedent #{}})
-
-(deflanguage python
-  {:lang :python
-   :pattern "\\.py$"
-   :faces modes/python-face-table
-   :indent modes/python-indent-spec
-   ;; paired triple quotes, exactly Elixir's case
-   :heredocs modes/*elixir-heredocs*
-   :format ["black" "-q"]
-   :comment "# "})
-
-(defn elisp-indent (text bol)
-  "The elisp `:indent` service — Emacs' rule, which differs from Brood's in one place
-that a config file is full of.
-
-Brood indents every non-`let` form's body `+2`. Emacs indents the body of a SPECIAL FORM
-by 2 and aligns a plain CALL's arguments under its first argument:
-
-    (set-face-attribute 'default nil
-                        :family my/font)     ; a call — aligned under `'default`
-
-    (when (display-graphic-p)
-      (tool-bar-mode -1))                    ; a special form — body +2
-
-Which is which is the same `elisp-special-forms` set that decides the colouring, so the
-two agree by construction: anything painted as a keyword indents its body, and anything
-painted as a call aligns its arguments. A call with nothing after its head on the line
-falls back to one past the open paren, as Emacs does. The rule is `lisp-indent-with`
-over `elisp-special-forms`; Common Lisp's `lisp-indent` is the same rule over its own set."
-  (lisp-indent-with elisp-special-forms text bol))
-
-(defn lisp-indent-with (specials text bol)
-  "Emacs's Lisp indent rule for the line at `bol` of `text`, given the dialect's
-`specials` (head → true): a special form's body +2, a plain call's arguments under its
-first argument, a call whose head is alone on its line one past the open paren. Shared
-by `elisp-indent` and `lisp-indent` — which set decides is the one thing a dialect says."
-  (let (fstart (reflect/scan-form-start text bol)
-        start (model/ed-line-start-offset text fstart)
-        sub (string/substring text start bol)
-        n (string/length sub))
-    (if (= n 0)
-      0
-      (let (tr (sexp/tree sub)
-            enc (sexp/enclosing tr (dec n))
-            kind (:kind enc))
-        (if (= kind :root)
-          0
-          (let (opencol (model/ed-column-at sub (:start enc))
-                kids (sexp/forms-of enc)
-                head (when (not (empty? kids)) (brood-head-text sub (first kids)))
-                special (and head (= true (get specials head))))
-            (cond
-              ;; a special form, or a form with no head to speak of: body +2
-              (or special (empty? kids)) (+ opencol 2)
-              ;; a call with arguments on the head's line: align under the first argument
-              (>= (count kids) 2) (model/ed-column-at sub (:start (second kids)))
-              ;; a call whose head is alone on its line
-              else (+ opencol 1))))))))
-
-;; ---- elisp-mode: editing an Emacs config, in an Emacs clone that is not Emacs -------
-;; The joke is load-bearing. `init.el` is a file people edit constantly and it is
-;; s-expressions, so everything bedit already has for Brood — `C-M-f/b/u/d`, `C-M-SPC`,
-;; the paren matching, the comment/string lexing — applies to it unchanged. What is
-;; genuinely elisp is this list.
-
-(def elisp-special-forms
-  ;; Special forms and the core macros an `init.el` is made of. `if`/`let`/`lambda`/`when`
-  ;; overlap with Brood's set, which is unsurprising — they are both Lisps — but the
-  ;; `defcustom`/`use-package`/`setq` end of it is what makes a config look right.
-  (fold ["defun"
-          "defmacro" "defvar" "defconst" "defcustom" "defface" "defgroup" "defsubst"
-          "define-minor-mode" "define-derived-mode" "define-key" "lambda" "let" "let*" "letrec" "if"
-          "when" "unless" "cond" "case" "pcase" "while" "dolist" "dotimes" "catch" "condition-case"
-          "unwind-protect" "save-excursion" "save-restriction" "with-current-buffer"
-          "with-eval-after-load" "setq" "setq-default" "setq-local" "push" "add-hook" "require"
-          "provide" "use-package" "quote" "function" "progn" "prog1" "and" "or" "not"]
-    {}
-    (fn (m s) (assoc m s true))))
-
-(deflisp elisp
-  {:pattern "\\.el$"
-   :specials modes/elisp-special-forms
-   :indent 'modes/elisp-indent
-   :comment ";; "})
-
-;; ---- lisp-mode: Common Lisp, the other Lisp people still write by hand ------------
-;; The same argument as elisp: s-expressions, so the structural keys, the paren matching
-;; and the comment/string lexing are Brood's unchanged; what is Common Lisp is the set of
-;; heads that indent their body and paint as keywords, and Emacs's `lisp-mode` indent
-;; rule — which is `elisp-indent`'s, over this set (`lisp-indent-with`).
-
-(def lisp-special-forms
-  ;; The defining forms and the special operators / core macros of Common Lisp (the
-  ;; `defpackage`/`defclass`/`loop`/`handler-case` end of it is what makes a `.lisp` file
-  ;; look right), plus the `setf` family.
-  (fold ["defun"
-          "defmacro" "defvar" "defparameter" "defconstant" "defclass" "defmethod" "defgeneric"
-          "defstruct" "deftype" "defpackage" "define-condition" "defsetf" "in-package" "lambda"
-          "let" "let*" "flet" "labels" "macrolet" "symbol-macrolet" "if" "when" "unless" "cond"
-          "case" "ecase" "ccase" "typecase" "etypecase" "loop" "do" "do*" "dolist" "dotimes" "progn"
-          "prog1" "prog2" "block" "return" "return-from" "tagbody" "go" "catch" "throw"
-          "handler-case" "handler-bind" "restart-case" "ignore-errors" "unwind-protect"
-          "multiple-value-bind" "multiple-value-prog1" "destructuring-bind" "with-open-file"
-          "with-slots" "with-accessors" "with-output-to-string" "with-input-from-string" "setf"
-          "setq" "psetf" "push" "pop" "incf" "decf" "declare" "declaim" "proclaim" "quote"
-          "function" "and" "or" "not" "the" "eval-when" "locally" "assert" "check-type" "error"
-          "signal" "warn"]
-    {}
-    (fn (m s) (assoc m s true))))
-
-(defn lisp-indent (text bol)
-  "The Common Lisp `:indent` service: Emacs's `lisp-mode` rule — a special form's body
-+2, a plain call's arguments under the first argument (`lisp-indent-with`, over
-`lisp-special-forms`)."
-  (lisp-indent-with lisp-special-forms text bol))
-
-(deflisp lisp
-  {:pattern "\\.(lisp|cl|lsp|asd)$"
-   :specials modes/lisp-special-forms
-   :indent 'modes/lisp-indent
-   :comment ";; "})
-
-;; ---- the other Lisps: Clojure, Scheme / Racket, Fennel ------------------------------
-;; Each is `deflisp` with its own head set — the whole of what is dialect-specific here.
-;; Brood's indent rule (body +2, `let`-family bindings aligned) is Clojure's and Fennel's
-;; own convention; Scheme's is the elisp/Common Lisp rule (special forms +2, calls
-;; aligned under the first argument), so it shares `lisp-indent-with`.
-
-(def clojure-special-forms
-  (fold ["def"
-          "defn" "defn-" "defmacro" "defmulti" "defmethod" "defprotocol" "defrecord" "deftype"
-          "defonce" "definterface" "ns" "fn" "let" "letfn" "if" "if-let" "if-not" "if-some" "when"
-          "when-let" "when-not" "when-some" "cond" "condp" "case" "do" "loop" "recur" "for" "doseq"
-          "dotimes" "while" "try" "catch" "finally" "throw" "quote" "var" "set!" "binding"
-          "with-open" "with-redefs" "and" "or" "not" "->" "->>" "as->" "some->" "some->>" "cond->"
-          "cond->>" "comment" "import" "require" "use" "declare" "delay" "future" "lazy-seq" "reify"
-          "proxy" "extend-protocol" "extend-type"]
-    {}
-    (fn (m s) (assoc m s true))))
-
-(deflisp clojure
-  {:pattern "\\.(clj|cljs|cljc|cljx|edn|bb)$"
-   :specials modes/clojure-special-forms
-   :comment ";; "})
-
-(def scheme-special-forms
-  (fold ["define"
-          "define-syntax" "define-record-type" "define-values" "define-macro" "define-module"
-          "lambda" "λ" "case-lambda" "let" "let*" "letrec" "letrec*" "let-values" "let*-values"
-          "let-syntax" "letrec-syntax" "named-lambda" "if" "when" "unless" "cond" "case" "and" "or"
-          "not" "do" "begin" "delay" "force" "set!" "quote" "quasiquote" "unquote" "syntax-rules"
-          "syntax-case" "guard" "dynamic-wind" "call/cc" "call-with-current-continuation"
-          "parameterize" "assert" "import" "export" "library" "require" "provide" "module" "struct"
-          "match" "for" "for/list" "for/fold" "define-struct" "else"]
-    {}
-    (fn (m s) (assoc m s true))))
-
-(defn scheme-indent (text bol)
-  "The Scheme / Racket `:indent` service: the Lisp rule over `scheme-special-forms`."
-  (lisp-indent-with scheme-special-forms text bol))
-
-(deflisp scheme
-  {:pattern "\\.(scm|ss|sld|sls|rkt|rktl)$"
-   :specials modes/scheme-special-forms
-   :indent 'modes/scheme-indent
-   :comment ";; "})
-
-(def fennel-special-forms
-  (fold ["fn"
-          "lambda" "λ" "local" "var" "global" "let" "set" "tset" "if" "when" "each" "for" "while"
-          "do" "match" "case" "macro" "macros" "import-macros" "require-macros" "eval-compiler"
-          "values" "not" "and" "or" "->" "->>" "-?>" "-?>>" "doto" "collect" "icollect" "accumulate"
-          "faccumulate" "fcollect" "with-open" "pick-values" "pick-args" "comment" "lua" "quote"
-          "hashfn" "partial"]
-    {}
-    (fn (m s) (assoc m s true))))
-
-(deflisp fennel
-  {:pattern "\\.fnl$"
-   :specials modes/fennel-special-forms
-   :comment ";; "})
-
-;; ---- the configuration formats: tables over std's `editor/lexer` ---------------------
-;; Fontify-only layers like env-mode and docker-mode; the lexing is `editor/configs`'.
-;; The `:file-pattern` matches the file's basename, so the extensionless names
-;; (`Makefile`, `COMMIT_EDITMSG`, `.gitconfig`) trigger too. Line-oriented: each restarts at
-;; the viewport's own line (`editor/highlight/line-restart`), so a keystroke lexes the band alone.
-
-(def json-mode-layer
-  {:name 'json
-   :file-pattern "\\.(json|jsonc|json5|jsonl|webmanifest)$|(^|/)\\.(babelrc|eslintrc|prettierrc)$"
-   :fontify 'editor/configs/json-spans
-   :fontify-restart 'editor/highlight/line-restart
-   :comment-syntax "// "})
-
-(register-language-mode 'modes/json-mode-layer :json)
-
-(def yaml-mode-layer
-  {:name 'yaml
-   :file-pattern "\\.(ya?ml)$|(^|/)\\.(clang-format|yamllint)$"
-   :fontify 'editor/configs/yaml-spans
-   :fontify-restart 'editor/highlight/line-restart
-   :comment-syntax "# "})
-
-(register-language-mode 'modes/yaml-mode-layer :yaml)
-
-(def toml-mode-layer
-  {:name 'toml
-   :file-pattern "\\.toml$|(^|/)(Cargo|Pipfile|poetry)\\.lock$"
-   :fontify 'editor/configs/toml-spans
-   :fontify-restart 'editor/highlight/line-restart
-   :comment-syntax "# "})
-
-(register-language-mode 'modes/toml-mode-layer :toml)
-
-(def makefile-mode-layer
-  {:name 'makefile
-   :file-pattern "(^|/)(GNUmakefile|Makefile|makefile)$|\\.(mk|make)$"
-   :fontify 'editor/configs/makefile-spans
-   :fontify-restart 'editor/highlight/line-restart
-   :comment-syntax "# "})
-
-(register-language-mode 'modes/makefile-mode-layer :makefile)
-
-(def ini-mode-layer
-  {:name 'ini
-   :file-pattern "\\.(ini|cfg|conf|properties|gitconfig|gitmodules|editorconfig|npmrc|service|desktop)$|(^|/)\\.(gitconfig|gitmodules|editorconfig|npmrc|hgrc)$"
-   :fontify 'editor/configs/ini-spans
-   :fontify-restart 'editor/highlight/line-restart
-   :comment-syntax "# "})
-
-(register-language-mode 'modes/ini-mode-layer :ini)
-
-(def gitcommit-mode-layer
-  {:name 'gitcommit
-   :file-pattern "(^|/)(COMMIT_EDITMSG|MERGE_MSG|TAG_EDITMSG|SQUASH_MSG|NOTES_EDITMSG)$"
-   :fontify 'editor/configs/gitcommit-spans
-   :fontify-restart 'editor/highlight/line-restart})
-
-(register-language-mode 'modes/gitcommit-mode-layer :gitcommit)
+(register-special-type :markdown-preview 'modes/markdown-preview-layer)
 
 ;; ---- process-menu-mode: the read-only, killable *Process List* --------------
 ;; Emacs `process-menu-mode` (a `special-mode`): the generated `*Process List*`
@@ -1663,8 +297,7 @@ style) — its own keys act while text edits are refused (`ed-edit` reports it).
   {:name 'help
    :doc "A help report (C-h) — what is bound, what is on, what a name means."})
 
-(register-type-layers :help
-  (list 'modes/help-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+(register-special-type :help 'modes/help-mode-layer)
 
 (def process-menu-keymap
   (-> {}
@@ -1682,13 +315,12 @@ style) — its own keys act while text edits are refused (`ed-edit` reports it).
   {:name 'process-menu
    :doc "The running processes — d/x/k kills the one on this line, g refreshes."
    :keymap modes/process-menu-keymap
-   :commands '("process-menu-kill" "process-menu-refresh" "process-menu-toggle-tree")})
+   :commands (layer-commands modes/process-menu-keymap)})
 
 ;; :process-menu stacks process-menu-mode over special-mode (read-only + no gutter) over
 ;; text-mode (so motion still works); the list buffer gets it via `set-buffer-type` (see
-;; commands/ed-show-named), no file.
-(register-type-layers :process-menu
-  (list 'modes/process-menu-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+;; pool/ed-show-named), no file.
+(register-special-type :process-menu 'modes/process-menu-mode-layer)
 
 ;; ---- buffer-menu-mode: the *Buffer List* (C-x C-b) ----------------------------
 (def buffer-menu-keymap
@@ -1702,392 +334,74 @@ style) — its own keys act while text edits are refused (`ed-edit` reports it).
   {:name 'buffer-menu
    :doc "The open buffers — RET selects the one on this line."
    :keymap modes/buffer-menu-keymap
-   :commands '("buffer-menu-select" "buffer-menu-refresh")})
+   :commands (layer-commands modes/buffer-menu-keymap)})
 
 ;; :buffer-menu stacks over special-mode (read-only + no gutter, `q` quits) over
 ;; text-mode, like the process list; the buffer gets it via `set-buffer-type`.
-(register-type-layers :buffer-menu
-  (list 'modes/buffer-menu-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+(register-special-type :buffer-menu 'modes/buffer-menu-mode-layer)
 
-;; ---- report fontify: whole-line role faces ------------------------------------
-;; Every report buffer (*Tests*, *Run*, *Debug*, *Spy*) colours whole lines by role;
-;; this is the one accumulator behind them (git's status fontifier stays separate —
-;; it produces multiple spans per line, a more general contract).
+;; ---- report fontify: spans per line ------------------------------------------
+;; Every line-structural fontifier (*Tests*, *Run*, *Debug*, *Spy*, dired, the hex view,
+;; *Project Search*) walks the slice line by line, threading the line's offset; this is
+;; the one accumulator behind them all, git's diff and process buffers included.
 
-(defn fontify-line-faces (src line-face)
-  "Whole-line spans for `src`: `line-face` is `(line-text) -> face|nil` per line. Spans are
-`cons`'d and `reverse`d once (NOT `append`ed onto a growing accumulator, which recopies it
-each line — O(n²) in the window). This is the shared fontify behind the streaming *Run*
-(apprun) and *Spy*/*Debug* (debugger) buffers, so keeping it linear is what stops their
-window re-fontify from lagging as output pours in."
-  (letrec (go (fn (lines off acc)
+(defn fontify-lines (src line-spans)
+  "`[start end face]` spans for `src`, built a line at a time: `line-spans` is
+`(line-text offset) -> spans` (a list or vector, possibly empty), `offset` being where the
+line starts in `src`. Line-structural, so the windowed slice the view hands a `:fontify`
+service colours correctly wherever it starts. Spans are `cons`'d and `reverse`d once (NOT
+`append`ed onto a growing accumulator, which recopies it each line — O(n²) in the window):
+the streaming *Run* / *Spy* / *Tests* buffers re-fontify their window on every append, so
+keeping this linear is what stops them lagging as output pours in.
+
+    (modes/fontify-lines \"ab\\ncd\" (fn (line offset) [[offset (inc offset) :x]]))   → ([0 1 :x] [3 4 :x])"
+  (letrec (go (fn (lines offset acc)
                 (if (empty? lines)
                   (reverse acc)
-                  (let (line (first lines)
-                        face (line-face line))
+                  (let (line (first lines))
                     (go (rest lines)
-                      (+ off (string/length line) 1)
-                      (if (nil? face) acc (cons [off (+ off (string/length line)) face] acc)))))))
+                      (+ offset (string/length line) 1)
+                      (fold (line-spans line offset) acc (fn (spans span) (cons span spans))))))))
     (go (string/split src "\n") 0 '())))
+
+(defn fontify-line-faces (src line-face)
+  "Whole-line spans for `src`: `line-face` is `(line-text) -> face|nil` per line — the
+`fontify-lines` of a report that colours each line by its role."
+  (fontify-lines src
+    (fn (line offset)
+      (let (face (line-face line))
+        (if (nil? face) '() (list [offset (+ offset (string/length line)) face]))))))
 
 ;; ---- location-jump ----------------------------------------------------------
 ;; The shared "report row -> source" layer (`location-jump-layer`) + its location
 ;; vocabulary moved to `src/results.blsp` (the results-buffer abstraction). Modes stack
-;; `results/location-jump-layer`; occur/git below keep their own `:on-click` commands.
+;; `results/location-jump-layer`; git below keeps its own `:on-click` command.
 
 ;; ---- occur-mode: the read-only *Occur* results buffer -----------------------
 ;; The *Occur* buffer (commands/cmd-occur) lists matching lines; it's stamped :occur,
-;; made read-only on activate (like the process list), and binds RET to jump to the
-;; matching source line. Stacks over text-mode so motion (C-n/C-p, arrows) navigates rows.
-
-(def occur-keymap
-  (-> {}
-    (keymap-bind [:enter] 'commands/cmd-occur-jump)))
+;; made read-only on activate (like the process list), and is a results buffer: each row's
+;; `{:buffer :line}` rides in `:line-links`, so RET / a click visit it through the shared
+;; `results/location-jump-layer`. Stacks over text-mode so motion (C-n/C-p, arrows)
+;; navigates rows.
 
 (def occur-mode-layer
   {:name 'occur
    :doc "Search hits, one per line — RET jumps to the line it names."
-   :keymap modes/occur-keymap
-   :on-click 'commands/cmd-occur-jump ; click = RET (the location-jump contract; occur
-   ; rows are "N: text" line numbers, its own parser)
-   :commands '("occur-jump")})
+   :line-loc 'results/line-links-only-loc})
 
-(register-type-layers :occur
-  (list 'modes/occur-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; ---- the *Diagnostics* list (src/diagnostics.blsp) ---------------------------
-;; Every warning and error in the buffer, one row each, beside it. The rows carry their
-;; locations OFF-text (`:line-links`, resolved by `results/line-links-loc`) because they
-;; name a BUFFER rather than a path — the findings are about the buffer in front of you,
-;; which may never have been saved.
-(def diagnostics-list-mode-layer
-  {:name 'diagnostics-list
-   :doc "Every warning and error in the buffer — RET jumps to the one on this line."
-   :line-loc 'results/line-links-loc
-   :commands '("diagnostics")})
-
-(register-type-layers :diagnostics-list
-  (list 'modes/diagnostics-list-mode-layer
-    'results/location-jump-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; ---- dired-mode: the read-only directory browser ----------------------------
-;; The dired buffer (dired/cmd-dired) lists a directory; it's stamped :dired, made
-;; read-only on activate, and its single-key bindings navigate (RET/f open, ^ up, g
-;; refresh, q quit) and operate (+ mkdir, R rename, C copy, d flag + x delete, D delete). Stacks over
-;; text-mode so n/p/arrows move between rows. The commands rebuild the listing via
-;; ed-show-named rather than editing text, so they work on the read-only buffer.
-
-(def dired-keymap
-  (-> {}
-    (keymap-bind [:enter] 'dired/cmd-dired-open)
-    (keymap-bind ["f"] 'dired/cmd-dired-open)
-    (keymap-bind ["^"] 'dired/cmd-dired-up)
-    (keymap-bind ["g"] 'dired/cmd-dired-refresh)
-    (keymap-bind ["q"] 'dired/cmd-dired-quit)
-    ;; line motion snaps point onto the filename (Emacs dired n/p/C-n/C-p/arrows)
-    (keymap-bind ["n"] 'dired/cmd-dired-next-line)
-    (keymap-bind ["p"] 'dired/cmd-dired-previous-line)
-    (keymap-bind [:ctrl-n] 'dired/cmd-dired-next-line)
-    (keymap-bind [:ctrl-p] 'dired/cmd-dired-previous-line)
-    (keymap-bind [:down] 'dired/cmd-dired-next-line)
-    (keymap-bind [:up] 'dired/cmd-dired-previous-line)
-    (keymap-bind ["+"] 'dired/cmd-dired-create-dir)
-    (keymap-bind ["R"] 'dired/cmd-dired-rename)
-    (keymap-bind ["C"] 'dired/cmd-dired-copy)
-    ;; marking (emacs dired): m mark, u unmark, U unmark-all, t toggle; x/D delete
-    ;; (the marked set, else the entry under point).
-    (keymap-bind ["m"] 'dired/cmd-dired-mark)
-    (keymap-bind ["u"] 'dired/cmd-dired-unmark)
-    (keymap-bind ["U"] 'dired/cmd-dired-unmark-all)
-    (keymap-bind ["t"] 'dired/cmd-dired-toggle-marks)
-    ;; d flags for deletion, x deletes the flagged (Emacs); D deletes marked-or-current now
-    (keymap-bind ["d"] 'dired/cmd-dired-flag)
-    (keymap-bind ["x"] 'dired/cmd-dired-do-flagged-delete)
-    (keymap-bind ["D"] 'dired/cmd-dired-delete)))
-
-(def dired-mode-layer
-  {:name 'dired
-   :doc "A directory: RET/f opens, ^ up, g refresh, d flags and x deletes."
-   :keymap modes/dired-keymap
-   :commands '("dired-open" "dired-up"
-                "dired-refresh" "dired-quit" "dired-create-dir" "dired-rename" "dired-copy"
-                "dired-delete" "dired-flag" "dired-do-flagged-delete" "dired-mark" "dired-unmark"
-                "dired-unmark-all" "dired-toggle-marks" "dired-next-line" "dired-previous-line")
-   :fontify 'dired/dired-fontify})
+(register-special-type :occur 'modes/occur-mode-layer 'results/location-jump-layer)
 
 ;; ---- hexl-mode: a binary as a hex view --------------------------------------
-;; A file that is not UTF-8 opens through `commands/ed-open-binary` (Emacs hexl-mode):
-;; xxd rows, coloured by `commands/hexl-fontify` (offsets dim, zero bytes dimmer, the
+;; A file that is not UTF-8 opens through `hexl/ed-open-binary` (Emacs hexl-mode):
+;; xxd rows, coloured by `hexl/hexl-fontify` (offsets dim, zero bytes dimmer, the
 ;; ASCII column as a string). Read-only and without line numbers (each row carries its
 ;; offset) via the special-mode layer beneath; q quits.
 
 (def hexl-mode-layer
   {:name 'hexl
    :doc "A binary file as hex — read-only, sixteen bytes a row."
-   :fontify 'commands/hexl-fontify})
+   :fontify 'hexl/hexl-fontify
+   ;; its text renders the binary, it is not the binary: C-x C-s / C-x C-w refuse it
+   :no-write {:what "a hex view" :why "it renders the binary; edit the file itself"}})
 
-(register-type-layers :hexl
-  (list 'modes/hexl-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-(register-type-layers :dired
-  (list 'modes/dired-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; ---- git (the *git-status* porcelain + its commit/diff/log/blame/refs buffers) ----
-;; Every git SECTION buffer shares one keymap — Magit's `magit-mode-map`: the section keys
-;; (TAB, n/p, ^, M-n/M-p, 1-4, M-w) from `sectionbuf`, and every menu on the letter Magit
-;; gives it, so `A` cherry-picks the commit under point whether that commit is in the status
-;; buffer, a log, or the commit you are reading. Each buffer type adds what is its own on top.
-
-(defn git-common-keymap ()
-  "The keys every git section buffer has."
-  (-> {}
-    (keymap-bind [:tab] 'sectionbuf/cmd-section-toggle) ; TAB — fold / unfold the section at point
-    (keymap-bind ["n"] 'sectionbuf/cmd-section-next) ; n / p — the next / previous section
-    (keymap-bind ["p"] 'sectionbuf/cmd-section-prev)
-    (keymap-bind ["^"] 'sectionbuf/cmd-section-up) ; ^ — the parent section
-    (keymap-bind [:alt-n] 'sectionbuf/cmd-section-next-sibling) ; M-n / M-p — sibling sections
-    (keymap-bind [:alt-p] 'sectionbuf/cmd-section-prev-sibling)
-    (keymap-bind ["1"] 'sectionbuf/cmd-section-level-1) ; 1-4 — show the tree to a depth
-    (keymap-bind ["2"] 'sectionbuf/cmd-section-level-2)
-    (keymap-bind ["3"] 'sectionbuf/cmd-section-level-3)
-    (keymap-bind ["4"] 'sectionbuf/cmd-section-level-4)
-    (keymap-bind [:alt-w] 'sectionbuf/cmd-section-copy) ; M-w — copy the hash / path at point
-    (keymap-bind [:enter] 'git/cmd-git-visit) ; RET — go to the line, the file, the commit
-    (keymap-bind ["g"] 'git/cmd-git-refresh)
-    (keymap-bind ["q"] 'git/cmd-git-quit)
-    (keymap-bind ["$"] 'git/cmd-git-process) ; $ — what git actually ran (Magit's process buffer)
-    (keymap-bind ["?"] 'git/cmd-git-dispatch) ; ? / h — every menu, from one key
-    (keymap-bind ["h"] 'git/cmd-git-dispatch)
-    (keymap-bind ["!"] 'git/cmd-git-run-command) ; ! — run a git command the menus lack
-    ;; acting on what is at point — a hunk, a file, a list — wherever it is shown
-    (keymap-bind ["s"] 'git/cmd-git-stage) ; s / u / k — stage, unstage, discard (region = lines)
-    (keymap-bind ["u"] 'git/cmd-git-unstage)
-    (keymap-bind ["k"] 'git/cmd-git-discard)
-    (keymap-bind ["S"] 'git/cmd-git-stage-all)
-    (keymap-bind ["U"] 'git/cmd-git-unstage-all)
-    (keymap-bind ["a"] 'gitview/cmd-git-apply) ; a — apply the hunk / stash / commit at point
-    (keymap-bind ["v"] 'gitview/cmd-git-reverse) ; v — reverse it in the work tree
-    (keymap-bind ["e"] 'git/cmd-git-resolve-in-file) ; e — open a conflicted file at its conflict
-    (keymap-bind ["K"] 'git/cmd-git-untrack) ; K — stop tracking the file at point
-    (keymap-bind ["R"] 'git/cmd-git-rename-file) ; R — git mv the file at point
-    ;; The MENU keys, Magit's letters. Each opens a transient rather than running something:
-    ;; the flags live in the menu (src/transient.blsp), and a bare key that pushed or reset
-    ;; without showing you what it was about to do is the thing these replace.
-    (keymap-bind ["c"] 'git/cmd-git-commit-menu) ; c — commit
-    (keymap-bind ["b"] 'git/cmd-git-branch-menu) ; b — branch
-    (keymap-bind ["d"] 'git/cmd-git-diff-menu) ; d — diff
-    (keymap-bind ["l"] 'git/cmd-git-log-menu) ; l — log
-    (keymap-bind ["P"] 'git/cmd-git-push-menu) ; P — push
-    (keymap-bind ["F"] 'git/cmd-git-pull-menu) ; F — pull
-    (keymap-bind ["f"] 'git/cmd-git-fetch-menu) ; f — fetch
-    (keymap-bind ["M"] 'git/cmd-git-remote-menu) ; M — remote
-    (keymap-bind ["z"] 'git/cmd-git-stash-menu) ; z — stash
-    (keymap-bind ["m"] 'git/cmd-git-merge-menu) ; m — merge
-    (keymap-bind ["r"] 'git/cmd-git-rebase-menu) ; r — rebase (and the way out of one)
-    (keymap-bind ["A"] 'git/cmd-git-cherry-pick-menu) ; A — cherry-pick
-    (keymap-bind ["V"] 'git/cmd-git-revert-menu) ; V — revert
-    (keymap-bind ["X"] 'git/cmd-git-reset-menu) ; X — reset
-    (keymap-bind ["t"] 'git/cmd-git-tag-menu) ; t — tag
-    (keymap-bind ["B"] 'git/cmd-git-bisect-menu) ; B — bisect
-    (keymap-bind ["%"] 'git/cmd-git-worktree-menu) ; % — worktrees
-    (keymap-bind ["W"] 'git/cmd-git-patch-menu) ; W — format patches
-    (keymap-bind ["w"] 'git/cmd-git-apply-menu) ; w — apply patches
-    (keymap-bind ["o"] 'git/cmd-git-submodule-menu) ; o — submodules
-    (keymap-bind ["T"] 'git/cmd-git-notes-menu) ; T — notes
-    (keymap-bind ["i"] 'git/cmd-git-ignore-menu) ; i — ignore a file
-    (keymap-bind ["y"] 'gitview/cmd-git-refs) ; y — every branch and tag
-    (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
-    (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)
-    (keymap-bind [:down] 'commands/cmd-next-line)
-    (keymap-bind [:up] 'commands/cmd-previous-line)))
-
-(def git-status-keymap
-  (-> (modes/git-common-keymap)
-    (keymap-bind ["j"] 'git/cmd-git-jump-menu))) ; j — jump to a section
-(def git-status-mode-layer
-  {:name 'git-status
-   :doc "The working tree (Magit-style): s/u/k stage, unstage, discard; c commits; ? every menu."
-   :keymap modes/git-status-keymap
-   ;; buffer-local M-x names (a layer's `:commands` leave the global set): the ones that only
-   ;; mean something with a status buffer under them
-   :commands '("git-stage" "git-stage-all"
-                "git-unstage" "git-unstage-all" "git-discard" "git-refresh" "git-quit" "git-visit"
-                "git-untrack" "git-rename-file" "git-jump-menu")
-   :on-click 'git/cmd-git-visit
-   ;; the SHARED results link mechanism: file rows carry a pointer cursor + hover underline
-   ;; and RET/click visits them — reading the off-text `:line-links` git stashes on the buffer,
-   ;; like *Tests* — but with no text fallback (`line-links-only-loc`): the map holds every
-   ;; file row, and a commit subject that reads `foo.c:12` is not a link
-   :line-loc 'results/line-links-only-loc
-   :section-faces 'git/git-section-faces
-   :section-reload 'git/git-status-reload})
-
-(register-type-layers :git-status
-  (list 'modes/git-status-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; ---- packages (the *Packages* browser — M-x package-list) -------------------
-(def packages-keymap
-  (-> {}
-    (keymap-bind ["i"] 'packages/cmd-package-install) ; i — install the package under point
-    (keymap-bind ["d"] 'packages/cmd-package-remove) ; d — remove it
-    (keymap-bind ["u"] 'packages/cmd-package-update) ; u — update it to the newest version
-    (keymap-bind ["g"] 'packages/cmd-package-refresh) ; g — re-fetch the list from the hive
-    (keymap-bind ["q"] 'packages/cmd-package-quit) ; q — bury the buffer
-    (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
-    (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)
-    (keymap-bind [:down] 'commands/cmd-next-line)
-    (keymap-bind [:up] 'commands/cmd-previous-line)))
-
-(def packages-mode-layer
-  {:name 'packages
-   :doc "Installed and available bedit packages — i installs, u updates, x removes."
-   :keymap modes/packages-keymap
-   :commands '("package-install" "package-remove"
-                "package-update" "package-refresh" "package-quit")})
-
-(register-type-layers :packages
-  (list 'modes/packages-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; *git-process* — the process log ($): every git command this editor ran. Its own layer
-;; rather than the shared report keymap, because `k` clears the log here.
-(def git-process-keymap
-  (-> {}
-    (keymap-bind ["q"] 'git/cmd-git-quit)
-    (keymap-bind ["g"] 'git/cmd-git-process)
-    (keymap-bind ["k"] 'git/cmd-git-process-clear)
-    (keymap-bind ["$"] 'git/cmd-git-process)
-    (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
-    (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)
-    (keymap-bind [:down] 'commands/cmd-next-line)
-    (keymap-bind [:up] 'commands/cmd-previous-line)))
-
-(def git-process-mode-layer
-  {:name 'git-process
-   :doc "What git actually ran: every command, its exit code, how long it took and its output."
-   :keymap modes/git-process-keymap
-   ;; NOT "git-process": a layer's `:commands` are subtracted from the GLOBAL M-x set
-   ;; (`model/ed-all-layer-commands`), and `M-x git-process` has to work from anywhere —
-   ;; the buffer it opens is exactly where you are not
-   :commands '("git-process-clear" "git-quit")
-   :fontify 'git/git-process-fontify})
-
-(register-type-layers :git-process
-  (list 'modes/git-process-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; The git VIEWS (src/gitview.blsp): a commit, a diff, a log, blame, the refs — section
-;; buffers with the common keys, plus each one's own.
-(def git-revision-keymap (modes/git-common-keymap))
-
-(def git-diff-keymap
-  (-> (modes/git-common-keymap)
-    (keymap-bind ["+"] 'gitview/cmd-git-diff-more-context) ; + / - — more or less context
-    (keymap-bind ["-"] 'gitview/cmd-git-diff-less-context)))
-
-(def git-log-keymap
-  (-> (modes/git-common-keymap)
-    (keymap-bind [:enter] 'gitview/cmd-git-log-show) ; RET — the commit at point
-    (keymap-bind [" "] 'gitview/cmd-git-log-peek) ; SPC — show it beside the log, staying here
-    (keymap-bind ["+"] 'gitview/cmd-git-log-more))) ; + — twice as many commits
-(def git-blame-keymap
-  (-> (modes/git-common-keymap)
-    (keymap-bind [:enter] 'gitview/cmd-git-blame-visit) ; RET — the chunk's commit, or the line
-    (keymap-bind ["b"] 'gitview/cmd-git-blame-previous))) ; b — blame the version before
-(def git-refs-keymap
-  (-> (modes/git-common-keymap)
-    (keymap-bind [:enter] 'gitview/cmd-git-refs-visit) ; RET — the log of the ref at point
-    (keymap-bind ["k"] 'git/cmd-git-branch-delete))) ; k — delete the ref at point
-(defn- git-view-layer (name doc keymap)
-  "A git view's layer: its keymap, the shared section faces, no mode-local M-x names."
-  {:name name :doc doc :keymap keymap :commands '() :section-faces 'git/git-section-faces})
-
-(def git-revision-mode-layer
-  (git-view-layer 'git-revision
-    "A commit: RET goes to a line, a applies a hunk, v reverses it." modes/git-revision-keymap))
-(def git-diff-mode-layer
-  (git-view-layer 'git-diff
-    "A diff: s/u/k as in the status buffer; + / - more or less context." modes/git-diff-keymap))
-(def git-log-mode-layer
-  (git-view-layer 'git-log
-    "A log: RET shows a commit, SPC peeks, + shows more; A / V / X / r act on it."
-    modes/git-log-keymap))
-(def git-blame-mode-layer
-  (git-view-layer 'git-blame
-    "Blame: RET shows a chunk's commit or goes to a line; b blames the version before."
-    modes/git-blame-keymap))
-(def git-refs-mode-layer
-  (git-view-layer 'git-refs
-    "Branches and tags: RET logs one, b checks out, k deletes." modes/git-refs-keymap))
-
-(register-type-layers :git-revision
-  (list 'modes/git-revision-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-(register-type-layers :git-diff
-  (list 'modes/git-diff-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-(register-type-layers :git-log
-  (list 'modes/git-log-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-(register-type-layers :git-blame
-  (list 'modes/git-blame-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-(register-type-layers :git-refs
-  (list 'modes/git-refs-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; *git-remotes* / *git-worktrees* / `!`'s output — plain text git reports: q quits, and a
-;; diff in one is coloured by its text.
-(def git-report-keymap
-  (-> {}
-    (keymap-bind ["$"] 'git/cmd-git-process) ; $ reaches the process log from any git buffer
-    (keymap-bind ["q"] 'git/cmd-git-quit)))
-
-(def git-text-mode-layer
-  {:name 'git-text
-   :keymap modes/git-report-keymap
-   :commands '("git-quit")
-   :fontify 'git/git-diff-fontify})
-
-(register-type-layers :git-text
-  (list 'modes/git-text-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
-
-;; *git-commit* — EDITABLE (you type the message); no read-only hook. C-c C-c / C-c C-k,
-;; M-p / M-n through the messages committed before, C-c C-s to sign off.
-(def git-commit-keymap
-  (-> {}
-    (keymap-bind [:ctrl-c :ctrl-c] 'git/cmd-git-commit-finish)
-    (keymap-bind [:ctrl-c :ctrl-k] 'git/cmd-git-commit-abort)
-    (keymap-bind [:ctrl-c :ctrl-s] 'git/cmd-git-commit-signoff)
-    (keymap-bind [:alt-p] 'git/cmd-git-commit-prev-message)
-    (keymap-bind [:alt-n] 'git/cmd-git-commit-next-message)))
-
-(def git-commit-mode-layer
-  {:name 'git-commit
-   :keymap modes/git-commit-keymap
-   :no-line-numbers true
-   ;; the summary line over 50 columns, the blank after it, the comments — the gitcommit
-   ;; language mode's lexer, which knows all three
-   :fontify 'editor/configs/gitcommit-spans
-   :commands '("git-commit-finish" "git-commit-abort"
-                "git-commit-signoff" "git-commit-prev-message" "git-commit-next-message")})
-
-(register-type-layers :git-commit (list 'modes/git-commit-mode-layer 'modes/text-mode-layer))
-
-;; *git-rebase-todo* — the interactive-rebase plan. A read/WRITE buffer (you may edit the
-;; lines by hand) with a key per verb over the top, because `f` is quicker than selecting
-;; `pick` and typing `fixup`, and the verbs are the whole vocabulary.
-(def git-rebase-keymap
-  (-> {}
-    (keymap-bind [:ctrl-c :ctrl-c] 'git/cmd-git-rebase-todo-run)
-    (keymap-bind [:ctrl-c :ctrl-k] 'git/cmd-git-rebase-todo-abort)
-    (keymap-bind ["p"] 'git/cmd-git-rebase-pick)
-    (keymap-bind ["r"] 'git/cmd-git-rebase-reword)
-    (keymap-bind ["e"] 'git/cmd-git-rebase-edit)
-    (keymap-bind ["s"] 'git/cmd-git-rebase-squash)
-    (keymap-bind ["f"] 'git/cmd-git-rebase-fixup)
-    (keymap-bind ["d"] 'git/cmd-git-rebase-drop)
-    (keymap-bind [:alt-up] 'git/cmd-git-rebase-move-up)
-    (keymap-bind [:alt-down] 'git/cmd-git-rebase-move-down)))
-
-(def git-rebase-mode-layer
-  {:name 'git-rebase
-   :doc "An interactive rebase plan: p pick · r reword · e edit · s squash · f fixup · d drop · M-up/M-down reorder · C-c C-c run"
-   :keymap modes/git-rebase-keymap
-   :no-line-numbers true
-   :commands '("git-rebase-todo-run" "git-rebase-todo-abort")})
-
-(register-type-layers :git-rebase (list 'modes/git-rebase-mode-layer 'modes/text-mode-layer))
+(register-special-type :hexl 'modes/hexl-mode-layer)

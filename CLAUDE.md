@@ -74,7 +74,24 @@ feature work — surfacing it is half the point of this project.
 
 ```
 src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop
-src/model.blsp              the ui-run model: buffer pool, kill ring, minibuffer, *Messages*, scrolling
+src/model.blsp              the ui-run model: buffer pool, panes, kill ring, minibuffer, *Messages*,
+                            the timers — and the REGISTRIES the rest plugs into: idle-beat jobs
+                            (`register-idle-job`), off-loop task replies, inbound `[:tag …]`
+                            event handlers, feature timers. The core names no feature: a
+                            module registers its rows when it loads
+src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
+                            over the live keymap, `\[command]` substitution, docstrings
+src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
+                            `ed-max-top`, `ed-wrap?`, and the snap that ends a glide on a line
+src/autosave.blsp           `#file#` auto-save sidecars + auto-revert of files changed on disk
+                            (idle-beat jobs)
+src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the idle beat — in
+                            the sandbox child for a brood buffer (its own session client), an
+                            in-image task otherwise; folds into the model's diagnostics cache
+src/eldoc.blsp              the idle beat's point-driven hints: the eldoc line (off the loop),
+                            when an LSP signature hint is due, the inline completion preview
+src/treewarm.blsp           a large tree-sitter buffer's parse warmed off the loop, so the first
+                            structural query does not pay for it on a keypress
 src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd)
 src/about.blsp              M-x version · --version · C-h C-a *About bedit* — bedit's version,
                             the brood under it and the build date, all from project-release/build-info
@@ -87,13 +104,39 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             hive packages that `:enhances bedit` at RUNTIME, into
                             ~/.config/bedit/packages (the elpa model) — never the build's _deps
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
-src/view.blsp               pure view: model -> render frame (editor/display ops)
-src/statusbar.blsp          the mode line as extensible segments (render ops + click/hover zones in one pass)
+src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
+                            feature: a pane body's layers share ONE geometry map, and the
+                            mode line's feature chips come from the statusbar registry
+src/hittest.blsp            the mouse side of the view: every hit-test / hover fold that takes
+                            a model and returns one (:hover, :diag-hover, :link-hover, a chip
+                            click, the context menu's hit) — recomputed from the same widget /
+                            segments / layout the view drew, so input never imports the renderer
+src/statusbar.blsp          the mode line as extensible segments (render ops + click/hover zones in one pass),
+                            and the chip REGISTRY (`register-modeline-segment`): a feature puts
+                            its chip on the bar when its module loads — presence (collab), the
+                            running app (apprun), the findings count (results), the attached
+                            node (attach) — ordered by rank
 src/ui-kit.blsp             the widget kit over editor/display: a widget is `(area ctx) ->
                             {:ops :zones}` — paint and hit-test in ONE pass, styled by semantic
                             role. The shared shape behind the context menu, popup, plume, which-key
 src/input.blsp              dispatch: fold a key/mouse/tick event into the next model
-src/commands.blsp           the editing commands, each a (model key) -> model
+src/commands.blsp           the GENERAL editing commands, each a (model key) -> model — motion,
+                            editing, kill ring, panes, buffers, prompts. A feature's commands
+                            live in its own module (dired, help, vim, registers, hexl,
+                            eval-commands, shell-command), bound by qualified symbol
+src/registers.blsp          registers (C-x r SPC / j / s / i) behind a `Register` ability, and
+                            bookmarks (C-x r m / b)
+src/hexl.blsp               hexl-mode: a non-UTF-8 file opened as a read-only hex view (pool's
+                            find-file reaches it late-bound); the mode's `:no-write` facet is
+                            what makes C-x C-s / C-x C-w refuse it
+src/pool.blsp               the buffer pool and where its buffers are shown — open / select /
+                            kill, `ed-display-buffer` (Emacs display-buffer), `ed-pop-to-file`
+                            (next-error), find-file + its path prompt, the default dir and
+                            project root, saving. What most modules `:use` instead of
+                            `commands`: showing a report buffer needs none of the commands
+src/menu.blsp               the right-click context menu's model ops (open / move / run /
+                            close); an item names its command by SYMBOL, resolved when it
+                            runs, so a redefined command reaches the menu too
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
 src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of std's
@@ -104,15 +147,39 @@ src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of st
                             its flags with `ed-transient-args` and cannot tell it was
                             reached from one. A keymap has nowhere to put a FLAG, which
                             is why `--force-with-lease` was untypeable before this
-src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services.
-                            `deflanguage` declares a tree-sitter language from ONE spec
+src/modes.blsp              modes as layers — the INFRASTRUCTURE: text-mode, the shared
+                            `prog` base (C-M-* motions), `register-language-mode` /
+                            `register-prog-mode`, and the generic read-only modes
+                            (special, help, occur, hexl, process / buffer menus, markdown).
+                            A feature's own buffer types (git, dired, packages, bshell,
+                            term, *Diagnostics*) register in that feature's module —
+                            a read-only report through `register-special-type` (its
+                            layers over special-mode over text-mode), its M-x names
+                            derived from its keymap by `layer-commands`, its line
+                            colouring through `fontify-lines` (spans per line)
+src/brood-mode.blsp         brood-mode: the `.blsp` keymap (paredit, electric pairs) and
+                            its services — eldoc, doc-at, completion against the live
+                            image, the CST indenter, the checker as `:diagnostics`
+src/lisp-modes.blsp         the other Lisps: `deflisp` (a special-form set + a file
+                            pattern over Brood's own reader) for elisp, Common Lisp,
+                            Clojure, Scheme, Fennel; `lisp-indent-with` (Emacs's rule);
+                            wos kernel source
+src/languages.blsp          `deflanguage` declares a tree-sitter language from ONE spec
                             (faces, indent, heredocs, formatter) and generates its whole
                             service set — checked against
                             editor/treesit/language-contract, so an incomplete language
-                            fails at load rather than at the keypress that needed it
-src/grammars.blsp           M-x grammar-list / grammar-reload: what tree-sitter grammars
-                            are installed (ABI, path), the recipe to build one, and a live
-                            swap — drop a new .so in and reload, no restart
+                            fails at load rather than at the keypress that needed it.
+                            Ruby / Elixir / Python, plus the lexer-only layers: env,
+                            shell, Dockerfile, JSON / YAML / TOML / Makefile / INI / commit
+src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
+                            services: the number column, the diff-hl bar, and the margin
+                            marks (● ✓ ✗ ⚠) read through one precedence table that both
+                            paints and resolves a click
+src/grammars.blsp           tree-sitter grammars the runtime was not built with: where they
+                            live (~/.config/bedit/grammars), loading them at startup, and
+                            M-x grammar-list / grammar-reload: what is installed (ABI,
+                            path), the recipe to build one, and a live swap — drop a new
+                            .so in and reload, no restart
 src/format.blsp             M-x format-buffer + format-on-save: the language's own
                             formatter (mix format, black, rubocop), declared per language
                             and run over the FILE, so a failing formatter costs nothing
@@ -128,10 +195,11 @@ src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, g
                             (expert-lsp.org), which narrates its own startup — forwarded to
                             *Messages*, because it answers nothing until its engine is up
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
-                            shared by lsp (connection side) and commands (model side); eager-loaded so
-                            commands can register fold impls while lsp stays deferred
+                            shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
+                            lsp-commands can register fold impls while lsp stays deferred
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
-src/completion.blsp         shared fuzzy ranking + vertical-menu card + ls -l perms (complete + plume + dired)
+src/completion.blsp         shared fuzzy ranking + vertical-menu card (complete + plume)
+src/fileperm.blsp           the `ls -l` permission string (`rwx`, `perms-string`) — dired + plume marginalia
 src/plume.blsp              the minibuffer completion UI — vertical list + marginalia + N/M counter (our Vertico/Marginalia)
 src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d session, *Spy* trace
                             stream, *Debug* paused-process queue with resume/eval-in-scope,
@@ -152,7 +220,8 @@ src/session.blsp            ONE event vocabulary for every evalsession the edito
                             the session's NAME) plus the shared emit and client API. Each
                             backend used to carry its own three records and its own emit
                             purely so the router could tell whose event it was — a fact the
-                            session already knows, and now says
+                            session already knows, and now says. A live-evaluating client's
+                            ready/down bookkeeping too (`client-ready` / `client-down`)
 src/brood-test.blsp         C-c t in a Brood project without the project load: an eval-server
                             child answering `:test` / `:teststop`, streaming per-test
                             verdicts AND the spy entries a test traces.
@@ -174,13 +243,20 @@ src/wrap.blsp              visual-line-mode: the pure break rule (a line → `[f
                             by default (a `:visual-line` mode facet); M-x visual-line-mode toggles
 src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
+src/eval-commands.blsp      the C-x C-e family as commands (eval-last-sexp / -region / -buffer):
+                            off the loop as a std/task, C-g cancels; loaded with the image (main)
+src/shell-command.blsp      M-! / M-| (Emacs shell-command): one `sh -c` in the buffer's dir, off
+                            the loop, output to the echo area or a side pane; C-u M-| replaces
+                            the region. Loaded with the image (main)
 src/sandbox.blsp            the Brood eval session's BACKEND over std's `editor/evalsession`:
                             find a runtime, start it on a generated eval-server script
                             (ADR-198), the pr-str-line codec, and session events -> UiEvent
                             records. The supervision (queue-until-ready, id-matched replies,
                             the watchdog, strikes, respawn) is std's and shared with Elixir
 src/liveeval.blsp           the live-evaluating buffer as a VOCABULARY, shared by tutor +
-                            playground: parse-state, result/type/timing notes, spy cascade
+                            playground: parse-state, result/type/timing notes, spy cascade,
+                            and `form-step` — ONE form's turn in either's launch (carry, note,
+                            hold, send, or answer in-image), each client a map of callbacks
 src/sandbox-events.blsp     routes the shared sandbox's UiEvents to every client that wants
                             them (an `impl` is per record type, so one client can't own them)
 src/playground-core.blsp    the live-evaluating buffer as a MECHANISM, parameterised by a
@@ -275,35 +351,56 @@ src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is
                             ^ · M-n/M-p · 1-4 · M-w are shared by every such buffer. A lazy
                             section (a status file whose diff was never fetched) asks the
                             mode's `:section-reload`
-src/git.blsp                git porcelain, Magit's: C-x g *git-status* is a section tree —
-                            in-progress line, Head:/Merge:/Push:/Tag:, Unmerged / Untracked /
-                            Unstaged / Staged files (TAB fetches a file's hunks), unpushed,
-                            unpulled, stashes, recent commits; one blank line between
-                            sections and nothing indented. s/u/k act on what is at point: a
-                            REGION of a hunk's lines (std/diff `hunk-select`), a hunk, a file,
-                            several files, a whole list, a stash; k on a conflict offers
-                            ours/theirs, e opens it at its first marker (smerge). RET goes to
-                            the line a diff line became. `$` is the PROCESS LOG (magit's
-                            `magit-process-buffer`) — every command, exit code, duration and
-                            output; one logged seam (`git-run` / `git-run-hunk`, `git-do` to
-                            refresh after), credentials redacted, `\r` progress applied
-src/git.blsp (cont.)        every Magit menu on Magit's letter, each a transient of flags:
-                            c commit (extend · reword · amend · fixup · squash · instant
-                            fixup/squash; off the loop, the staged diff beside the message,
-                            M-p/M-n message history, a failed commit keeps its draft) · b
-                            branch (a remote branch checks out as a tracking local one;
+src/git.blsp                the TOP of the git porcelain (Magit's): `:use`s every git* module
+                            below, so loading git loads all of it and every command a menu
+                            or keymap names by symbol is there. Holds what has no better
+                            home: the l log / d diff menus, `!` any git command, the file
+                            menu (C-c g), % worktrees, W/w patches, o submodules, T notes,
+                            i ignore, K untrack, R rename, j jump, M-x git-init / git-clone,
+                            and ? — every menu from one key
+src/gitcore.blsp            the ground under it: `git-git` (never prompting), the repo a
+                            buffer is about, `git status --porcelain -z`, upstream and
+                            ahead/behind, refs / remotes / stashes, which operation is
+                            half-done in .git (the SEQUENCER). One logged seam: `git-run` /
+                            `git-run-hunk`, `git-do` to refresh after, `git-launch-op` for
+                            network commands OFF the loop, `git-confirm`. `$` is the PROCESS
+                            LOG (magit's `magit-process-buffer`) — every command, exit code,
+                            duration and output, credentials redacted, `\r` progress applied.
+                            Knows nothing of the status buffer: it refreshes it by name
+                            (`git-refresh-status`), because gitstatus stands on this
+src/gitbar.blsp             the mode line's git: ⎇ branch, state dot, ↓/↑ vs upstream,
+                            +staged ~unstaged ?untracked — summarised in a task on the idle beat
+src/gitsection.blsp         what every git SECTION buffer shares (status and gitview's views):
+                            file / hunk / commit section builders, `git-section-faces` (a
+                            line coloured by what it IS), `git log` parsing, what is at point,
+                            and `git-common-keymap` (Magit's `magit-mode-map`)
+src/gitpick.blsp            asking for ONE thing — a remote, ref, commit, name, start point —
+                            in a completing prompt, the one at point first (`git-prompt`)
+src/gitstatus.blsp          C-x g *git-status*, a section tree: in-progress line,
+                            Head:/Merge:/Push:/Tag:, Unmerged / Untracked / Unstaged / Staged
+                            files (TAB fetches a file's hunks), unpushed, unpulled, stashes,
+                            recent commits — collected in a task. s/u/k act on what is at
+                            point: a REGION of a hunk's lines (std/diff `hunk-select`), a
+                            hunk, a file, several files, a whole list, a stash; k on a
+                            conflict offers ours/theirs, e opens it at its first marker
+                            (smerge). RET goes to the line a diff line became. The background
+                            fetch that says when the upstream moved
+src/gitremote.blsp          P push (where it pushes / upstream / elsewhere / another branch /
+                            tags; a branch with nowhere to go is asked and remembers) · F
+                            pull · f fetch · M remotes — each a transient, all off the loop
+src/gitrefs.blsp            b branch (a remote branch checks out as a tracking local one;
                             create from a start point, spin off, upstream, reset, delete
-                            asking before -D) · P push (where it pushes / upstream /
-                            elsewhere / another branch / tags; a branch with nowhere to go
-                            is asked and remembers) · F pull · f fetch · m merge (+preview) ·
-                            r rebase (interactive from the commit at point, and reword /
-                            modify / remove ONE commit, autosquash — a plan handed to git as
-                            `sequence.editor=cp <file>`, so no editor ever opens) · A · V ·
-                            X (mixed/soft/hard/keep, index, worktree, file) · z (at point) ·
-                            t · M · B bisect · % worktrees · W/w patches · o submodules · T
-                            notes · i ignore · K untrack · R rename · j jump · ? all of them.
-                            The SEQUENCER is one idea not five: git records which operation is
-                            half-done in .git, so one continue/skip/abort dispatches on it
+                            asking before -D) · t tags · z stash (at point) · X reset
+                            (mixed/soft/hard/keep, index, worktree, file)
+src/gitcommit.blsp          c commit (extend · reword · amend · fixup · squash · instant
+                            fixup/squash; off the loop, the staged diff beside the message,
+                            M-p/M-n message history, a failed commit keeps its draft)
+src/gitsequence.blsp        m merge (+preview) · r rebase (interactive from the commit at
+                            point, and reword / modify / remove ONE commit, autosquash — a
+                            plan handed to git as `sequence.editor=cp <file>`, so no editor
+                            ever opens) · A cherry-pick · V revert · B bisect. The SEQUENCER
+                            is one idea not five: one continue/skip/abort dispatches on
+                            whichever operation git says is half-done
 src/gitview.blsp            the git VIEWS, section buffers acted on in place: *git-revision*
                             (a commit's message then files and hunks — RET to a line, a applies
                             a hunk, v reverses it), *git-diff* (s/u/k as in the status, + / -
@@ -314,7 +411,8 @@ src/gitview.blsp            the git VIEWS, section buffers acted on in place: *g
                             step through its history
 src/smerge.blsp             conflicts resolved IN the file, Emacs's smerge: C-c ^ n/p between
                             conflicts, u/l/a/b keep upper / lower / both / base
-src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
+src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD, recomputed
+                            off the loop on the idle beat (and the blink tick)
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
                             (biggest first — where the memory went) · C-c b t trace a named
