@@ -5,7 +5,7 @@ in brood's `docs/devlog.md` (bedit's own [`devlog.md`](devlog.md) stops in July)
 in brood's `docs/decisions.md`; the open backlog is [`../issues.md`](../issues.md). Read
 this to pick the work back up cold.
 
-## State when written — 2026-10-18, late
+## State when written — 2026-10-19, morning
 
 - **brood** `v0.41.0` is tagged (`f9878a63`): `std/mime`, `(string/bytes-> b :lossy)`, and
   a backward rope search that walks back from point instead of scanning from offset 0.
@@ -25,14 +25,31 @@ this to pick the work back up cold.
   a release resolves std's first, so every call into bedit's (format-buffer, format-on-save,
   every terminal) landed in std's — dark in the v0.5.1 binary. brood 0.41.0's `nest
   release` refuses such a bundle. `terminal` now loads with `main`.
-- **brood CI on `main` was red before 0.41.0** on the other session's json / browser-tab
-  work: `tests/temp_purge_coverage_test.blsp` and `process_wide_statics::every_process_wide_table_says_why`.
-  Not mail's; that session's to fix.
+- **brood CI on `main` was red from 0.41.0 on** (the other session's json / browser-tab
+  work), with two failures. Both are fixed in brood `c76336ef` (2026-10-19), pushed from the worktree:
+  - `tests/project_test.blsp` now purges its `brood-gate-` / `brood-shadow-` temp
+    prefixes, which `temp_purge_coverage_test.blsp` demanded.
+  - `boot.rs PROVIDED_PRELUDE_IMAGE` is listed as `OneMachine` in
+    `crates/lisp/tests/process_wide_statics.rs`.
+
+  Both passed locally. CI on `c76336ef` itself was cancelled, because the other session pushed
+  `e9ddd4c6` (feat(tab)) on top within minutes. Run `39215546916` covers both commits and
+  was still running at the restart. **Check it first**:
+  `gh run view 39215546916 -R broodlang/brood`. A new failure there is most likely from
+  e9ddd4c6, so classify it before touching anything.
+- **The other brood session is LIVE again** (it pushed e9ddd4c6 on 2026-10-19). Keep using the
+  worktree `~/.cache/brood-wt-mime`, which is now detached at origin/main. Its `target`
+  symlink points at `~/.cache/brood-wt-mime-target`, which holds a debug test build, not a
+  nest. The pre-push hook fell back to the installed nest 0.41.0, and that was fine.
+- **bedit v0.5.2 is not cut.** The installed v0.5.1 has formatting and terminals dark (the
+  `format`/`term` std clash). The fix is on main (`8490c904`). The user has not yet said whether
+  to release. If yes: follow `71d75a42 release: v0.5.1` (bump `project.blsp`, tag, push,
+  `make install`).
 - `issues.md` has no open items.
 
 ## Traps
 
-1. **The disk is ~99% full.** A GUI `make install` needs ~6 GB under `target/release-fast`.
+1. **The disk is tight** (85% on 2026-10-19, 93 GB free; it hit 81 MB free on 10-18). A GUI `make install` needs ~6 GB under `target/release-fast`.
    Delete a worktree's `debug/` target once it is pushed; never build into the primary
    brood checkout's `target/` while its session is live.
 2. **brood's pre-push hook looks for `./target/{release-fast,release,debug}/nest`.** A
@@ -44,11 +61,11 @@ this to pick the work back up cold.
 
 ## Work queue
 
-1. Watch brood's `v0.41.0` release run and the next `ci.yml` on main
-   (`gh run list -R broodlang/brood`); bump brood's `BEDIT_REF` to the bedit commit that
-   requires 0.41.0, so the downstream smoke runs mail_test.
-2. Try `*lsp-log*` and the echo area live against Expert in an Elixir project.
-3. HTML-only mail shows its raw HTML in `*Message*` (with a note). An HTML→text in brood's
+1. Confirm brood CI is green on main (run `39215546916` or later). The v0.41.0 release run
+   succeeded, and `BEDIT_REF` is already bumped to `42633ab`.
+2. Ask the user about cutting bedit v0.5.2.
+3. Try `*lsp-log*` and the echo area live against Expert in an Elixir project.
+4. HTML-only mail shows its raw HTML in `*Message*` (with a note). An HTML→text in brood's
    std (the prime directive) would let it render.
 
 ## How to verify a change here
