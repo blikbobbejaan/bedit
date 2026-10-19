@@ -451,7 +451,7 @@ formats. What it leaves, in the order to take it up:
    the loop and loads it, and opening a file whose grammar is missing says so with the
    command. Brood gained `editor/treesit/languages` (what parses now) and a `subdir` for a
    repository holding several grammars.
-3. ✅ **Org-mode** (2026-10-18): brood's `std/editor/org` colours it and knows the outline
+3. ✅ **Org-mode** (2026-10-18): `src/org.blsp` (std's `editor/org` until ADR-417) colours it and knows the outline
    (heading level, subtree end, the TODO cycle); bedit's org-mode has TAB / S-TAB folding,
    `C-c C-t`, `C-c C-n` / `C-c C-p`, M-<left> / M-<right> and M-RET. Folding is the
    editor's own (`src/folds.blsp`): any mode that declares a `:fold-extent` gets it.

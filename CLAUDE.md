@@ -35,9 +35,23 @@ capability into bedit as a one-off workaround.
 
 This is not a detour from building the editor — it *is* building the editor. A
 self-editing Emacs clone is only possible if its abstractions live in a language
-expressive enough to host them. Every gap the editor exposes is a gap in Brood
-worth fixing properly. **Be actively on the lookout for these** — treat "bedit
+expressive enough to host them. **Be actively on the lookout for these** — treat "bedit
 wants X and can't express it cleanly" as a signal to improve Brood, and say so.
+
+**A capability, not a feature.** The gap has to be one the *language* has: a
+primitive, a protocol, a mechanism that bedit cannot express without it. A feature
+built from capabilities Brood already has belongs in bedit, however reusable it
+looks: Org-mode, Magit's transient menus and section trees, form buffers, the format
+highlighters and the mail parser all started in Brood's std and moved here (brood
+ADR-417). A std module has to pass three questions:
+
+1. Is it a mechanism rather than a feature?
+2. Would something besides bedit use it (Brood's REPL, the observer, `nest`, the eval
+   server, a program that is not an editor)?
+3. Does it have to version with the kernel?
+
+If it fails 1 and 2, it lives in bedit. If other projects would want it but it fails 3
+(a file format's highlighter, a mail parser), it is a hive package.
 
 **Worked example (the live one).** Eval-in-buffer (`C-x C-e`: eval the form
 before point, show its output in the `*Messages*` buffer) needs to *capture*
@@ -63,7 +77,8 @@ Every plan for this project **must have two explicit parts, in this order**:
    because it's the prime directive: if a core abstraction is missing, we improve
    the language before building on it. If a plan has nothing here, say so
    explicitly — "no language gap; builds on existing primitives" — so it's clear
-   the question was asked, not skipped.
+   the question was asked, not skipped. A proposed std module names the caller
+   besides bedit that needs it; without one, it is part 2 work.
 2. **What we will do.** The concrete editor work in bedit, built on the
    primitives from part 1 (and existing ones): the files, the order, the tests.
 
@@ -139,14 +154,17 @@ src/menu.blsp               the right-click context menu's model ops (open / mov
                             runs, so a redefined command reaches the menu too
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
-src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of std's
-                            `editor/transient` (brood ADR-387) — the modal overlay, the
+src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of
+                            `transient-core` (brood ADR-387) — the modal overlay, the
                             minibuffer read behind a `:read` outcome, and the MEMORY (a
                             menu reopens with the arguments it had last time, in
                             state/transients.blsp). A command invoked from a menu reads
                             its flags with `ed-transient-args` and cannot tell it was
                             reached from one. A keymap has nowhere to put a FLAG, which
                             is why `--force-with-lease` was untypeable before this
+src/transient-core.blsp     the transient MECHANISM, no editor in it: a menu spec, its keymap,
+                            the argument value it builds and the rows it renders (Magit's
+                            transient.el; moved from brood's std by ADR-417)
 src/modes.blsp              modes as layers — the INFRASTRUCTURE: text-mode, the shared
                             `prog` base (C-M-* motions), `register-language-mode` /
                             `register-prog-mode`, and the generic read-only modes
@@ -173,13 +191,24 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             Go / C, each naming where its grammar lives (`:grammar`, for
                             M-x grammar-install), plus the lexer-only layers: env, shell,
                             Dockerfile, JSON / YAML / TOML / Makefile / INI / commit, and
-                            org-mode (std's `editor/org`, folding, TODO cycling, heading
+                            org-mode (`org`'s spans and outline, folding, TODO cycling, heading
                             motion)
+src/org.blsp                Org text: `org-spans` (the colouring), heading levels, where a
+                            subtree ends, the TODO cycle. Pure; languages.blsp's org-mode
+                            is the mode over it (moved from brood's std by ADR-417)
 src/mail.blsp               mail: mbox-mode (C-c C-n / C-c C-p between messages, on rope
                             searches that cost the distance, not the offset), eml-mode, and
                             C-c C-v — the message at point DECODED in *Message* (Gnus's
-                            article buffer) over std's `mime`: the headers that matter, the
+                            article buffer) over `mail-message`: the headers that matter, the
                             text part, the attachments, RET saves one
+src/mail-message.blsp       Internet mail messages: RFC 5322 headers, the MIME part tree,
+                            encoded words, quoted-printable / base64, legacy charsets — what
+                            mail.blsp decodes with (std's `mime` until brood ADR-417)
+src/lex-*.blsp              the lexical highlighters, each a pure `[start end face]` span fn
+                            for a `:fontify` service: `lex-configs` (JSON / YAML / TOML /
+                            Makefile / INI / commit, as `editor/lexer` tables), `lex-shell`,
+                            `lex-dotenv`, `lex-dockerfile`, `lex-markdown` (spans, and the
+                            rendering mdpreview paints). std's `editor/*` until brood ADR-417
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
                             marks (● ✓ ✗ ⚠) read through one precedence table that both
@@ -345,6 +374,9 @@ src/compile.blsp            M-x compile: run a build in the project root, C-x ` 
                             are an Emacs-style regexp TABLE (`*error-patterns*`), which
                             needed brood's regex captures to be expressible at all
 src/projects.blsp           project root + file walk (find-file-in-project)
+src/formbuf.blsp            FORM BUFFERS: generated text with editable regions (a shell's
+                            input, a tutorial's boxes) — the region algebra, `splice`, and the
+                            `:veto` / `:clamp` guards. Pure; moved from brood's std by ADR-417
 src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a line
                             typed at bedit's own prompt runs as `sh -c` (pipes, output
                             stripped) or, starting with `(`, evaluates as Brood in the
@@ -365,8 +397,11 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             are painted; history above the screen keeps its colour and
                             is capped; the mode line chip says which program and mode
                             (named to dodge std's `term`, as formatter dodges `format`)
+src/section.blsp            SECTION TREES (magit-section) as data: a tree rendered to lines
+                            plus parallel rows, walked and folded by index. Pure; moved from
+                            brood's std by ADR-417
 src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is a
-                            std/editor/section tree (brood ADR-388) — tree, rows and
+                            `section` tree (brood ADR-388) — tree, rows and
                             visibility live ON THE BUFFER, faces come from the mode's
                             `:section-faces` service as data (`:face-spans`), and TAB · n/p ·
                             ^ · M-n/M-p · 1-4 · M-w are shared by every such buffer. A lazy
