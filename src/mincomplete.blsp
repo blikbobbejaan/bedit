@@ -6,7 +6,8 @@ completion-at-point popup); these run on the prompt's text and close over the pr
 candidate source (see the `:complete-fn`s in `commands`). Data→data and side-effect
 free apart from `ed-complete-path` reading the filesystem, so they're unit-testable
 without a window."
-  (:use projects)) ; float-recent — the one shared recency-ordering core
+  (:use projects) ; float-recent — the one shared recency-ordering core
+  (:use filename)) ; substitute — what a typed path means (`~`, `$HOME`, a restarted `//`)
 ;; ---- longest common prefix --------------------------------------------------
 
 (sig lcp-len (string string int int -> int))
@@ -42,16 +43,27 @@ shared Tab action behind find-file, project find-file, switch-buffer and M-x."
 (defn- ed-last-slash (s i)
   (cond (< i 0) -1 (= (string/char-at s i) "/") i else (ed-last-slash s (dec i))))
 
-(defn- ed-split-path (text)
-  "Split `text` into the directory to list, the literal prefix to reattach, and
-the fragment being completed. With no `/`, the directory is `.` and there's
-nothing to reattach (relative to cwd)."
-  (let (i (ed-last-slash text (dec (string/length text))))
+(defn- ed-split-path (typed base)
+  "Split the live part of `typed` — what follows a restarting `//` or `/~/`
+(`filename/shadow-end`) — at its last `/`: the prefix to reattach, kept AS TYPED (`~/`,
+`$HOME/`, a `$$` all stay as they are, so a candidate reads the way you wrote it), the
+directory that prefix names (`filename/expand`: absolute, a relative one under `base`), and
+the fragment being completed, read as a name (`$$` is `$`). With no `/`, the directory
+is `base` (else `.`) and there is nothing to reattach."
+  (let (live (string/substring typed (filename/shadow-end typed base) (string/length typed))
+        i (ed-last-slash live (dec (string/length live))))
     (if (< i 0)
-      {:dir "." :prefix "" :frag text}
-      {:dir (if (= i 0) "/" (string/substring text 0 i))
-       :prefix (string/substring text 0 (inc i))
-       :frag (string/substring text (inc i) (string/length text))})))
+      {:dir (or base ".") :prefix "" :frag (filename/substitute live base)}
+      (let (prefix (string/substring live 0 (inc i)))
+        {:dir (without-trailing-slash (filename/expand prefix base))
+         :prefix prefix
+         :frag (filename/substitute (string/substring live (inc i) (string/length live)) base)}))))
+
+(defn- without-trailing-slash (dir)
+  "`dir` without the `/` that ends it — except the root, which is only that."
+  (if (and (> (string/length dir) 1) (string/ends-with? dir "/"))
+    (string/substring dir 0 (dec (string/length dir)))
+    dir))
 
 (defn- ed-join (dir name)
   (cond (= dir "/") (str "/" name) (= dir ".") name else (str dir "/" name)))
@@ -63,13 +75,14 @@ live candidate list."
   (seq/filter (check-allow :discarded-catch (try (file/ls (:dir p)) (catch e ())))
     (fn (nm) (string/starts-with? nm (:frag p)))))
 
-(defn ed-complete-path (text)
+(defn ed-complete-path (text &optional base)
   "Complete a filesystem `path` against the entries of its directory: the sole match (a
 trailing `/` for a directory), else the longest common prefix; the unchanged `text` when
 nothing matches. Tolerates a non-existent directory. The find-file Tab action — the same
 `complete-prefix` core as project find-file, over `ed-path-candidates` (relative entries,
-each already carrying the typed directory prefix and a dir's trailing `/`)."
-  (complete-prefix text (ed-path-candidates text)))
+each already carrying the typed directory prefix and a dir's trailing `/`). A relative
+`text` completes under `base` (else the working dir)."
+  (complete-prefix text (ed-path-candidates text base)))
 
 (defn- ed-cand-name (c)
   "The entry name of a path candidate for sorting — its trailing `/` (a directory marker)
@@ -88,19 +101,22 @@ Floats through the shared `projects/float-recent` (over a name-sorted base), the
 (defn path-label (path)
   "The display label for a path candidate: its last component, a directory's trailing
 `/` kept — so the find-file Vertico list shows `src/` / `commands.blsp` (relative to the
-folder being browsed) while the candidate's *value* stays the full path used to open it."
-  (if (string/ends-with? path "/")
-    (str (path/basename (string/substring path 0 (dec (string/length path)))) "/")
-    (path/basename path)))
+folder being browsed) while the candidate's *value* stays the full path used to open it. A
+candidate is in input spelling (`$` doubled, `filename/escape`); the label is the name itself."
+  (filename/unescape (if (string/ends-with? path "/")
+                       (str (path/basename (string/substring path 0 (dec (string/length path))))
+                         "/")
+                       (path/basename path))))
 
-(defn ed-path-candidates (text)
+(defn ed-path-candidates (text &optional base)
   "The directory entries that complete path `text` — each a **full path** (the typed
 directory prefix + the entry name, a trailing `/` marking a directory), so the find-file
 Vertico list can open the selected one directly. The live candidate list `C-x C-f` shows
-as you type (shares `ed-dir-matches` with `ed-complete-path`)."
-  (let (p (ed-split-path text))
-    (map (ed-dir-matches p)
-      (fn (nm) (str (:prefix p) (if (file/dir? (ed-join (:dir p) nm)) (str nm "/") nm))))))
+as you type (shares `ed-dir-matches` with `ed-complete-path`). Each is spelled as you typed
+the directory, the entry's name escaped (`path-candidate`), so putting one on the line, or
+accepting it, reads back as that file. A relative `text` lists under `base`."
+  (let (p (ed-split-path text base))
+    (map (ed-dir-matches p) (fn (nm) (path-candidate p nm)))))
 
 ;; ---- name completion (against a fixed candidate list) -----------------------
 
@@ -175,35 +191,39 @@ the listing it caches. Once it has settled the whole listing is read and cached.
     (and (< i (count names)) (= (nth names i) nm))))
 
 (defn- path-candidate (p nm)
-  "The candidate string for entry `nm` of split-path `p` — a directory marked with `/`."
-  (str (:prefix p) (if (file/dir? (ed-join (:dir p) nm)) (str nm "/") nm)))
+  "The candidate for entry `nm` of split-path `p`: the prefix as typed + the name in input
+spelling (`filename/escape` — a `$` in it doubled, so the line reads it back as this file),
+a directory marked with `/`."
+  (str (:prefix p) (filename/escape nm) (if (file/dir? (ed-join (:dir p) nm)) "/" "")))
 
-(defn- recent-candidate? (p names r)
-  "Is recent path `r` one of the candidates of split-path `p` (whose directory's entries are
-`names`, sorted)? Exactly when it is `prefix + entry` for a matching file, or `prefix + entry/`
-for a matching directory."
-  (and (string/starts-with? r (:prefix p))
-    (let (tail (string/substring r (string/length (:prefix p)) (string/length r))
-          dir? (string/ends-with? tail "/")
-          nm (if dir? (string/substring tail 0 (dec (string/length tail))) tail))
-      (and (sorted-member? names nm)
-        (string/starts-with? nm (:frag p))
-        (= dir? (file/dir? (ed-join (:dir p) nm)))))))
+(defn- recent-candidate (p names r)
+  "Recent path `r` (absolute) as a candidate of split-path `p` — spelled as `path-candidate`
+spells it — when it is one: an entry of `p`'s directory (`names`, sorted) that starts with
+the fragment, a directory exactly when `r` marks it with `/`. Nil otherwise."
+  (let (under (if (= (:dir p) "/") "/" (str (:dir p) "/")))
+    (when (string/starts-with? r under)
+      (let (tail (string/substring r (string/length under) (string/length r))
+            dir? (string/ends-with? tail "/")
+            nm (if dir? (string/substring tail 0 (dec (string/length tail))) tail))
+        (when (and (sorted-member? names nm)
+                (string/starts-with? nm (:frag p))
+                (= dir? (file/dir? (ed-join (:dir p) nm))))
+          (path-candidate p nm))))))
 
-(defn ed-path-candidates-top (text recent n)
+(defn ed-path-candidates-top (text recent n &optional base)
   "The first `n` live find-file candidates for path `text` — the same list as
 `(take (ed-sort-candidates (ed-path-candidates text) recent) n)`: the `recent` paths among
 them first (most recent first), then the rest by name. Lists the directory once per change
-to it and stats only the entries returned."
-  (let (p (ed-split-path text)
+to it and stats only the entries returned. In input spelling, like `ed-path-candidates`;
+a relative `text` lists under `base`."
+  (let (p (ed-split-path text base)
         listing (current-listing (:dir p) (:frag p)))
     (if (nil? listing)
       ()
       (let (names listing
             frag (:frag p)
-            present (if (empty? recent)
-                      '()
-                      (seq/filter recent (fn (r) (recent-candidate? p names r))))
+            ;; the recent files among the candidates, spelled as the candidates are
+            present (seq/keep recent (fn (r) (recent-candidate p names r)))
             present-set (into #{} present)
             total (count names)
             want (math/max 0 (- n (count present))))
