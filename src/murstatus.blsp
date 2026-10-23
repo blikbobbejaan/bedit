@@ -35,10 +35,9 @@ Collected OFF the loop (three subprocesses: status, diff, and the forge's log), 
 (def *mur-log-timeout-ms* 4000) ; how long the status waits for the forge's log before going without
 
 (defn mur-collect-status (root)
-  "Everything *mur-status* shows for working copy `root`: `{:root :status :error :diff
-:log}` — `mur status --json` (nil, with `:error` saying why, when mur cannot answer),
-`mur diff`'s text, and trunk's newest snapshots (`mur log --json`, which reads the forge:
-nil when it cannot be reached, which is not an error here)."
+  "What *mur-status* shows of working copy `root` from this machine alone: `{:root :status
+:error :diff}` — `mur status --json` (nil, with `:error` saying why, when mur cannot answer)
+and `mur diff`'s text. Trunk's log, which asks the forge, is [[mur-collect-log]]."
   (let (r (mur-mur root ["status" "--json"])
         status (if (= (:exit r) 0)
                  (check-allow :discarded-catch (try (json/decode (:stdout r)) (catch _ nil)))
@@ -254,12 +253,20 @@ holds the work back (a refused send, a trunk move waiting, a merge under way)."
     (if (>= i 0) (inc i) 1)))
 
 (defn- mur-render-status (m root collected line action)
-  "PURE: fold a finished collection into *mur-status* for working copy `root`."
+  "PURE: fold a collection into *mur-status* for working copy `root`. The collection rides
+on the buffer (`:ctx`), so the forge's log, which lands after it, re-renders the same view."
   (let (fresh? (nil? (ed-buffer-index-by-name m "*mur-status*")))
     (sb-show m
       "*mur-status*"
       (mur-status-tree collected)
-      :mur-status {:action action :ctx {:root root} :line (if (and (nil? line) fresh?) mur-first-line line)})))
+      :mur-status {:action action
+       :ctx {:root root :collected collected}
+       :line (if (and (nil? line) fresh?) mur-first-line line)})))
+
+(defn- mur-status-collected (m)
+  "The collection *mur-status* shows now (on its buffer), or nil when it is not open."
+  (let (i (ed-buffer-index-by-name m "*mur-status*"))
+    (if (nil? i) nil (get-in (ed-buf-at m i) [:section-ctx :collected]))))
 
 (defn- mur-status-focus (m)
   "`:here` when the reader is looking at *mur-status* (or it is not open yet), else `:none` —
@@ -267,16 +274,29 @@ a refresh behind them lands quietly."
   (let (i (ed-buffer-index-by-name m "*mur-status*"))
     (if (or (nil? i) (= i (ed-current-index m))) :here :none)))
 
+(defn mur-collect-log (root)
+  "Trunk's newest snapshots for *mur-status* (`mur log --json`): the forge's, so asked
+separately from the rest and bounded — offline, nil, and the status shows without them."
+  (mur-json root ["log" "-n" (str *mur-log-count*) "--json"] {:timeout-ms *mur-log-timeout-ms*}))
+
 (defn mur-show-status (m root &optional (line nil) (action nil))
-  "Show or refresh *mur-status* for `root`, collecting OFF the loop: the buffer appears at
-once (`Loading…` the first time, the old contents on a refresh) and fills when mur answers.
-Headless collects inline."
+  "Show or refresh *mur-status* for `root`, collecting OFF the loop in two steps: the
+working copy (status and diff, this machine only) lands first and is shown at once, beside
+the reader on a first open; trunk's log, which asks the forge, fills in when it arrives — a
+refresh keeps the log it had meanwhile. Headless collects both inline."
   (let (act (or action (mur-status-focus m)))
     (if (ed-headless?)
-      (mur-render-status m root (mur-collect-status root) line act)
+      (mur-render-status m
+        root
+        (assoc (mur-collect-status root) :log (mur-collect-log root))
+        line
+        act)
       (let (job (task (fn () (mur-collect-status root)) {:timeout vcproc/*vc-op-timeout-ms*})
             m1 (if (nil? (ed-buffer-index-by-name m "*mur-status*"))
-                 (ed-show-named m "*mur-status*" "Loading…\n" :mur-status)
+                 (pool/ed-display-buffer m
+                   "*mur-status*"
+                   "Loading…\n"
+                   :mur-status {:action (if (= act :none) :display act)})
                  m))
         (assoc m1
           :mur-status-proc job
@@ -286,15 +306,43 @@ Headless collects inline."
 
 (register-task-reply :mur-status-proc 'murstatus/mur-apply-show-status nil "mur status")
 (defn mur-apply-show-status (m collected)
-  "Fold a finished collection into the buffer; a nil answer (the task errored or timed out)
-says so rather than rendering an empty change."
+  "Fold the working copy's collection into the buffer, then ask the forge for trunk's log. A
+nil answer (the task errored or timed out) says so rather than rendering an empty change.
+Where it lands is decided NOW: `:here` was the reader's place when the refresh started, and
+if they have since moved, landing it there would drag them back."
   (let (root (:mur-status-root m)
         line (:mur-status-line m)
         action (:mur-status-action m :none)
-        m1 (dissoc m :mur-status-proc :mur-status-root :mur-status-line :mur-status-action))
+        m1 (dissoc m :mur-status-proc :mur-status-root :mur-status-line :mur-status-action)
+        ;; the log it had, until the forge answers again
+        shown (assoc collected :log (:log (mur-status-collected m1))))
     (if (nil? collected)
       (message m1 "mur status: no answer (timed out)")
-      (mur-render-status m1 root collected line action))))
+      (mur-launch-log (mur-render-status m1
+                        root
+                        shown
+                        line
+                        (if (= :here (mur-status-focus m1)) action :none))
+        root))))
+
+(defn- mur-launch-log (m root)
+  "Ask the forge for trunk's log off the loop, unless an ask is already out."
+  (if (:mur-log-proc m)
+    m
+    (assoc m
+      :mur-log-proc (task (fn () (mur-collect-log root)) {:timeout vcproc/*vc-op-timeout-ms*})
+      :mur-log-root root)))
+
+(register-task-reply :mur-log-proc 'murstatus/mur-apply-log nil nil)
+(defn mur-apply-log (m log)
+  "Fold trunk's log into *mur-status* — the same view, re-rendered in place and quietly
+(point kept, no pane moved) — when it is still about the same working copy."
+  (let (root (:mur-log-root m)
+        m1 (dissoc m :mur-log-proc :mur-log-root)
+        collected (mur-status-collected m1))
+    (if (or (nil? collected) (not (= (:root collected) root)) (nil? log))
+      m1
+      (mur-render-status m1 root (assoc collected :log log) nil (mur-status-focus m1)))))
 
 (defn mur-refresh (m)
   "Refresh *mur-status* — in place, point kept on the line it was on."
@@ -351,7 +399,7 @@ after it that are in the new file (context and additions); nil off a diff line."
   "The status of the mur working copy this buffer is in (C-x g): the change you are on,
 what changed since its last save, the clashes to settle, the other changes here."
   (let (root (mur-resolve-root m))
-    (if (nil? root) (message m "not in a mur working copy") (mur-show-status m root nil :here))))
+    (if (nil? root) (message m "not in a mur working copy") (mur-show-status m root nil :pop))))
 
 (defcommand cmd-mur-refresh
   (m key)

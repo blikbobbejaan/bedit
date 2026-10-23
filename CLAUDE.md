@@ -434,10 +434,11 @@ src/mur.blsp                the TOP of the mur porcelain (git.blsp's counterpart
                             mur module, and holds its menus — C-x M-g (and ? in *mur-status*)
                             every mur verb, C-c g mur about this file — both reached through
                             `vc` rows (`:dispatch`, `:file-menu`), as git's are. main loads it
-src/murcore.blsp            the ground the mur porcelain stands on: `mur-mur` (the client, found
-                            by std's `vcs/mur-program`), `mur-json` over its `--json`, the
-                            working copy a buffer is about, `mur-do` / `mur-launch` through
-                            vcproc's log. mur is Murmuration's VCS (mur.fly.dev): a CHANGE,
+src/murcore.blsp            the ground the mur porcelain stands on: `mur-mur` (the client, as
+                            the editor's own seat, MUR_RUNNER=bedit), `mur-json` over its
+                            `--json`, the working copy a buffer is about, `mur-do` /
+                            `mur-launch` through vcproc's log — and mur's ROW in std's `vcs`
+                            (files, changed, base text, id): bedit is the package that knows mur. mur is Murmuration's VCS (mur.fly.dev): a CHANGE,
                             its saved VERSIONS, a land puts it on TRUNK
 src/murbar.blsp             mur's row in vc and its mode line: ◆ what the change is for, a
                             state dot, ~changed !clashes ↑unsent ?unclaimed — one
