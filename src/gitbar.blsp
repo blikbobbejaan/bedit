@@ -1,38 +1,36 @@
 (defmodule gitbar
-  "The branch and working-tree state on the mode line, for every buffer in a repo: a ⎇
-branch segment, a state dot, `↓2 ↑1` against the upstream and `+staged ~unstaged
-?untracked` counts — each clickable to `C-x g`. The summary behind them is four git
-subprocesses, so it is computed in a task on the idle beat and folded back, never on the
-loop."
-  (:use model) ; ed-current-buf / ed-headless? / register-idle-job / register-task-reply
-  (:use pool) ; ed-default-dir
+  "git on the mode line, for every buffer in a repo: a ⎇ branch segment, a state dot,
+`↓2 ↑1` against the upstream and `+staged ~unstaged ?untracked` counts — each clickable to
+`C-x g`. git's row in `vc` (`register-vc-backend :git`): `vc` computes the summary off the
+loop on the idle beat and draws these segments from it; this module only knows what git's
+summary holds and how it reads."
+  (:use vc) ; register-vc-backend — git's row
   (:use statusbar) ; `seg` — build the branch + working-tree status-bar segments
-  (:use editor/buffer) ; buffer-file
-  (:use task) ; task — the summary's git subprocesses, off the loop
   (:use gitcore)) ; git-git / git-entries / git-upstream / the faces
 
 ;; ---- the status-bar segments (branch + working-tree indicator) --------------
 ;; The branch and a colour-coded working-tree indicator on the status bar, for **every**
-;; buffer in a repo (not just *git-status*). Built off the render path: the idle beat calls
-;; `git-cache-status` to recompute the summary + segments and cache them on the model as
-;; `:git-segments` (see `input`), which the view lays out (`view/ed-statusbar-segments`).
-;; Both segments are clickable (→ `C-x g`) and carry a hover tooltip.
+;; buffer in a repo (not just *git-status*). Built from the summary `vc` caches on the model
+;; as `:vc-summary`, which the view lays out. Both segments are clickable (→ `C-x g`) and
+;; carry a hover tooltip.
 
 (def *git-branch-glyph* "⎇ ") ; the branch marker; set to "git:" if your font lacks ⎇
 (def *git-state-glyph* "●") ; the working-tree state dot
 
 (defn git-summary (root)
-  "A working-tree summary for the status bar, or nil outside a repo: `{:root :branch :upstream
-:ahead :behind :staged :unstaged :untracked}`. Counts come from `git status --porcelain`;
-ahead/behind are best-effort strings vs the upstream. A few `git` calls, so it runs off the
-render path (the idle beat — `git-cache-status`)."
+  "A working-tree summary for the status bar, or nil outside a repo: `{:root :branch :label
+:upstream :ahead :behind :staged :unstaged :untracked}`. Counts come from `git status
+--porcelain`; ahead/behind are best-effort strings vs the upstream. A few `git` calls, so `vc`
+runs it off the render path, on the idle beat."
   (if (nil? root)
     nil
     (let (entries (git-entries (:stdout (git-git root ["status" "--porcelain" "-z"])))
           upstream (git-upstream root)
-          ab (and upstream (git-ahead-behind root)))
+          ab (and upstream (git-ahead-behind root))
+          branch (git-branch root))
       {:root root
-       :branch (git-branch root)
+       :branch branch
+       :label branch
        :upstream upstream
        :ahead (and ab (:ahead ab))
        :behind (and ab (:behind ab))
@@ -95,7 +93,7 @@ once as a message you might miss and once as a mark that stays."
            ;; behind reads as "there is something to pull" — the colour the unstaged count
            ;; uses for "you have work to do"; ahead-only is quieter, it is just unpushed
            :face (if (> behind 0) git-face-unstaged git-face-branch)
-           :on-click 'gitstatus/cmd-git-status
+           :on-click 'vc/cmd-vc-status
            :tooltip (string/join (map moves (fn ([n _ meaning]) (str n " " meaning))) ", ")})))))
 
 (defn git-statusbar-segments (summary)
@@ -109,13 +107,13 @@ working tree (tooltip: the counts; click: `C-x g`), then colour-coded **+staged 
                         (str *git-branch-glyph* (:branch summary))
                         {:sep "  —  "
                          :face git-face-branch
-                         :on-click 'gitstatus/cmd-git-status
+                         :on-click 'vc/cmd-vc-status
                          :tooltip (git-repo-tooltip summary)})
                   (seg :git-dot
                     *git-state-glyph*
                     {:sep "   "
                      :face (git-dot-face summary)
-                     :on-click 'gitstatus/cmd-git-status
+                     :on-click 'vc/cmd-vc-status
                      :tooltip (git-tree-tooltip summary)})
                   (git-sync-seg summary)
                   (git-count-seg :git-staged "+" (:staged summary) git-face-staged)
@@ -123,77 +121,12 @@ working tree (tooltip: the counts; click: `C-x g`), then colour-coded **+staged 
                   (git-count-seg :git-untracked "?" (:untracked summary) git-face-untracked))
       (fn (s) (not (nil? s))))))
 
-;; ---- the status summary, off the loop ---------------------------------------
-;; `git-summary` is FOUR `git` subprocesses — `rev-parse --show-toplevel`, `status
-;; --porcelain -z`, `rev-parse --abbrev-ref HEAD` and `rev-list --left-right --count` — and
-;; it ran on the loop process on every idle beat. On a 27,310-file repo `git status` alone
-;; measures 40 ms, and each spawn is a few more: fifty-odd milliseconds of frozen editor
-;; every time typing settled, which is exactly when a reader looks up and notices. It also
-;; scales with the repo rather than with anything the editor is doing.
-;;
-;; So it runs in a spawned task and folds its answer back like every other async recompute
-;; (`gitdiff/ed-launch-gitdiff`, `diagcheck/ed-launch-diag`, `eldoc/ed-launch-eldoc` — same shape, same reply
-;; route).
-;;
-;; Note what travels: a KEY, not a root. Resolving the root is itself `git rev-parse
-;; --show-toplevel`, so asking for the root on the loop — and asking again when the answer
-;; lands, to check it is still the right one — would have left two of the four subprocesses
-;; exactly where they were. The key is what the editor already knows (the git buffer's root
-;; if it has one, the current buffer's directory, whether it is file-backed), it is free to
-;; compute, and comparing it is how a stale answer is recognised.
-
-(defn git-status-key (m)
-  "What the status-bar summary is ABOUT, as a value the loop can compute for nothing:
-`[git-root default-dir file-backed?]`. Resolving that to a repo root is a subprocess, so it
-happens in the task; this is what is compared to tell a stale answer from a current one.
-
-A **fileless** buffer (*scratch*, *Playground*, a report) that is not itself a git buffer
-carrying `:git-root` has nothing to describe: it only *inherits* a `:dir` from wherever it
-was created, and one that cannot be saved has no working-tree relationship for a branch +
-dirty-state indicator to be about."
-  [(:git-root m) (pool/ed-default-dir m) (and (buffer-file (ed-current-buf m)) true)])
-
-(defn git-status-summary (key)
-  "The working-tree summary for a `git-status-key`, or nil when there is nothing to describe.
-Resolves the repo root and runs `git-summary` — five subprocesses all told, which is why
-this is what the task runs and nothing on the loop calls it directly."
-  (let ([git-root dir file?] key)
-    (if (not (or git-root file?)) nil (git-summary (or git-root (git-toplevel dir))))))
-
-(defn git-cache-status (m)
-  "Recompute the cached git status-bar segments (`:git-segments`) + summary (`:git-summary`)
-**synchronously**. The headless path, and the one the tests drive; a live editor goes through
-`git-launch-status` instead."
-  (let (summary (git-status-summary (git-status-key m)))
-    (if (= summary (:git-summary m))
-      m
-      (assoc m :git-summary summary :git-segments (git-statusbar-segments summary)))))
-
-(defn git-launch-status (m)
-  "Recompute the status-bar git summary OFF the loop when nothing is already in flight.
-Headless (no loop for a reply to land in) falls back to the synchronous `git-cache-status`,
-so tests and a `--headless` daemon behave exactly as before."
-  (cond
-    (:git-proc m) m
-    (ed-headless?) (git-cache-status m)
-    :else
-      (let (key (git-status-key m)
-            job (task (fn () (git-status-summary key))))
-        (assoc m :git-proc job :git-checking key))))
-
-;; …asked on every idle beat once this module has loaded (`model/register-idle-job`): no
-;; `:stale?` of its own — the in-flight slot is its gate, and it rides a beat an edit armed
-(register-idle-job :git-summary {:order 100 :run 'gitbar/git-launch-status})
-
-;; the status-bar git summary, computed off the loop (`model/register-task-reply`)
-(register-task-reply :git-proc 'gitbar/git-apply-status nil nil)
-(defn git-apply-status (m summary)
-  "Fold a finished summary into `:git-summary` + `:git-segments` and free the in-flight slot.
-An answer about a buffer the reader has since left is dropped — the next idle beat asks about
-the one they are in now."
-  (let (asked (:git-checking m)
-        m1 (dissoc m :git-proc :git-checking))
-    (cond
-      (not (= asked (git-status-key m1))) m1
-      (= summary (:git-summary m1)) m1
-      :else (assoc m1 :git-summary summary :git-segments (git-statusbar-segments summary)))))
+(register-vc-backend :git
+  {:status 'gitstatus/cmd-git-status
+   :dispatch 'git/cmd-git-dispatch
+   :file-menu 'git/cmd-git-file-menu
+   :diff-file 'gitview/cmd-git-diff-file
+   :log-file 'gitview/cmd-git-log-file
+   :blame 'gitview/cmd-git-blame
+   :summary 'gitbar/git-summary
+   :segments 'gitbar/git-statusbar-segments})

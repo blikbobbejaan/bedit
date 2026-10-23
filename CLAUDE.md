@@ -380,7 +380,8 @@ src/compile.blsp            M-x compile: run a build in the project root, C-x ` 
                             M-x project-task (mix tasks / npm scripts). The error locations
                             are an Emacs-style regexp TABLE (`*error-patterns*`), which
                             needed brood's regex captures to be expressible at all
-src/projects.blsp           project root + file walk (find-file-in-project)
+src/projects.blsp           project root + file walk (find-file-in-project); a VCS checkout (git,
+                            mur — std's `vcs`) is a root and lists its own files
 src/formbuf.blsp            FORM BUFFERS: generated text with editable regions (a shell's
                             input, a tutorial's boxes) — the region algebra, `splice`, and the
                             `:veto` / `:clamp` guards. Pure; moved from brood's std by ADR-417
@@ -414,6 +415,42 @@ src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is
                             ^ · M-n/M-p · 1-4 · M-w are shared by every such buffer. A lazy
                             section (a status file whose diff was never fetched) asks the
                             mode's `:section-reload`
+src/vc.blsp                 version control in the editor, whichever system — Emacs's VC. The
+                            checkout a buffer is in comes from std's `vcs` (`.git`, `.mur`);
+                            what the editor does with it goes through that system's ROW
+                            (`register-vc-backend`): C-x g its status, C-x M-g its menus, C-c g
+                            its file menu, C-x v = / l / b the
+                            file's diff, log and blame, and the mode line's chip, summarised
+                            OFF the loop on the idle beat (`:vc-summary` / `:vc-segments`;
+                            `:label` — git's branch, mur's change — is the window title's too).
+                            Names no backend: a row's hooks are symbols called late
+src/vcproc.blsp             what every VCS's command line shares: the PROCESS LOG (`$`,
+                            *vc-process*, magit's `magit-process-buffer`) — git and mur
+                            commands in the order they ran, exit code, duration, output,
+                            credentials redacted, `\r` progress applied — `vc-run` (journalled)
+                            and `vc-launch` (OFF the loop, for the network), `vc-report-cmd`,
+                            `vc-confirm`, and a unified diff's faces (`vc-diff-line-face`)
+src/mur.blsp                the TOP of the mur porcelain (git.blsp's counterpart): `:use`s every
+                            mur module, and holds its menus — C-x M-g (and ? in *mur-status*)
+                            every mur verb, C-c g mur about this file — both reached through
+                            `vc` rows (`:dispatch`, `:file-menu`), as git's are. main loads it
+src/murcore.blsp            the ground the mur porcelain stands on: `mur-mur` (the client, found
+                            by std's `vcs/mur-program`), `mur-json` over its `--json`, the
+                            working copy a buffer is about, `mur-do` / `mur-launch` through
+                            vcproc's log. mur is Murmuration's VCS (mur.fly.dev): a CHANGE,
+                            its saved VERSIONS, a land puts it on TRUNK
+src/murbar.blsp             mur's row in vc and its mode line: ◆ what the change is for, a
+                            state dot, ~changed !clashes ↑unsent ?unclaimed — one
+                            `mur status --json`
+src/murstatus.blsp          C-x g in a mur working copy: *mur-status*, a section tree — the
+                            change and where it stands, clashes, files changed since the last
+                            save (TAB: the diff), unclaimed edits, the other changes here,
+                            trunk. c change · r rename · s save · l land · u update · y sync ·
+                            S settle · k restore · a claim · x drop · d diff · L log · V
+                            versions · ! any; C-x v = / l for a mur file
+src/murforge.blsp           the forge's side (mur-forge, mur.fly.dev) through the client: o the
+                            change's page in the browser, O *mur-changes* (the forge's open
+                            changes; RET brings one here), C checks, D discussion, R reviews
 src/git.blsp                the TOP of the git porcelain (Magit's): `:use`s every git* module
                             below, so loading git loads all of it and every command a menu
                             or keymap names by symbol is there. Holds what has no better
@@ -426,13 +463,12 @@ src/gitcore.blsp            the ground under it: `git-git` (never prompting), th
                             ahead/behind, refs / remotes / stashes, which operation is
                             half-done in .git (the SEQUENCER). One logged seam: `git-run` /
                             `git-run-hunk`, `git-do` to refresh after, `git-launch-op` for
-                            network commands OFF the loop, `git-confirm`. `$` is the PROCESS
-                            LOG (magit's `magit-process-buffer`) — every command, exit code,
-                            duration and output, credentials redacted, `\r` progress applied.
+                            network commands OFF the loop — git's side of vcproc's log
+                            and runner.
                             Knows nothing of the status buffer: it refreshes it by name
                             (`git-refresh-status`), because gitstatus stands on this
-src/gitbar.blsp             the mode line's git: ⎇ branch, state dot, ↓/↑ vs upstream,
-                            +staged ~unstaged ?untracked — summarised in a task on the idle beat
+src/gitbar.blsp             git's row in vc and its mode line: ⎇ branch, state dot, ↓/↑ vs
+                            upstream, +staged ~unstaged ?untracked
 src/gitsection.blsp         what every git SECTION buffer shares (status and gitview's views):
                             file / hunk / commit section builders, `git-section-faces` (a
                             line coloured by what it IS), `git log` parsing, what is at point,
@@ -474,8 +510,9 @@ src/gitview.blsp            the git VIEWS, section buffers acted on in place: *g
                             step through its history
 src/smerge.blsp             conflicts resolved IN the file, Emacs's smerge: C-c ^ n/p between
                             conflicts, u/l/a/b keep upper / lower / both / base
-src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD, recomputed
-                            off the loop on the idle beat (and the blink tick)
+src/diffhl.blsp             diff-hl change gutter: per-line added/modified/deleted against the
+                            file's base text (std's `vcs/base-text`: git's HEAD, mur's last
+                            save), recomputed off the loop on the idle beat (and the blink tick)
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
                             (biggest first — where the memory went) · C-c b t trace a named

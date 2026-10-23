@@ -1,0 +1,122 @@
+(defmodule murcore
+  "The ground the mur porcelain stands on: running the `mur` client in a working copy
+(`mur-mur`), reading what it answers for programs (`mur-json` over its `--json`), finding
+the working copy a buffer is about (`mur-resolve-root`), and the seam every command that
+changes it goes through — `mur-do` runs it journalled and refreshes *mur-status*,
+`mur-launch` runs one that talks to the forge OFF the loop. Both journal into the shared
+process log (`$`, `vcproc`), beside git's.
+
+mur is the version control of Murmuration (`mur.fly.dev`): a CHANGE is one piece of work,
+each `mur save` a VERSION of it sent to the forge, `mur land` puts it on TRUNK. Nothing
+here knows about the status buffer: refreshing it reaches `murstatus` by name."
+  (:use model) ; message
+  (:use vc) ; vc-checkout — the working copy a buffer is in
+  (:use vcproc)) ; vc-run / vc-launch / vc-report-cmd — the process log and the off-loop runner
+;; `theme` (a project source module, loaded with the image) provides the *blue* / *yellow* /
+;; *red* / *green* / *subtext* / *overlay0* dynamic-var colour globals this file reads bare.
+
+;; ---- faces -----------------------------------------------------------------------
+
+(theme/defchrome mur-face-section {:fg *blue* :bold true}) ; a *mur-status* section heading
+(theme/defchrome mur-face-id {:fg *yellow*}) ; a change or snapshot ID
+(theme/defchrome mur-face-title {:bold true}) ; what a change is for
+(theme/defchrome mur-face-label {:fg *subtext*}) ; a header line's label (`Change:`)
+(theme/defchrome mur-face-note {:fg *subtext* :italic true}) ; an explanation, a hint
+(theme/defchrome mur-face-clash {:fg *red* :bold true}) ; a clash left to settle
+(theme/defchrome mur-face-changed {:fg *yellow*}) ; a file changed since the last save
+(theme/defchrome mur-face-saved {:fg *green*}) ; saved and sent: nothing waits
+(theme/defchrome mur-face-unsent {:fg *blue*}) ; saved here, not on the forge yet
+(theme/defchrome mur-face-dim {:fg *overlay0*}) ; claimed by no change
+
+;; ---- running mur ------------------------------------------------------------------
+
+(def *mur-seat* "bedit")
+;; The seat (`MUR_RUNNER`) every mur command the editor runs speaks as — its own, and std's
+;; `vcs` hooks the change gutter reads through. With no terminal, mur would otherwise call
+;; the editor `person`, the one seat every terminal-less process shares: a script's or an
+;; agent's tool call `mur change 2` would then move *mur-status*, and the gutter could read a
+;; different change's last save than the status shows. Named once, when this module loads.
+(vcs/use-mur-seat *mur-seat*)
+
+(defn mur-env ()
+  "The environment every mur the editor runs gets: its seat (`vcs/mur-env`), and no colour
+codes in what it prints (mur colours its diff only at a terminal, but say so rather than rely
+on it)."
+  (merge {"NO_COLOR" "1"} (vcs/mur-env)))
+
+(defn mur-mur (root args &optional (opts {}))
+  "Run the `mur` client in working copy `root` with `args`: `{:exit :stdout :stderr}`. When
+mur is not installed the result says so, as a failed command, rather than raising — the
+message names where it was looked for. `opts` go to `os/cmd` (`:timeout-ms`, `:stdin`)."
+  (let (program (vcs/mur-program))
+    (if (nil? program)
+      {:exit 127
+       :stdout ""
+       :stderr "mur is not installed: not on PATH, nor in ~/.local/bin or ~/.cargo/bin (mur.fly.dev/install.sh)"}
+      (os/cmd program args (assoc opts :cwd root :env (merge (mur-env) (get opts :env {})))))))
+
+(defn mur-json (root args &optional (opts {}))
+  "What `mur args` answers as JSON, decoded (keyword keys) — nil when mur failed, is not
+installed, or printed something that is not JSON (a client older than its `--json`). `opts`
+as [[mur-mur]]'s (`:timeout-ms` for one that reads the forge)."
+  (let (r (mur-mur root args opts))
+    (if (= (:exit r) 0)
+      (check-allow :discarded-catch (try (json/decode (:stdout r)) (catch _ nil)))
+      nil)))
+
+(defn mur-resolve-root (m)
+  "The mur working copy the current buffer is about — a mur buffer's own, else the one its
+directory is in — or nil."
+  (let (where (vc-checkout m)) (if (= (:kind where) :mur) (:root where) nil)))
+
+(defn mur-short (id)
+  "The start of a change or snapshot ID as mur's commands show it: its first twelve
+characters.
+
+    (murcore/mur-short \"0ec8927f51595d56ebc1dceee9ba7d85\")   → \"0ec8927f5159\""
+  (if (string? id) (string/substring id 0 (math/min 12 (string/length id))) ""))
+
+;; ---- running a command, journalled ---------------------------------------------------
+
+(sig mur-run (model string seqable -> vector))
+(defn mur-run (m root args)
+  "Run `mur args` in working copy `root`, journalled: `[model' result]`."
+  (vc-run m "mur" args (fn () (mur-mur root args))))
+
+;; check-allow: the function is fetched by name, so the checker cannot see its result; it is
+;; `mur-refresh`'s own `model -> model` contract.
+(check-allow :trusted
+  (sig mur-refresh-status (model -> model))
+  (defn mur-refresh-status (m)
+    "Refresh *mur-status* when it is open — `murstatus/mur-refresh`, reached LATE, by name:
+the status buffer stands on this module, so this module cannot `:use` it back."
+    (if (nil? (ed-buffer-index-by-name m "*mur-status*"))
+      m
+      (do (require-one 'murstatus) ((reflect/eval 'murstatus/mur-refresh) m)))))
+
+(defn mur-refresh-if-open (m _r)
+  "Refresh *mur-status* when it is open — the usual `then` for a launched mur command."
+  (mur-refresh-status m))
+
+(defn mur-do (m verb args)
+  "Run `mur args` (logged) in the working copy the buffer is about, then refresh
+*mur-status* and say what mur said — its first line on success, the failure and where the
+rest is (`$`) otherwise. For a command that stays on this machine (claim, restore, settle,
+change to a change here); one that talks to the forge goes through `mur-launch`."
+  (let (root (mur-resolve-root m))
+    (if (nil? root)
+      (message m "not in a mur working copy")
+      (let ([m1 r] (mur-run m root args)) (vc-report-cmd (mur-refresh-status m1) verb r)))))
+
+;; check-allow: `then` is an opaque caller-supplied `(model result) -> model`; the
+;; declaration is the contract (ADR-341's `:trusted`).
+(check-allow :trusted
+  (sig mur-launch (model string seqable &optional any -> model))
+  (defn mur-launch (m verb args &optional (then mur-refresh-if-open))
+    "Run `mur args` in the working copy OFF the loop (`vcproc/vc-launch`) and report when it
+lands, then run `then` — by default refreshing *mur-status*. For what talks to the forge:
+save, land, update, sync, and anything that reads it."
+    (let (root (mur-resolve-root m))
+      (if (nil? root)
+        (message m "not in a mur working copy")
+        (vc-launch m "mur" verb root args (fn (dir arguments) (mur-mur dir arguments)) then)))))

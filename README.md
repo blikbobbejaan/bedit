@@ -101,8 +101,10 @@ src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error
 src/projects.blsp           project root + file walk (find-file-in-project)
 src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e)
-src/git*.blsp               git porcelain (Magit): C-x g status buffer, diff/log/commit, C-x v = vc-diff
-src/gitdiff.blsp            diff-hl change gutter: per-line added/modified/deleted vs HEAD
+src/vc.blsp                 version control, whichever system (Emacs VC): C-x g, C-x v =/l/b, the mode line
+src/git*.blsp               git porcelain (Magit): the status buffer, diff/log/commit
+src/mur*.blsp               mur porcelain (mur.fly.dev): *mur-status*, save/land/update, the forge
+src/diffhl.blsp             diff-hl change gutter: per-line added/modified/deleted vs git HEAD or mur's last save
 src/web.blsp                live HTTP mirror of the selected buffer (C-x w)
 src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclient model
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror

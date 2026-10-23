@@ -1,0 +1,621 @@
+(defmodule murstatus
+  "C-x g in a mur working copy: *mur-status*, a section buffer (Magit's feel, mur's model).
+The change you are on — what it is for, where it stands, its versions and whether the forge
+has them — then the clashes left to settle, the files changed since the last save (TAB shows
+each one's diff), edits no change has claimed, the other changes open in this working copy,
+and trunk's newest snapshots.
+
+The keys are mur's verbs, acting on what is at point where that means something:
+`c` says what a change is for (a fresh one once this one holds files) · `r` renames it ·
+`s` saves (the file at point, or every file) · `l` lands · `u` updates onto the latest trunk
+· `y` syncs what the forge lacks · `S` settles the clash at point · `k` restores the file at
+point · `a` claims it · `x` drops the change · RET visits (a file, a clash at its line, a
+change here goes to it, a snapshot shows) · `d` the diff · `L` trunk's log · `V` the
+versions · `!` any mur command. The forge's side — `o` the change's page, `O` the open
+changes, `C` checks, `D` discussion, `R` reviews — is `murforge`'s.
+
+Collected OFF the loop (three subprocesses: status, diff, and the forge's log), like
+*git-status*."
+  (:use model) ; message / ed-buffer-index-by-name / ed-current-index / ed-headless? / register-task-reply
+  (:use pool) ; ed-pop-to-file / ed-show-named
+  (:use editor/buffer) ; buffer-file / buffer-text
+  (:use editor/keymap :only [keymap-bind]) ; the *mur-status* keymap
+  (:use editor/layers :only [register-type-layers]) ; its buffer types
+  (:use section) ; section — the tree
+  (:use sectionbuf) ; sb-show / sb-at / sb-rows / sb-line / sb-ctx / sb-keymap
+  (:use interactive) ; defcommand
+  (:use task) ; task — the collection, off the loop
+  (:use vcproc) ; vc-confirm / vc-show-report / the diff faces
+  (:use murcore) ; mur-mur / mur-json / mur-do / mur-launch / the faces
+  (:use murbar)) ; mur-summary-of / mur-state-words — the header says what the mode line says
+
+;; ---- collecting, off the loop -----------------------------------------------------
+
+(def *mur-log-count* 10) ; trunk's newest snapshots the status lists
+(def *mur-log-timeout-ms* 4000) ; how long the status waits for the forge's log before going without
+
+(defn mur-collect-status (root)
+  "Everything *mur-status* shows for working copy `root`: `{:root :status :error :diff
+:log}` — `mur status --json` (nil, with `:error` saying why, when mur cannot answer),
+`mur diff`'s text, and trunk's newest snapshots (`mur log --json`, which reads the forge:
+nil when it cannot be reached, which is not an error here)."
+  (let (r (mur-mur root ["status" "--json"])
+        status (if (= (:exit r) 0)
+                 (check-allow :discarded-catch (try (json/decode (:stdout r)) (catch _ nil)))
+                 nil))
+    {:root root
+     :status status
+     :error (cond
+              (map? status) nil
+              ;; a client from before `--json` prints its prose and succeeds
+              (= (:exit r) 0)
+                "this mur client answers without --json: update it (mur.fly.dev/install.sh, or make install in mur)"
+              :else (string/trim (str (:stderr r "") (:stdout r ""))))
+     :diff (if (map? status) (:stdout (mur-mur root ["diff"])) "")
+     ;; the forge's, so bounded: offline, the status still opens (without trunk) at once
+     :log (if (map? status)
+            (mur-json root
+              ["log" "-n" (str *mur-log-count*) "--json"]
+              {:timeout-ms *mur-log-timeout-ms*})
+            nil)}))
+
+;; ---- the diff, per file ----------------------------------------------------------
+
+(defn mur-split-diff (text)
+  "`mur diff`'s text as `{path [line …]}`: each file's hunks, from its `@@` on, under the
+path its `--- path` / `+++ path` header names. Pure.
+
+    (murstatus/mur-split-diff \"--- a\\n+++ a\\n@@ -1 +1 @@\\n-x\\n+y\")   → {\"a\" [\"@@ -1 +1 @@\" \"-x\" \"+y\"]}"
+  (let (lines (string/split (or text "") "\n")
+        n (count lines))
+    (letrec (walk (fn (i path acc)
+                    (cond
+                      (>= i n) acc
+                      ;; a file's header: `--- path` then `+++ path`
+                      (and (string/starts-with? (nth lines i) "--- ")
+                        (< (inc i) n)
+                        (string/starts-with? (nth lines (inc i) "") "+++ "))
+                        (let (named (string/substring (nth lines i) 4 (string/length (nth lines i))))
+                          (walk (+ i 2) named (assoc acc named [])))
+                      (nil? path) (walk (inc i) path acc)
+                      (= (nth lines i) "") (walk (inc i) path acc)
+                      :else (walk (inc i) path (update acc path conj (nth lines i))))))
+      (walk 0 nil {}))))
+
+;; ---- the tree ----------------------------------------------------------------------
+
+(defn- mur-count-heading (title items) (str title " (" (count items) ")"))
+
+(defn- mur-head-lines (status)
+  "The block at the top: the change, where it stands, the project, trunk, and anything that
+holds the work back (a refused send, a trunk move waiting, a merge under way)."
+  (let (unsent (or (:unsent status) 0)
+        summary (murbar/mur-summary-of status))
+    (seq/reject [(str "Change:   "
+                   (mur-short (:change status))
+                   "  "
+                   (or (:title status) "(not said what it is for yet)"))
+                  (str "State:    "
+                    (murbar/mur-state-words summary)
+                    (if (> unsent 0) (str ", " unsent " not on the forge yet (y sends)") ""))
+                  (str "Project:  " (or (:project status) "?") "  " (or (:url status) ""))
+                  (str "Trunk:    " (mur-short (:base status)) "  (where this change starts)")
+                  (if (:onto status) (str "Onto:     " (mur-short (:onto status))) nil)
+                  (if (:pending_trunk_move status)
+                    "Waiting:  a trunk move to settle with the forge (y)"
+                    nil)
+                  (:blocked status)]
+      nil?)))
+
+(defn- mur-clash-section (clash)
+  (section :clash
+    clash
+    (if (:whole clash)
+      (str (:path clash) "  (the whole file)")
+      (str (:path clash) ":" (:line clash)))))
+
+(defn- mur-file-section (file diffs)
+  (section :file
+    file
+    (str (string/pad-right (:status file) 10) " " (:path file))
+    (or (get diffs (:path file)) [])
+    {:key (:path file) :hidden true}))
+
+(defn- mur-here-section (entry)
+  (section :here
+    entry
+    (str (if (:yours entry) "* " "  ")
+      (string/pad-right (str (:number entry)) 3)
+      (mur-short (:change entry))
+      "  "
+      (or (:title entry) "(not said what it is for yet)")
+      (let (who (append (if (:yours entry) ["you"] []) (or (:others entry) []))
+            files (:claimed entry 0)
+            detail (append who (if (> files 0) [(str files (if (= files 1) " file" " files"))] [])))
+        (if (empty? detail) "" (str "  (" (string/join detail ", ") ")"))))
+    []
+    {:key (:change entry)}))
+
+(defn- mur-snapshot-section (snapshot)
+  (section :snapshot
+    snapshot
+    (str (mur-short (:snapshot snapshot))
+      "  "
+      (:title snapshot)
+      "  — "
+      (:author snapshot)
+      (if (:base snapshot) "  ← this change starts here" ""))
+    []
+    {:key (:snapshot snapshot)}))
+
+(defn- mur-group (type title items build)
+  "A top-level section of `items` (each through `build`), or nil when there are none."
+  (if (empty? items)
+    nil
+    (section type
+      title
+      (mur-count-heading title items)
+      (into [] (map items build))
+      {:separator true})))
+
+(defn mur-status-tree (collected)
+  "PURE: the *mur-status* section tree from a `mur-collect-status` answer."
+  (let (status (:status collected))
+    (if (not (map? status))
+      (section :root
+        nil
+        nil
+        [(section :head
+           nil
+           nil
+           ["mur cannot read this working copy:"
+             ""
+             (or (:error collected) "no answer")
+             ""
+             "(g tries again; $ shows what ran)"])])
+      (let (diffs (mur-split-diff (:diff collected))
+            against (if (= (:against status) "trunk") "trunk" "the last save")
+            files (or (:files status) [])
+            others (murbar/mur-other-changes (:here status)))
+        (section :root
+          nil
+          nil
+          (seq/reject [(section :head nil nil (into (mur-head-lines status) [""]))
+                        (mur-group :clashes
+                          "Clashes to settle"
+                          (or (:clashes status) [])
+                          mur-clash-section)
+                        (mur-group :changed
+                          (str "Changed since " against)
+                          files
+                          (fn (f) (mur-file-section f diffs)))
+                        (mur-group :unclaimed
+                          "Edited here, claimed by no change"
+                          (or (:unclaimed status) [])
+                          (fn (p) (section :unclaimed p p)))
+                        (mur-group :here
+                          "Changes here"
+                          (if (empty? others)
+                            []
+                            (seq/filter (or (:here status) [])
+                              (fn (entry) (or (:yours entry) (includes? others entry)))))
+                          mur-here-section)
+                        (mur-group :trunk "Trunk" (or (:log collected) []) mur-snapshot-section)]
+            nil?))))))
+
+;; ---- the faces: a line coloured by what it IS --------------------------------------
+
+(defn- mur-span (from to face) (if (or (nil? face) (>= from to)) nil [from to face]))
+
+(defn mur-status-faces (row line)
+  "The *mur-status* `:section-faces` service: the faces of `line`, which `row` says is."
+  (let (type (:type row)
+        n (string/length line))
+    (seq/reject (cond
+                  (= type :head)
+                    (if (and (> n 10) (= (string/substring line 8 10) "  "))
+                      [(mur-span 0 9 mur-face-label)
+                        (if (string/starts-with? line "Change:")
+                          (mur-span 10 (math/min n 22) mur-face-id)
+                          (if (string/starts-with? line "Trunk:")
+                            (mur-span 10 (math/min n 22) mur-face-id)
+                            nil))
+                        (if (string/starts-with? line "Change:") (mur-span 24 n mur-face-title) nil)]
+                      [])
+                  (not (:heading? row))
+                    (if (string/starts-with? line "@@")
+                      [(mur-span 0 n vc-face-hunk)]
+                      [(mur-span 0 n (vc-diff-line-face line))])
+                  (contains? #{:clashes :changed :unclaimed :here :trunk} type)
+                    (let (i (index-of line " ("))
+                      (if (< i 0)
+                        [(mur-span 0 n mur-face-section)]
+                        [(mur-span 0 i mur-face-section) (mur-span (inc i) n mur-face-note)]))
+                  (= type :clash) [(mur-span 0 n mur-face-clash)]
+                  (= type :file)
+                    (let (status (:status (:value row)))
+                      [(mur-span 0
+                         10
+                         (cond
+                           (= status "added") vc-face-add
+                           (= status "removed") vc-face-del
+                           :else mur-face-changed))])
+                  (= type :unclaimed) [(mur-span 0 n mur-face-dim)]
+                  (= type :here) [(mur-span 5 (math/min n 17) mur-face-id)]
+                  (= type :snapshot) [(mur-span 0 (math/min n 12) mur-face-id)]
+                  :else [])
+      nil?)))
+
+;; ---- showing it --------------------------------------------------------------------
+
+(defn- mur-first-line (rows)
+  "Where point goes on a first open: the first changed file, else the top."
+  (let (i (seq/index-where rows (fn (row) (and (:heading? row) (= (:type row) :file)))))
+    (if (>= i 0) (inc i) 1)))
+
+(defn- mur-render-status (m root collected line action)
+  "PURE: fold a finished collection into *mur-status* for working copy `root`."
+  (let (fresh? (nil? (ed-buffer-index-by-name m "*mur-status*")))
+    (sb-show m
+      "*mur-status*"
+      (mur-status-tree collected)
+      :mur-status {:action action :ctx {:root root} :line (if (and (nil? line) fresh?) mur-first-line line)})))
+
+(defn- mur-status-focus (m)
+  "`:here` when the reader is looking at *mur-status* (or it is not open yet), else `:none` —
+a refresh behind them lands quietly."
+  (let (i (ed-buffer-index-by-name m "*mur-status*"))
+    (if (or (nil? i) (= i (ed-current-index m))) :here :none)))
+
+(defn mur-show-status (m root &optional (line nil) (action nil))
+  "Show or refresh *mur-status* for `root`, collecting OFF the loop: the buffer appears at
+once (`Loading…` the first time, the old contents on a refresh) and fills when mur answers.
+Headless collects inline."
+  (let (act (or action (mur-status-focus m)))
+    (if (ed-headless?)
+      (mur-render-status m root (mur-collect-status root) line act)
+      (let (job (task (fn () (mur-collect-status root)) {:timeout vcproc/*vc-op-timeout-ms*})
+            m1 (if (nil? (ed-buffer-index-by-name m "*mur-status*"))
+                 (ed-show-named m "*mur-status*" "Loading…\n" :mur-status)
+                 m))
+        (assoc m1
+          :mur-status-proc job
+          :mur-status-root root
+          :mur-status-line line
+          :mur-status-action act)))))
+
+(register-task-reply :mur-status-proc 'murstatus/mur-apply-show-status nil "mur status")
+(defn mur-apply-show-status (m collected)
+  "Fold a finished collection into the buffer; a nil answer (the task errored or timed out)
+says so rather than rendering an empty change."
+  (let (root (:mur-status-root m)
+        line (:mur-status-line m)
+        action (:mur-status-action m :none)
+        m1 (dissoc m :mur-status-proc :mur-status-root :mur-status-line :mur-status-action))
+    (if (nil? collected)
+      (message m1 "mur status: no answer (timed out)")
+      (mur-render-status m1 root collected line action))))
+
+(defn mur-refresh (m)
+  "Refresh *mur-status* — in place, point kept on the line it was on."
+  (let (i (ed-buffer-index-by-name m "*mur-status*")
+        root (if (nil? i) nil (get-in (ed-buf-at m i) [:section-ctx :root])))
+    (if (nil? root) m (mur-show-status m root nil nil))))
+
+;; ---- what is at point --------------------------------------------------------------
+
+(defn- mur-row-at (m) (sb-at m))
+
+(defn- mur-file-at (m)
+  "The file a command at point is about, as a path relative to the working copy: in
+*mur-status* the changed file point is on (its heading or a line of its diff), an unclaimed
+one or a clash's; in a file buffer, that file. nil elsewhere — then a command acts on the
+whole change."
+  (let (file (sb-ancestor m :file)
+        row (mur-row-at m)
+        visited (buffer-file (ed-current-buf m))
+        root (mur-resolve-root m))
+    (cond
+      file (:path (:value file))
+      (and row (= (:type row) :unclaimed)) (:value row)
+      (and row (= (:type row) :clash)) (:path (:value row))
+      (and visited root (string/starts-with? visited (str root "/")))
+        (string/substring visited (inc (string/length root)) (string/length visited))
+      :else nil)))
+
+(defn- mur-diff-line-number (m)
+  "The file line a diff line at point stands for: the `@@`'s new start, plus the lines
+after it that are in the new file (context and additions); nil off a diff line."
+  (let (rows (sb-rows m)
+        i (sb-line m)
+        lines (string/split (buffer-text (ed-current-buf m)) "\n"))
+    (letrec (back (fn (j kept)
+                    (cond
+                      (< j 0) nil
+                      (:heading? (section-row rows j)) nil
+                      (string/starts-with? (nth lines j "") "@@")
+                        (let (hunk (diff/hunk-header (nth lines j "")))
+                          (if hunk (+ (:new-start hunk) kept) nil))
+                      :else
+                        (back (dec j)
+                          (if (string/starts-with? (nth lines j "") "-") kept (inc kept))))))
+      (let (here (nth lines i ""))
+        (if (string/starts-with? here "@@")
+          (let (hunk (diff/hunk-header here)) (if hunk (:new-start hunk) nil))
+          (back (dec i) 0))))))
+
+;; ---- commands ----------------------------------------------------------------------
+
+(defcommand cmd-mur-status
+  (m key)
+  "The status of the mur working copy this buffer is in (C-x g): the change you are on,
+what changed since its last save, the clashes to settle, the other changes here."
+  (let (root (mur-resolve-root m))
+    (if (nil? root) (message m "not in a mur working copy") (mur-show-status m root nil :here))))
+
+(defcommand cmd-mur-refresh
+  (m key)
+  "Read the working copy again (g)."
+  (mur-refresh m))
+
+(defcommand cmd-mur-visit
+  (m key)
+  "Visit what is at point (RET): a diff line opens its file at that line, a file opens it,
+a clash opens at its line, a change here goes to it (`mur change N`), a snapshot shows what
+it changed."
+  (let (row (mur-row-at m)
+        root (mur-resolve-root m)
+        type (and row (:type row)))
+    (cond
+      (or (nil? row) (nil? root)) m
+      (= type :clash)
+        (pool/ed-pop-to-file m
+          (path/join root (:path (:value row)))
+          (math/max 1 (:line (:value row) 1)))
+      (= type :here)
+        (if (:yours (:value row))
+          (message m "already on this change")
+          (mur-do m "change" ["change" (str (:number (:value row)))]))
+      (= type :snapshot)
+        (mur-show-text m root "show" ["show" (:snapshot (:value row))] "*mur-show*")
+      (= type :unclaimed) (pool/ed-pop-to-file m (path/join root (:value row)) 1)
+      (not (nil? (sb-ancestor m :file)))
+        (let (path (mur-file-at m))
+          (if (= (:status (:value (sb-ancestor m :file))) "removed")
+            (message m (str path " is removed in the working files"))
+            (pool/ed-pop-to-file m (path/join root path) (or (mur-diff-line-number m) 1))))
+      :else (sb-toggle m))))
+
+(defn- mur-ask-words (m prompt initial then)
+  "A free-text prompt whose non-blank answer, trimmed, goes to `(then model words)`."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit prompt initial)
+       :on-complete (fn (mm text)
+                      (let (words (string/trim text))
+                        (if (= words "") (message mm "nothing said") (then mm words))))}))
+
+(defcommand cmd-mur-change
+  (m key)
+  "Say what you are about to do (c): the change you are on takes the words while it holds no
+files yet, else a fresh change starts and the one you were on stays open here. The forge
+lists it as open at once."
+  (if (nil? (mur-resolve-root m))
+    (message m "not in a mur working copy")
+    (mur-ask-words m
+      "What is the change for: "
+      ""
+      (fn (mm words) (mur-launch mm "change" ["change" "-m" words])))))
+
+(defcommand cmd-mur-rename
+  (m key)
+  "Say again what the change you are on is for (r)."
+  (if (nil? (mur-resolve-root m))
+    (message m "not in a mur working copy")
+    (mur-ask-words m
+      "The change is for: "
+      ""
+      (fn (mm words) (mur-launch mm "rename" ["change" "--rename" words])))))
+
+(defcommand cmd-mur-save
+  (m key)
+  "Save the change's next version and send it to the forge (s): the file at point (claimed
+for the change first), or every file the change has when point is on none."
+  (let (path (mur-file-at m))
+    (mur-launch m "save" (if (nil? path) ["save"] ["save" path]))))
+
+(defcommand cmd-mur-land
+  (m key)
+  "Land the change on trunk (l): what changed since the last save is saved first, the change
+is brought onto the latest trunk, and everyone gets it with their next update. Asks first."
+  (vc-confirm m
+    "Land this change on trunk, for everyone?"
+    (fn (mm) (mur-launch mm "land" ["land"]))))
+
+(defcommand cmd-mur-update
+  (m key)
+  "Bring the change onto the latest trunk (u); where you and trunk changed the same lines it
+stops, and the clashes are listed to settle."
+  (mur-launch m "update" ["update"]))
+
+(defcommand cmd-mur-sync
+  (m key)
+  "Send what the forge lacks (y): versions saved while it could not be reached."
+  (mur-launch m "sync" ["sync"]))
+
+(defcommand cmd-mur-settle
+  (m key)
+  "Settle the clashes of the file at point's clash (S) — mur settles a FILE's clashes one way:
+keep yours (m), trunk's (t) or both (b). A whole-file clash (one side removed it, or it is
+not text) takes yours, trunk's, or the file as you fixed it by hand (k). To settle one clash
+of several differently, edit those lines: that settles it too."
+  (let (row (mur-row-at m))
+    (if (or (nil? row) (not (= (:type row) :clash)))
+      (message m "not on a clash (the Clashes section lists them)")
+      (let (path (:path (:value row))
+            whole? (:whole (:value row)))
+        (ed-read-char m
+          (if whole?
+            (str "Settle " path ": [m]ine, [t]runk's, or [k]eep it as it is now? ")
+            (str "Settle every clash in " path ": [m]ine, [t]runk's, [b]oth? "))
+          (fn (mm c)
+            (let (side (get (if whole?
+                              {"m" "mine" "t" "trunk" "k" "keep"}
+                              {"m" "mine" "t" "trunk" "b" "both"})
+                         c))
+              (if (nil? side) (message mm "cancelled") (mur-do mm "settle" ["settle" side path])))))))))
+
+(defcommand cmd-mur-restore
+  (m key)
+  "Put the file at point back as the last save has it (k), throwing away its edits since.
+Asks first, naming the file: what is thrown away is saved nowhere."
+  (let (path (mur-file-at m))
+    (if (nil? path)
+      (message m "not on a file")
+      (vc-confirm m
+        (str "Throw away your edits to " path " since the last save?")
+        (fn (mm) (mur-do mm "restore" ["restore" path]))))))
+
+(defcommand cmd-mur-claim
+  (m key)
+  "Claim the file at point for the change you are on (a), so no other change here takes it."
+  (let (path (mur-file-at m))
+    (if (nil? path) (message m "not on a file") (mur-do m "claim" ["claim" path]))))
+
+(defcommand cmd-mur-drop
+  (m key)
+  "Drop the change (x): it is no longer open, its files go back as trunk has them, and a
+fresh change starts. Asks first."
+  (vc-confirm m
+    "Drop this change? Its files go back as trunk has them."
+    (fn (mm) (mur-launch mm "drop" ["drop"]))))
+
+(defn mur-show-text (m root verb args buffer)
+  "Run `mur args` OFF the loop and show what it printed in the read-only report `buffer`
+(beside the status) — for what reads the forge (checks, discussion, the log) as well as
+what does not."
+  (mur-launch m
+    verb
+    args
+    (fn (mm r)
+      (if (= (:exit r) 0)
+        (vc-show-report mm buffer (string/trimr (:stdout r "")) :mur-text {:action :pop})
+        mm))))
+
+(defcommand cmd-mur-diff
+  (m key)
+  "The diff of the file at point, or of every changed file (d), in *mur-diff*."
+  (let (root (mur-resolve-root m)
+        path (mur-file-at m))
+    (if (nil? root)
+      (message m "not in a mur working copy")
+      (mur-show-text m root "diff" (if (nil? path) ["diff"] ["diff" path]) "*mur-diff*"))))
+
+(defcommand cmd-mur-diff-file
+  (m key)
+  "This file's changes since the change's last save (C-x v =), in *mur-diff*."
+  (let (root (mur-resolve-root m)
+        file (buffer-file (ed-current-buf m)))
+    (cond
+      (nil? root) (message m "not in a mur working copy")
+      (nil? file) (message m "no file to diff")
+      :else (mur-show-text m root "diff" ["diff" file] "*mur-diff*"))))
+
+(defcommand cmd-mur-log
+  (m key)
+  "Trunk's history (L), newest first, in *mur-log*."
+  (let (root (mur-resolve-root m))
+    (if (nil? root)
+      (message m "not in a mur working copy")
+      (mur-show-text m root "log" ["log" "-n" "50"] "*mur-log*"))))
+
+(defcommand cmd-mur-log-file
+  (m key)
+  "This file's history on trunk (C-x v l): only the snapshots that changed it."
+  (let (root (mur-resolve-root m)
+        file (or (let (path (mur-file-at m)) (and path root (path/join root path)))
+               (buffer-file (ed-current-buf m))))
+    (cond
+      (nil? root) (message m "not in a mur working copy")
+      (nil? file) (message m "no file here to log")
+      :else (mur-show-text m root "log" ["log" "-n" "50" file] "*mur-log*"))))
+
+(defcommand cmd-mur-versions
+  (m key)
+  "The change you are on and its versions (V)."
+  (let (root (mur-resolve-root m))
+    (if (nil? root)
+      (message m "not in a mur working copy")
+      (mur-show-text m root "versions" ["versions"] "*mur-versions*"))))
+
+(defcommand cmd-mur-run-command
+  (m key)
+  "Run any mur command in this working copy (!) and show what it printed — the line split
+into words as a shell would (`os/shell-split`: `comment -m 'two words'`), run as an argv."
+  (let (root (mur-resolve-root m))
+    (if (nil? root)
+      (message m "not in a mur working copy")
+      (mur-ask-words m
+        "mur "
+        ""
+        (fn (mm words)
+          (mur-show-text mm
+            root
+            (str "mur " words)
+            (os/shell-split words)
+            "*mur-output*"))))))
+
+;; ---- the buffer types --------------------------------------------------------------
+
+(def mur-status-keymap
+  (-> (sb-keymap)
+    (keymap-bind [:enter] 'murstatus/cmd-mur-visit)
+    (keymap-bind ["g"] 'murstatus/cmd-mur-refresh)
+    (keymap-bind ["q"] 'vcproc/cmd-vc-quit)
+    (keymap-bind ["$"] 'vcproc/cmd-vc-process)
+    (keymap-bind ["?"] 'mur/cmd-mur-dispatch)
+    (keymap-bind ["c"] 'murstatus/cmd-mur-change)
+    (keymap-bind ["r"] 'murstatus/cmd-mur-rename)
+    (keymap-bind ["s"] 'murstatus/cmd-mur-save)
+    (keymap-bind ["l"] 'murstatus/cmd-mur-land)
+    (keymap-bind ["u"] 'murstatus/cmd-mur-update)
+    (keymap-bind ["y"] 'murstatus/cmd-mur-sync)
+    (keymap-bind ["S"] 'murstatus/cmd-mur-settle)
+    (keymap-bind ["k"] 'murstatus/cmd-mur-restore)
+    (keymap-bind ["a"] 'murstatus/cmd-mur-claim)
+    (keymap-bind ["x"] 'murstatus/cmd-mur-drop)
+    (keymap-bind ["d"] 'murstatus/cmd-mur-diff)
+    (keymap-bind ["L"] 'murstatus/cmd-mur-log)
+    (keymap-bind ["V"] 'murstatus/cmd-mur-versions)
+    (keymap-bind ["!"] 'murstatus/cmd-mur-run-command)
+    ;; the forge's side (murforge)
+    (keymap-bind ["o"] 'murforge/cmd-mur-browse)
+    (keymap-bind ["O"] 'murforge/cmd-mur-open-changes)
+    (keymap-bind ["C"] 'murforge/cmd-mur-checks)
+    (keymap-bind ["D"] 'murforge/cmd-mur-discussion)
+    (keymap-bind ["R"] 'murforge/cmd-mur-reviews)))
+
+(def mur-status-mode-layer
+  {:name 'mur-status
+   :doc "The mur change you are on: c says what it is for, s saves, l lands, u updates; ? every verb."
+   :keymap murstatus/mur-status-keymap
+   ;; buffer-local M-x names: the ones that only mean something with a status under them
+   :commands '("mur-refresh" "mur-visit"
+                "mur-settle" "mur-restore" "mur-claim" "mur-diff")
+   :section-faces 'murstatus/mur-status-faces})
+
+(register-type-layers :mur-status
+  (list 'murstatus/mur-status-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+
+;; *mur-diff* / *mur-log* / *mur-output* / a forge read — plain text: q quits, $ the log, a
+;; diff in one is coloured by its text
+(def mur-text-keymap
+  (-> {}
+    (keymap-bind ["q"] 'vcproc/cmd-vc-quit)
+    (keymap-bind ["$"] 'vcproc/cmd-vc-process)))
+
+(def mur-text-mode-layer
+  {:name 'mur-text :keymap murstatus/mur-text-keymap :commands '() :fontify 'vcproc/vc-diff-fontify})
+
+(register-type-layers :mur-text
+  (list 'murstatus/mur-text-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))

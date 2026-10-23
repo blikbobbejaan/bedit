@@ -1,0 +1,204 @@
+(defmodule vc
+  "Version control in the editor, whichever system the project uses — Emacs's VC. The
+checkout a buffer is in is found by std's `vcs` (git's `.git`, mur's `.mur`); what the
+editor DOES with it goes through that system's ROW here (`register-vc-backend`):
+
+- `C-x g` opens its status (`cmd-vc-status`): Magit's for git, *mur-status* for mur;
+- `C-x v =` · `C-x v l` · `C-x v b` diff, log and blame the file, as Emacs's `vc-diff`,
+  `vc-print-log` and `vc-annotate` do, each answered by the backend or said not to be;
+- the mode line carries the backend's chip — git's branch and counts, mur's change —
+  computed off the loop on the idle beat (`vc-launch-summary`).
+
+A backend's porcelain (git's staging and sequencer, mur's changes, saves and lands) lives in
+its own modules and is reached from here only through its row's symbols, called late, so
+this module names none of them and a backend that has not loaded is simply not offered."
+  (:use model) ; ed-current-buf / ed-headless? / message / register-idle-job / register-task-reply
+  (:use pool) ; ed-default-dir
+  (:use editor/buffer) ; buffer-file
+  (:use sectionbuf) ; sb-ctx — a VC buffer (a status, a log) knows which checkout it shows
+  (:use interactive) ; defcommand
+  (:use task)) ; task — the summary's subprocesses, off the loop
+
+;; ---- the backends -------------------------------------------------------------
+;; A row per VCS kind (`:git`, `:mur` — the kinds std's `vcs/locate` answers), each hook a
+;; symbol resolved when it is called:
+;;   :status    (m key) -> m      the status buffer (C-x g)
+;;   :diff-file (m key) -> m      this file's changes (C-x v =)
+;;   :log-file  (m key) -> m      this file's history (C-x v l)
+;;   :blame     (m key) -> m      who changed each line (C-x v b); absent when it cannot
+;;   :dispatch  (m key) -> m      every menu, from one key (C-x M-g)
+;;   :file-menu (m key) -> m      the VCS about this file (C-c g)
+;;   :summary   (root) -> map     the mode line's facts, off the loop; nil for none
+;;   :segments  (summary) -> list the mode line's segments from those facts, pure
+;; A summary carries `:label` — what the work is on (git's branch, mur's change) — which the
+;; window title shows too.
+
+(defn register-vc-backend (kind row)
+  "Make `row` the editor's porcelain for checkouts of `kind` (`:git`, `:mur`). Called when
+the backend's module loads."
+  (registry/put! :vc/backends kind row))
+
+(defn vc-backend (kind)
+  "The editor's row for VCS `kind`, or nil when no porcelain for it has loaded."
+  (and kind (registry/lookup :vc/backends kind)))
+
+(defn vc-checkout (m)
+  "The checkout the current buffer is about, `{:kind :root}`: a VC buffer's own (a status
+or a log knows which checkout it shows), else the one its directory is in. nil outside any."
+  (let (root (get (sb-ctx m) :root))
+    (vcs/locate (or root (pool/ed-default-dir m)))))
+
+(defn vc-kind-name (kind)
+  "A checkout kind as a person reads it: `:mur` is `mur`.
+
+    (vc/vc-kind-name :mur)   → \"mur\""
+  (string/drop-prefix (->string kind) ":"))
+
+(defn- vc-load-command (command)
+  "Load the module a row's command lives in, when it has not loaded: a backend's porcelain
+is deferred (git's status buffer loads on the first C-x g), and its row names commands by
+symbol, which does not load anything by itself."
+  (let (module (interactive/command-module command))
+    (when (and module (not (bound? command)))
+      (check-allow :discarded-catch
+        (try
+          (require-one (symbol module))
+          (catch e (log/warn (str "could not load " module ": " (error-message e)))))))))
+
+;; check-allow: the hook is a symbol resolved now, so the checker cannot see its result;
+;; every row's command hook is a `(m key) -> m`, the contract `register-vc-backend` states.
+(check-allow :trusted
+  (sig vc-dispatch (model any keyword string -> model))
+  (defn- vc-dispatch (m key hook what)
+    "Run the current checkout's `hook` command, or say why not: outside a checkout, or a
+backend with no answer for `what` it is asked."
+    (let (where (vc-checkout m)
+          row (vc-backend (:kind where))
+          command (and row (get row hook)))
+      (cond
+        (nil? where) (message m "not in a version-controlled directory")
+        (nil? row)
+          (message m (str "no porcelain for " (vc-kind-name (:kind where)) " checkouts has loaded"))
+        (nil? command) (message m (str (vc-kind-name (:kind where)) " has no " what))
+        :else
+          (do
+            (vc-load-command command)
+            (reflect/call-if-bound command
+              (message m
+                (str (vc-kind-name (:kind where)) "'s " what " did not load ( *Messages* say why)"))
+              m
+              key))))))
+
+(defcommand cmd-vc-status
+  (m key)
+  "The status of the checkout this buffer is in (C-x g): Magit's for a git repository,
+*mur-status* for a mur working copy."
+  (vc-dispatch m key :status "status buffer"))
+
+(defcommand cmd-vc-diff
+  (m key)
+  "This file's changes, beside it (C-x v =): against HEAD in git, against the change's last
+save in mur."
+  (vc-dispatch m key :diff-file "file diff"))
+
+(defcommand cmd-vc-log-file
+  (m key)
+  "This file's history (C-x v l): git's log following renames, mur's trunk history of it."
+  (vc-dispatch m key :log-file "file log"))
+
+(defcommand cmd-vc-blame
+  (m key)
+  "Who last changed each line of this file (C-x v b)."
+  (vc-dispatch m key :blame "blame"))
+
+(defcommand cmd-vc-dispatch
+  (m key)
+  "Every menu of the checkout's VCS, from one key (C-x M-g): Magit's dispatch for git, every
+mur verb for mur."
+  (vc-dispatch m key :dispatch "menu"))
+
+(defcommand cmd-vc-file-menu
+  (m key)
+  "The VCS about THIS file (C-c g): its diff, history and the change it can make to it — git's
+stage, unstage and discard, mur's save, claim and restore."
+  (vc-dispatch m key :file-menu "file menu"))
+
+;; ---- the mode line, off the loop ---------------------------------------------------
+;; A backend's summary is a subprocess or several (git's is four: status, branch, upstream,
+;; ahead/behind; mur's is one `mur status --json`), and on a large repo `git status` alone
+;; is tens of milliseconds. Run on the loop on every idle beat, that is a freeze each time
+;; typing settles. So it runs in a task and folds back like every other async recompute.
+;;
+;; What travels is a KEY, not a checkout: the key is what the editor already knows (a VC
+;; buffer's root, the buffer's directory, whether it is file-backed), free to compute, and
+;; comparing it is how a stale answer is recognised. Finding the checkout is a walk up the
+;; directories, so it happens in the task too.
+
+(defn vc-summary-key (m)
+  "What the mode line's VC summary is ABOUT, as a value the loop computes for nothing:
+`[vc-buffer-root default-dir file-backed?]`.
+
+A fileless buffer that is not itself a VC buffer (*scratch*, a report) has nothing to
+describe: it only inherits a `:dir` from wherever it was made."
+  [(get (sb-ctx m) :root) (pool/ed-default-dir m) (and (buffer-file (ed-current-buf m)) true)])
+
+;; check-allow: the summary hook is a backend's symbol called late; its contract (a map or
+;; nil) is the one `register-vc-backend` states.
+(check-allow :trusted
+  (sig vc-summary (any -> any))
+  (defn vc-summary (key)
+    "The mode line's summary for a `vc-summary-key`, or nil when there is nothing to
+describe: the checkout's backend's `:summary`, with `:kind` and `:root` added. Subprocesses,
+so this is what the task runs and nothing on the loop calls it directly."
+    (let ([vc-root dir file?] key
+          where (if (or vc-root file?) (vcs/locate (or vc-root dir)) nil)
+          row (and where (vc-backend (:kind where)))
+          facts (and row (reflect/call-if-bound (:summary row) nil (:root where))))
+      (if (nil? facts) nil (assoc facts :kind (:kind where) :root (:root where))))))
+
+;; check-allow: the segments hook is a backend's symbol called late, `(summary) -> list`.
+(check-allow :trusted
+  (sig vc-segments (any -> any))
+  (defn vc-segments (summary)
+    "The mode line's VC segments for `summary` — its backend's `:segments` — or `()`."
+    (let (row (and summary (vc-backend (:kind summary))))
+      (if (nil? row) '() (or (reflect/call-if-bound (:segments row) nil summary) '())))))
+
+(defn vc-label (m)
+  "What the current checkout's work is on — git's branch, mur's change — or nil. The window
+title's suffix."
+  (:label (:vc-summary m)))
+
+(defn- vc-fold-summary (m summary)
+  (if (= summary (:vc-summary m))
+    m
+    (assoc m :vc-summary summary :vc-segments (vc-segments summary))))
+
+(defn vc-cache-summary (m)
+  "Recompute the mode line's VC summary **synchronously**: the headless path, and the one
+the tests drive; a live editor goes through `vc-launch-summary`."
+  (vc-fold-summary m (vc-summary (vc-summary-key m))))
+
+(defn vc-launch-summary (m)
+  "Recompute the mode line's VC summary OFF the loop when nothing is already in flight.
+Headless (no loop for a reply to land in) runs it synchronously instead."
+  (cond
+    (:vc-proc m) m
+    (ed-headless?) (vc-cache-summary m)
+    :else
+      (let (key (vc-summary-key m)
+            job (task (fn () (vc-summary key))))
+        (assoc m :vc-proc job :vc-checking key))))
+
+;; asked on every idle beat (`model/register-idle-job`): the in-flight slot is its gate
+(register-idle-job :vc-summary {:order 100 :run 'vc/vc-launch-summary})
+
+;; the summary, computed off the loop (`model/register-task-reply`)
+(register-task-reply :vc-proc 'vc/vc-apply-summary nil nil)
+(defn vc-apply-summary (m summary)
+  "Fold a finished summary into `:vc-summary` + `:vc-segments` and free the in-flight slot.
+An answer about a buffer the reader has since left is dropped — the next idle beat asks
+about the one they are in now."
+  (let (asked (:vc-checking m)
+        m1 (dissoc m :vc-proc :vc-checking))
+    (if (= asked (vc-summary-key m1)) (vc-fold-summary m1 summary) m1)))

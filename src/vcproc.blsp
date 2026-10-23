@@ -1,0 +1,404 @@
+(defmodule vcproc
+  "What every version control's command line shares in the editor, git's and mur's alike:
+the PROCESS LOG (`$`, Magit's `magit-process-buffer`) — every command a VCS porcelain ran,
+its exit code, how long it took and its output — and running one OFF the loop (`vc-launch`),
+for a command that talks to a network (git's pull and push, mur's land and update).
+
+A porcelain runs its commands through `vc-run` (journalled, synchronous) or `vc-launch`
+(journalled, in a task), naming the PROGRAM, so the log reads `git push` beside `mur land`
+in the order they ran. Nothing here knows any one VCS's arguments or output."
+  (:use editor/keymap :only [keymap-bind]) ; the *vc-process* keymap
+  (:use editor/layers :only [register-type-layers]) ; its buffer type
+  (:use model) ; message / ed-apply / ed-buffer-index-by-name / ed-headless? / register-task-reply
+  (:use pool) ; ed-display-buffer / ed-upsert-named / ed-goto-line
+  (:use commands) ; cmd-kill-buffer — q in the log
+  (:use interactive) ; defcommand
+  (:use task)) ; task — a network command, off the loop
+;; `theme` (a project source module, loaded with the image) provides the *green* / *red* /
+;; *blue* / *subtext* dynamic-var colour globals this file reads bare.
+
+;; ---- unified diffs, as every VCS prints them ---------------------------------------
+;; git and mur both print a unified diff (`git diff`, `mur diff`), so the faces of one, and
+;; the classifiers that pick them from a line, are the shared vocabulary of every diff view:
+;; a section buffer's hunk lines, a plain-text report's raw output, the process log.
+
+(theme/defchrome vc-face-add {:fg *green*}) ; an added (+) line; a command that exited 0
+(theme/defchrome vc-face-del {:fg *red*}) ; a removed (-) line; a command that failed
+(theme/defchrome vc-face-hunk {:fg *blue* :bold true}) ; a @@ hunk header; a command still running
+(theme/defchrome vc-face-file {:fg *subtext* :bold true}) ; diff --git / +++ / --- file headers
+(theme/defchrome vc-face-meta {:fg *subtext*}) ; index / mode / rename metadata
+
+(defn vc-whole-line (off line face)
+  "A whole-line span `[off end face]`, or `()` when `face` is nil."
+  (if (nil? face) '() (list [off (+ off (string/length line)) face])))
+
+(defn vc-diff-line-face (line)
+  "The face of one diff BODY line by its first character, or nil for context."
+  (cond
+    (string/starts-with? line "+") vc-face-add
+    (string/starts-with? line "-") vc-face-del
+    (string/starts-with? line "\\") vc-face-meta
+    :else nil))
+
+(defn vc-diff-text-face (line)
+  "The face for a line of raw unified-diff TEXT: headers, hunk headers, `+` and `-` lines;
+nil for a context line. For the plain-text reports (`!`'s output, `mur diff`); a section
+buffer colours by what a line IS instead (its row)."
+  (cond
+    (string/starts-with? line "@@") vc-face-hunk
+    (or (string/starts-with? line "+++") (string/starts-with? line "---")) vc-face-file
+    (string/starts-with? line "diff ") vc-face-file
+    (or (string/starts-with? line "index ")
+      (string/starts-with? line "new ")
+      (string/starts-with? line "deleted ")
+      (string/starts-with? line "rename ")
+      (string/starts-with? line "similarity ")
+      (string/starts-with? line "old mode")
+      (string/starts-with? line "new mode"))
+      vc-face-meta
+    :else (vc-diff-line-face line)))
+
+(defn vc-diff-fontify (src)
+  "The `:fontify` of a plain-text report holding a unified diff — colour each line."
+  (modes/fontify-lines src (fn (l off) (vc-whole-line off l (vc-diff-text-face l)))))
+
+;; ---- the journal: what the VCS actually ran (`$`) -------------------------------
+;; Magit's `$` (`magit-process-buffer`): every invocation, its exit code and its output,
+;; newest last — the answer to "what did it actually run" and to "it failed and the echo
+;; area only gave me one line of it". ONE log for every VCS, because a project that moved
+;; from git to mur still asks the question of both.
+;;
+;; Called the JOURNAL and not the process log because the porcelains already have handles
+;; to running things named `…-proc` (`:vc-proc`, `:vc-op-proc`), and a list of past
+;; commands four characters away from one is a misreading waiting to happen.
+;;
+;; It lives on the MODEL rather than in a shared table because every command worth
+;; recording already threads the model — the synchronous ones through `vc-run`, the network
+;; ones through `vc-launch` (recorded when they START, so an in-flight pull reads `run`) and
+;; `vc-apply-op` (completed when they land). A read-only command a renderer runs to draw a
+;; diff is not in here; Magit logs those too and they are mostly noise.
+;;
+;; Four things this does that Magit does not:
+;;   - a DURATION per entry, which is what you want to know when a push feels slow;
+;;   - `\r` progress applied — `git push`'s "Writing objects: 47%" rewrites its line, so the
+;;     entry holds the line it ended on rather than forty of them (`ansi/render`);
+;;   - credentials in a remote URL are REDACTED, because a journal gets pasted into bug
+;;     reports;
+;;   - the NUL a `-z` command separates its paths with is shown as `^@` rather than written
+;;     into the rope.
+
+(def *vc-journal-max* 64) ; entries kept; the oldest go first, never one still running
+
+(def *vc-op-timeout-ms* 120000)
+;; A network operation gets two minutes before the task is killed and reported as a timeout.
+;; Unbounded is how a wedged pull against an unreachable host becomes a slot that never frees
+;; and a command that is "already running" until restart.
+
+;; ---- an entry ----------------------------------------------------------------
+;; `{:id :program :args :exit :ms :output :running? :at}` — one map, built in ONE place, so
+;; the producers (a synchronous run, a git hunk apply, a launched network op) cannot drift
+;; into three shapes.
+
+(defn- vc-redact (s)
+  "`s` with the credentials in its URLs replaced by `***`: the password of a
+`user:secret@`, and the whole user part of an `http(s)://token@` — a personal access
+token is sent as the USERNAME (`https://ghp_…@github.com`), so hiding only what follows a
+colon left the token itself in the log. An ssh `git@host` names an account, not a
+secret, and stays."
+  (regex/replace "(https?://)[^/@:\\s]+@"
+    (regex/replace "://([^/@:\\s]+):[^/@\\s]+@" s "://$1:***@")
+    "$1***@"))
+
+(defn- vc-printable (s)
+  "`s` made fit to put in a rope: `\\r` progress and escape sequences APPLIED (so
+\"Writing objects: 47%\" is the line it ended on, not forty lines), the NUL a `-z`
+command separates paths with shown as `^@`, and credentials redacted."
+  (let (rendered (if (or (includes? s "\r") (includes? s "\e")) (ansi/render "" s) s))
+    (vc-redact (string/trimr (string/replace rendered (string/int->char 0) "^@")))))
+
+(defn vc-entry-output (r)
+  "The output an entry shows: stderr then stdout — a VCS says the interesting thing on
+stderr — or what a task that never answered leaves behind."
+  (if (nil? r)
+    "no result (timed out)"
+    (vc-printable (str (:stderr r "") (:stdout r "")))))
+
+(defn vc-entry (program args)
+  "A journal entry for `program args`, as it reads while it is still running. No `verb`:
+the label a command puts in the echo area (`stage hunk`) is the echo's business, and an
+entry that carried both could disagree with the command line — which is the one thing this
+buffer exists to be right about."
+  {:program program :args (into [] args) :running? true :at (os/now)})
+
+(defn- vc-entry-done (e r)
+  "Entry `e` completed by result `r` (nil = the task never answered), timed from its
+own `:at` — the entry knows when it started, so nothing else has to carry that."
+  (assoc e
+    :running? false
+    :ms (- (os/now) (or (:at e) (os/now)))
+    :exit (if (nil? r) nil (:exit r))
+    :output (vc-entry-output r)))
+
+;; ---- the log ------------------------------------------------------------------
+;; The buffer is a VIEW of the log, not a copy of it: every write re-renders it in place
+;; (`ed-upsert-named` — no pane, no selection touched) when it happens to be open, so a
+;; `pull` you are watching completes in front of you rather than when you next press `g`.
+
+;; check-allow: `:vc-journal` is the log this file owns and only ever writes as a vector;
+;; the model record does not declare it, so `or` reads as every value a map key could hold.
+(check-allow :trusted
+  (sig vc-journal (model -> vector))
+  (defn vc-journal (m)
+    "The process log, oldest first."
+    (or (:vc-journal m) [])))
+
+(defn- vc-journal-sync (m)
+  "Re-render *vc-process* in place when it is open; the model unchanged when it is not."
+  (if (nil? (ed-buffer-index-by-name m "*vc-process*"))
+    m
+    (pool/ed-upsert-named m "*vc-process*" (vc-journal-text m) :vc-process)))
+
+(defn- vc-journal-trim (entries)
+  "`entries` cut to `*vc-journal-max*`, dropping the oldest — but never one still running,
+whose output has not arrived yet."
+  (let (n (count entries))
+    (if (<= n *vc-journal-max*)
+      entries
+      (into []
+        (append (seq/filter (seq/subvec entries 0 (- n *vc-journal-max*)) :running?)
+          (seq/subvec entries (- n *vc-journal-max*)))))))
+
+(defn vc-journal-add (m entry)
+  "`[model' id]`: the model with `entry` appended under a fresh id, the log trimmed and the
+buffer re-rendered if it is open."
+  (let (id (or (:vc-journal-seq m) 1))
+    [(vc-journal-sync (assoc m
+                        :vc-journal (vc-journal-trim (into (vc-journal m) [(assoc entry :id id)]))
+                        :vc-journal-seq (inc id)))
+      id]))
+
+(defn vc-journal-finish (m id r)
+  "The model with running entry `id` completed by result `r` — unchanged when that entry has
+already been trimmed away. Re-renders the buffer if it is open, so a `pull` you are watching
+stops reading `run` the moment it lands."
+  (vc-journal-sync (assoc m
+                     :vc-journal
+                       (into []
+                         (map (vc-journal m) (fn (e) (if (= (:id e) id) (vc-entry-done e r) e)))))))
+
+(defn vc-journal-note ()
+  "The hint appended to a failed command's message: how to see the whole output. Magit
+appends the same thing, for the same reason — the echo area shows one line, and nobody
+guesses that a key exists to show the rest. Nothing to point at when there is no UI."
+  (if (ed-headless?) "" " ($ for the full output)"))
+
+;; check-allow: `run` is an opaque caller-supplied thunk; the declaration is the contract.
+(check-allow :trusted
+  (sig vc-run (model string seqable fn -> vector))
+  (defn vc-run (m program args run)
+    "`[model' result]`: record `program args` as started, call `run` (which runs it and
+returns `{:exit :stdout :stderr}`), complete the entry. The one seam a porcelain's
+model-threaded commands go through, so the log cannot disagree with what ran: a command
+cannot be run without being recorded."
+    (let ([m1 id] (vc-journal-add m (vc-entry program args))
+          r (run))
+      [(vc-journal-finish m1 id r) r])))
+
+;; ---- rendering the buffer ------------------------------------------------------
+;; A heading starts at column 0 and its exit code is right-aligned in three columns; every
+;; line of output is indented FOUR, one more than the widest heading prefix can be. That is
+;; what lets the `:fontify` — which sees text and nothing else — tell the two apart by the
+;; line alone: an output line that happens to read `0 …` is never taken for a command that
+;; exited 0. It also lines the output up under the command.
+
+(def- vc-output-indent "    ")
+
+(def- vc-global-flags
+  ;; the porcelain's own arguments before the subcommand — git's `-C <root>` and
+  ;; `-c core.quotePath=false`, on every call and typed by nobody: elided. Magit collapses
+  ;; the same thing to `…` with the full text in a tooltip.
+  #{"-C" "-c"})
+
+(defn- vc-command-text (e)
+  "The command line as the user means it: the program and its arguments, less the
+porcelain's own flags."
+  (letrec (strip (fn (a)
+                   (if (and (> (count a) 1) (contains? vc-global-flags (first a)))
+                     (strip (drop a 2))
+                     a)))
+    (vc-redact (string/join (into [(:program e "git")] (strip (into [] (:args e)))) " "))))
+
+(defn vc-journal-heading (e)
+  "One entry's heading: the exit code (Magit's right-aligned three columns, `run` while in
+flight), the command, and how long it took."
+  ;; `(or …)` and not a `get` default: a timed-out entry HAS an `:exit`, whose value is nil,
+  ;; so a default would never be reached — and 0 is truthy in Brood, so an exit of 0 still
+  ;; reads as itself
+  (str (if (:running? e) "run " (str (string/pad-left (str (or (:exit e) "?")) 3) " "))
+    (vc-command-text e)
+    (if (:running? e) "" (str "  (" (humanize/duration (:ms e 0)) ")"))))
+
+(defn- vc-journal-block (e)
+  "An entry as text: its heading, then its output indented under it."
+  (let (out (:output e ""))
+    (if (= out "")
+      (vc-journal-heading e)
+      (str (vc-journal-heading e)
+        "\n"
+        (string/join (map (string/split out "\n") (fn (l) (str vc-output-indent l))) "\n")))))
+
+(defn vc-journal-text (m)
+  "The whole journal as the buffer shows it: one block per entry, oldest first."
+  (let (entries (vc-journal m))
+    (if (empty? entries)
+      "(no version control commands yet)"
+      (string/join (map entries vc-journal-block) "\n"))))
+
+(defn vc-process-fontify (src)
+  "The *vc-process* `:fontify`: a heading reads by its exit code — green for 0, red for
+anything else, blue while it runs — and the output indented under it is plain."
+  (modes/fontify-lines src
+    (fn (line off)
+      (cond
+        (string/starts-with? line "run ") (vc-whole-line off line vc-face-hunk)
+        (string/starts-with? line vc-output-indent) '()
+        (string/starts-with? line "  0 ") (vc-whole-line off line vc-face-add)
+        :else (vc-whole-line off line vc-face-del)))))
+
+(defcommand cmd-vc-process
+  (m key)
+  "Show what the version control actually ran (`$`, Magit's `magit-process-buffer`): every
+git or mur command this editor issued, with its exit code, how long it took and its output
+— the whole of it, where the echo area could only show the first line. `g` refreshes, `k`
+clears, `q` quits."
+  (vc-show-report m "*vc-process*" (vc-journal-text m) :vc-process {:action :pop}))
+
+(defcommand cmd-vc-process-clear
+  (m key)
+  "Clear the process log (k in *vc-process*)."
+  (let (m1 (dissoc m :vc-journal))
+    (vc-show-report m1 "*vc-process*" (vc-journal-text m1) :vc-process {:action :here})))
+
+(defcommand cmd-vc-quit
+  (m key)
+  "Bury the version-control buffer (q)."
+  (cmd-kill-buffer m key))
+
+;; ---- reporting -----------------------------------------------------------------
+
+(defn vc-show-report (m name text type &optional (opts {:action :here}))
+  "Show `text` in a read-only report buffer `name` of `type` (a diff, a log, a command's
+output), point at the top. `opts` routes through `ed-display-buffer` (default
+`{:action :here}`, replacing the current pane; `{:action :pop}` opens it in another pane)."
+  (ed-apply (pool/ed-display-buffer m name (if (= text "") "(empty)" text) type opts)
+    (fn (b) (pool/ed-goto-line b 1))))
+
+(defn vc-report-cmd (m verb r)
+  "Echo the result of a command `r` (`verb` names it), preferring stderr then stdout;
+falls back to the exit code when both streams are empty. A FAILURE says where the rest of
+the output is: the echo area holds one line, and nobody guesses that a key shows the whole
+of it (Magit appends the same hint, for the same reason)."
+  (let (e (string/trim (:stderr r ""))
+        raw (if (= e "") (string/trim (:stdout r "")) e)
+        failed? (not (= (:exit r) 0))
+        out (one-line (if (= raw "") (str "exit " (:exit r)) raw)))
+    (message m (str verb (if failed? " failed: " ": ") out (if failed? (vc-journal-note) "")))))
+
+;; ---- off the loop: no VCS command ever blocks a keystroke -----------------------
+;; A command that talks to a network (git's pull / push / fetch, mur's land / update /
+;; sync) run on the loop freezes the whole editor — no repaint, no C-g — for as long as the
+;; remote takes. So it goes through `vc-launch`, which runs it in a `task` and folds the
+;; result when it lands (`model/register-task-reply`). The editor stays live and C-g
+;; cancels it. `ed-headless?` keeps the synchronous path for tests and `--headless`, where
+;; there is no loop for a reply to land in.
+
+(defn vc-op-running (m)
+  "The verb of the operation in flight (`\"pull\"`, `\"land\"`, …), or nil."
+  (get-in m [:vc-op :verb]))
+
+;; check-allow: `runner` and `then` are opaque caller-supplied functions; the declaration
+;; is the contract (ADR-341's `:trusted`).
+(check-allow :trusted
+  (sig vc-launch (model string string string seqable fn any -> model))
+  (defn vc-launch (m program verb root args runner then)
+    "Run `program args` in `root` OFF the loop — `(runner root args)` in a task, returning
+`{:exit :stdout :stderr}` — and report when it lands, then run `then`, a
+`(model result) -> model` (nil for nothing more).
+
+Refuses to start a second operation while one is in flight: two lands at once is not a
+thing anyone means, and the in-flight slot holds exactly one handle. Headless runs it
+synchronously, because there is no loop to hand the reply to."
+    (cond
+      (vc-op-running m) (message m (str (vc-op-running m) " is already running"))
+      (ed-headless?)
+        (let ([m0 r] (vc-run m program args (fn () (runner root args)))
+              m1 (vc-report-cmd m0 verb r))
+          (if (nil? then) m1 (then m1 r)))
+      :else
+      ;; the entry is journalled when the command STARTS, so an in-flight pull reads as
+      ;; `run git pull` while it is still out there — which is the question you have when
+      ;; one is slow. `vc-apply-op` completes it; the entry times itself.
+        (let (job (task (fn () (runner root args)) {:timeout *vc-op-timeout-ms*})
+              [logged id] (vc-journal-add m (vc-entry program args)))
+          (assoc (message logged (str verb "…"))
+            :vc-op-proc job
+            :vc-op {:verb verb :root root :then then :entry id})))))
+
+(check-allow :trusted
+  ;; a command that can outlast a frame — network, so a task
+  (register-task-reply :vc-op-proc 'vcproc/vc-apply-op nil "vc")
+  (sig vc-apply-op (model any -> model))
+  (defn vc-apply-op (m r)
+    "Fold a finished `vc-launch`: report the outcome and run its `then`. A nil `r` is the
+task having errored or timed out — said plainly, rather than reported as a success with an
+empty output, which is what a bare exit-code check would do with it."
+    (let (op (:vc-op m)
+          verb (or (:verb op) "command")
+          m1 (vc-journal-finish (dissoc m :vc-op :vc-op-proc) (:entry op) r))
+      (if (nil? r)
+        (message m1
+          (str verb
+            " failed: no result (timed out after "
+            *vc-op-timeout-ms*
+            "ms)"
+            (vc-journal-note)))
+        (let (m2 (vc-report-cmd m1 verb r))
+          (if (nil? (:then op)) m2 ((:then op) m2 r)))))))
+
+;; ---- the buffer type -------------------------------------------------------------
+;; *vc-process* — its own layer rather than a shared report keymap, because `k` clears the
+;; log here.
+(def vc-process-keymap
+  (-> {}
+    (keymap-bind ["q"] 'vcproc/cmd-vc-quit)
+    (keymap-bind ["g"] 'vcproc/cmd-vc-process)
+    (keymap-bind ["k"] 'vcproc/cmd-vc-process-clear)
+    (keymap-bind ["$"] 'vcproc/cmd-vc-process)
+    (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
+    (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)
+    (keymap-bind [:down] 'commands/cmd-next-line)
+    (keymap-bind [:up] 'commands/cmd-previous-line)))
+
+(def vc-process-mode-layer
+  {:name 'vc-process
+   :doc "What the version control actually ran: every command, its exit code, how long it took and its output."
+   :keymap vcproc/vc-process-keymap
+   ;; NOT "vc-process": a layer's `:commands` are subtracted from the GLOBAL M-x set
+   ;; (`model/ed-all-layer-commands`), and `M-x vc-process` has to work from anywhere —
+   ;; the buffer it opens is exactly where you are not
+   :commands '("vc-process-clear" "vc-quit")
+   :fontify 'vcproc/vc-process-fontify})
+
+(register-type-layers :vc-process
+  (list 'vcproc/vc-process-mode-layer 'modes/special-mode-layer 'modes/text-mode-layer))
+;; ---- asking before something that cannot be undone ---------------------------
+
+(defn vc-confirm (m prompt then)
+  "Ask `prompt` (y/n) and run `then` on yes. The one-key reader every irreversible VC command
+uses (git's discard and reset, mur's drop and restore) — and the prompt NAMES what is
+about to happen (`Reset --hard to abc123, losing all uncommitted changes?`) rather than
+asking whether you are sure. \"Are you sure?\" is answered yes by reflex; a sentence that
+says what will be lost is not."
+  (ed-read-char m
+    (str prompt " (y/n) ")
+    (fn (mm c) (if (ed-yes-key? c) (then mm) (message mm "cancelled")))))
