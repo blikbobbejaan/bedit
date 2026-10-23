@@ -2,9 +2,9 @@
   "The editor's input layer: fold one key event into the next model.
 
 Dispatch goes through **layers** (`std/layers.blsp`) composed across two scopes
-(`ed-active-keymap` → `scope-keymap`): the active buffer's *mode* layers (`text-mode`
+(`ed-key-binding` → `scope-binding`): the active buffer's *mode* layers (`text-mode`
 by default, see `modes`) over the model's keybinding *profile* layers (emacs/vim, see
-`keymaps`), the buffer winning. `keymap-step` then runs one (possibly chorded)
+`keymaps`), the buffer winning. `keymap-run` then runs one (possibly chorded)
 keystroke through it, threading the prefix-`:pending` state — so the chord state
 machine (prefix entry, mid-chord resolution, dead-end reset, self-insert fallback)
 lives in the language toolkit, not here (the prime directive — see CLAUDE.md). The
@@ -25,7 +25,7 @@ self-editing editor)."
   (:use complete-at-point) ; the completion popup (Tab) + its modal key handling
   (:use isearch) ; the modal incremental-search / query-replace mini-loops
   (:use interactive) ; current-prefix-arg / prefix-consuming? — the prefix-arg seam
-  (:use editor/keymap) ; keymap-step — the std chord dispatcher
+  (:use editor/keymap) ; keymap-run — the std chord dispatcher's running half
   (:use editor/ui) ; overlay-route — the shared modal-overlay dispatch fallthrough
   ; bshell is loaded below with a bare `require`: its event handlers register at load,
   ; and its per-key prompt guard rides the generic `:post-key` layer facet now — nothing
@@ -36,7 +36,7 @@ self-editing editor)."
   (:use collab) ; shared-buffer-process pushes: the [:buffer-updated …] event handler
   ; web / git / diffhl are deferred — each registers its idle-beat job when it loads
   (:use keymaps) ; ed-ensure-profile — seed the model-scope keybinding profile (emacs/vim)
-  (:use editor/layers) ; scope-keymap (compose buffer + model layers) + init-buffer-layers
+  (:use editor/layers) ; scope-resolve / scope-binding (buffer + model layers) + init-buffer-layers
   (:use wrap)) ; rows-from — the last line a wrapped pane shows (ed-point-into-view)
 ;; `modes` defines the layers and registers the default (text-mode); the bindings live
 ;; there, as data, not here. It — with bshell (C-x p e shell), compile (M-x compile +
@@ -65,9 +65,11 @@ second spelling of it there is the one way help could come to describe a keymap 
 dispatcher is not using."
   (list (ed-current-buf m) m))
 
-(defn- ed-active-keymap (m)
-  "The keymap in force: `ed-scope` merged (`scope-keymap`), the buffer winning."
-  (scope-keymap (ed-scope m)))
+(defn- ed-key-binding (m key)
+  "What `key` is bound to in the keymap in force — `ed-scope`'s layers, the buffer winning
+(`scope-binding`). Asked per key rather than merging every layer's keymap into one map
+first, which dispatch used to do on every keystroke to read one entry."
+  (scope-binding (ed-scope m) key))
 
 (defn- ed-post-key-guards (m-before m key)
   "Run the current buffer's mode `:post-key` guards over the just-dispatched model
@@ -245,8 +247,8 @@ additions merged over it. Not the composed keymap the dispatcher uses, because l
 merge shallowly and a chord belongs to its winning layer (std/editor/layers) — the term
 mode binds `C-c C-j`, which takes the whole `C-c` map with it, and a command whose entire
 purpose is to reach the editor's map would hand back only the two keys the mode added."
-  (let (profile (get (scope-keymap (list m)) key)
-        mode (get (ed-active-keymap m) key)
+  (let (profile (scope-binding (list m) key)
+        mode (ed-key-binding m key)
         sub (merge (if (map? profile) profile {}) (if (map? mode) mode {})))
     (if (empty? sub) m (assoc m :prefix-map sub :prefix-key key))))
 
@@ -273,11 +275,12 @@ a shift-selection collapsed when the command is a plain motion."
                            (assoc (ed-current-buf started) :undo-amalgamate amalgamate))
       this-cmd)))
 
-(defn- ed-keymap-step (keymap input m)
-  "One keymap step: resolve `input` through `:pending` / `keymap` (`keymap-step`), threading
-`:pending`. A command that PRESSED a prefix (`ed-press-prefix`) leaves the next key to
-resolve in that sub-map, and the chord reads as the prefix."
-  (let ([stepped pending] (keymap-step keymap (:pending m) (assoc m :echo "") input ed-self-insert)
+(defn- ed-keymap-step (resolved input m)
+  "One keymap step: run `input`'s `resolved` binding (`scope-resolve` against `:pending`)
+through `keymap-run`, threading `:pending`. A command that PRESSED a prefix
+(`ed-press-prefix`) leaves the next key to resolve in that sub-map, and the chord reads as
+the prefix."
+  (let ([stepped pending] (keymap-run resolved (:pending m) (assoc m :echo "") input ed-self-insert)
         pressed (:prefix-map stepped))
     (if (nil? pressed)
       (assoc stepped :pending pending)
@@ -325,10 +328,13 @@ the chord resolves (a command ran) or aborts."
 repeating the command `:prefix-arg` times when one is set (negative runs the inverse —
 see `ed-run-arg`). A prefix key mid-chord just steps (the prefix arg carries until the
 chord completes); a prefix-consuming command (set-mark) runs once and reads the arg."
-  (let (keymap (ed-active-keymap m)
-        binding (get (or (:pending m) keymap) input)
+  (let (pending (:pending m)
+        binding (if (nil? pending) (ed-key-binding m input) (get pending input))
+        ;; resolved ONCE: every repetition under a prefix arg steps from this same
+        ;; `:pending` (`ed-run-command`), so it would find this same binding
+        resolved (keymap-classify binding)
         this-cmd (ed-binding-command binding)
-        step (fn (mm) (ed-keymap-step keymap input mm))
+        step (fn (mm) (ed-keymap-step resolved input mm))
         result (cond
                  ;; a prefix key mid-chord: step, keep the prefix arg for the resolving key
                  (nil? this-cmd) (step m)
@@ -526,10 +532,9 @@ into a pending prefix). On a command, report its name + first docstring line; on
 keep reading; on an unbound key, say so. Esc/C-g aborts."
   (if (ed-cancel-key? input)
     (message (dissoc m :describe-key) "quit")
-    (let (km (ed-active-keymap m)
-          st (:describe-key m)
+    (let (st (:describe-key m)
           keys (append (:keys st) (list input))
-          binding (get (or (:pending st) km) input))
+          binding (if (nil? (:pending st)) (ed-key-binding m input) (get (:pending st) input)))
       (cond
         (map? binding) (assoc m :describe-key {:pending binding :keys keys})
         (nil? binding) (message (dissoc m :describe-key) (str (ed-keys-label keys) " is undefined"))
