@@ -415,29 +415,33 @@ src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is
                             ^ · M-n/M-p · 1-4 · M-w are shared by every such buffer. A lazy
                             section (a status file whose diff was never fetched) asks the
                             mode's `:section-reload`
-src/vc.blsp                 version control in the editor, whichever system — Emacs's VC. The
+src/vcscore.blsp            the VCS layer, whichever system the project uses (Emacs's VC). The
                             checkout a buffer is in comes from std's `vcs` (`.git`, `.mur`);
                             what the editor does with it goes through that system's ROW
-                            (`register-vc-backend`): C-x g its status, C-x M-g its menus, C-c g
-                            its file menu, C-x v = / l / b the
-                            file's diff, log and blame, and the mode line's chip, summarised
-                            OFF the loop on the idle beat (`:vc-summary` / `:vc-segments`;
-                            `:label` — git's branch, mur's change — is the window title's too).
-                            Names no backend: a row's hooks are symbols called late
-src/vcproc.blsp             what every VCS's command line shares: the PROCESS LOG (`$`,
-                            *vc-process*, magit's `magit-process-buffer`) — git and mur
+                            (`register-vcs-backend`): C-x g its status, C-x M-g its menus, C-c g
+                            its file menu, C-x v = / l / b the file's diff, log and blame, and
+                            the mode line's chip — a backend's `:chip` is FACTS (glyph, label,
+                            dot, counts), drawn by one renderer (`vcs-chip-segments`) so every
+                            backend's reads alike — summarised OFF the loop and only when the
+                            disk may have moved (`:vcs-summary` / `:vcs-segments`; `:label`,
+                            git's branch or mur's change, is the window title's too). Names no
+                            backend: a row's hooks are symbols called late
+src/vcsproc.blsp            what every VCS's command line shares: the PROCESS LOG (`$`,
+                            *vcs-process*, magit's `magit-process-buffer`) — git and mur
                             commands in the order they ran, exit code, duration, output,
-                            credentials redacted, `\r` progress applied — `vc-run` (journalled)
-                            and `vc-launch` (OFF the loop, for the network), `vc-report-cmd`,
-                            `vc-confirm`, and a unified diff's faces (`vc-diff-line-face`)
+                            credentials redacted, `\r` progress applied — `vcs-run` (journalled)
+                            and `vcs-launch` (OFF the loop, for the network), `vcs-report-cmd`,
+                            `vcs-confirm`, a unified diff's faces, and a file's hunks as
+                            sections (`vcs-hunk-sections`, std's `diff`) with the file line a
+                            diff line is (`vcs-hunk-line`) — git's and mur's diffs are one tree
 src/mur.blsp                the TOP of the mur porcelain (git.blsp's counterpart): `:use`s every
                             mur module, and holds its menus — C-x M-g (and ? in *mur-status*)
                             every mur verb, C-c g mur about this file — both reached through
-                            `vc` rows (`:dispatch`, `:file-menu`), as git's are. main loads it
+                            `vcscore` rows (`:dispatch`, `:file-menu`), as git's are. main loads it
 src/murcore.blsp            the ground the mur porcelain stands on: `mur-mur` (the client, as
                             the editor's own seat, MUR_RUNNER=bedit), `mur-json` over its
                             `--json`, the working copy a buffer is about, `mur-do` /
-                            `mur-launch` through vcproc's log — and mur's ROW in std's `vcs`
+                            `mur-launch` through vcsproc's log — and mur's ROW in std's `vcs`
                             (files, changed, base text, id): bedit is the package that knows mur. mur is Murmuration's VCS (mur.fly.dev): a CHANGE,
                             its saved VERSIONS, a land puts it on TRUNK
 src/murbar.blsp             mur's row in vc and its mode line: ◆ what the change is for, a
@@ -464,7 +468,7 @@ src/gitcore.blsp            the ground under it: `git-git` (never prompting), th
                             ahead/behind, refs / remotes / stashes, which operation is
                             half-done in .git (the SEQUENCER). One logged seam: `git-run` /
                             `git-run-hunk`, `git-do` to refresh after, `git-launch-op` for
-                            network commands OFF the loop — git's side of vcproc's log
+                            network commands OFF the loop — git's side of vcsproc's log
                             and runner.
                             Knows nothing of the status buffer: it refreshes it by name
                             (`git-refresh-status`), because gitstatus stands on this
@@ -513,7 +517,8 @@ src/smerge.blsp             conflicts resolved IN the file, Emacs's smerge: C-c 
                             conflicts, u/l/a/b keep upper / lower / both / base
 src/diffhl.blsp             diff-hl change gutter: per-line added/modified/deleted against the
                             file's base text (std's `vcs/base-text`: git's HEAD, mur's last
-                            save), recomputed off the loop on the idle beat (and the blink tick)
+                            save), recomputed off the loop on the idle beat (and the blink tick);
+                            C-x v ] / [ walk its changes, whichever VCS drew them
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
                             (biggest first — where the memory went) · C-c b t trace a named

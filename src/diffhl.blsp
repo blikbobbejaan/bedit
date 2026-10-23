@@ -4,7 +4,7 @@ the version control compares the file with — git's HEAD, mur's last save), pai
 coloured bar in the left of the line-number gutter. The per-line status is computed by
 `git diff --no-index` of the buffer's text against that base text (`vcs/base-text`, std's,
 whichever VCS the file is in) and cached on
-the buffer under `:vc-line-status` (a `{0-based-line -> :added|:modified|:deleted}` map), so
+the buffer under `:vcs-line-status` (a `{0-based-line -> :added|:modified|:deleted}` map), so
 the gutter cell — which sees only the buffer — can paint it without the model. The model-level
 recompute (off the loop, re-armed on edit/save) is `ed-launch-diffhl`, below: an idle-beat job
 this module registers when it loads (`model/register-idle-job`). The module is deferred: the
@@ -15,6 +15,7 @@ recompute — what the `bound?` guard in the model used to say.
 unit-tested against real git without the editor (tests/diffhl_test.blsp)."
   (:use editor/buffer) ; buffer-file / buffer-text
   (:use model) ; ed-current-buf / ed-set-buf / ed-buf-at / ed-headless? / the registries
+  (:use interactive) ; defcommand — C-x v ] / [
   (:use task)) ; task — the diff runs off the loop
 ;; `theme` (a project source module, loaded with the image) provides the *green* /
 ;; *yellow* / *red* dynamic-var colour globals this file reads bare.
@@ -113,12 +114,12 @@ error. Plain strings in, plain map out — safe to run inside a spawned worker."
 (vs its base text — git's HEAD, mur's last save) given its current `text` — an empty map
 when the file is new or in no checkout. **Plain data in, plain data out**: it takes the text
 as a string (not a buffer/rope), so it can run inside a spawned task that has no buffer
-handle (the rope is process-local). The editor folds the result onto the buffer's `:vc-line-status`."
+handle (the rope is process-local). The editor folds the result onto the buffer's `:vcs-line-status`."
   (let (head (vcs/base-text path))
     (if (nil? head) {} (diffhl-status-map head text))))
 
 (defn diffhl-annotate (buf)
-  "Return `buf` with `:vc-line-status` set to its per-line diff vs its base text — an empty
+  "Return `buf` with `:vcs-line-status` set to its per-line diff vs its base text — an empty
 map when the file is new or in no checkout (so the gutter shows the bar column but no
 colours).
 A fileless buffer is returned unchanged (no status key — never gets a diff gutter). The
@@ -131,7 +132,7 @@ synchronous wrapper over `diffhl-status`, used on the headless path; the live ed
       ;; bars draw only while positionally current, which is what blanks them the
       ;; moment a line is inserted rather than drawing every bar one line off
       (editor/buffer/annotate buf
-        :vc-line-status (diffhl-status path (buffer-text buf))))))
+        :vcs-line-status (diffhl-status path (buffer-text buf))))))
 
 ;; ---- diff-hl annotation, off the loop (mirrors the diagnostics pair) ---------
 ;; Diffing a buffer against its base text is `std/diff` over the whole file. On a large
@@ -151,7 +152,7 @@ runs OFF the loop (`ed-launch-diffhl`), so a large file no longer blocks it."
   (and (:diff-hl? m true)
     (let (b (ed-current-buf m))
       (and (buffer-file b)
-        (let (a (editor/buffer/annotation b :vc-line-status))
+        (let (a (editor/buffer/annotation b :vcs-line-status))
           (or (nil? a) (:stale? a)))))))
 
 (defn ed-launch-diffhl (m)
@@ -198,7 +199,7 @@ Mirrors `ed-apply-diag`."
       (update m1
         :buffers assoc
         idx
-        (editor/buffer/annotate (ed-buf-at m1 idx) :vc-line-status (or result {}))))))
+        (editor/buffer/annotate (ed-buf-at m1 idx) :vcs-line-status (or result {}))))))
 
 (defn ed-quit-diffhl (m)
   "C-g killed a diff-hl recompute (`:on-quit`): forget the rope it was diffing, and re-stamp
@@ -212,7 +213,7 @@ again."
     ;; this exists to keep.
     (dissoc (ed-set-buf m
               (editor/buffer/annotate b
-                :vc-line-status (or (:value (editor/buffer/annotation b :vc-line-status)) {})))
+                :vcs-line-status (or (:value (editor/buffer/annotation b :vcs-line-status)) {})))
       :diffhl-checking)))
 
 ;; ---- registration ---------------------------------------------------------------
@@ -228,3 +229,44 @@ again."
 ;; tick fires whenever the editor is idle, so it keeps the bars current regardless
 (register-idle-job :diffhl
   {:order 80 :run 'diffhl/ed-launch-diffhl :stale? 'diffhl/ed-diffhl-stale? :on-blink? true})
+
+;; ---- moving between the changes (diff-hl's C-x v [ / ]) ------------------------------
+;; The bars already say where the changes are, whichever VCS made them, so walking them needs
+;; no VCS at all: a hunk starts where a marked line follows an unmarked one (or one of another
+;; kind — an addition right after a modification is its own change).
+
+(defn diffhl-hunk-starts (status -> (list int))
+  "The 0-based lines where a change starts in a `{line -> :added|:modified|:deleted}` status
+map, ascending. Pure.
+
+    (diffhl/diffhl-hunk-starts {2 :added 3 :added 7 :modified 9 :deleted})   → (2 7 9)"
+  (let (lines (sort (keys (or status {}))))
+    (seq/filter lines (fn (l) (not (= (get status (dec l)) (get status l)))))))
+
+(defn- diffhl-jump (m forward?)
+  "Point to the next (or previous) change's first line in the current buffer, or say there
+is none that way."
+  (let (b (ed-current-buf m)
+        status (editor/buffer/annotation-value b :vcs-line-status)
+        here (buffer-current-line b)
+        starts (diffhl-hunk-starts status)
+        target (if forward?
+                 (seq/find starts (fn (l) (> l here)))
+                 (last (seq/filter starts (fn (l) (< l here))))))
+    (cond
+      (nil? status)
+        (message m
+          "no change marks here yet (a file the version control does not track, or not yet read)")
+      (nil? target) (message m (if forward? "no more changes below" "no more changes above"))
+      :else (ed-set-buf m (pool/ed-goto-line b (inc target))))))
+
+(defcommand cmd-diffhl-next-hunk
+  (m key)
+  "Go to the next change in this file (C-x v ]) — the next bar in the gutter, whichever
+version control drew it."
+  (diffhl-jump m true))
+
+(defcommand cmd-diffhl-previous-hunk
+  (m key)
+  "Go to the previous change in this file (C-x v [)."
+  (diffhl-jump m false))
