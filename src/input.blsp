@@ -680,47 +680,19 @@ owning handler consumes the key; otherwise the overlay exits (`:exit`) and the k
 dispatched normally (Emacs' dismiss-and-process)."
   (overlay-route ed-transient-handlers m input ed-dispatch))
 
-;; ---- key repeat (consumer-paced, off the GUI's down/up pair) ----------------
-;; The GUI backend no longer relays the OS auto-repeat (it floods the mailbox, so a
-;; release left a backlog that kept "playing" — the cursor scrolling on past the
-;; key-up). Instead it sends one key-down and, on release, a `[:key-up k]`. We track
-;; the held key (`:held-key`) and re-issue it on the refresh `:tick`, shortening the
-;; tick to a repeat beat so the cadence is paced by *our* render loop — it can't
-;; outrun the screen and stops the instant the key lifts. The terminal frontend sends
-;; no releases, so repeat is gated on `:gui-keys` (set once a `[:key-up]` is seen):
-;; there the terminal's own key repeat still applies, and we never engage (and so
-;; never run away with no release to stop us).
-
-;; The typematic numbers are the DESKTOP's, not ours. Every window system ships the same
-;; pair of defaults — 500 ms before a held key starts repeating, ~30 ms between repeats
-;; (X11's `xset r rate`, GNOME's `org.gnome.desktop.peripherals.keyboard delay` /
-;; `repeat-interval`, KDE's the same) — and an editor that picks its own is the one thing
-;; on the screen that behaves differently from the rest of it.
+;; ---- key repeat: the desktop's, not ours (brood ADR-431) ---------------------
+;; The window is opened with `{:key-repeat :os}`: a held key's auto-repeats arrive as
+;; plain presses at the delay and rate the user set for their desktop (GNOME's keyboard
+;; settings, `xset r rate`, KDE's), with at most one ever queued, so a slow frame cannot
+;; leave a backlog that keeps playing after the release. Each repeat is dispatched like
+;; the press it repeats: a chord's last key repeats as itself (C-x o o o, which repeat-mode
+;; answers), and a mode's `:post-key` guards see every one.
 ;;
-;; This was 220 ms, which is less than half the platform's. That is short enough that a
-;; DELIBERATE single press which lingers — routine, and more so while you are waiting on a
-;; busy machine — crosses it and fires one repeat: press once, move twice. Nothing in the
-;; loop double-dispatches a tap (tools/probe-repeat.blsp drives the real `ui-run` over a
-;; scripted display at 0/120/300/600 ms frames and a tap moves exactly once every time);
-;; the delay itself was the whole of it.
-;;
-;; Brood cannot ask the window system for these yet — winit surfaces no repeat info to the
-;; GUI backend (only its own unreliable `ke.repeat` flag, ADR-086), so reading Wayland's
-;; `wl_keyboard.repeat_info` would mean going below winit. The platform DEFAULT is the
-;; honest stand-in until `std/gui` can answer it; `:repeat-delay` / `:repeat-rate` in
-;; init.blsp override both for anyone who has tuned their own.
-(defdyn *repeat-delay-ms* 500) ; initial pause before a held key starts repeating (typematic)
-(defdyn *repeat-rate-ms* 30) ; interval between repeats once it has started
-(defn ed-repeat-delay (m)
-  "The hold-before-repeat delay for this model: the init file's `:repeat-delay` when
-set (`config/apply-to-model` seeds it), else `*repeat-delay-ms*`. The 'initial motion'
-feel of holding a key is exactly this number."
-  (or (:repeat-delay m) *repeat-delay-ms*))
-
-(defn ed-repeat-rate (m)
-  "The interval between repeats once a held key is repeating: the init file's
-`:repeat-rate` when set, else `*repeat-rate-ms*`."
-  (or (:repeat-rate m) *repeat-rate-ms*))
+;; What bedit still tracks is WHETHER a key is down (`:held-key`, set on a repeatable
+;; press, cleared by its `[:key-up]` or a `:blur`): the caret stays solid while a key
+;; repeats, and the point-driven idle jobs wait for it to lift. A missed key-up holds the
+;; flag only until the next press. The terminal frontend reports no releases and has its
+;; own repeat, so there `:held-key` is never set.
 
 (def *view-resume-keys*
   ;; Plain cursor-movement keys that should resume from the VISIBLE area after you've
@@ -731,118 +703,56 @@ feel of holding a key is exactly this number."
   [:up :down :left :right :ctrl-n :ctrl-p :ctrl-f :ctrl-b])
 
 (defdyn *no-repeat-keys*
-  ;; Repeat is the DEFAULT for any key in the plain editing context (so every motion,
-  ;; deletion, open-line, etc. auto-repeats while held without being enumerated). Only
-  ;; these are excluded: the cancel keys, where holding is pointless. Prefix chords
-  ;; (C-x, M-x, …) need no entry — they set `:pending`, which `ed-repeatable?` already
-  ;; excludes; transient overlays (isearch, completion, the minibuffer) are excluded the
-  ;; same way. Add a key here only to *stop* it repeating.
+  ;; Every key counts as HELD while it is down (the caret stays solid, the point-driven idle
+  ;; jobs wait) except these: the cancel keys, which nobody holds to move anything.
   [:escape :ctrl-g])
 
 (defn ed-repeat-key? (input)
-  "Whether `input` is a key that may auto-repeat while held. Repeat-by-default: any
-self-inserting character (a 1-char string) or command key repeats, EXCEPT the cancel
-keys in `*no-repeat-keys*`. (Prefix keys are excluded separately by `ed-repeatable?`
-via `:pending`, so they need no entry here.) So every navigation / text-manipulation
-key repeats without being enumerated — to opt a key out, add it to `*no-repeat-keys*`."
+  "Whether `input`, held down, counts as a held key (`:held-key`): any self-inserting
+character (a 1-char string) or command key, except the cancel keys in `*no-repeat-keys*`."
   (and (or (string? input) (keyword? input))
     (not (includes? *no-repeat-keys* input))))
 
+(def *modifier-prefixes* ["ctrl-meta-" "ctrl-" "alt-" "shift-" "super-"])
+
+(defn- ed-strip-modifiers (name)
+  "`name` with every leading modifier prefix (`*modifier-prefixes*`, brood ADR-431) removed."
+  (let (prefix (first (seq/filter *modifier-prefixes* (fn (p) (string/starts-with? name p)))))
+    (if (nil? prefix)
+      name
+      (ed-strip-modifiers (string/substring name (string/length prefix) (string/length name))))))
+
 (defn- ed-base-key (k)
-  "The modifier-stripped base of key `k` — `:ctrl-n`/`:alt-n` → \"n\", a printable key →
-itself, any other keyword → its name. Lets a release match the held key regardless of
-whether the modifier or the key itself came up first (`C-n` held, then either `n` or
-`C-n` released → same base \"n\")."
+  "The modifier-stripped base of key `k` — `:ctrl-n`/`:alt-n`/`:ctrl-super-n` → \"n\", a
+printable key → itself, any other keyword → its name. Lets a release match the held key
+regardless of whether the modifier or the key itself came up first (`C-n` held, then
+either `n` or `C-n` released → same base \"n\")."
   (cond
     (string? k) k
-    (keyword? k)
-      (let (n (->string k))
-        (cond
-          (string/starts-with? n "ctrl-") (string/substring n 5 (string/length n))
-          (string/starts-with? n "alt-") (string/substring n 4 (string/length n))
-          else n))
+    (keyword? k) (ed-strip-modifiers (->string k))
     else (pr-str k)))
 
-(defn- ed-minibuffer-nav? (m input)
-  "True if a Vertico-style minibuffer (`:accept-selection`) is open and `input` is a
-selection-move key (↓/↑/C-n/C-p) — so holding it scrolls the candidate list, the same
-delay-then-repeat as holding a motion key in a buffer."
-  (let (mb (:minibuffer m))
-    (and mb
-      (:accept-selection mb)
-      (includes? [:up :down :ctrl-n :ctrl-p] input))))
-
-(defn- ed-repeatable? (m input)
-  "Whether, after dispatching `input`, key-repeat should be armed: `input` is a
-repeatable key, it landed in the plain editing context (no prefix chord mid-flight) and
-either no transient overlay is open or it's the minibuffer candidate list being scrolled
-(`ed-minibuffer-nav?`), and this frontend can *stop* a hold — either it reports key
-releases (`:gui-keys`) or it's a GUI window we can poll (`:window`, via `ed-still-held?`
-on `gui/held-key`). Gating on `:window` lets repeat engage from the very first keystroke
-(before any release has been seen), while the terminal — no `:window`, no `:gui-keys`,
-and its own OS repeat — never engages. Re-checked each repeat, so a key whose context
-changed stops cleanly."
-  (and (or (:gui-keys m) (:window m))
-    (ed-repeat-key? input)
-    (nil? (:pending m))
-    (or (nil? (overlay-active ed-transient-handlers m))
-      (ed-minibuffer-nav? m input)
-      ;; a held arrow or backspace repeats into a program as it would in any terminal —
-      ;; but never RET: each repeat RUNS something, and a key-up lost to a focus change
-      ;; would run it again and again. Holding a key is for moving and deleting.
-      (and (ed-term-buffer? m) (not (= input :enter))))))
+(defn- ed-holds? (m input)
+  "Whether pressing `input` marks a key as held (`:held-key`): a repeatable key, on a
+frontend that reports releases (`:gui-keys`) or is a GUI window (`:window`, which does
+from its first keystroke on). The terminal reports no releases, so it never holds one."
+  (and (or (:gui-keys m) (:window m)) (ed-repeat-key? input)))
 
 (defn- ed-repeat-clear (m)
-  "Stop any in-progress key repeat: drop `:held-key` and remove the `:key-repeat` timer."
-  (ed-drop-timer (dissoc m :held-key) :key-repeat))
+  "The held key lifted (its `[:key-up]`, or a `:blur` that may have swallowed it)."
+  (dissoc m :held-key))
 
-(defn- ed-still-held? (m)
-  "Confirm the held key is *still physically down* by polling the GUI's source of
-truth (`gui/held-key` on the window) before a repeat tick fires — so a missed key-up
-(e.g. one lost when focus changed) can't sustain runaway repeat: the next tick polls,
-sees it's no longer held, and stops. With no window to poll (terminal / tests) it
-returns true and we fall back to the `:key-up`/`:blur` events (and the terminal's own
-repeat); a poll error (a non-GUI runtime) likewise falls back. This is the games-engine
-pattern — re-read the device state each frame rather than trust accumulated edges."
-  (let (w (:window m))
-    (if (nil? w)
-      true
-      (check-allow :discarded-catch (try (= (gui/held-key w) (:held-key m)) (catch e true))))))
-
-(defn- ed-arm-repeat (m input spec)
-  "After dispatching `input`, arm repeat if it's a repeatable key still in the plain
-editing context — hold it and set the `:key-repeat` timer to `spec` (`{:after delay}` on
-a fresh press, `{:every rate}` once repeating — ADR-102); otherwise stop any repeat."
-  (if (ed-repeatable? m input)
-    (ed-set-timer (assoc m :held-key input) :key-repeat spec)
-    (ed-repeat-clear m)))
-
-(defn ed-repeat-key-step (m input textrows textcols spec)
+(defn ed-repeat-key-step (m input textrows textcols)
   "Route one key through normal dispatch, re-clamp scroll (vertical + horizontal so a long
-line follows point), then (re)arm the `:key-repeat` timer at `spec`. The shared core of a
-fresh keystroke (`spec` = `{:after delay}`) and a held-key repeat fire (`spec` =
-`{:every rate}`).
-
-A key that **completes a chord** (a prefix was pending before it dispatched — e.g. the
-`C-o` of `C-x C-o`, or the `o` of `C-x o`) does NOT arm hold-repeat: re-issuing it would
-run the *bare* key (insert `o`, plain open-line), not the chord, since the prefix is
-already consumed. This matches Emacs, where OS auto-repeat only repeats the last physical
-key, so chords never hold-repeat — repeating a command is `C-x z` / `repeat-mode` instead."
-  (let (chord? (:pending m) ; this key is mid-/completing a prefix chord
-        ;; The mode `:post-key` guards run HERE, so every key that edits is guarded on the
-        ;; one shared step — the fresh press AND each held-key repeat. A held key repeats
-        ;; down the timer path (`ed-timer-fire` → here), which used to skip the guard
-        ;; entirely: holding backspace to clear a tutorial box then ate straight through the
-        ;; ╭─ border into the read-only prose (and past a bshell prompt), because only the
-        ;; fresh-press call site wrapped the guard. Guarding in the shared step makes that
-        ;; bypass structurally impossible. Before scroll so a veto's restored point is what
-        ;; the viewport clamps to.
-        guarded (ed-clamp-restriction (ed-adjust-restriction m
+line follows point), then note whether a key is now held (`ed-holds?`). A press and each
+of its OS auto-repeats take this same step, so the mode `:post-key` guards see every one:
+holding backspace in a tutorial box stops at its ╭─ border instead of eating into the
+read-only prose. The guards run before the scroll clamp, so a veto's restored point is
+what the viewport follows."
+  (let (guarded (ed-clamp-restriction (ed-adjust-restriction m
                                         (ed-post-key-guards m (ed-route-transient m input) input)))
         stepped (ed-scroll-horizontal (ed-scroll guarded textrows) textcols))
-    (if chord?
-      (ed-repeat-clear stepped)
-      (ed-arm-repeat stepped input spec))))
+    (if (ed-holds? stepped input) (assoc stepped :held-key input) (ed-repeat-clear stepped))))
 
 ;; ---- named timers (ADR-102): firing the model's declared `:timers` -------------
 ;; `ed-update` routes a `[:timer name]` firing here. The arming side (which timers are
@@ -855,24 +765,10 @@ key, so chords never hold-repeat — repeating a command is `C-x z` / `repeat-mo
   (and (vector? input) (= (first input) :timer)))
 
 (defn- ed-timer-fire (m name textrows textcols cols rows)
-  "Service the fired timer `name`: `:key-repeat` re-issues the held key at the repeat rate
-(confirming it's still physically down first, so a missed key-up can't run away);
-`:idle-recompute` runs the debounced eldoc cache + diagnostics check; `:which-key` reveals
+  "Service the fired timer `name`: `:idle-recompute` runs the debounced eldoc cache + diagnostics check; `:which-key` reveals
 the prefix panel; `:undo-pause` closes the typing run (next edit starts a fresh undo
 group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
   (cond
-    (= name :key-repeat)
-      (cond
-        (nil? (:held-key m)) (ed-drop-timer m :key-repeat)
-        (ed-still-held? m)
-          (ed-repeat-key-step m
-            (:held-key m)
-            textrows
-            textcols
-            ;; :idle? — see the fresh-press arm in
-            ;; ed-update for why both specs carry it
-            {:every (ed-repeat-rate m) :idle? true})
-        else (ed-repeat-clear m))
     ;; the idle debounce: eldoc, the diagnostics check, a large completion source's
     ;; re-rank, the off-the-loop diff-hl launch, the web-mirror push… — all the work too
     ;; costly for the per-key path, run once activity settles. Each is a row its module
@@ -1250,7 +1146,23 @@ else — a key."
     (= input :close) ((reflect/eval 'commands/cmd-quit) m0 input)
     ;; the window lost focus (`:blur`): the key-up may now never arrive (the release lands in
     ;; another window), so stop any repeat now — the safety net for a missed key-up.
-    (= input :blur) (ed-repeat-clear m0)
+    (= input :blur) (assoc (ed-repeat-clear m0) :unfocused true)
+    ;; and back: the caret is solid again (brood ADR-431's `:focus-in`)
+    (= input :focus-in) (dissoc m0 :unfocused)
+    ;; Text that is more than one key's worth (an input method's commit, a compose sequence,
+    ;; brood ADR-431): each character takes the key path, as though typed, so the minibuffer,
+    ;; isearch and a terminal's program all get it the way they get typing. Nothing is held
+    ;; afterwards (no release will come for these), and the composition shown at point ends.
+    (and (vector? input) (= (first input) :text))
+      (ed-repeat-clear (fold (string/->graphemes (nth input 1))
+                         (dissoc m0 :preedit)
+                         (fn (acc character) (ed-repeat-key-step acc character textrows textcols))))
+    ;; The input method's composition in progress, shown at point and not yet inserted
+    ;; (`[:preedit text range]`); an empty text clears it.
+    (and (vector? input) (= (first input) :preedit))
+      (if (= (nth input 1) "")
+        (dissoc m0 :preedit)
+        (assoc m0 :preedit {:text (nth input 1) :range (nth input 2 nil)}))
     ;; an app-produced async event record → it folds itself in (`UiEvent`, see model.blsp —
     ;; no handler table to consult).
     (ui-event? input) (ui-event-fold input m0 textrows cols rows)
@@ -1267,25 +1179,14 @@ else — a key."
     ;; the user scrolled it off-screen (so the move resumes from what's visible instead of
     ;; snapping the view to the off-screen cursor) — skipped while a transient overlay owns
     ;; input, and NOT for other commands (recenter/goto/search act on the real point). Then
-    ;; route through the keymap and arm held-key repeat if it's repeatable; the buffer's mode
-    ;; `:post-key` guards ride `ed-repeat-key-step` itself (so the held-repeat timer path gets
-    ;; them too).
-    ;;
-    ;; The repeat delay is `:idle? true` — it counts from the LAST real input, not from when
-    ;; the timer first appeared. During rollover typing (press b while a is still down) the
-    ;; timer NAME never leaves `:timers`, so a plain `{:after …}` stayed anchored to the
-    ;; burst's FIRST key: the delay budget eroded to nothing mid-burst and the current key
-    ;; machine-gunned at the repeat rate. Idle anchoring = true typematic: repeat starts
-    ;; `delay` after the newest press, whatever came before.
+    ;; route through the keymap (`ed-repeat-key-step`, which also runs the mode `:post-key`
+    ;; guards and notes the held key).
     else
       (ed-repeat-key-step (if (and (includes? *view-resume-keys* input)
                                 (nil? (overlay-active ed-transient-handlers m0)))
                             (ed-point-into-view m0 textrows)
                             m0)
-        input
-        textrows
-        textcols
-        {:after (ed-repeat-delay m0) :idle? true})))
+        input textrows textcols)))
 
 (defn- ed-loop-tail (m0 result input cols rows)
   "After the event folded in: replay a keyboard macro if one was asked for, else propagate.
