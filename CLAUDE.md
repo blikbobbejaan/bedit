@@ -108,7 +108,7 @@ src/eldoc.blsp              the idle beat's point-driven hints: the eldoc line (
 src/treewarm.blsp           a large tree-sitter buffer's parse warmed off the loop, so the first
                             structural query does not pay for it on a keypress — and its held
                             tree (syntaxtree) opened in the task and handed back
-src/syntaxtree.blsp         the tree-sitter parse each pool buffer KEEPS (brood ADR-433):
+src/syntaxtree.blsp         the tree-sitter parse each pool buffer KEEPS (brood ADR-443):
                             `:syntax-trees` by pool index, updated incrementally per edit by the
                             span refresh, freed on kill; panes colour a band from it
                             (`fontify-tree`) and keep a band its `tree-changes` left alone. A
