@@ -11,7 +11,8 @@ over it, so screen coordinates line up. Pure (data→data)."
   (:use editor/buffer) ; buffer-line-count (scroll clamp)
   (:use editor/highlight) ; shift-spans — re-base windowed fontify spans to absolute coords
   (:use editor/pane) ; pane-layout / divider-at / pane-select-at / pane-set-ratio / pane-* ops
-  (:use wrap)) ; rows-from / row-of — the visual-line break rule the row table is built on
+  (:use wrap) ; rows-from / row-of — the visual-line break rule the row table is built on
+  (:use syntaxtree)) ; the tree-sitter parse each buffer keeps — a band coloured from it
 ;; ---- pane layout (shared geometry: view & hit-testing agree) ----------------
 
 (sig ed-body-layout (map int int -> layout))
@@ -482,7 +483,10 @@ one of hundreds of appended lines."
     (or (= (:rope entry) (buffer-rope buf))
       ;; rope changed: reuse only if this band's fontify input is unchanged AND the band
       ;; still lies within the buffer (a shrink would make the line range slice past EOF).
-      (and (<= (:bhi entry) (buffer-line-count buf))
+      ;; A band coloured from a tree kept no fontify input to compare: its tree's change
+      ;; ranges say whether it survives (`ed-tree-band-survives?`).
+      (and (not (:tree? entry))
+        (<= (:bhi entry) (buffer-line-count buf))
         (= [(:src entry) (:base entry)]
           (ed-window-src buf restart (:blo entry) (:bhi entry)))))))
 
@@ -518,6 +522,81 @@ it), tagged with the rope, the `[blo bhi)` lines they cover, and the exact fonti
          :base base
          :spans (shift-spans (fontify src) base)}))))
 
+;; ---- bands coloured from a held tree (brood ADR-433) ---------------------------
+;; A tree-sitter buffer with a current tree (`syntaxtree`) is coloured by asking the tree
+;; for a char range: nothing is sliced and nothing is parsed — the edit already reparsed
+;; the document incrementally, and the band only walks the nodes that reach it. The tree is
+;; the WHOLE document's, so no lead-in or restart point is needed: a string opened far
+;; above the band colours as a string. Without a tree (an old runtime, a large buffer
+;; `treewarm` has not opened yet, an evicted handle) the slice path above serves as before.
+
+(defn- ed-line-end-char (buf line)
+  "The char offset where `line` begins — or the buffer's end for a line past the last."
+  (if (>= line (buffer-line-count buf))
+    (buffer-length buf)
+    (text/line->char (buffer-rope buf) line)))
+
+(defn- ed-tree-range-spans (buf tree faces lo hi clip)
+  "Absolute spans for lines `[lo, hi)` from `tree`, or nil when the handle is gone. A window
+with a line past `*fontify-line-cap*` asks per line, each clipped to `clip` characters — the
+long-line path's bound on what is coloured, kept because what costs there is the span count
+of text no pane shows, not the parse."
+  (if (ed-long-lines? buf lo hi)
+    (let (rope (buffer-rope buf)
+          nlines (buffer-line-count buf)
+          total (buffer-length buf)
+          lines (range (math/max 0 lo) (math/min nlines hi))
+          per-line (map lines
+                     (fn (line)
+                       (let (bol (text/line->char rope line)
+                             len (ed-line-length rope nlines total line))
+                         (tree-spans tree faces bol (+ bol (math/min len clip)))))))
+      (if (any? per-line nil?)
+        nil
+        ;; an empty join is nil, which would read as a gone handle
+        (let (joined (apply append per-line)) (if (empty? joined) [] joined))))
+    (tree-spans tree faces (ed-line-end-char buf lo) (ed-line-end-char buf hi))))
+
+(defn- ed-tree-band-for (tree-entry faces buf top vrows clip)
+  "A `:span-cache` entry for `buf`'s viewport coloured from `tree-entry`'s tree: the viewport
+widened by `ed-pane-margin` each side (or, on the long-line path, just the viewport), marked
+`:tree? true` so `ed-tree-band-survives?` may keep it across an edit the tree says left it
+alone. Nil when the handle is gone — the caller falls back to the slice band."
+  (let (nlines (buffer-line-count buf)
+        long? (ed-long-lines? buf top (+ top vrows))
+        margin (if long? 0 (ed-pane-margin vrows))
+        blo (math/max 0 (- top margin))
+        bhi (math/min nlines (+ top vrows margin))
+        spans (ed-tree-range-spans buf (:tree tree-entry) faces blo bhi clip))
+    (when spans
+      {:rope (buffer-rope buf) :blo blo :bhi bhi :src nil :base 0 :tree? true :spans spans})))
+
+(defn- ed-tree-band-survives? (entry tree-entry buf top vrows)
+  "True when tree band `entry`, coloured from the text `tree-entry` was just updated FROM,
+still serves the viewport: it covers `[top, top+vrows)`, and every range the update may have
+recoloured (`editor/treesit/tree-changes`) starts at or after the band's end — so the text
+before the band's end, and with it every span offset in the band, is unchanged. An edit
+inside or above the band, or a fresh parse (`true`), re-colours it; that costs a range walk
+of the tree, not a parse."
+  (let (changes (:changes tree-entry))
+    (and entry
+      (:tree? entry)
+      (= (:rope entry) (:from-rope tree-entry))
+      (vector? changes)
+      (<= (:blo entry) top)
+      (>= (:bhi entry) (math/min (buffer-line-count buf) (+ top vrows)))
+      (< (:bhi entry) (buffer-line-count buf))
+      (let (band-end (ed-line-end-char buf (:bhi entry)))
+        (every? changes (fn (range-pair) (>= (first range-pair) band-end)))))))
+
+(defn- ed-tree-spans-now (m pane buf top vrows)
+  "The viewport's spans straight from `buf`'s current tree, for the view's uncached frame —
+nil when there is no current tree (or no face table), so the caller lexes a slice."
+  (let (tree-entry (current-syntax-tree m (get-in pane [:payload :buffer]) buf)
+        faces (when tree-entry (ed-mode-service buf :ts-faces)))
+    (when faces
+      (ed-tree-range-spans buf (:tree tree-entry) faces top (+ top vrows) (ed-fontify-clip pane)))))
+
 (sig ed-pane-spans (model pane buffer int int -> any))
 (defn ed-pane-spans (m pane buf top vrows)
   "The `[start end face]` syntax spans for `pane`'s viewport — from the model's
@@ -543,7 +622,10 @@ markup is gone — serves those instead: absolute already, valid as long as the 
             (let (restart (ed-mode-service buf :fontify-restart))
               (if (ed-band-covers? entry buf top vrows restart)
                 (:spans entry)
-                (ed-window-spans buf fontify restart top (+ top vrows) (ed-fontify-clip pane)))))))))
+                ;; a current tree colours the viewport without a parse; without one the
+                ;; window is sliced and lexed
+                (or (ed-tree-spans-now m pane buf top vrows)
+                  (ed-window-spans buf fontify restart top (+ top vrows) (ed-fontify-clip pane))))))))))
 
 (sig ed-layout-now (model -> (or nil layout)))
 (defn ed-layout-now (m)
@@ -632,10 +714,11 @@ mode offers none."
           (:cells entry)
           (ed-gutter-cells buf cell top vh gw nil ctx))))))
 
-(defn- ed-refreshed-span-entry (old pane buf)
+(defn- ed-refreshed-span-entry (m old pane buf)
   "`pane`'s `:span-cache` entry this frame: `old` while its band still covers the viewport
-(`ed-band-covers?`), else a freshly lexed band (`ed-band-for`) — nil when the buffer's mode
-does not fontify."
+(`ed-band-covers?`, or for a band coloured from a tree `ed-tree-band-survives?`), else a
+fresh band — coloured from the buffer's current tree when it has one (`ed-tree-band-for`),
+lexed from a slice otherwise (`ed-band-for`). Nil when the buffer's mode does not fontify."
   (let (fontify (ed-mode-service buf :fontify))
     (when fontify
       (let (top (ed-pane-top pane buf)
@@ -643,10 +726,24 @@ does not fontify."
         ;; as `ed-pane-spans`: the unchanged band is recognised before the restart lookup
         (if (ed-band-hits? old buf top vrows)
           old
-          (let (restart (ed-mode-service buf :fontify-restart))
-            (if (ed-band-covers? old buf top vrows restart)
-              old
-              (ed-band-for buf fontify restart top vrows (ed-fontify-clip pane)))))))))
+          (let (tree-entry (current-syntax-tree m (get-in pane [:payload :buffer]) buf)
+                faces (when tree-entry (ed-mode-service buf :ts-faces)))
+            (cond
+              ;; the edit left this band's text and colouring alone: re-stamp it with the
+              ;; rope it now serves, keeping its spans (the view memo keys on that vector)
+              (and faces (ed-tree-band-survives? old tree-entry buf top vrows))
+                (assoc old :rope (buffer-rope buf))
+              faces
+                (or (ed-tree-band-for tree-entry faces buf top vrows (ed-fontify-clip pane))
+                  (ed-slice-band buf fontify old top vrows pane))
+              else (ed-slice-band buf fontify old top vrows pane))))))))
+
+(defn- ed-slice-band (buf fontify old top vrows pane)
+  "`old` while its slice band still covers the viewport, else a band lexed from a slice."
+  (let (restart (ed-mode-service buf :fontify-restart))
+    (if (ed-band-covers? old buf top vrows restart)
+      old
+      (ed-band-for buf fontify restart top vrows (ed-fontify-clip pane)))))
 
 (defn- ed-refreshed-gutter-entry (old pane buf)
   "`pane`'s `:gutter-cache` entry this frame: `old` while it still serves the pane
@@ -688,6 +785,10 @@ fresh each call — reusing a still-valid entry from the old cache, and GC'ing p
 closed (a stale pane path never accumulates). Run by `input/ed-update` after each event so the
 pure `view` just reads the result; also caches the layout as `:_lc`."
   (let (layout (ed-body-layout m cols rows)
+        ;; the trees first: an edit this event reparses each shown buffer's tree
+        ;; incrementally, once however many panes show it, and the bands below read it
+        m (ed-sync-syntax-trees m
+            (map (:panes layout) (fn (pane) (get-in pane [:payload :buffer]))))
         old-spans (or (:span-cache m) {})
         old-gutters (or (:gutter-cache m) {})
         [spans gutters] (fold (:panes layout)
@@ -697,7 +798,7 @@ pure `view` just reads the result; also caches the layout as `:_lc`."
                                   buf (ed-buf-at m (get-in pane [:payload :buffer])))
                               [(ed-assoc-present spans
                                  path
-                                 (ed-refreshed-span-entry (get old-spans path) pane buf))
+                                 (ed-refreshed-span-entry m (get old-spans path) pane buf))
                                 (ed-assoc-present gutters
                                   path
                                   (ed-refreshed-gutter-entry (get old-gutters path) pane buf))]))))

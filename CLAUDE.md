@@ -106,7 +106,13 @@ src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the 
 src/eldoc.blsp              the idle beat's point-driven hints: the eldoc line (off the loop),
                             when an LSP signature hint is due, the inline completion preview
 src/treewarm.blsp           a large tree-sitter buffer's parse warmed off the loop, so the first
-                            structural query does not pay for it on a keypress
+                            structural query does not pay for it on a keypress — and its held
+                            tree (syntaxtree) opened in the task and handed back
+src/syntaxtree.blsp         the tree-sitter parse each pool buffer KEEPS (brood ADR-433):
+                            `:syntax-trees` by pool index, updated incrementally per edit by the
+                            span refresh, freed on kill; panes colour a band from it
+                            (`fontify-tree`) and keep a band its `tree-changes` left alone. A
+                            runtime without tree handles keeps the slice path
 src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd)
 src/about.blsp              M-x version · --version · C-h C-a *About bedit* — bedit's version,
                             the brood under it and the build date, all from project-release/build-info

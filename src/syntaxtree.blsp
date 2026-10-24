@@ -1,0 +1,170 @@
+(defmodule syntaxtree
+  "The tree-sitter parse tree each pool buffer keeps (brood ADR-433), so highlighting
+reparses a document INCREMENTALLY from its last tree instead of re-parsing a sliced window
+from scratch on every keystroke.
+
+The model's `:syntax-trees` maps a pool index to `{:tree :rope :lang :from-rope :changes}`:
+the kernel's handle, the rope it was parsed from, its language, the rope of the tree it was
+updated from, and `editor/treesit/tree-changes` of that update (the char ranges whose
+colouring may differ). `panes/ed-refresh-spans` brings the entries of the buffers on screen
+up to date each event (`ed-sync-syntax-trees`) and reads them to colour a band
+(`editor/treesit/fontify-tree`); `pool/ed-kill-at` frees a killed buffer's
+(`ed-drop-syntax-tree-slot`); `treewarm` opens a large buffer's first tree off the loop.
+
+Keyed by pool index, the way `:hosted` is, and kept honest the same way: a kill shifts the
+keys above it down. A key that ever names a different document than its tree was parsed
+from costs a full reparse and is never wrong, because a handle carries its own text and an
+update diffs the two ropes.
+
+Every handle query goes through `tree-handles?`: an installed runtime older than ADR-433
+has no `%tree-sitter-tree`, and there every buffer keeps the windowed slice path. The
+`editor/treesit` tree functions are resolved late (`reflect/eval`) for the same reason — a
+direct reference to a name the installed std lacks is unbound at load. Once every runtime
+bedit runs on has ADR-433, the indirection can become direct calls."
+  (:use editor/buffer) ; buffer-rope / buffer-length
+  (:use model)) ; ed-buf-at / ed-mode-service
+
+(defdyn *tree-open-max*
+  ;; The largest buffer whose FIRST tree is opened on the loop. A cold whole-document parse
+  ;; of 250 KB costs ~650 ms; below about 40 KB it is imperceptible. A larger buffer keeps
+  ;; the windowed slice path until `treewarm` has opened its tree in a task; after that
+  ;; every update is incremental and cheap at any size.
+  40000)
+
+(defn tree-handles? ()
+  "Whether the running kernel keeps tree handles (brood ADR-433's `%tree-sitter-tree`)."
+  (bound? '%tree-sitter-tree))
+
+;; ---- the editor/treesit tree API, resolved late --------------------------------
+;; Each wrapper answers nil when the runtime lacks the API or the call raises (a grammar
+;; that is not loaded), which every caller reads as "no tree: take the slice path".
+
+(defn- tree-call (name arguments)
+  (when (tree-handles?)
+    (check-allow :discarded-catch
+      (try (apply (reflect/eval name) arguments) (catch _ nil)))))
+
+(defn tree-open (rope lang)
+  "A fresh tree handle for the whole document `rope` in tree-sitter language `lang`, or nil."
+  (tree-call 'editor/treesit/open-tree [rope lang]))
+
+(defn- tree-update (tree rope lang)
+  ;; nil edits: the kernel derives the change by comparing the two ropes — exact for any
+  ;; single contiguous edit, and a sound covering edit for several
+  (tree-call 'editor/treesit/update-tree [tree rope lang nil]))
+
+(defn tree-free (tree)
+  "Drop `tree`'s handle now (nil-safe)."
+  (when tree (tree-call 'editor/treesit/free-tree [tree])))
+
+(defn tree-changed-ranges (tree)
+  "`editor/treesit/tree-changes` of `tree`: `[[start end] …]`, `true` for a fresh parse, nil
+when the handle is gone."
+  (tree-call 'editor/treesit/tree-changes [tree]))
+
+(defn tree-spans (tree faces from to)
+  "`[start end face]` spans, absolute, for chars `[from, to)` of `tree` coloured by the face
+table `faces` — `[]` when nothing there is coloured — or nil when the handle is gone (or the
+runtime has none).
+
+An empty LIST is nil, so `fontify-tree`'s answer cannot tell \"gone\" from \"no colour in this
+range\" (a band of blank lines, of plain identifiers); the handle's `tree-changes`, nil only
+for a gone handle, does."
+  (let (spans (tree-call 'editor/treesit/fontify-tree [tree faces from to]))
+    (cond
+      spans spans
+      (nil? (tree-changed-ranges tree)) nil
+      else [])))
+
+;; ---- the per-buffer store ----------------------------------------------------------
+
+(defn syntax-tree-entry (m idx)
+  "Pool buffer `idx`'s tree entry, or nil."
+  (get (or (:syntax-trees m) {}) idx))
+
+(defn current-syntax-tree (m idx buf)
+  "Pool buffer `idx`'s tree entry when it was parsed from `buf`'s rope exactly — the only
+entry `editor/treesit/fontify-tree` may be asked about, since its offsets are that text's."
+  (let (entry (syntax-tree-entry m idx))
+    (when (and entry (= (:rope entry) (buffer-rope buf))) entry)))
+
+(defn- without-entry (m idx)
+  (let (entry (syntax-tree-entry m idx))
+    (if (nil? entry)
+      m
+      (do
+        (tree-free (:tree entry))
+        (assoc m :syntax-trees (dissoc (:syntax-trees m) idx))))))
+
+(defn install-syntax-tree (m idx tree rope lang)
+  "`m` with `tree` (parsed from `rope` as `lang`) as pool buffer `idx`'s tree, freeing the one
+it replaces. A fresh parse, so its changes are `true` — every cached band is suspect."
+  (let (cleared (without-entry m idx))
+    (assoc cleared
+      :syntax-trees
+        (assoc (or (:syntax-trees cleared) {})
+          idx {:tree tree :rope rope :lang lang :from-rope nil :changes true}))))
+
+(defn- synced-entry (m idx buf)
+  "`m` with pool buffer `idx`'s tree brought up to `buf`'s rope: kept when current, updated
+incrementally from the old tree (then freed) when the rope moved, opened when there is none
+and the buffer is small enough to parse on the loop, dropped when the buffer is no longer
+a tree-sitter one."
+  (let (entry (syntax-tree-entry m idx)
+        lang (ed-mode-service buf :ts-lang)
+        rope (buffer-rope buf))
+    (cond
+      (or (nil? lang) (nil? (ed-mode-service buf :ts-faces))) (without-entry m idx)
+      (and entry (= (:lang entry) lang) (= (:rope entry) rope)) m
+      ;; updating from a gone (evicted) handle is a full parse — on the loop, for a buffer
+      ;; too large to open there; drop it and let `treewarm` reopen it off the loop
+      (and entry
+        (> (buffer-length buf) *tree-open-max*)
+        (nil? (tree-changed-ranges (:tree entry))))
+        (without-entry m idx)
+      (and entry (= (:lang entry) lang))
+        (let (updated (tree-update (:tree entry) rope lang))
+          (if (nil? updated)
+            (without-entry m idx)
+            (do
+              (tree-free (:tree entry))
+              (assoc-in m
+                [:syntax-trees idx]
+                {:tree updated
+                 :rope rope
+                 :lang lang
+                 :from-rope (:rope entry)
+                 :changes (tree-changed-ranges updated)}))))
+      (> (buffer-length buf) *tree-open-max*) (without-entry m idx)
+      else
+        (let (opened (tree-open rope lang))
+          (if (nil? opened) (without-entry m idx) (install-syntax-tree m idx opened rope lang))))))
+
+(defn ed-sync-syntax-trees (m indices)
+  "`m` with the trees of the pool buffers at `indices` (the ones on screen) brought up to
+date, and every entry whose index fell off the end of the pool freed. A no-op on a runtime
+without tree handles."
+  (if (not (tree-handles?))
+    m
+    (let (pool-size (count (:buffers m))
+          swept (fold (keys (or (:syntax-trees m) {}))
+                  m
+                  (fn (acc idx) (if (>= idx pool-size) (without-entry acc idx) acc))))
+      (fold (seq/distinct indices)
+        swept
+        (fn (acc idx)
+          (if (and (int? idx) (< idx pool-size)) (synced-entry acc idx (ed-buf-at acc idx)) acc))))))
+
+(defn ed-drop-syntax-tree-slot (m killed)
+  "Free pool slot `killed`'s tree ahead of its removal from the pool, and shift the entries
+above it down one — mirroring the pool shift, as `hosted/hosted-drop-slot` does for
+`:hosted`, so every surviving tree stays with its document."
+  (let (cleared (without-entry m killed)
+        trees (:syntax-trees cleared))
+    (if (nil? trees)
+      cleared
+      (assoc cleared
+        :syntax-trees
+          (fold (%map-pairs trees)
+            {}
+            (fn (acc [idx entry]) (assoc acc (if (> idx killed) (dec idx) idx) entry)))))))
