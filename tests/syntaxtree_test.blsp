@@ -1,0 +1,151 @@
+;; The held tree-sitter tree (brood ADR-433): a tree-sitter buffer's highlighting comes from
+;; the document's own parse, updated incrementally per edit, instead of a sliced window
+;; parsed from scratch. Every test that needs the kernel's tree handles checks
+;; `syntaxtree/tree-handles?` first and passes trivially on a runtime without them, which
+;; is also the fallback the editor takes there.
+(defmodule syntaxtree-test
+  (:use model)
+  (:use-internals panes)
+  (:use pool)
+  (:use main)
+  (:use-internals syntaxtree)
+  (:use treewarm)
+  (:use editor/buffer)
+  (:use test))
+
+(defn ruby-model (text) (ed-init (make-buffer text "x.rb" "x.rb")))
+(defn big-ruby (n) (string/join (map (range n) (fn (i) (str "def f" i "\n  " i "\nend"))) "\n"))
+(defn refreshed (m) (ed-refresh-spans m 80 24))
+(defn band-of (m)
+  (get (:span-cache m) (:path (ed-selected-pane (:panes (ed-body-layout m 80 24))))))
+(defn edited-at (m position text)
+  (ed-set-buf m (insert (goto-char (ed-current-buf m) position) text)))
+(defn has-span? (spans from to)
+  (any? spans (fn (span) (and (= (nth span 0) from) (= (nth span 1) to)))))
+
+(describe "syntaxtree: the services a held tree is coloured with"
+  (test "a deflanguage mode names its face table and language"
+    (let (buf (ed-current-buf (ruby-model "def f\nend\n")))
+      (assert= (ed-mode-service buf :ts-lang) :ruby)
+      (is (map? (ed-mode-service buf :ts-faces)))))
+
+  (test "a lexer-only mode has no face table, so it keeps the slice path"
+    (let (m (refreshed (ed-init (make-buffer "A=1\n" ".env" ".env"))))
+      (is (nil? (ed-mode-service (ed-current-buf m) :ts-faces)))
+      (is (nil? (syntax-tree-entry m 0)))))
+
+  (test "without tree handles the refresh keeps no trees and still colours"
+    (if (tree-handles?)
+      (is true)
+      (let (m (refreshed (ruby-model "def f\nend\n")))
+        (is (nil? (:syntax-trees m)))
+        (is (has-span? (:spans (band-of m)) 0 3))))))
+
+(describe "syntaxtree: a tree per buffer, kept across edits"
+  (test "the first refresh opens the shown buffer's tree and colours the band from it"
+    (if (not (tree-handles?))
+      (is true)
+      (let (m (refreshed (ruby-model "def f\nend\n"))
+            entry (syntax-tree-entry m 0)
+            band (band-of m))
+        (is (not (nil? entry)))
+        (is (= (:rope entry) (buffer-rope (ed-current-buf m))))
+        (assert= (:lang entry) :ruby)
+        (is (:tree? band))
+        (is (has-span? (:spans band) 0 3)))))
+
+  (test "an edit updates the tree from the old one and frees the old handle"
+    (if (not (tree-handles?))
+      (is true)
+      (let (m0 (refreshed (ruby-model "def f\nend\n"))
+            old (syntax-tree-entry m0 0)
+            m1 (refreshed (edited-at m0 0 "x = 1\n"))
+            new (syntax-tree-entry m1 0))
+        (is (= (:rope new) (buffer-rope (ed-current-buf m1))))
+        (is (= (:from-rope new) (:rope old)))
+        (is (vector? (:changes new)))
+        (is (nil? (tree-changed-ranges (:tree old))))
+        ;; the def moved down six chars and is still coloured, in absolute offsets
+        (is (has-span? (:spans (band-of m1)) 6 9)))))
+
+  (test "an edit far below the band keeps its spans and re-stamps its rope"
+    (if (not (tree-handles?))
+      (is true)
+      (let (m0 (refreshed (ruby-model (big-ruby 300)))
+            band0 (band-of m0)
+            end (buffer-length (ed-current-buf m0))
+            ;; point stays at the top, so the viewport does not follow the edit
+            m1 (refreshed (ed-set-buf m0
+                            (goto-char (insert (goto-char (ed-current-buf m0) end) "\nx = 1") 0)))
+            band1 (band-of m1))
+        (is (= (:spans band1) (:spans band0)))
+        (is (= (:rope band1) (buffer-rope (ed-current-buf m1)))))))
+
+  (test "an edit inside the band re-colours it from the updated tree"
+    (if (not (tree-handles?))
+      (is true)
+      (let (m1 (refreshed (edited-at (refreshed (ruby-model (big-ruby 300))) 0 "x = 1\n"))
+            band (band-of m1))
+        (is (:tree? band))
+        (is (= (:rope band) (buffer-rope (ed-current-buf m1))))
+        (is (has-span? (:spans band) 6 9)))))
+
+  (test "a gone handle falls back to the slice band"
+    (if (not (tree-handles?))
+      (is true)
+      (let (m0 (refreshed (ruby-model "def f\nend\n"))
+            _ (tree-free (:tree (syntax-tree-entry m0 0)))
+            m1 (refreshed (assoc m0 :span-cache {}))
+            band (band-of m1))
+        (is (not (:tree? band)))
+        (is (has-span? (:spans band) 0 3)))))
+
+  (test "a buffer too large to parse on the loop waits for the warm"
+    (if (not (tree-handles?))
+      (is true)
+      (binding (*tree-open-max* 10)
+        (let (m (refreshed (ruby-model "def f\nend\ndef g\nend\n")))
+          (is (nil? (syntax-tree-entry m 0)))
+          (is (has-span? (:spans (band-of m)) 0 3)))))))
+
+(describe "syntaxtree: a tree's lifetime follows its buffer"
+  (test "dropping a pool slot frees its tree and shifts the ones above it down"
+    (if (not (tree-handles?))
+      (is true)
+      (let (trees (map (range 3)
+                    (fn (i) (tree-open (text/from-string (str "def f" i "\nend\n")) :ruby)))
+            m0 (fold (range 3)
+                 (ruby-model "")
+                 (fn (acc i) (install-syntax-tree acc i (nth trees i) nil :ruby)))
+            m1 (ed-drop-syntax-tree-slot m0 1))
+        (assert= (sort (keys (:syntax-trees m1))) [0 1])
+        (is (nil? (tree-changed-ranges (nth trees 1))))
+        (is (= (:tree (syntax-tree-entry m1 1)) (nth trees 2)))
+        (is (= (:tree (syntax-tree-entry m1 0)) (nth trees 0))))))
+
+  (test "killing a buffer frees its tree"
+    (if (not (tree-handles?))
+      (is true)
+      (let (m0 (refreshed (ed-open-buffer (ruby-model "def f\nend\n")
+                            (make-buffer "def g\nend\n" "y.rb" "y.rb")))
+            tree (:tree (syntax-tree-entry m0 1))
+            m1 (ed-kill-buffer-at m0 1))
+        (is (not (nil? tree)))
+        (is (nil? (syntax-tree-entry m1 1)))
+        (is (nil? (tree-changed-ranges tree))))))
+
+  (test "a warm's tree is installed for its slot, or freed when the slot has one"
+    (if (not (tree-handles?))
+      (is true)
+      (let (m0 (ruby-model "def f\nend\n")
+            rope (buffer-rope (ed-current-buf m0))
+            warmed (tree-open rope :ruby)
+            m1 (treewarm/ed-apply-tree-warm (assoc m0 :tree-warm-index 0 :tree-warming rope)
+                 {:tree warmed :rope rope :lang :ruby})
+            spare (tree-open rope :ruby)
+            m2 (treewarm/ed-apply-tree-warm (assoc m1 :tree-warm-index 0 :tree-warming rope)
+                 {:tree spare :rope rope :lang :ruby}))
+        (is (= (:tree (syntax-tree-entry m1 0)) warmed))
+        (is (= (:tree (syntax-tree-entry m2 0)) warmed))
+        (is (nil? (tree-changed-ranges spare)))
+        (is (nil? (:tree-warm-index m2)))))))
