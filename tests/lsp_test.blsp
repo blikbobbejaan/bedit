@@ -68,6 +68,27 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
   (test "a root is a directory, not a prefix: /p/crate does not hold /p/crate2"
     (is (lsp-under? "/p/crate/s.rs" "/p/crate"))
     (is (not (lsp-under? "/p/crate2/s.rs" "/p/crate"))))
+  (test "a nested project is not the running server's once its root is known"
+    ;; a project with its own Cargo.lock inside another's tree: rust-analyzer started at the
+    ;; top would answer for it, and autostart would never start the one it needs
+    (let (top (temp-dir "bedit-lsproot-")
+          nested (path/join top "tools/gen")
+          file (path/join nested "src/main.rs")
+          top-file (path/join top "src/lib.rs")
+          m (assoc (rust-model "")
+              :lsp-servers {:outer {:spec "rust-analyzer" :roots [top] :conn :outer}}))
+      (file/mkdir (path/join nested "src"))
+      (file/mkdir (path/join top "src"))
+      (file/spit (path/join top "Cargo.lock") "")
+      (file/spit (path/join nested "Cargo.lock") "")
+      ;; nobody has looked yet: the deepest root around the file, as before
+      (assert= :outer (:conn (lsp-server-entry m file)))
+      (let (learnt (ed-lsp-learn-roots (ed-lsp-learn-roots m file) top-file))
+        (assert= nested (lsp-known-root learnt "rust-analyzer" file))
+        (is (nil? (lsp-server-entry learnt file)))
+        (assert= :outer (:conn (lsp-server-entry learnt top-file)))
+        ;; the retry looks again
+        (is (nil? (lsp-known-root (ed-lsp-forget-roots learnt file) "rust-analyzer" file))))))
   (test "a .py file has a main server and the ruff add-on, main first"
     (assert= ["python" "ruff"] (into [] (map (lsp-specs-for "/p/a.py") (fn (spec) (:name spec)))))
     (assert= [] (lsp-specs-for "/p/k.wos"))
@@ -212,6 +233,14 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
 (defn told (conn)
   (receive ([:told ^conn msg] msg) (after 1000 nil)))
 
+(defn- relay-told (to left)
+  (when (> left 0)
+    (receive (msg (do (send to [:told (self) msg]) (relay-told to (dec left)))) (after 5000 nil))))
+
+(defn telling-n (to n)
+  ;; a stand-in connection that tells `to` the first `n` things it is sent, in order
+  (spawn (fn () (relay-told to n))))
+
 (def folder-caps {:workspace {:workspaceFolders {:supported true :changeNotifications true}}})
 
 (describe "lsp: servers started together become one"
@@ -235,6 +264,41 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
       (assert= [:shutdown] (told newer))
       (is (empty? (:lsp-pending after)))
       (is (includes? (:echo after) "ask that again"))))
+  (test "a lookup the merged server had not answered is asked of the host instead"
+    (let (host (telling-n (self) 2)
+          newer (telling (self))
+          base (rust-model "fn main() {}")
+          rope (editor/buffer/buffer-rope (model/ed-current-buf base))
+          request {:uri "file:///tmp/s.rs" :lang "rust" :line 0 :char 3}
+          m (assoc base
+              :lsp-servers
+                {host {:spec "rust-analyzer"
+                       :roots ["/a"]
+                       :conn host
+                       :caps folder-caps
+                       :identity [:same]
+                       :command "rust-analyzer"}
+                 newer {:spec "rust-analyzer"
+                        :roots ["/tmp"]
+                        :conn newer
+                        :caps {}
+                        :identity [:same]}}
+              :lsp-pending
+                {:current (assoc (lsp-hover) :conn newer :request request :about ["/tmp/s.rs" rope])
+                 ;; asked about text that has changed since: its position means nothing now
+                 :stale (assoc (lsp-hover) :conn newer :request request :about ["/tmp/s.rs" nil])})
+          after (ed-ev-lsp-capabilities m [:lsp-capabilities folder-caps newer] 0 0 0)
+          _ (assert= [:folders ["/tmp"] []] (told host))
+          [verb _ corr reply-to sent] (told host))
+      (assert= :ask verb)
+      (assert= :current corr)
+      (assert= (self) reply-to)
+      ;; the host never saw the document, so it goes with the request
+      (assert= "fn main() {}" (:text sent))
+      (assert= host (get-in after [:lsp-pending :current :conn]))
+      (is (nil? (get-in after [:lsp-pending :stale])))
+      (is (includes? (:echo after) "ask that again"))
+      (assert= [:shutdown] (told newer))))
   (test "a server pinned differently, or one that takes no folders, stays its own"
     (let (host (telling (self))
           newer (telling (self))

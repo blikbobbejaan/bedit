@@ -129,12 +129,19 @@ the server must answer about the text on screen, and pushing it here — as the 
 the last push, recorded on the model — is what lets the request itself carry no text.
 
 The pending lookup remembers `conn`, so a server that dies takes its unanswered lookups with
-it ([[ed-lsp-server-down]]) instead of leaving them until C-g."
-  (let (m (if (contains? request :uri) (ed-lsp-push-text m) m))
+it ([[ed-lsp-server-down]]) instead of leaving them until C-g. It remembers the `request`
+and the text it was about too, so a server merged into another hands its lookups over
+([[ed-lsp-reroute-pending]]) rather than dropping them."
+  (let (about? (contains? request :uri)
+        m (if about? (ed-lsp-push-text m) m)
+        buf (ed-current-buf m))
     (ed-lsp-ask m
       kind
       (fn (corr) (lsp/lsp-ask-async conn kind corr (self) request))
-      (assoc (or extra {}) :conn conn)
+      (merge (or extra {})
+        {:conn conn
+         :request request
+         :about (when about? [(buffer-file buf) (buffer-rope buf)])})
       note)))
 
 (defn ed-ev-lsp-reply (m input textrows cols rows)
@@ -800,6 +807,29 @@ folder."
       found
       (let (project (project-root dir)) (if (string? project) project dir)))))
 
+(defn ed-lsp-learn-roots (m file)
+  "`m` with the project root of every server `file`'s type names recorded for its folder
+(`:lsp-roots`, read by `lsp/lsp-known-root`) — the marker walk once per server and folder,
+not on every idle beat. Knowing it is what keeps a nested project from being taken for part
+of the running server around it."
+  (if (not (string? file))
+    m
+    (fold (lsp/lsp-specs-for file)
+      m
+      (fn (acc spec)
+        (if (lsp/lsp-known-root acc (:name spec) file)
+          acc
+          (assoc-in acc [:lsp-roots [(:name spec) (path/dirname file)]] (ed-lsp-root spec file)))))))
+
+(defn ed-lsp-forget-roots (m file)
+  "`m` without the roots learnt for `file`'s folder, so the next look walks the disk again —
+`M-x lsp-connect`'s retry, after a `Cargo.toml` or `mix.exs` was added."
+  (let (folder (when (string? file) (path/dirname file)))
+    (assoc m
+      :lsp-roots
+        (into {}
+          (seq/reject (%map-pairs (or (:lsp-roots m) {})) (fn ([key _]) (= (nth key 1) folder)))))))
+
 (defn ed-lsp-pins (root)
   "What pins `root`'s toolchain: each `*lsp-toolchain-pins*` file found from `root` up,
 mapped to its text (the nearest one, which is the one the version manager reads)."
@@ -899,21 +929,49 @@ detached whole."
         waiting (seq/filter (keys pending) (fn (corr) (= (:conn (get pending corr)) conn))))
     [(assoc m :lsp-pending (fold waiting pending dissoc)) (count waiting)]))
 
+(defn- ed-lsp-reroute-pending (m conn host)
+  "`[m2 dropped]`: the lookups waiting on server `conn` asked again of `host`, under the same
+corr, so the answer folds as if `conn` had given it. The host has never seen the document,
+so the request carries its whole text (the connection syncs it first). One whose buffer is
+gone or has changed since it was asked is dropped and counted — its position is about text
+that is no longer there — and so is one about no document (a command, which `conn` may
+already have run)."
+  (let (pending (or (:lsp-pending m) {})
+        waiting (seq/filter (keys pending) (fn (corr) (= (:conn (get pending corr)) conn))))
+    (fold waiting
+      [m 0]
+      (fn ([acc dropped] corr)
+        (let (pend (get pending corr)
+              [path rope] (or (:about pend) [nil nil])
+              idx (when path (ed-buffer-index-by-file acc path))
+              buf (when idx (ed-buf-at acc idx)))
+          (if (and buf (= (buffer-rope buf) rope))
+            (do
+              (lsp/lsp-ask-async host
+                pend
+                corr
+                (self)
+                (assoc (:request pend) :text (buffer-text buf)))
+              [(assoc-in acc [:lsp-pending corr] (assoc pend :conn host)) dropped])
+            [(assoc acc :lsp-pending (dissoc (:lsp-pending acc) corr)) (inc dropped)]))))))
+
 (defn ed-lsp-merge-into-host (m conn)
   "Fold server `conn` into another running for a project pinned the same way, once both say
 they take workspace folders: `conn`'s projects become the other's folders and `conn` stops.
 Two projects opened while the first server was still starting each got a process of their
 own; this makes them one, and so does a project connected by hand beside a running one.
 `conn`'s documents go to the host on their next push (whole, as to any new server), its
-findings leave with it until the host publishes, and a lookup it had not answered is
-dropped — said, so it can be asked again. `m` unchanged when there is nothing to fold into."
+findings leave with it until the host publishes, and a lookup it had not answered is asked
+of the host instead ([[ed-lsp-reroute-pending]]) — or, when it no longer can be, dropped
+and said, so it can be asked again. `m` unchanged when there is nothing to fold into."
   (let (entry (get-in m [:lsp-servers conn])
         host (when (and (:identity entry) (lsp/lsp-folders-supported? (:caps entry)))
                (ed-lsp-share-host m (:spec entry) (:identity entry) conn)))
     (if (nil? host)
       m
-      (let ([m1 dropped] (ed-lsp-drop-pending m conn))
-        (doseq (root (:roots entry)) (lsp/lsp-add-folder (:conn host) root))
+      ;; the folders first: the host answers a re-asked lookup about a file in them
+      (let (_ (doseq (root (:roots entry)) (lsp/lsp-add-folder (:conn host) root))
+            [m1 dropped] (ed-lsp-reroute-pending m conn (:conn host)))
         (lsp/lsp-shutdown conn)
         (message (assoc-in (ed-lsp-detach m1 conn)
                    [:lsp-servers (:conn host) :roots]
@@ -1000,6 +1058,8 @@ hover and rename share these servers, and what went wrong is the server's, not t
 `os/which` asks before spawning: `os/spawn` raises when the binary is missing, inside the
 connection PROCESS, and that answered a goto-definition with a crash trace."
   (let (file (buffer-file (ed-current-buf m))
+        ;; first: which servers serve the file depends on its project root
+        m (ed-lsp-learn-roots m file)
         specs (when file (ed-lsp-unserved m file)))
     (cond
       (nil? file) [(message m "lsp: the buffer has no file") nil]
@@ -1013,7 +1073,7 @@ connection PROCESS, and that answered a goto-definition with a crash trace."
                              (let ([started _ line] (ed-lsp-start-spec acc
                                                       spec
                                                       file
-                                                      (ed-lsp-root spec file)))
+                                                      (lsp/lsp-known-root acc (:name spec) file)))
                                [started (conj lines line)]))))
           [(message m2 (str "lsp: " (string/join lines " · "))) (lsp/lsp-conn m2 file)]))))
 
@@ -1032,8 +1092,9 @@ completions on (M-x lsp-connect). Looks the file extension up in `lsp/*lsp-serve
 project to a running server that serves several — and registers `lsp-complete-source`, so
 Tab also offers the servers' candidates. M-x lsp-disconnect stops them; M-x lsp-servers
 lists what is running."
-  (let (m1 (ed-lsp-drop-dead m)
-        file (buffer-file (ed-current-buf m1)))
+  (let (file (buffer-file (ed-current-buf m))
+        ;; the roots looked for again: this is the retry, and a project marker may be new
+        m1 (ed-lsp-learn-roots (ed-lsp-forget-roots (ed-lsp-drop-dead m) file) file))
     (if (and file (ed-lsp-live m1) (empty? (ed-lsp-unserved m1 file)))
       (message m1
         (str "lsp: "
@@ -1169,8 +1230,8 @@ send the whole text, which puts the two back in step."
 (defn- ed-lsp-autostart-spec (m spec file)
   "Autostart's step for one of the file's servers: nothing when one is serving it; said once
 when the one that was has exited; otherwise started — once per server and folder, and once
-per server and project root (`:lsp-autostarted`), so the root's marker walk and the `PATH`
-search run once, not on every idle beat."
+per server and project root (`:lsp-autostarted`), so the `PATH` search runs once, not on
+every idle beat. The root is the one [[ed-lsp-learn-roots]] found for the folder."
   (let (entry (seq/find (lsp/lsp-server-entries m file) (fn (entry) (= (:spec entry) (:name spec))))
         tried (fn (mm key) (update mm :lsp-autostarted (fn (started) (conj (or started #{}) key))))
         folder [(:name spec) (path/dirname file)])
@@ -1181,7 +1242,7 @@ search run once, not on every idle beat."
       entry (tried (ed-lsp-server-down m (:conn entry) nil) folder)
       (contains? (:lsp-autostarted m #{}) folder) m
       :else
-        (let (root (ed-lsp-root spec file)
+        (let (root (lsp/lsp-known-root m (:name spec) file)
               project [(:name spec) root]
               m1 (tried (tried m folder) project))
           (cond
@@ -1207,7 +1268,9 @@ with nothing typed. Now its death is said once, and `M-x lsp-connect` is the ret
   (let (file (buffer-file (ed-current-buf m)))
     (if (or (not *lsp-autostart*) (nil? file) (ed-headless?))
       m
-      (fold (lsp/lsp-specs-for file) m (fn (acc spec) (ed-lsp-autostart-spec acc spec file))))))
+      (fold (lsp/lsp-specs-for file)
+        (ed-lsp-learn-roots m file)
+        (fn (acc spec) (ed-lsp-autostart-spec acc spec file))))))
 
 ;; ---- registration: the events and idle-beat jobs this module owns ----------------
 ;; Registered at load, so neither the dispatcher's event table nor its idle beat names a
