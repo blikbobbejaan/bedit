@@ -92,7 +92,10 @@ presses, not a hold — `drive-mspc` was flaky from it), `b9cd1d03` (the gap ana
 - **No benchmarks, stress runs or heavy brood suites on this desktop** (global CLAUDE.md);
   bedit's `nest test` and a single brood test file are fine. Push brood with `--no-verify` (its pre-push hook runs tests).
 - Brood work goes in a worktree (`git worktree add ~/.cache/brood-wt-X origin/main -b X`,
-  `ln -s ~/src/broodlang/brood/target …/target`, copy `config.mk`); other sessions use the
+  copy `config.mk`) with its OWN `target/` — **never symlink the primary checkout's**: other
+  sessions build there, and `target/debug/nest` was rebuilt from another tree under this
+  session twice (a lint that "found nothing", drivers that failed). Check `nest --version`
+  names your commit before trusting a run. Other sessions use the
   primary checkout (it currently has another session's uncommitted edits — leave them).
   Worktrees `brood-wt-perf`, `brood-wt-vcs`, `brood-b2d-handoff` are NOT this session's.
 - In a Bash call that also runs `nest`/`cargo`, `$(…)` shell variables can come out empty
