@@ -245,10 +245,18 @@ src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, g
                             is how one that builds the project finds it. Elixir is Expert
                             (expert-lsp.org), which narrates its own startup — forwarded to
                             *Messages*, because it answers nothing until its engine is up.
-                            ONE SERVER PER LANGUAGE AND PROJECT ROOT (`:lsp-servers`,
-                            `lsp-server-entry`): a buffer reaches the server its extension names,
-                            or none — so wos source beside a running brood-lsp is never checked
-                            as Brood, and a .rs file gets rust-analyzer. M-x lsp-servers lists them
+                            THE SERVER TABLE (`*lsp-server-specs*`): per server its file types,
+                            command alternatives (the first installed runs), root markers
+                            (`Cargo.lock` before `Cargo.toml`) and whether it is an ADD-ON or
+                            SHARED. A buffer reaches every server its extension names (pyright
+                            and ruff for .py), each rooted where its markers say, or none — so
+                            wos source beside a running brood-lsp is never checked as Brood.
+                            Lookups go to the first server offering the feature; diagnostics
+                            and completions merge. A shared server (rust-analyzer, gopls,
+                            pyright, TypeScript) takes a further project as a workspace folder
+                            when it says it can and both pin the same toolchain
+                            (`ed-lsp-identity`). `:lsp-servers` files them; M-x lsp-servers
+                            lists them
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
                             lsp-commands can register fold impls while lsp stays deferred

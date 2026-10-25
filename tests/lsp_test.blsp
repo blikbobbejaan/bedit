@@ -14,21 +14,27 @@
   (:use model) ; ed-init / ed-set-buf / ed-current-buf — the sync hook is a model step
   (:use editor/buffer)) ; make-buffer / insert — the edit a sync is about
 
-(defn serving (m conn &optional (caps {}))
-  "`m` with `conn` filed as the server for its current buffer's file — the one
-`*lsp-servers*` names for the extension, rooted at the file's directory — saying `caps`.
-What `M-x lsp-connect` files, without spawning anything."
+(defn serving (m conn &optional (caps {}) (spec-name nil))
+  "`m` with `conn` filed as a server for its current buffer's file — the main one
+`*lsp-server-specs*` names for the extension (or `spec-name`), rooted at the file's
+directory — saying `caps`. What `M-x lsp-connect` files, without spawning anything."
   (let (file (buffer-file (ed-current-buf m))
-        key [(first (lsp-server-for file)) (path/dirname file)]
-        attached (ed-lsp-attach m key conn))
-    (assoc attached :lsp-servers (assoc (:lsp-servers attached) key {:conn conn :caps caps}))))
+        name (or spec-name (:name (first (lsp-specs-for file))))
+        root (path/dirname file))
+    (ed-lsp-attach m [name root] {:spec name :roots [root] :conn conn :caps caps})))
 
 (defn rust-model (text)
   ;; a buffer whose FILE has a server configured (`.rs`): a buffer reaches a server only
   ;; through its file's extension, never by being whichever buffer happens to be current
   (model/ed-init (editor/buffer/make-buffer text "s.rs" "/tmp/s.rs")))
 
-(describe "lsp: one server per language — a buffer reaches its own or none"
+(defn python-model ()
+  ;; a `.py` buffer: a main server and the ruff add-on both serve it
+  (model/ed-init (editor/buffer/make-buffer "" "a.py" "/tmp/a.py")))
+
+(purge-stale-temp "bedit-lsproot-")
+
+(describe "lsp: the servers a file reaches"
   (test "a file finds the server its extension names, rooted above it"
     (let (m (serving (rust-model "fn main() {}") (self)))
       (is (= (self) (ed-lsp-live m)))
@@ -54,28 +60,67 @@ What `M-x lsp-connect` files, without spawning anything."
   (test "the deeper root wins when two hold the file"
     (let (m (assoc (rust-model "")
               :lsp-servers
-                {["rust-analyzer" "/p"] {:conn :outer} ["rust-analyzer" "/p/crate"] {:conn :inner}}))
+                {["rust-analyzer" "/p"] {:spec "rust-analyzer" :roots ["/p"] :conn :outer}
+                 ["rust-analyzer" "/p/crate"] {:spec "rust-analyzer"
+                                               :roots ["/p/crate"]
+                                               :conn :inner}}))
       (assert= :inner (:conn (lsp-server-entry m "/p/crate/src/s.rs")))
       (assert= :outer (:conn (lsp-server-entry m "/p/other/s.rs")))))
   (test "a root is a directory, not a prefix: /p/crate does not hold /p/crate2"
     (is (lsp-under? "/p/crate/s.rs" "/p/crate"))
     (is (not (lsp-under? "/p/crate2/s.rs" "/p/crate"))))
+  (test "a .py file has a main server and the ruff add-on, main first"
+    (assert= ["python" "ruff"] (into [] (map (lsp-specs-for "/p/a.py") (fn (spec) (:name spec)))))
+    (assert= [] (lsp-specs-for "/p/k.wos"))
+    (assert= ["typescript"] (into [] (map (lsp-specs-for "/p/App.tsx") (fn (spec) (:name spec))))))
+  (test "both servers of one file are found, and a lookup goes to the one that offers it"
+    (let (m (serving (serving (python-model) :pyright {:hoverProvider true})
+              :ruff {:codeActionProvider true}
+              "ruff"))
+      (assert= ["python" "ruff"]
+        (into [] (map (lsp-server-entries m "/tmp/a.py") (fn (entry) (:spec entry)))))
+      (assert= :pyright (:conn (lsp-server-entry m "/tmp/a.py")))))
+  (test "one process can serve several projects: each root is the server's"
+    (let (m (assoc (rust-model "")
+              :lsp-servers
+                {["rust-analyzer" "/a"] {:spec "rust-analyzer" :roots ["/a" "/b"] :conn :shared}}))
+      (assert= :shared (:conn (lsp-server-entry m "/a/s.rs")))
+      (assert= :shared (:conn (lsp-server-entry m "/b/src/s.rs")))
+      (is (nil? (lsp-server-entry m "/c/s.rs")))))
   (test "capabilities land on the server that sent them"
     (let (m (serving (rust-model "") :rust-conn)
           m2 (ed-ev-lsp-capabilities m [:lsp-capabilities {:hoverProvider true} :rust-conn] 0 0 0)
           stray (ed-ev-lsp-capabilities m [:lsp-capabilities {:hoverProvider true} :gone] 0 0 0))
-      (assert= {:hoverProvider true} (ed-lsp-caps m2))
+      (assert= {:hoverProvider true} (:caps (lsp-server-entry m2 "/tmp/s.rs")))
       (assert= m stray)))
-  (test "a new server forgets what was pushed to ITS files, and only those"
+  (test "a server says it takes more projects only with folders and their change notices"
+    (is (lsp-folders-supported? {:workspace {:workspaceFolders {:supported true
+                                                                :changeNotifications true}}}))
+    (is (lsp-folders-supported? {:workspace {:workspaceFolders {:supported true
+                                                                :changeNotifications "id"}}}))
+    (is (not (lsp-folders-supported? {:workspace {:workspaceFolders {:supported true}}})))
+    (is (not (lsp-folders-supported? {}))))
+  (test "a new server forgets what was pushed to IT, and only that"
     (let (m (assoc (rust-model "")
-              :lsp-synced {"file:///tmp/s.rs" {:token :a} "file:///tmp/k.blsp" {:token :b}})
-          m2 (ed-lsp-attach m ["rust-analyzer" "/tmp"] :rust-conn))
-      (assert= ["file:///tmp/k.blsp"] (into [] (keys (:lsp-synced m2))))))
-  (test "M-x lsp-servers names each server and marks this buffer's"
+              :lsp-synced
+                {[["rust-analyzer" "/tmp"] "file:///tmp/s.rs"] {:token :a}
+                 [["brood-lsp" "/tmp"] "file:///tmp/k.blsp"] {:token :b}})
+          m2 (ed-lsp-attach m
+               ["rust-analyzer" "/tmp"]
+               {:spec "rust-analyzer" :roots ["/tmp"] :conn :rust-conn}))
+      (assert= [[["brood-lsp" "/tmp"] "file:///tmp/k.blsp"]] (into [] (keys (:lsp-synced m2))))))
+  (test "M-x lsp-servers names each server, its projects, and marks this buffer's"
     (let (m (assoc (rust-model "")
               :lsp-servers
-                {["rust-analyzer" "/tmp"] {:conn (self)} ["brood-lsp" "/srv"] {:conn (self)}}))
-      (assert= "brood-lsp /srv · *rust-analyzer /tmp" (ed-lsp-servers-line m))
+                {["rust-analyzer" "/tmp"] {:spec "rust-analyzer"
+                                           :command "rust-analyzer"
+                                           :roots ["/tmp" "/srv/b"]
+                                           :conn (self)}
+                 ["brood-lsp" "/srv"] {:spec "brood-lsp"
+                                       :command "brood-lsp"
+                                       :roots ["/srv"]
+                                       :conn (self)}}))
+      (assert= "brood-lsp /srv · *rust-analyzer /tmp, /srv/b" (ed-lsp-servers-line m))
       (assert= "lsp: no servers running" (:echo (cmd-lsp-servers (rust-model "") :key)))))
   (test "M-x lsp-disconnect stops this buffer's server and leaves the others"
     ;; stand-in connections that take the `[:shutdown]` themselves, rather than the test
@@ -85,7 +130,61 @@ What `M-x lsp-connect` files, without spawning anything."
           both (serving (ed-set-buf brood (editor/buffer/make-buffer "" "s.rs" "/p/s.rs")) (sink))
           after (cmd-lsp-disconnect both :key))
       (assert= [["brood-lsp" "/p"]] (into [] (keys (:lsp-servers after))))
-      (is (includes? (:echo after) "rust-analyzer disconnected")))))
+      (is (includes? (:echo after) "rust-analyzer disconnected"))))
+  (test "disconnecting one project from a shared server keeps it for the others"
+    (let (sink (spawn (receive (_ :done) (after 30000 :done)))
+          m (assoc (rust-model "")
+              :lsp-servers
+                {["rust-analyzer" "/tmp"] {:spec "rust-analyzer"
+                                           :roots ["/tmp" "/srv/b"]
+                                           :conn sink}})
+          after (cmd-lsp-disconnect m :key))
+      (assert= ["/srv/b"] (get-in after [:lsp-servers ["rust-analyzer" "/tmp"] :roots])))))
+
+(describe "lsp: where a server starts"
+  (test "the root is the nearest folder holding the first marker any folder above holds"
+    ;; a cargo workspace: Cargo.lock at the top, a member crate with its own Cargo.toml
+    (let (top (temp-dir "bedit-lsproot-")
+          member (path/join top "crates/core")
+          spec (lsp-spec-named "rust-analyzer"))
+      (file/mkdir (path/join member "src"))
+      (file/spit (path/join top "Cargo.lock") "")
+      (file/spit (path/join top "Cargo.toml") "")
+      (file/spit (path/join member "Cargo.toml") "")
+      (assert= top (ed-lsp-root spec (path/join member "src/lib.rs")))))
+  (test "with no marker the file's project root stands, else its own folder"
+    (let (dir (temp-dir "bedit-lsproot-"))
+      (file/mkdir dir)
+      (assert= dir (ed-lsp-root (lsp-spec-named "gopls") (path/join dir "main.go")))))
+  (test "two projects pinned alike share an identity; a different pin does not"
+    (let (a (temp-dir "bedit-lsproot-")
+          b (temp-dir "bedit-lsproot-")
+          c (temp-dir "bedit-lsproot-"))
+      (doseq (dir [a b c]) (file/mkdir dir))
+      (file/spit (path/join a "rust-toolchain.toml") "[toolchain]\nchannel = \"1.80\"\n")
+      (file/spit (path/join b "rust-toolchain.toml") "[toolchain]\nchannel = \"1.80\"\n")
+      (file/spit (path/join c "rust-toolchain.toml") "[toolchain]\nchannel = \"nightly\"\n")
+      (assert= (ed-lsp-identity "sh" a) (ed-lsp-identity "sh" b))
+      (is (not (= (ed-lsp-identity "sh" a) (ed-lsp-identity "sh" c)))))))
+
+(describe "lsp: diagnostics from several servers on one file"
+  (test "each server's publication replaces only its own, and the file shows them all"
+    (let (m (serving (serving (python-model) :pyright) :ruff {} "ruff")
+          item (fn (text) {:line 1 :col 1 :message text})
+          m1 (ed-ev-lsp-diagnostics m
+               [:lsp-diagnostics "/tmp/a.py" [(item "type")] [{:message "type"}] :pyright]
+               0
+               0
+               0)
+          m2 (ed-ev-lsp-diagnostics m1
+               [:lsp-diagnostics "/tmp/a.py" [(item "unused")] [{:message "unused"}] :ruff]
+               0
+               0
+               0)
+          m3 (ed-ev-lsp-diagnostics m2 [:lsp-diagnostics "/tmp/a.py" [] [] :pyright] 0 0 0))
+      (assert= 2 (count (ed-lsp-merged-diags m2 "/tmp/a.py")))
+      (assert= [(item "unused")] (ed-lsp-merged-diags m3 "/tmp/a.py"))
+      (assert= [{:message "unused"}] (ed-lsp-raw-diags m3 "/tmp/a.py" ["ruff" "/tmp"])))))
 
 (describe "lsp: completion-result shapes"
   (test "a CompletionItem[] vector yields its labels"
@@ -873,17 +972,21 @@ What `M-x lsp-connect` files, without spawning anything."
 ;; — because `os/spawn` raises inside the connection PROCESS, where a raise is a report on
 ;; the user's screen rather than a value a command could turn into a sentence. `os/which`
 ;; (brood's std/os, added the same day) is the ask-first that replaces it.
+(defn lspt-only (command)
+  ;; the server table with one Elixir server, run by `command`
+  [{:name "elixir-test" :extensions ["ex"] :commands [[command []]] :root-markers ["mix.exs"]}])
+
 (describe "lsp: a server that is not installed is a message, not a crash"
   (defn lspt-elixir-model ()
-    ;; a .ex buffer, so `lsp-server-for` resolves whatever `*lsp-servers*` maps "ex" to
+    ;; a .ex buffer, so `lsp-specs-for` resolves whatever `*lsp-server-specs*` serves "ex" with
     (model/ed-init (editor/buffer/make-buffer "defmodule M do\nend\n" "m.ex" "/tmp/m.ex")))
   ;; The absent server is NAMED here rather than assumed of this machine: asserting that
   ;; `elixir-ls` is missing would make the suite depend on nobody ever installing it, and
-  ;; go red on the day someone does. `*lsp-servers*` is a dynvar precisely so it can be
+  ;; go red on the day someone does. `*lsp-server-specs*` is a dynvar precisely so it can be
   ;; pointed somewhere for a test.
   (def lspt-missing "bedit-no-such-language-server")
   (test "the real .ex mapping is configured, and a name that cannot exist is seen to be absent"
-    (let ([cmd args] (lsp/lsp-server-for "/tmp/m.ex"))
+    (let ([cmd args] (first (:commands (first (lsp/lsp-specs-for "/tmp/m.ex")))))
       ;; Expert (expert-lsp.org) — the official Elixir server, and the one ElixirLS,
       ;; Lexical and Next LS converged into. `--stdio` because that is this client's only
       ;; transport.
@@ -891,13 +994,13 @@ What `M-x lsp-connect` files, without spawning anything."
       (assert= ["--stdio"] (into [] args))
       (is (nil? (os/which lspt-missing)))))
   (test "M-x lsp-connect names the missing binary and leaves the model unconnected"
-    (binding (*lsp-servers* {"ex" [lspt-missing []]})
+    (binding (*lsp-server-specs* (lspt-only lspt-missing))
       (let (m (lsp-commands/cmd-lsp-connect (lspt-elixir-model) nil))
         (is (includes? (:echo m) lspt-missing))
         (is (includes? (:echo m) "not installed"))
         (is (empty? (or (:lsp-servers m) {})))))) ; nothing was spawned, so nothing to wait on later
   (test "the lookup commands say the same thing instead of starting a doomed server"
-    (binding (*lsp-servers* {"ex" [lspt-missing []]})
+    (binding (*lsp-server-specs* (lspt-only lspt-missing))
       (let ([m ready?] (lsp-commands/ed-lsp-ensure (lspt-elixir-model)))
         (refute ready?)
         (is (includes? (:echo m) "not installed"))
@@ -982,7 +1085,7 @@ What `M-x lsp-connect` files, without spawning anything."
   (test "a configured server that is not installed is not started, and says nothing"
     ;; silence matters here: a message would fire on every idle beat in every buffer whose
     ;; language has a server nobody installed
-    (binding (*lsp-servers* {"ex" ["bedit-no-such-language-server" []]})
+    (binding (*lsp-server-specs* (lspt-only "bedit-no-such-language-server"))
       (let (m (lspa-model "m.ex" "/tmp/m.ex")
             m2 (lsp-commands/ed-lsp-autostart m))
         (is (empty? (or (:lsp-servers m2) {})))
@@ -1001,7 +1104,7 @@ What `M-x lsp-connect` files, without spawning anything."
   ;; BARE: an earmuffed `defdyn` is ambient, never namespaced, however deep the module.
   (test "autostart is off when the reader turns it off"
     (binding (*lsp-autostart* false)
-      (binding (*lsp-servers* {"ex" ["expert" ["--stdio"]]})
+      (binding (*lsp-server-specs* (lspt-only "expert"))
         (let (m (lspa-model "m.ex" "/tmp/m.ex"))
           (assert= (lsp-commands/ed-lsp-autostart m) m)))))
 
@@ -1010,7 +1113,7 @@ What `M-x lsp-connect` files, without spawning anything."
   ;; beat. Bound inside a loop (`*ui-loop*`), because headless the autostart does nothing.
   (test "a server that died is said once and not respawned"
     (binding (*ui-loop* (self))
-      (binding (*lsp-servers* {"ex" ["sh" []]})
+      (binding (*lsp-server-specs* (lspt-only "sh"))
         (let (dead (spawn (fn () :done))
               _ (receive ([:never] nil) (after 50 nil))
               m (serving (lspa-model "m.ex" "/tmp/m.ex") dead)
@@ -1020,10 +1123,16 @@ What `M-x lsp-connect` files, without spawning anything."
 
   (test "autostart tries a server once per project root"
     (binding (*ui-loop* (self))
-      (binding (*lsp-servers* {"ex" ["sh" []]})
-        (let (m (assoc (lspa-model "m.ex" "/tmp/m.ex")
-                  :lsp-autostarted #{["sh" (lsp-commands/ed-lsp-root "/tmp/m.ex")]}))
-          (assert= (lsp-commands/ed-lsp-autostart m) m))))))
+      (binding (*lsp-server-specs* (lspt-only "sh"))
+        (let (root (lsp-commands/ed-lsp-root (first (lsp/lsp-specs-for "/tmp/m.ex")) "/tmp/m.ex")
+              tried-folder (assoc (lspa-model "m.ex" "/tmp/m.ex")
+                             :lsp-autostarted #{["elixir-test" "/tmp"]})
+              tried-root (assoc (lspa-model "m.ex" "/tmp/m.ex")
+                           :lsp-autostarted (conj #{} ["elixir-test" root])))
+          ;; tried from this folder: not even the root is looked for again
+          (assert= (lsp-commands/ed-lsp-autostart tried-folder) tried-folder)
+          ;; tried for this project from another folder: nothing starts
+          (is (empty? (or (:lsp-servers (lsp-commands/ed-lsp-autostart tried-root)) {}))))))))
 
 ;; ---- the document sync that is not a question ---------------------------------------
 ;; A server does not ANSWER with diagnostics; it PUSHES them when it learns the text
@@ -1174,14 +1283,15 @@ What `M-x lsp-connect` files, without spawning anything."
       (assert= (:changes second-sync)
         [{:range {:start {:line 0 :character 0} :end {:line 0 :character 0}} :text "x"}])
       (assert= (:base second-sync) (:token first-sync))
-      (assert= (get-in m2 [:lsp-synced "file:///tmp/lsp-inc.ex" :token]) (:token second-sync))
+      (assert= (get-in m2 [:lsp-synced [["expert" "/tmp"] "file:///tmp/lsp-inc.ex"] :token])
+        (:token second-sync))
       ;; a refused sync forgets the base, so the next push is the whole text again
       (is (nil? (get-in (lsp-commands/ed-ev-lsp-resync m2
-                          [:lsp-resync "file:///tmp/lsp-inc.ex"]
+                          [:lsp-resync "file:///tmp/lsp-inc.ex" conn]
                           0
                           0
                           0)
-                  [:lsp-synced "file:///tmp/lsp-inc.ex"])))))
+                  [:lsp-synced [["expert" "/tmp"] "file:///tmp/lsp-inc.ex"]])))))
 
   (test "a server that wants the whole text gets the whole text"
     (let (conn (spawn (fn ()
@@ -1228,7 +1338,7 @@ What `M-x lsp-connect` files, without spawning anything."
           buf (goto-char (assoc (make-buffer "defmo") :file "/tmp/lsp-c.ex") 5)
           ;; synced AFTER the server is filed: filing one forgets what was pushed to its files
           m (assoc (serving (ed-init buf) conn)
-              :lsp-synced {"file:///tmp/lsp-c.ex" {:buf buf :token :t}})
+              :lsp-synced {[["expert" "/tmp"] "file:///tmp/lsp-c.ex"] {:buf buf :token :t}})
           answer (lsp/lsp-complete-source m))
       (assert= answer [0 "defmo" (list "defmodule") {:cache true}])
       (refute (contains? (lspc-request) :text))))
