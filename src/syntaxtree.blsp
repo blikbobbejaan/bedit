@@ -8,7 +8,7 @@ the kernel's handle, the rope it was parsed from, its language, the rope of the 
 updated from, and `editor/treesit/tree-changes` of that update (the char ranges whose
 colouring may differ). `panes/ed-refresh-spans` brings the entries of the buffers on screen
 up to date each event (`ed-sync-syntax-trees`) and reads them to colour a band
-(`editor/treesit/fontify-tree`); `pool/ed-kill-at` frees a killed buffer's
+(`editor/treesit/fontify-tree`); `pool/ed-kill-at` drops a killed buffer's
 (`ed-drop-syntax-tree-slot`); `treewarm` opens a large buffer's first tree off the loop.
 
 Keyed by pool index, the way `:hosted` is, and kept honest the same way: a kill shifts the
@@ -16,11 +16,10 @@ keys above it down. A key that ever names a different document than its tree was
 from costs a full reparse and is never wrong, because a handle carries its own text and an
 update diffs the two ropes.
 
-Every handle query goes through `tree-handles?`: an installed runtime older than ADR-443
-has no `%tree-sitter-tree`, and there every buffer keeps the windowed slice path. The
-`editor/treesit` tree functions are resolved late (`reflect/eval`) for the same reason — a
-direct reference to a name the installed std lacks is unbound at load. Once every runtime
-bedit runs on has ADR-443, the indirection can become direct calls."
+A handle is freed in ONE place, after a turn commits (`ed-release-dropped-trees`, which
+`input/ed-update` calls): every handle the model held before the turn and not after. Nothing
+else here frees, so a turn that throws and is rolled back still names live handles; what a
+thrown turn opened is left to the kernel's least-recently-used bound."
   (:use editor/buffer) ; buffer-rope / buffer-length
   (:use model)) ; ed-buf-at / ed-mode-service
 
@@ -31,50 +30,37 @@ bedit runs on has ADR-443, the indirection can become direct calls."
   ;; every update is incremental and cheap at any size.
   40000)
 
-(defn tree-handles? ()
-  "Whether the running kernel keeps tree handles (brood ADR-443's `%tree-sitter-tree`)."
-  (bound? '%tree-sitter-tree))
+;; ---- the editor/treesit tree API ------------------------------------------------
+;; Each answers nil when the call raises (a language whose grammar is not loaded), which
+;; every caller reads as "no tree: take the slice path".
 
-;; ---- the editor/treesit tree API, resolved late --------------------------------
-;; Each wrapper answers nil when the runtime lacks the API or the call raises (a grammar
-;; that is not loaded), which every caller reads as "no tree: take the slice path".
-
-(defn- tree-call (name arguments)
-  (when (tree-handles?)
-    (check-allow :discarded-catch
-      (try (apply (reflect/eval name) arguments) (catch _ nil)))))
+(defn- or-nil (thunk)
+  ;; the error IS the answer: a language without a loaded grammar has no tree
+  (check-allow :discarded-catch
+    (try (thunk) (catch _ nil))))
 
 (defn tree-open (rope lang)
   "A fresh tree handle for the whole document `rope` in tree-sitter language `lang`, or nil."
-  (tree-call 'editor/treesit/open-tree [rope lang]))
+  (or-nil (fn () (editor/treesit/open-tree rope lang))))
 
 (defn- tree-update (tree rope lang)
   ;; nil edits: the kernel derives the change by comparing the two ropes — exact for any
   ;; single contiguous edit, and a sound covering edit for several
-  (tree-call 'editor/treesit/update-tree [tree rope lang nil]))
+  (or-nil (fn () (editor/treesit/update-tree tree rope lang nil))))
 
 (defn tree-free (tree)
   "Drop `tree`'s handle now (nil-safe)."
-  (when tree (tree-call 'editor/treesit/free-tree [tree])))
+  (when tree (or-nil (fn () (editor/treesit/free-tree tree)))))
 
 (defn tree-changed-ranges (tree)
   "`editor/treesit/tree-changes` of `tree`: `[[start end] …]`, `true` for a fresh parse, nil
 when the handle is gone."
-  (tree-call 'editor/treesit/tree-changes [tree]))
+  (or-nil (fn () (editor/treesit/tree-changes tree))))
 
 (defn tree-spans (tree faces from to)
   "`[start end face]` spans, absolute, for chars `[from, to)` of `tree` coloured by the face
-table `faces` — `[]` when nothing there is coloured — or nil when the handle is gone (or the
-runtime has none).
-
-An empty LIST is nil, so `fontify-tree`'s answer cannot tell \"gone\" from \"no colour in this
-range\" (a band of blank lines, of plain identifiers); the handle's `tree-changes`, nil only
-for a gone handle, does."
-  (let (spans (tree-call 'editor/treesit/fontify-tree [tree faces from to]))
-    (cond
-      spans spans
-      (nil? (tree-changed-ranges tree)) nil
-      else [])))
+table `faces` — `[]` when nothing there is coloured — or nil when the handle is gone."
+  (or-nil (fn () (editor/treesit/fontify-tree tree faces from to))))
 
 ;; ---- the per-buffer store ----------------------------------------------------------
 
@@ -89,27 +75,22 @@ entry `editor/treesit/fontify-tree` may be asked about, since its offsets are th
     (when (and entry (= (:rope entry) (buffer-rope buf))) entry)))
 
 (defn- without-entry (m idx)
-  (let (entry (syntax-tree-entry m idx))
-    (if (nil? entry)
-      m
-      (do
-        (tree-free (:tree entry))
-        (assoc m :syntax-trees (dissoc (:syntax-trees m) idx))))))
+  (if (nil? (syntax-tree-entry m idx)) m (assoc m :syntax-trees (dissoc (:syntax-trees m) idx))))
 
 (defn install-syntax-tree (m idx tree rope lang)
-  "`m` with `tree` (parsed from `rope` as `lang`) as pool buffer `idx`'s tree, freeing the one
-it replaces. A fresh parse, so its changes are `true` — every cached band is suspect."
-  (let (cleared (without-entry m idx))
-    (assoc cleared
-      :syntax-trees
-        (assoc (or (:syntax-trees cleared) {})
-          idx {:tree tree :rope rope :lang lang :from-rope nil :changes true}))))
+  "`m` with `tree` (parsed from `rope` as `lang`) as pool buffer `idx`'s tree, in place of the
+one it had (freed once the turn commits). A fresh parse, so its changes are `true` — every
+cached band is suspect."
+  (assoc m
+    :syntax-trees
+      (assoc (or (:syntax-trees m) {})
+        idx {:tree tree :rope rope :lang lang :from-rope nil :changes true})))
 
 (defn- synced-entry (m idx buf)
   "`m` with pool buffer `idx`'s tree brought up to `buf`'s rope: kept when current, updated
-incrementally from the old tree (then freed) when the rope moved, opened when there is none
-and the buffer is small enough to parse on the loop, dropped when the buffer is no longer
-a tree-sitter one."
+incrementally from the old tree when the rope moved, opened when there is none and the
+buffer is small enough to parse on the loop, dropped when the buffer is no longer a
+tree-sitter one."
   (let (entry (syntax-tree-entry m idx)
         lang (ed-mode-service buf :ts-lang)
         rope (buffer-rope buf))
@@ -126,15 +107,13 @@ a tree-sitter one."
         (let (updated (tree-update (:tree entry) rope lang))
           (if (nil? updated)
             (without-entry m idx)
-            (do
-              (tree-free (:tree entry))
-              (assoc-in m
-                [:syntax-trees idx]
-                {:tree updated
-                 :rope rope
-                 :lang lang
-                 :from-rope (:rope entry)
-                 :changes (tree-changed-ranges updated)}))))
+            (assoc-in m
+              [:syntax-trees idx]
+              {:tree updated
+               :rope rope
+               :lang lang
+               :from-rope (:rope entry)
+               :changes (tree-changed-ranges updated)})))
       (> (buffer-length buf) *tree-open-max*) (without-entry m idx)
       else
         (let (opened (tree-open rope lang))
@@ -142,18 +121,28 @@ a tree-sitter one."
 
 (defn ed-sync-syntax-trees (m indices)
   "`m` with the trees of the pool buffers at `indices` (the ones on screen) brought up to
-date, and every entry whose index fell off the end of the pool freed. A no-op on a runtime
-without tree handles."
-  (if (not (tree-handles?))
-    m
-    (let (pool-size (count (:buffers m))
-          swept (fold (keys (or (:syntax-trees m) {}))
-                  m
-                  (fn (acc idx) (if (>= idx pool-size) (without-entry acc idx) acc))))
-      (fold (seq/distinct indices)
-        swept
-        (fn (acc idx)
-          (if (and (int? idx) (< idx pool-size)) (synced-entry acc idx (ed-buf-at acc idx)) acc))))))
+date, and every entry whose index fell off the end of the pool dropped."
+  (let (pool-size (count (:buffers m))
+        swept (fold (keys (or (:syntax-trees m) {}))
+                m
+                (fn (acc idx) (if (>= idx pool-size) (without-entry acc idx) acc))))
+    (fold (seq/distinct indices)
+      swept
+      (fn (acc idx)
+        (if (and (int? idx) (< idx pool-size)) (synced-entry acc idx (ed-buf-at acc idx)) acc)))))
+
+(defn- held-trees (m)
+  (map (vals (or (:syntax-trees m) {})) (fn (entry) (:tree entry))))
+
+(defn ed-release-dropped-trees (before after)
+  "`after`, once every tree handle `before` held and `after` does not has been freed — the one
+place a handle is freed, run when a turn COMMITS, so a turn rolled back to `before` frees
+nothing it still names. Freeing a gone handle is a no-op, so a nested turn (a macro's replay)
+releasing first is harmless."
+  (let (kept (held-trees after))
+    (do
+      (doseq (tree (held-trees before)) (when (not (includes? kept tree)) (tree-free tree)))
+      after)))
 
 (defn- shift-warm-index (m killed)
   "`m` with its in-flight warm's `:tree-warm-index` following pool slot `killed`'s removal."
@@ -165,11 +154,12 @@ without tree handles."
       else m)))
 
 (defn ed-drop-syntax-tree-slot (m killed)
-  "Free pool slot `killed`'s tree ahead of its removal from the pool, and shift the entries
-above it down one — mirroring the pool shift, as `hosted/hosted-drop-slot` does for
-`:hosted`, so every surviving tree stays with its document. A warm in flight
-(`treewarm`) is re-aimed the same way: at the buffer it was warming, or at none when that is
-the one killed, so its tree is freed on arrival rather than installed on a neighbour."
+  "Drop pool slot `killed`'s tree ahead of its removal from the pool (freed once the turn
+commits), and shift the entries above it down one — mirroring the pool shift, as
+`hosted/hosted-drop-slot` does for `:hosted`, so every surviving tree stays with its
+document. A warm in flight (`treewarm`) is re-aimed the same way: at the buffer it was
+warming, or at none when that is the one killed, so its tree is freed on arrival rather than
+installed on a neighbour."
   (let (cleared (shift-warm-index (without-entry m killed) killed)
         trees (:syntax-trees cleared))
     (if (nil? trees)
