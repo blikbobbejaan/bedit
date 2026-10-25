@@ -251,7 +251,9 @@ silently stopped matching); exit signals never reached a natively-nested `receiv
 
 ## F. The customization surface (deferred — design note)
 
-- ⬜ **A settings registry + a real config surface** — the editor is internally
+- 🟡 **A settings registry + a real config surface** — **stage 1 built 2026-10-23:** the
+  registry is brood's `std/settings` (ADR-428) and every init key is one `settings/define`
+  in `config.blsp`; stages 2–4 below are still open. Was: the editor is internally
   layered and hot-swappable, but the user can configure almost none of it from
   `init.blsp` (a closed 3-key DSL today). The keystone is a `defsetting` registry
   (named/typed/defaulted/documented variables — Emacs `defcustom`), off which the rest
@@ -392,7 +394,10 @@ not hacked in here. Recorded as suggestions; implement upstream.
   body and gate the park on a structural sub-form match — is possible but heuristic
   (identical sub-forms misfire; whole-fn spy is slow), so the real fix is the span
   primitive. Scoped 2026-07-30.
-- ⬜ **Module cache for fast startup** (the big one). Cold start is **~680ms of module
+- ✅ **Module cache for fast startup** — done in brood: the prelude and stdlib load from a
+  binary image (ADR-314, ADR-256/281), and the project from its own image, so a warm
+  `nest run` opens no source file (ADR-380; an edit reloads only what changed, ADR-419; a
+  cold build loads in parallel, ADR-426). The 2026-06 notes below are history. Cold start was **~680ms of module
   load** — Brood re-reads, parses, macro-expands and evals the *entire* editor + `std`
   source on every launch (there's no compiled-module cache). Measured 2026-06-16, ruling
   out the likely suspects:

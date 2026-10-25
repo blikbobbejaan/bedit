@@ -113,7 +113,11 @@ src/syntaxtree.blsp         the tree-sitter parse each pool buffer KEEPS (brood 
                             span refresh, freed on kill; panes colour a band from it
                             (`fontify-tree`) and keep a band its `tree-changes` left alone. A
                             runtime without tree handles keeps the slice path
-src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd)
+src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd).
+                            Every key is ONE `settings/define` (std `settings`, brood ADR-428):
+                            its default, type and doc give the check, the fallback
+                            (`config/setting`) and the generated default file. A package
+                            declares its own under `:bedit/settings`
 src/about.blsp              M-x version · --version · C-h C-a *About bedit* — bedit's version,
                             the brood under it and the build date, all from project-release/build-info
                             (named to dodge std's `version`, whose `version/newer?` packages uses)

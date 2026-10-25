@@ -1,8 +1,11 @@
-# The customization surface (design note, deferred)
+# The customization surface (design note)
 
-**Status:** design-of-record for a direction we've decided on but are **not building
-yet**. Captured so the reasoning isn't lost. Nothing here is implemented; the editor
-today exposes only the closed 3-key `init.blsp` DSL described under "Where we are."
+**Status:** design-of-record. **Stage 1 is built (2026-10-23):** the settings registry is
+brood's `std/settings` (ADR-428), and `config.blsp` declares each of its thirteen keys once —
+the check, the fallback and the default file come from the declaration, and an unknown key
+warns. nest's own user config is its other caller. Stages 2–4 (`bind-key` + `key-parse`,
+named hooks, command properties) and a live `M-x set-variable` are not built. The text
+below predates stage 1: "Where we are" describes the editor before it.
 
 The question that started this: *the editor is internally layered and hot-swappable —
 so why can the user configure almost none of it from their init file?* This note is
