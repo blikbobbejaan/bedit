@@ -57,11 +57,23 @@ time; it now allows ordinary tests, see Traps); CI ran them, and both repos are 
 
 ## Next
 
-1. GPU subpixel text is only a proposal — do not start it unasked.
-2. The two LSP limits are built (see Done): a merged-away server's lookups are re-asked of
-   the host (`ed-lsp-reroute-pending`; dropped only when the text moved), and a file's
-   project root is learnt per folder (`:lsp-roots`, `ed-lsp-learn-roots`) so a nested
-   project starts its own server. Tests in `tests/lsp_test.blsp`; CI green at `7bdec657`, brood green at `ebe8b906`.
+1. Brood's "suite with contracts armed" CI job is red on `tests/names_test.blsp` (10 of them,
+   `monitor: first argument must be a pid or a {:name :node}`) — another session's process
+   registry (ADR-445, `1eee8e88`). Not this session's; check whether it was fixed.
+2. `drive-git-menus` failed once under a DEBUG nest (Escape not dismissing a menu, then a
+   cascade) and passed on the next run and with the installed release nest. Likely ESC and
+   the next key read together by a slow build (legacy-terminal ambiguity). Watch it.
+3. The installed nest (`~/.local/bin`) is 35074a9c, older than brood main: the
+   `:cross-module-def` lint, GPU subpixel text and the terminal burst fix are not in it until
+   `make install` in brood (the primary checkout has another session's edits — use a worktree).
+4. The gap analysis (`../brood/docs/general-purpose-gaps.md`) recommends an order; nothing
+   from it is started.
+
+Done since the morning's handoff, all pushed: bedit `1a35124d`..`3bbcca40` (CI fixes, the two
+LSP limits, theme faces as a registry, `drive-lsp`, `drive-term` fixed); brood `9f4c54c3`
+(`:cross-module-def` lint), `d89d7410` (BEDIT_REF → bcea228c), `58d2aabd` (GPU subpixel
+text, byte-identical to the CPU painter's on an RTX 5060), `e32c3eff` (a burst of one key is
+presses, not a hold — `drive-mspc` was flaky from it), `b9cd1d03` (the gap analysis).
 
 ## Decisions
 
