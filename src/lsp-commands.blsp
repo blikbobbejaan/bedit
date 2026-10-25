@@ -23,13 +23,18 @@ an explanatory message already on `m2` (`ed-lsp-start` writes it)."
   (if (ed-lsp-live m)
     [m true]
     (let ([m2 conn] (ed-lsp-start (ed-lsp-drop-dead m)))
-      (if (nil? conn)
-        [m2 false]
+      (cond
+        (nil? conn) [m2 false]
+        ;; handed to a server already running for another project: it is ready now
+        (not (empty? (get-in m2 [:lsp-servers conn :caps] {}))) [m2 true]
         ;; started, but the handshake has not finished: say so in the voice of the
         ;; feature that asked rather than reporting a connection it cannot use yet
-        [(message m2
-           (str "lsp: starting " (first (:key (ed-lsp-server m2))) " — run that again in a moment"))
-          false]))))
+        :else
+          [(message m2
+             (str "lsp: starting "
+               (get-in m2 [:lsp-servers conn :command])
+               " — run that again in a moment"))
+            false]))))
 
 (defn- ed-imenu-label (s)
   "The imenu candidate text for a symbol `{:name :kind …}` — its (qualified) name with a
@@ -174,71 +179,64 @@ also goes to `*Messages*`, the way Emacs's do."
       ;; progress is transient: the echo area, not a `*Messages*` line per report
       :else (assoc logged :echo echo))))
 
-(defn ed-lsp-key-of (m conn)
-  "The `:lsp-servers` key of the server whose connection is `conn`, or nil when none is
-filed under it any more."
-  (let (servers (or (:lsp-servers m) {}))
-    (seq/find (keys servers) (fn (key) (= (:conn (get servers key)) conn)))))
-
 (defn ed-lsp-merged-diags (m path)
-  "Every diagnostic the servers published for `path`, in bedit's shape, one list."
-  (fold (vals (get-in m [:lsp-diags path] {}))
-    []
-    (fn (merged published) (into merged (first published)))))
+  "Every diagnostic the servers published for `path`, in bedit's shape, one list: the
+file's own servers in their order (main first), then any other publication kept for it."
+  (let (published (get-in m [:lsp-diags path] {})
+        ordered (map (lsp/lsp-server-entries m path) (fn (entry) (:key entry)))
+        keys-in-order (append (seq/filter ordered (fn (key) (contains? published key)))
+                        (seq/reject (keys published) (fn (key) (includes? ordered key)))))
+    (fold keys-in-order [] (fn (merged key) (into merged (first (get published key)))))))
 
 (defn ed-lsp-raw-diags (m path key)
   "The raw LSP diagnostics the server under `key` published for `path` — what a code
 action request about them hands back."
   (second (get-in m [:lsp-diags path key] [[] []])))
 
+(defn ed-lsp-show-diags (m path)
+  "Show what the servers published for `path` ([[ed-lsp-merged-diags]]) on its buffer: the
+full fold when it is the one on screen (the model's cache, which is about the buffer you are
+looking at, and the line index), its margin marks when it is open elsewhere, nothing when it
+is not open."
+  (let (items (ed-lsp-merged-diags m path)
+        buf (ed-current-buf m)
+        idx (ed-buffer-index-by-file m path))
+    (cond
+      ;; `buffer-file` is `nil | string` — a scratch buffer has none, and nil never matches
+      (= (buffer-file buf) path) (ed-set-diagnostics m items (buffer-rope buf))
+      ;; a file that is OPEN but not in front of you still gets its margin marks. This arm
+      ;; did not exist, and its absence is why a stale diagnostic could not clear: a server
+      ;; retracts by publishing an empty list, and that retraction is overwhelmingly likely to
+      ;; arrive after you have moved on from the edit that caused it.
+      (not (nil? idx)) (ed-stamp-diagnostics-at m idx items)
+      :else m)))
+
 (defn ed-ev-lsp-diagnostics (m input textrows cols rows)
   "A language server publishing a file's diagnostics (`[:lsp-diagnostics path items raw conn]`)
-— shown on that buffer if it is the one on screen, merged with what the file's other
-servers published (a main server and an add-on both report on one file, and each
-publication replaces only its own).
+— shown on that buffer, merged with what the file's other servers published (a main server
+and an add-on both report on one file, and each publication replaces only its own).
 
 This is what makes an LSP worth connecting for. bedit already renders diagnostics — the
 underline on the token, the ⚠ note at the end of the line, the gutter mark — and until now
 the only thing that ever produced them was the Brood checker, so every other language had
-the whole apparatus and nothing to put in it. Elixir, Rust, Ruby, Python, Go and
-TypeScript all publish them; none of it was read.
+the whole apparatus and nothing to put in it.
 
-Applied only for the CURRENT buffer, and stamped with its rope. The model holds one
-diagnostic set — it is a view of the buffer you are looking at — so a server publishing
-about a file in the background must not replace what is on screen with findings about
-something else. An empty list is applied like any other: it is how a server says the file
-is clean now, and ignoring it would leave the errors you just fixed sitting there.
+An empty list is applied like any other: it is how a server says the file is clean now, and
+ignoring it would leave the errors you just fixed sitting there.
 
-Each server's publication is kept per file and server on `:lsp-diags` — `{path {key
-[items raw]}}`, the raw objects the server sent beside the rendered ones
-([[ed-lsp-raw-diags]]): a quickfix is asked for by handing the diagnostic back (see
-[[cmd-lsp-code-action]]), and bedit's flattened shape — all the view needs — is not a
-thing a server recognises."
+Kept per file and server on `:lsp-diags` — `{path {conn [items raw]}}`, the raw objects
+beside the rendered ones ([[ed-lsp-raw-diags]]): a quickfix is asked for by handing the
+diagnostic back (see [[cmd-lsp-code-action]]), and bedit's flattened shape is not a thing a
+server recognises. Kept only for a file that is OPEN: rust-analyzer publishes about its
+whole workspace, and a server publishes again for a file when it is opened. Dropped from a
+server no longer filed: a publication already queued when it was disconnected would
+otherwise stay merged in for the rest of the session, with nothing able to replace it."
   (let (path (nth input 1)
         conn (nth input 4 nil)
-        ;; filed by the server's key; one no longer filed (or a test's bare publication)
-        ;; under its connection, so it still replaces only its own
-        key (or (ed-lsp-key-of m conn) conn)
-        stored (assoc-in m [:lsp-diags path key] [(nth input 2) (nth input 3 [])])
-        items (ed-lsp-merged-diags stored path)
-        m stored
-        buf (ed-current-buf m)
-        ;; `buffer-file` is `nil | string` — a scratch buffer has none, and nil never
-        ;; matches a published path
-        here? (= (buffer-file buf) path)
-        idx (ed-buffer-index-by-file m path))
-    (cond
-      ;; the buffer it is about is on screen: the full fold — the model's cache (which is
-      ;; about the buffer you are looking at) and the line index
-      here? (ed-set-diagnostics m items (buffer-rope buf))
-      ;; a file that is OPEN but not in front of you still gets its margin marks. This
-      ;; arm did not exist, and its absence is why a stale diagnostic could not clear: a
-      ;; server retracts by publishing an empty list, and that retraction is overwhelmingly
-      ;; likely to arrive after you have moved on from the edit that caused it. Dropped, it
-      ;; left a mark describing text that no longer existed, with nothing able to remove it.
-      (not (nil? idx)) (ed-stamp-diagnostics-at m idx items)
-      ;; about a file we do not have open at all — nothing to mark
-      :else m)))
+        open? (not (nil? (ed-buffer-index-by-file m path))))
+    (if (or (not open?) (and conn (not (contains? (or (:lsp-servers m) {}) conn))))
+      m
+      (ed-lsp-show-diags (assoc-in m [:lsp-diags path conn] [(nth input 2) (nth input 3 [])]) path))))
 
 (defn ed-ev-lsp-capabilities (m input textrows cols rows)
   "A connected server reporting what it can do (`[:lsp-capabilities caps conn]`), kept on
@@ -249,8 +247,10 @@ Worth keeping for one reason: it is the difference between \"this server does no
 that\" and a command that appears to do nothing. Expert advertises code actions, hover,
 definition and references and does NOT advertise signature help — so the argument hints
 are silent in Elixir and loud in Rust, and only its own answer here can say which."
-  (let (key (ed-lsp-key-of m (nth input 2 nil)))
-    (if (nil? key) m (assoc-in m [:lsp-servers key :caps] (nth input 1 {})))))
+  (let (conn (nth input 2 nil))
+    (if (contains? (or (:lsp-servers m) {}) conn)
+      (assoc-in m [:lsp-servers conn :caps] (nth input 1 {}))
+      m)))
 
 (defn ed-ev-lsp-apply-edit (m input textrows cols rows)
   "A server asking to change files itself (`[:lsp-apply-edit wsedit]`) — what a code
@@ -584,10 +584,13 @@ your cursor not existing."
             diags-of (fn (entry)
                        (lsp/lsp-diagnostics-at-line (ed-lsp-raw-diags m2 file (:key entry))
                          (:line cx)))
+            ;; …else the first that offers them, else the main server: one that
+            ;; under-advertises (or has not finished starting) may answer anyway, or say no
             entry (or (seq/find offering (fn (entry) (not (empty? (diags-of entry)))))
-                    (first offering)))
+                    (first offering)
+                    (ed-lsp-for m2 :codeActionProvider)))
         (if (nil? entry)
-          (message m2 "lsp: no server here offers code actions")
+          (message m2 "lsp: no server is running for this buffer")
           (ed-lsp-ask-server m2
             (:conn entry)
             (lsp-code-actions)
@@ -702,24 +705,25 @@ applies the edits to every affected file (left modified for you to save)."
                             (ed-lsp-do-rename mm new-name)))}))))
 
 ;; ---- the connections: every server a file's type names, rooted where it says --------
-;; `:lsp-servers` on the model is `{[name root] entry}`, an entry `{:spec :roots :conn :caps
-;; :identity :command}` ([[lsp/lsp-server-entries]]). A file reaches every server its
-;; extension names (`lsp/*lsp-server-specs*`), each rooted at the nearest folder holding
-;; that server's root marker, so a `.py` buffer has pyright and ruff and a cargo workspace
-;; member has the workspace's rust-analyzer. wos kernel source, which no server serves,
-;; reaches none. A server that serves several projects (`:shared`) gets each further project
-;; as a workspace folder rather than another process — only when it says it takes them, and
-;; only for projects that pin the same toolchain ([[ed-lsp-identity]]).
+;; `:lsp-servers` on the model is `{conn entry}`, an entry `{:spec :roots :conn :caps
+;; :identity :command}` filed under its connection ([[lsp/lsp-server-entries]]): one
+;; process, one entry, whichever projects it comes to serve. A file reaches every server its
+;; extension names (`lsp/*lsp-server-specs*`), each rooted at the nearest folder holding that
+;; server's root marker, so a `.py` buffer has pyright and ruff and a cargo workspace member
+;; has the workspace's rust-analyzer. wos kernel source, which no server serves, reaches
+;; none. A server that serves several projects (`:shared`) gets each further project as a
+;; workspace folder rather than another process — only when it says it takes them, and only
+;; for projects that pin the same toolchain ([[ed-lsp-identity]]).
 
 (defn ed-lsp-server (m)
   "The main server entry for the current buffer's file (`{:key :conn :caps …}`), or nil."
   (lsp/lsp-server-entry m (buffer-file (ed-current-buf m))))
 
 (defn ed-lsp-live (m)
-  "The current buffer's main LSP connection while its process is still alive, else nil. A
-server that died — or never started — leaves a pid on the model that every later request
-sends into the void and then waits out its timeout, so liveness is asked here rather than
-in every request site."
+  "The current buffer's first live LSP connection — the main server's while it runs — else
+nil. A server that died leaves a pid on the model that every later request would send into
+the void and then wait out its timeout, so liveness is asked here rather than in every
+request site."
   (lsp/lsp-conn m (buffer-file (ed-current-buf m))))
 
 (defn ed-lsp-for (m feature)
@@ -746,6 +750,15 @@ asked for `feature` when given, else the main one; `{}` before it has said, or w
     ".mise.toml" "mise.toml" "rust-toolchain.toml" "rust-toolchain" ".ruby-version"
     ".python-version" ".nvmrc" ".node-version" ".go-version"])
 
+(defn- ed-lsp-home ()
+  "The home folder without a trailing `/`, so it compares equal to a folder walked up to;
+nil when `HOME` is unset."
+  (let (home (os/env "HOME"))
+    (cond
+      (or (nil? home) (= home "") (= home "/")) nil
+      (string/ends-with? home "/") (string/substring home 0 (dec (string/length home)))
+      :else home)))
+
 (defn ed-lsp-find-up (dir name stop &optional (depth *lsp-root-depth*))
   "The nearest folder from `dir` up that holds `name`, or nil — stopping before `stop` (a
 folder, or nil for none) and after `depth` levels."
@@ -757,19 +770,20 @@ folder, or nil for none) and after `depth` levels."
 
 (sig ed-lsp-root (map string -> string))
 (defn ed-lsp-root (spec file)
-  "The folder the server `spec` starts in for `file`: the nearest one holding its first root
-marker that any folder above the file holds (`Cargo.lock` before `Cargo.toml`, so a cargo
-workspace member gets the workspace) — else the file's project root, else its own folder."
+  "The folder the server `spec` starts in for `file`: the nearest one holding its FIRST root
+marker that any folder above the file holds — markers are tried in order, each up the whole
+tree, so `Cargo.lock` (a cargo workspace's top) wins over a nearer member's `Cargo.toml`,
+and a monorepo's `tsconfig.json` over a package's `package.json`. Never the home folder or
+above: a stray `~/package.json` is no project. Else the file's project root, else its own
+folder."
   (let (dir (path/dirname file)
+        home (ed-lsp-home)
         found (fold (or (:root-markers spec) [])
                 nil
-                (fn (hit marker)
-                  ;; never the home folder or above: a stray `~/package.json` is no project
-                  (or hit (ed-lsp-find-up dir marker (os/env "HOME"))))))
-    (cond
-      (string? found) found
-      (string? (project-root dir)) (project-root dir)
-      :else dir)))
+                (fn (hit marker) (or hit (ed-lsp-find-up dir marker home)))))
+    (if (string? found)
+      found
+      (let (project (project-root dir)) (if (string? project) project dir)))))
 
 (defn ed-lsp-pins (root)
   "What pins `root`'s toolchain: each `*lsp-toolchain-pins*` file found from `root` up,
@@ -792,7 +806,9 @@ mapped to its text (the nearest one, which is the one the version manager reads)
 
 (defn ed-lsp-share-host (m spec identity)
   "A running server of `spec` that can take another project with this `identity`: alive,
-started for a project pinned the same way, and saying it takes workspace folders."
+started for a project pinned the same way, and saying it takes workspace folders. Only one
+whose capabilities have arrived can say so, so two projects opened while the first server
+is still starting each get their own."
   (seq/find (vals (or (:lsp-servers m) {}))
     (fn (entry)
       (and (= (:spec entry) (:name spec))
@@ -802,37 +818,63 @@ started for a project pinned the same way, and saying it takes workspace folders
 
 ;; ---- filing servers on the model ----
 
-(defn ed-lsp-attach (m key entry)
-  "`m` with server `entry` filed under `key` (`[name root]`) — and every document recorded
-as pushed under that key forgotten, because a new server holds none of them, so nothing
-pushed before is a base."
-  (assoc m
-    :lsp-servers (assoc (or (:lsp-servers m) {}) key entry)
-    :lsp-synced
-      (fold (keys (or (:lsp-synced m) {}))
-        (or (:lsp-synced m) {})
-        (fn (synced pushed) (if (= (first pushed) key) (dissoc synced pushed) synced)))))
+(defn- ed-lsp-drop-diags (m conn keep?)
+  "`m` without what server `conn` published about the paths `keep?` rejects, each such path
+shown again without it, so its marks leave the screen with the server."
+  (let (diags (or (:lsp-diags m) {})
+        gone (seq/filter (keys diags)
+               (fn (path) (and (contains? (get diags path) conn) (not (keep? path))))))
+    (fold gone
+      m
+      (fn (acc path)
+        (let (left (dissoc (get-in acc [:lsp-diags path]) conn))
+          (ed-lsp-show-diags (assoc acc
+                               :lsp-diags
+                                 (if (empty? left)
+                                   (dissoc (:lsp-diags acc) path)
+                                   (assoc (:lsp-diags acc) path left)))
+            path))))))
 
-(defn ed-lsp-detach (m key)
-  "`m` without the server under `key`, and without what it published."
-  (assoc m
-    :lsp-servers (dissoc (or (:lsp-servers m) {}) key)
-    :lsp-diags
-      (fold (keys (or (:lsp-diags m) {}))
-        (or (:lsp-diags m) {})
-        (fn (diags path) (assoc diags path (dissoc (get diags path) key))))))
+(defn- ed-lsp-drop-synced (m conn keep?)
+  "`m` without the record of what was pushed to server `conn` for the uris `keep?` rejects."
+  (let (synced (or (:lsp-synced m) {}))
+    (assoc m
+      :lsp-synced
+        (fold (keys synced)
+          synced
+          (fn (acc pushed)
+            (if (and (= (first pushed) conn) (not (keep? (second pushed)))) (dissoc acc pushed) acc))))))
+
+(defn ed-lsp-attach (m entry)
+  "`m` with server `entry` filed under its connection — and anything recorded as pushed to
+that connection forgotten, so nothing pushed before is a base."
+  (ed-lsp-drop-synced (assoc-in m [:lsp-servers (:conn entry)] entry)
+    (:conn entry)
+    (fn (_) false)))
+
+(defn ed-lsp-detach (m conn)
+  "`m` without the server `conn`: its entry, what it was sent, and what it published (taken
+off the screen)."
+  (-> (assoc m :lsp-servers (dissoc (or (:lsp-servers m) {}) conn))
+    (ed-lsp-drop-synced conn (fn (_) false))
+    (ed-lsp-drop-diags conn (fn (_) false))))
 
 (defn ed-lsp-release (m entry file)
   "Stop serving `file`'s project with `entry`'s server: a server serving several projects
-drops that one (`workspace/didChangeWorkspaceFolders`) and keeps the rest; one serving only
-it is shut down."
-  (let (root (lsp/lsp-entry-root entry file)
-        roots (seq/reject (:roots entry) (fn (r) (= r root))))
-    (if (empty? roots)
-      (do (lsp/lsp-shutdown (:conn entry)) (ed-lsp-detach m (:key entry)))
+drops that one (`workspace/didChangeWorkspaceFolders`), with what it was sent and published
+about it, and keeps the rest; one serving only it, or one already dead, is shut down and
+detached whole."
+  (let (conn (:conn entry)
+        root (lsp/lsp-entry-root entry file)
+        roots (into [] (seq/reject (:roots entry) (fn (r) (= r root))))
+        outside? (fn (path) (not (lsp/lsp-under? path root))))
+    (if (or (empty? roots) (not (proc/alive? conn)))
+      (do (lsp/lsp-shutdown conn) (ed-lsp-detach m conn))
       (do
-        (lsp/lsp-remove-folder (:conn entry) root)
-        (assoc-in m [:lsp-servers (:key entry) :roots] (into [] roots))))))
+        (lsp/lsp-remove-folder conn root)
+        (-> (assoc-in m [:lsp-servers conn :roots] roots)
+          (ed-lsp-drop-synced conn (fn (uri) (outside? (lsp/lsp-uri->path uri))))
+          (ed-lsp-drop-diags conn outside?))))))
 
 (defn ed-lsp-start-spec (m spec file root)
   "Start server `spec` for `file`'s project `root` — or, for a shared server, hand `root` to
@@ -847,18 +889,19 @@ serving the file and what to say about it, or a nil conn and why not."
             identity (when (:shared spec) (ed-lsp-identity command root))
             host (when identity (ed-lsp-share-host m spec identity)))
         ;; …and the completion source, with the sync that lets its request carry no text:
-        ;; run before the sources are asked, as the edits since the last push
+        ;; run before the sources are asked, as the edits since the last push. Registering
+        ;; is idempotent, and here rather than at load so a session with no server never
+        ;; asks one on Tab.
         (complete-at-point/complete-add-source! 'lsp/lsp-complete-source)
         (complete-at-point/complete-add-prepare! 'lsp-commands/ed-lsp-push-text)
         (if host
-          (let (key (ed-lsp-key-of m (:conn host)))
+          (do
             (lsp/lsp-add-folder (:conn host) root)
-            [(assoc-in m [:lsp-servers key :roots] (conj (:roots host) root))
+            [(assoc-in m [:lsp-servers (:conn host) :roots] (conj (:roots host) root))
               (:conn host)
               (str command " now serves " root " too")])
           (let (conn (lsp/lsp-connect command args (lsp/lsp-path->uri root)))
             [(ed-lsp-attach m
-               [(:name spec) root]
                {:spec (:name spec)
                 :roots [root]
                 :conn conn
@@ -891,6 +934,7 @@ connection PROCESS, and that answered a goto-definition with a crash trace."
       (nil? file) [(message m "lsp: the buffer has no file") nil]
       (empty? (lsp/lsp-specs-for file))
         [(message m (str "lsp: no server configured for ." (lsp/lsp-extension file))) nil]
+      (empty? specs) [m (lsp/lsp-conn m file)]
       :else
         (let ([m2 lines] (fold specs
                            [m []]
@@ -903,11 +947,11 @@ connection PROCESS, and that answered a goto-definition with a crash trace."
           [(message m2 (str "lsp: " (string/join lines " · "))) (lsp/lsp-conn m2 file)]))))
 
 (defn- ed-lsp-drop-dead (m)
-  "`m` without the current buffer's server entries whose process is gone — a dead pid is
-not a connection, and keeping it would make every lookup report one."
+  "`m` without the current buffer's servers whose process is gone — a dead pid is not a
+connection, and keeping it would make every lookup report one."
   (fold (lsp/lsp-server-entries m (buffer-file (ed-current-buf m)))
     m
-    (fn (acc entry) (if (proc/alive? (:conn entry)) acc (ed-lsp-detach acc (:key entry))))))
+    (fn (acc entry) (if (proc/alive? (:conn entry)) acc (ed-lsp-detach acc (:conn entry))))))
 
 (defcommand cmd-lsp-connect
   (m key)
@@ -942,15 +986,16 @@ source stays registered and asks nothing for a file with no server."
   "The running servers in one line — `*brood-lsp ~/src/bedit · rust-analyzer ~/src/a,
 ~/src/b` — the current buffer's marked `*`, a dead one `(exited)`; `\"\"` when none."
   (let (mine (map (lsp/lsp-server-entries m (buffer-file (ed-current-buf m)))
-               (fn (entry) (:key entry)))
-        home (os/env "HOME")
+               (fn (entry) (:conn entry)))
+        home (ed-lsp-home)
         shown (fn (root)
                 (if (and home (lsp/lsp-under? root home))
                   (str "~" (string/substring root (string/length home)))
                   root)))
-    (string/join (map (sort-by (%map-pairs (or (:lsp-servers m) {})) (fn ([key _]) key))
-                   (fn ([key entry])
-                     (str (if (includes? mine key) "*" "")
+    (string/join (map (sort-by (vals (or (:lsp-servers m) {}))
+                        (fn (entry) (str (:spec entry) " " (first (:roots entry)))))
+                   (fn (entry)
+                     (str (if (includes? mine (:conn entry)) "*" "")
                        (or (:command entry) (:spec entry))
                        " "
                        (string/join (map (:roots entry) shown) ", ")
@@ -977,6 +1022,21 @@ uses, marked `*` (M-x lsp-servers — eglot's `eglot-list-connections`)."
 ;; project before it answers anything, which is a real cost to pay unasked. The name is
 ;; bare, not `commands/…`: an earmuffed `defdyn` is ambient however deep the module.
 
+(defn ed-lsp-close-gone (m)
+  "`m` with every document pushed to a server whose buffer is no longer open closed on that
+server (`didClose`) and forgotten — the record holds a whole buffer per document, which a
+killed buffer would otherwise keep for the session, and the server keeps analysing a file
+it was never told was closed."
+  (let (open (into #{} (seq/keep (:buffers m) (fn (buf) (lsp/lsp-path->uri (buffer-file buf)))))
+        synced (or (:lsp-synced m) {})
+        gone (seq/reject (keys synced) (fn (pushed) (contains? open (second pushed)))))
+    (if (empty? gone)
+      m
+      (do
+        (doseq (pushed gone)
+          (when (proc/alive? (first pushed)) (lsp/lsp-close (first pushed) (second pushed))))
+        (assoc m :lsp-synced (fold gone synced dissoc))))))
+
 (defn ed-lsp-push-text (m)
   "Tell each live server of the current buffer its text, once it has changed since the last
 push — the idle beat's hook, beside the autostart.
@@ -994,14 +1054,18 @@ EDITS since the last push when the server accepts ranged changes
 (`lsp/lsp-incremental-sync?`): a full-text `didChange` is the whole document JSON-encoded
 on the wire (341 ms for a 44k-line buffer) and re-read by the server, where a keystroke is
 one small range. What was pushed is recorded per server and file under `:lsp-synced` —
-`{[key uri] {:buf :token}}`, the buffer the server now mirrors and the token naming it — which is the base the
-next push diffs against (`lsp/lsp-content-changes`) and that the connection checks before
+`{[conn uri] {:buf :token}}`, the buffer the server now mirrors and the token naming it —
+which is the base the next push diffs against (`lsp/lsp-content-changes`) and that the connection checks before
 applying it (`lsp/lsp-sync-document`). The whole text goes instead for the first push, a
 server that wants it, and a change the buffer's splice log cannot account for.
 
+A file whose buffer is gone is closed on each server that had it (`didClose`) and
+forgotten ([[ed-lsp-close-gone]]), so neither the server nor this record keeps it.
+
 Also completion's prepare step (`complete-at-point/*completion-prepare*`) and the first
 thing every lookup does ([[ed-lsp-ask-server]]), so the request after it carries no text."
-  (let (buf (ed-current-buf m)
+  (let (m (ed-lsp-close-gone m)
+        buf (ed-current-buf m)
         file (buffer-file buf)
         uri (when file (lsp/lsp-path->uri file)))
     ;; THIS buffer's servers, never another language's: a file no server is configured for
@@ -1009,7 +1073,7 @@ thing every lookup does ([[ed-lsp-ask-server]]), so the request after it carries
     (fold (if (nil? file) [] (lsp/lsp-live-entries m file))
       m
       (fn (acc entry)
-        (let (pushed [(:key entry) uri]
+        (let (pushed [(:conn entry) uri]
               synced (get-in acc [:lsp-synced pushed]))
           (if (and synced (= (buffer-rope buf) (buffer-rope (:buf synced))))
             acc
@@ -1029,8 +1093,7 @@ thing every lookup does ([[ed-lsp-ask-server]]), so the request after it carries
 is not the one the change was made against (a new connection, a full sync a direct request
 made meanwhile). Forgetting what was pushed to that server for that uri makes the next push
 send the whole text, which puts the two back in step."
-  (let (key (ed-lsp-key-of m (nth input 2 nil)))
-    (if (nil? key) m (assoc m :lsp-synced (dissoc (:lsp-synced m {}) [key (nth input 1)])))))
+  (assoc m :lsp-synced (dissoc (:lsp-synced m {}) [(nth input 2 nil) (nth input 1)])))
 
 (defn- ed-lsp-autostart-spec (m spec file)
   "Autostart's step for one of the file's servers: nothing when one is serving it; said once
@@ -1042,9 +1105,10 @@ search run once, not on every idle beat."
         folder [(:name spec) (path/dirname file)])
     (cond
       (and entry (proc/alive? (:conn entry))) m
-      ;; a connection this editor made for this file, whose process is gone
+      ;; a connection this editor made, whose process is gone: detached WHOLE — a shared
+      ;; server serves every one of its projects with the same dead process
       entry
-        (message (tried (ed-lsp-release m entry file) folder)
+        (message (tried (ed-lsp-detach m (:conn entry)) folder)
           (str "lsp: "
             (or (:command entry) (:spec entry))
             " exited (M-x lsp-connect to start it again)"))

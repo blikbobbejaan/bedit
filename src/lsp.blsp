@@ -20,9 +20,9 @@ correlation, completion-result shapes — is **pure** (`lsp-ingest`,
 without a server (tests/lsp_test.blsp); the connection process is a thin IO shell
 around it.
 
-Opt-in: no server runs until something calls `lsp-connect` and files the pid on the
-model under `:lsp-servers` — one per language and project root (`lsp-server-entry`). Enable per language by adding
-`'lsp/lsp-complete-source` to `complete-at-point/*completion-sources*`.
+No server runs until the editor starts one (`lsp-commands/ed-lsp-start`, or the idle beat's
+autostart) and files it on the model under `:lsp-servers`, keyed by its connection
+([[lsp-server-entries]]); starting one registers [[lsp-complete-source]] with completion.
 
 Framing is std's `jsonrpc`, which is **byte-accurate**: `Content-Length` is LSP's byte
 count, and bodies are cut by UTF-8 byte offset, so multi-byte content — which
@@ -406,7 +406,7 @@ shapes; `{}` when nil."
       (cond
         changes
         ;; JSON object keys parse to keywords, so a `:changes` uri arrives as `:file:///a`,
-        ;; not a string — coerce back with `name` before stripping the scheme.
+        ;; not a string — coerce back with `->string` before stripping the scheme.
           (reduce (keys changes)
             {}
             (fn (acc uri)
@@ -432,6 +432,15 @@ shapes; `{}` when nil."
 (defn- lsp-did-open (uri lang text)
   (jsonrpc/notification "textDocument/didOpen"
     {:textDocument {:uri uri :languageId lang :version 1 :text text}}))
+
+(defn lsp-close-document (state uri)
+  "Pure: the server stops being told about `uri` (its buffer is gone, or its project left
+the server): `didClose` when it was opened, and the uri forgotten, so a later sync opens it
+afresh. `[state' frames]`."
+  (if (get (:opened state) uri)
+    [(assoc state :opened (dissoc (:opened state) uri) :tokens (dissoc (or (:tokens state) {}) uri))
+      [(jsonrpc/notification "textDocument/didClose" {:textDocument {:uri uri}})]]
+    [state []]))
 
 (defn- lsp-did-change (uri version changes)
   ;; `changes` is the `contentChanges` vector: one `{:text}` for the whole document, or
@@ -635,8 +644,8 @@ signature, code actions, commands, formatting, rename. Returns `[state' frames]`
 (defn- lsp-shape (kind result)
   "The `[reply-tag value]` for a response of the given request `kind` (an `LspRequest`
 record — `lsp-request-shape`), shaping the raw `result` into what the waiting command
-wants. Completion is the fallback for an untagged (2-element) pending entry."
-  (lsp-request-shape (or kind (lsp-completion)) result))
+wants."
+  (lsp-request-shape kind result))
 
 (def *lsp-message-levels*
   ;; LSP's `MessageType`, the `type` of a `window/logMessage` or `window/showMessage`.
@@ -790,7 +799,7 @@ and a server busy indexing refuses those by the dozen. The waiting command still
 reply — an empty result, so a lookup the reader DID ask for says `no definition found` in
 its own voice — and the server's reason is kept here, where someone debugging it can read
 it, instead of nowhere."
-  (let (method (lsp-request-method (or kind (lsp-completion)))
+  (let (method (lsp-request-method kind)
         text (str method " failed: " (or (:message error) "") " (code " (:code error) ")"))
     {:channel :log :level "error" :text text :line (lsp-notice-line text)}))
 
@@ -860,7 +869,7 @@ server just as well as agreement would."
       else
         (let (reply-to (first entry)
               corr (second entry)
-              kind (when (>= (count entry) 3) (nth entry 2))
+              kind (nth entry 2)
               [tag value] (lsp-shape kind (:result msg))
               ;; an error response still answers its waiter (as an empty result); the
               ;; server's reason goes to the log, not the echo area ([[lsp-error-notice]])
@@ -956,14 +965,13 @@ server; `:shutdown` or the server dying stops it."
     ;; sent one while you typed. The symptom was exact — imenu worked, because asking for
     ;; symbols synced the text on the way past, and then the findings arrived for that one
     ;; version and never again.
-    ;; `sync` is a bare string (the whole text, from a caller that tracks no tokens) or the
-    ;; `{:text|:changes …}` map [[lsp-sync-document]] takes
-    ([:sync uri lang sync] (let ([st2 frames] (lsp-sync-document state
-                                                uri
-                                                lang
-                                                (if (string? sync) {:text sync :token nil} sync)))
+    ;; `sync` is the `{:text|:changes …}` map [[lsp-sync-document]] takes
+    ([:sync uri lang sync] (let ([st2 frames] (lsp-sync-document state uri lang sync))
                              (lsp-send-all (:proc st2) frames)
                              (lsp-loop (lsp-drain st2 (list)))))
+    ([:close uri] (let ([st2 frames] (lsp-close-document state uri))
+                    (lsp-send-all (:proc st2) frames)
+                    (lsp-loop st2)))
     ;; a project joining or leaving a server that serves several (`lsp-add-folder`)
     ([:folders added removed] (do
                                 (lsp-send-all (:proc state)
@@ -1087,6 +1095,10 @@ explicit trigger, not per keystroke."
                       corr)))))
     (lsp-complete-collect corrs (+ (os/now) timeout) {:labels '() :incomplete false})))
 
+(defn lsp-close (conn uri)
+  "Tell a running server the document `uri` is closed (`textDocument/didClose`)."
+  (send conn [:close uri]))
+
 (defn lsp-add-folder (conn root)
   "Tell a running server it serves project `root` too (`workspace/didChangeWorkspaceFolders`)."
   (send conn [:folders [root] []]))
@@ -1104,8 +1116,8 @@ explicit trigger, not per keystroke."
 ;; modal UX — see `lsp-complete-all`).
 
 (defn lsp-sync (conn uri lang sync)
-  "Tell the server the document changed, asking nothing in return. `sync` is the whole
-text (a string), or the `{:text|:changes :base :token}` map [[lsp-sync-document]] takes —
+  "Tell the server the document changed, asking nothing in return. `sync` is the
+`{:text|:changes :base :token}` map [[lsp-sync-document]] takes —
 the editor sends the edits since its last sync when the server accepts them
 (`lsp-commands/ed-lsp-push-text`).
 
@@ -1212,10 +1224,10 @@ no file: a `.py` file has `python` and the `ruff` add-on."
   (seq/find *lsp-server-specs* (fn (spec) (= (:name spec) name))))
 
 ;; ---- which running servers a file belongs to ---------------------------------
-;; The model keeps every server it started, `:lsp-servers` — `{key entry}`, an entry
-;; `{:spec name :roots [root …] :conn pid :caps map :identity …}` and its key `[name root]`,
-;; the root it was started for. A server that serves several projects (`:shared`) has
-;; several roots. A file belongs to every entry whose spec serves its extension and one of
+;; The model keeps every server it started, `:lsp-servers` — `{conn entry}`, an entry
+;; `{:spec name :roots [root …] :conn pid :caps map :identity … :command}` filed under its
+;; connection: one process, one entry, whatever projects it comes to serve. A server that
+;; serves several projects (`:shared`) has several roots. A file belongs to every entry whose spec serves its extension and one of
 ;; whose roots holds it.
 ;;
 ;; There used to be ONE connection, `:lsp`, and every buffer with a file was pushed to it:
@@ -1235,7 +1247,8 @@ hold `/p/crate2/x`. False for a buffer with no file."
   (last (sort-by (seq/filter (:roots entry) (fn (root) (lsp-under? file root))) string/length)))
 
 (defn lsp-server-entries (m file)
-  "Every running server on model `m` that serves `file`, as entries carrying their `:key`,
+  "Every running server on model `m` that serves `file`, as entries carrying their `:key`
+(the connection they are filed under),
 main server first (`lsp-specs-for`'s order): per spec, the entry whose root holding the file
 is deepest. Asks no disk and no process, so it is cheap enough for every frame; whether a
 connection is still alive is `lsp-live-entries`' question."
