@@ -62,7 +62,7 @@ CI has not been checked for any of it.
 2. The two LSP limits are built (see Done): a merged-away server's lookups are re-asked of
    the host (`ed-lsp-reroute-pending`; dropped only when the text moved), and a file's
    project root is learnt per folder (`:lsp-roots`, `ed-lsp-learn-roots`) so a nested
-   project starts its own server. Their tests are in `tests/lsp_test.blsp`; check CI.
+   project starts its own server. Tests in `tests/lsp_test.blsp`; CI green at `7bdec657`, brood green at `ebe8b906`.
 
 ## Decisions
 
