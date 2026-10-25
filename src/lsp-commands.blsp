@@ -126,9 +126,16 @@ to `conn` (`lsp/lsp-ask-async`), the reply coming back to this loop. `request` i
 
 A request about the document (one with a `:uri`) syncs it first ([[ed-lsp-push-text]]):
 the server must answer about the text on screen, and pushing it here — as the edits since
-the last push, recorded on the model — is what lets the request itself carry no text."
+the last push, recorded on the model — is what lets the request itself carry no text.
+
+The pending lookup remembers `conn`, so a server that dies takes its unanswered lookups with
+it ([[ed-lsp-server-down]]) instead of leaving them until C-g."
   (let (m (if (contains? request :uri) (ed-lsp-push-text m) m))
-    (ed-lsp-ask m kind (fn (corr) (lsp/lsp-ask-async conn kind corr (self) request)) extra note)))
+    (ed-lsp-ask m
+      kind
+      (fn (corr) (lsp/lsp-ask-async conn kind corr (self) request))
+      (assoc (or extra {}) :conn conn)
+      note)))
 
 (defn ed-ev-lsp-reply (m input textrows cols rows)
   "An LSP reply landing on the loop (`[:lsp-definition corr locs]`, `[:lsp-hover corr
@@ -246,10 +253,13 @@ no longer filed (disconnected meanwhile) has nowhere to keep them, and they are 
 Worth keeping for one reason: it is the difference between \"this server does not offer
 that\" and a command that appears to do nothing. Expert advertises code actions, hover,
 definition and references and does NOT advertise signature help — so the argument hints
-are silent in Elixir and loud in Rust, and only its own answer here can say which."
+are silent in Elixir and loud in Rust, and only its own answer here can say which.
+
+Also the moment a shared server can say it takes more projects, so it is when two started
+together are folded into one ([[ed-lsp-merge-into-host]])."
   (let (conn (nth input 2 nil))
     (if (contains? (or (:lsp-servers m) {}) conn)
-      (assoc-in m [:lsp-servers conn :caps] (nth input 1 {}))
+      (ed-lsp-merge-into-host (assoc-in m [:lsp-servers conn :caps] (nth input 1 {})) conn)
       m)))
 
 (defn ed-ev-lsp-apply-edit (m input textrows cols rows)
@@ -804,14 +814,16 @@ mapped to its text (the nearest one, which is the one the version manager reads)
   "The first of `spec`'s `[command args]` alternatives that is installed, or nil."
   (seq/find (:commands spec) (fn (choice) (not (nil? (os/which (first choice)))))))
 
-(defn ed-lsp-share-host (m spec identity)
-  "A running server of `spec` that can take another project with this `identity`: alive,
-started for a project pinned the same way, and saying it takes workspace folders. Only one
-whose capabilities have arrived can say so, so two projects opened while the first server
-is still starting each get their own."
+(defn ed-lsp-share-host (m spec-name identity &optional (except nil))
+  "A running server named `spec-name` that can take another project with this `identity`
+(other than the connection `except`): alive, started for a project pinned the same way, and
+saying it takes workspace folders. Only one whose capabilities have arrived can say so, so
+two projects opened while the first server is still starting each get their own — until
+the second says it too, when [[ed-lsp-merge-into-host]] folds them into one."
   (seq/find (vals (or (:lsp-servers m) {}))
     (fn (entry)
-      (and (= (:spec entry) (:name spec))
+      (and (= (:spec entry) spec-name)
+        (not (= (:conn entry) except))
         (= (:identity entry) identity)
         (proc/alive? (:conn entry))
         (lsp/lsp-folders-supported? (:caps entry))))))
@@ -876,6 +888,58 @@ detached whole."
           (ed-lsp-drop-synced conn (fn (uri) (outside? (lsp/lsp-uri->path uri))))
           (ed-lsp-drop-diags conn outside?))))))
 
+(defn- ed-lsp-drop-pending (m conn)
+  "`[m2 dropped]`: `m` without the lookups waiting on server `conn`, and how many there were."
+  (let (pending (or (:lsp-pending m) {})
+        waiting (seq/filter (keys pending) (fn (corr) (= (:conn (get pending corr)) conn))))
+    [(assoc m :lsp-pending (fold waiting pending dissoc)) (count waiting)]))
+
+(defn ed-lsp-merge-into-host (m conn)
+  "Fold server `conn` into another running for a project pinned the same way, once both say
+they take workspace folders: `conn`'s projects become the other's folders and `conn` stops.
+Two projects opened while the first server was still starting each got a process of their
+own; this makes them one, and so does a project connected by hand beside a running one.
+`conn`'s documents go to the host on their next push (whole, as to any new server), its
+findings leave with it until the host publishes, and a lookup it had not answered is
+dropped — said, so it can be asked again. `m` unchanged when there is nothing to fold into."
+  (let (entry (get-in m [:lsp-servers conn])
+        host (when (and (:identity entry) (lsp/lsp-folders-supported? (:caps entry)))
+               (ed-lsp-share-host m (:spec entry) (:identity entry) conn)))
+    (if (nil? host)
+      m
+      (let ([m1 dropped] (ed-lsp-drop-pending m conn))
+        (doseq (root (:roots entry)) (lsp/lsp-add-folder (:conn host) root))
+        (lsp/lsp-shutdown conn)
+        (message (assoc-in (ed-lsp-detach m1 conn)
+                   [:lsp-servers (:conn host) :roots]
+                   (into [] (append (:roots host) (:roots entry))))
+          (str "lsp: one "
+            (:command host)
+            " now serves "
+            (string/join (:roots entry) ", ")
+            " too"
+            (if (> dropped 0) " — ask that again" "")))))))
+
+(defn ed-lsp-server-down (m pid reason)
+  "A server's connection died (`model/register-down-handler`): everything it left is cleared
+at once — its entry, what it was sent, its findings (off the screen), and the lookups waiting
+on it, which would otherwise sit until C-g — and said once. Its projects count as tried, so
+the idle beat does not respawn a server that cannot stay up; `M-x lsp-connect` is the retry.
+A server the editor stopped itself is already gone from the model, and passes silently."
+  (let (entry (get-in m [:lsp-servers pid]))
+    (if (nil? entry)
+      m
+      (let ([m1 dropped] (ed-lsp-drop-pending m pid)
+            tried (fold (:roots entry)
+                    (or (:lsp-autostarted m1) #{})
+                    (fn (acc root) (conj acc [(:spec entry) root]))))
+        (message (assoc (ed-lsp-detach m1 pid) :lsp-autostarted tried)
+          (str "lsp: "
+            (or (:command entry) (:spec entry))
+            " exited"
+            (if (> dropped 0) ", and the lookup it was answering with it" "")
+            " (M-x lsp-connect to start it again)"))))))
+
 (defn ed-lsp-start-spec (m spec file root)
   "Start server `spec` for `file`'s project `root` — or, for a shared server, hand `root` to
 one already serving a project pinned the same way. `[m2 conn line]`: the connection now
@@ -887,7 +951,7 @@ serving the file and what to say about it, or a nil conn and why not."
         (str (string/join (map (:commands spec) first) " / ") " is not installed (not on PATH)")]
       (let ([command args] choice
             identity (when (:shared spec) (ed-lsp-identity command root))
-            host (when identity (ed-lsp-share-host m spec identity)))
+            host (when identity (ed-lsp-share-host m (:name spec) identity)))
         ;; …and the completion source, with the sync that lets its request carry no text:
         ;; run before the sources are asked, as the edits since the last push. Registering
         ;; is idempotent, and here rather than at load so a session with no server never
@@ -901,6 +965,8 @@ serving the file and what to say about it, or a nil conn and why not."
               (:conn host)
               (str command " now serves " root " too")])
           (let (conn (lsp/lsp-connect command args (lsp/lsp-path->uri root)))
+            ;; watched, so its death reaches [[ed-lsp-server-down]] the moment it happens
+            (monitor conn)
             [(ed-lsp-attach m
                {:spec (:name spec)
                 :roots [root]
@@ -1105,13 +1171,9 @@ search run once, not on every idle beat."
         folder [(:name spec) (path/dirname file)])
     (cond
       (and entry (proc/alive? (:conn entry))) m
-      ;; a connection this editor made, whose process is gone: detached WHOLE — a shared
-      ;; server serves every one of its projects with the same dead process
-      entry
-        (message (tried (ed-lsp-detach m (:conn entry)) folder)
-          (str "lsp: "
-            (or (:command entry) (:spec entry))
-            " exited (M-x lsp-connect to start it again)"))
+      ;; a connection this editor made, whose process is gone and whose death has not been
+      ;; heard yet: cleared the way a heard one is
+      entry (tried (ed-lsp-server-down m (:conn entry) nil) folder)
       (contains? (:lsp-autostarted m #{}) folder) m
       :else
         (let (root (ed-lsp-root spec file)
@@ -1167,6 +1229,8 @@ with nothing typed. Now its death is said once, and `M-x lsp-connect` is the ret
 (register-event-handler :lsp-capabilities 'lsp-commands/ed-ev-lsp-capabilities)
 ;; …and a document whose incremental sync the connection had to refuse (see `ed-lsp-push-text`)
 (register-event-handler :lsp-resync 'lsp-commands/ed-ev-lsp-resync)
+;; …and a server dying, heard the moment it happens (see `ed-lsp-server-down`)
+(register-down-handler :lsp 'lsp-commands/ed-lsp-server-down)
 
 ;; The idle beat: connect once the buffer has settled, push the text (which is what makes
 ;; the server publish diagnostics), then ask for the signature at point. The push follows

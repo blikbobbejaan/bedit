@@ -92,7 +92,8 @@ src/main.blsp               entry point — window / daemon startup (--serve/--a
 src/model.blsp              the ui-run model: buffer pool, panes, kill ring, minibuffer, *Messages*,
                             the timers — and the REGISTRIES the rest plugs into: idle-beat jobs
                             (`register-idle-job`), off-loop task replies, inbound `[:tag …]`
-                            event handlers, feature timers. The core names no feature: a
+                            event handlers, feature timers, process deaths
+                            (`register-down-handler`). The core names no feature: a
                             module registers its rows when it loads
 src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
                             over the live keymap, `\[command]` substitution, docstrings
