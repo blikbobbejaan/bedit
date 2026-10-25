@@ -523,7 +523,7 @@ src/smerge.blsp             conflicts resolved IN the file, Emacs's smerge: C-c 
                             conflicts, u/l/a/b keep upper / lower / both / base
 src/diffhl.blsp             diff-hl change gutter: per-line added/modified/deleted against the
                             file's base text (std's `vcs/base-text`: git's HEAD, mur's last
-                            save), recomputed off the loop on the idle beat (and the blink tick);
+                            save), recomputed off the loop on the idle beat;
                             C-x v ] / [ walk its changes, whichever VCS drew them
 src/beam.blsp               the BEAM, from the editor. C-c b p processes · C-c b s the SUPERVISION
                             TREE (indented by depth, supervisors marked) · C-c b e ETS
