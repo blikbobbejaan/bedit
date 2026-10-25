@@ -6,9 +6,8 @@ in brood's `docs/devlog.md`; decisions in brood's `docs/decisions/`; the open ba
 
 ## State when written — 2026-10-25, evening
 
-Everything below is committed and pushed. **No test was run on this machine** (the user's
-rule, see Traps); only `nest check`, `nest format --check`, `cargo clippy` and `cargo fmt`.
-CI has not been checked for any of it.
+Everything below is committed and pushed. **No test was run on this machine** (the rule at the
+time; it now allows ordinary tests, see Traps); CI ran them, and both repos are green.
 
 ### Goal (the user's asks this session)
 
@@ -78,8 +77,8 @@ CI has not been checked for any of it.
 
 ## Traps
 
-- **Never run tests, benchmarks or programs on this desktop** (global CLAUDE.md). Build,
-  clippy and formatters are fine. Push brood with `--no-verify` (its pre-push hook runs tests).
+- **No benchmarks, stress runs or heavy brood suites on this desktop** (global CLAUDE.md);
+  bedit's `nest test` and a single brood test file are fine. Push brood with `--no-verify` (its pre-push hook runs tests).
 - Brood work goes in a worktree (`git worktree add ~/.cache/brood-wt-X origin/main -b X`,
   `ln -s ~/src/broodlang/brood/target …/target`, copy `config.mk`); other sessions use the
   primary checkout (it currently has another session's uncommitted edits — leave them).
