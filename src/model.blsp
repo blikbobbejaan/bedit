@@ -19,7 +19,7 @@ The model is a map threaded through the `ui-run` loop:
   :echo      the one-line echo area (the latest message, newlines flattened)
   :status    the mode-line message
   :done      set to quit; :timers the named timers (ADR-102: blink, debounce,
-             which-key, undo-pause, key-repeat); :blink-on? the caret on/off phase
+             which-key, undo-pause, scroll glide); :blink-on? the caret on/off phase
 
 The whole loop runs in one process, so buffers live in the model directly. `message`
 is the editor's echo primitive — like Emacs `message`, it writes to *both* the
@@ -60,16 +60,16 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 ;; this is the delay you feel narrowing a big list), the diff-hl launch, and the web-mirror
 ;; push. Kept short so narrowing/eldoc feel responsive; the type-check and diff it also
 ;; fires are async (spawned tasks) and rope-gated, so a short beat doesn't thrash them.
-;; While a key is held, the idle one-shots wait for its release (`:held-key`), so the
-;; desktop's auto-repeat never runs the beat between repeats.
+;; Every one-shot is `:idle?`, so each auto-repeat of a held key pushes it back: the
+;; desktop's repeat (tens of ms apart) never runs the beat between repeats.
 
 (def *which-key-delay-ms* 500)
 ;; How long a prefix chord (e.g. C-x) must sit pending before the which-key panel
 ;; appears (Emacs `which-key-idle-delay`), so a fast chord like C-x C-f doesn't flash
-;; it. Armed when a prefix is pending; the idle `:tick` that follows reveals the panel.
+;; it. Armed when a prefix is pending; the `:which-key` timer that follows reveals the panel.
 
 (defdyn *undo-pause-ms* 600)
-;; After a typing/deletion command, a `:tick` this long later closes the undo run (sets
+;; After a typing/deletion command, a quiet this long closes the undo run (sets
 ;; :undo-break, so the next edit starts a fresh undo group — the Emacs `undo-boundary`
 ;; on a typing pause). Without it, a plain buffer with no eldoc/diagnostics debounce
 ;; would never tick mid-session and the whole burst would amalgamate into one undo step.
@@ -611,7 +611,7 @@ feature's module loads; re-registering a tag replaces its handler."
 ;; name none of them, and a deferred module's job simply is not a job until it has loaded
 ;; (what the `bound?` guards used to say one call at a time).
 ;;
-;; A row is `{:order :run :stale? :held-key-gated? :on-blink?}`:
+;; A row is `{:order :run :stale?}`:
 ;;   :order   the position in the chain. ORDER MATTERS — a job sees the model every earlier
 ;;            one left: the LSP push must follow the autostart that connects it, the
 ;;            signature ask follows eldoc (which owns the slot when the mode answers), and
@@ -622,17 +622,9 @@ feature's module loads; re-registering a tag replaces its handler."
 ;;            gates itself on its own staleness and in-flight handle).
 ;;   :stale?  optional `(model) -> bool` symbol — whether this job's work is pending, which
 ;;            is what ARMS the beat. A job without one rides a beat something else armed.
-;;   :held-key-gated?  true when a held (auto-repeating) key suppresses the arming: eldoc,
-;;            the check, the completion work are point/typing-driven and should not
-;;            recompute on every repeat. The diff-hl gutter and the web mirror are NOT
-;;            gated: a missed key-up can leave `:held-key` stuck, which would otherwise
-;;            suppress the beat forever and freeze them (the `:idle?` deadline still
-;;            debounces — a repeating key resets the countdown).
-;;   :on-blink?  also run on the `:cursor-blink` tick — the diff gutter's second, ungated
-;;            trigger, so a stuck `:held-key` can never freeze it.
 
 (defn register-idle-job (name job)
-  "Add an idle-beat job `name` — `{:order :run :stale? :held-key-gated? :on-blink?}`, the
+  "Add an idle-beat job `name` — `{:order :run :stale?}`, the
 hooks as symbols (resolved late, so a redefinition hot-swaps; see the comment above) —
 replacing any job already registered under `name`. Called when the job's module loads."
   (registry/put! :model/idle-jobs name (assoc job :name name :rank (:order job))))
@@ -641,17 +633,14 @@ replacing any job already registered under `name`. Called when the job's module 
   "The registered idle jobs, in `:order` — the order the beat runs them in."
   (map (registry/ranked :model/idle-jobs) second))
 
-(defn ed-idle-due? (m held)
+(defn ed-idle-due? (m)
   "Whether some idle job has work pending — i.e. the `:idle-recompute` beat should be armed.
-A `:held-key-gated?` job is not asked while a key is `held`; a job whose module has not
-loaded is never due. Asked after every event, and order does not matter to an `any?`, so it
+A job whose module has not loaded is never due. Asked after every event, and order does not matter to an `any?`, so it
 reads the table unsorted."
   (any? (vals (registry/entries :model/idle-jobs))
     (fn (job)
       (let (stale (:stale? job))
-        (and (not (nil? stale))
-          (not (and held (:held-key-gated? job)))
-          (ed-call-deferred m stale false))))))
+        (and (not (nil? stale)) (ed-call-deferred m stale false))))))
 
 (defn ed-run-idle-jobs (m)
   "The `:idle-recompute` beat: every registered job's `:run`, in `:order`, each seeing the
@@ -683,12 +672,6 @@ slices as within one."
                       else (step (ed-call-deferred acc (:run (nth jobs i)) acc) (inc i)))))
       (step m from))))
 
-(defn ed-run-blink-jobs (m)
-  "The jobs that also ride the `:cursor-blink` tick (`:on-blink?`), in `:order`."
-  (fold (ed-idle-jobs)
-    m
-    (fn (acc job) (if (:on-blink? job) (ed-call-deferred acc (:run job) acc) acc))))
-
 (defn ed-activity (m)
   "The labels of every announced job currently in flight — what the activity indicator
 shows. `()` when the editor is idle or only doing its own upkeep."
@@ -703,7 +686,8 @@ shows. `()` when the editor is idle or only doing its own upkeep."
 ;; `ed-sync-timers` reconciles `:timers` with the model state after each event (the
 ;; declarative replacement for the old "shorten :tick-ms" arming cascade); the per-timer
 ;; firing is dispatched in `input/ed-timer-fire`. `ed-set-timer`/`ed-drop-timer` are the
-;; imperative pair for key-repeat (which transitions delay→rate as it fires).
+;; imperative pair, for a timer whose arming is not a function of the model (the idle
+;; beat's continuation, `:idle-continue`).
 
 (sig ed-set-timer (model keyword map -> model))
 (defn ed-set-timer (m name spec)
@@ -718,11 +702,10 @@ map, optionally `:idle? true`). See ADR-102."
 
 (defn ed-real-input? (input)
   "True if `input` is direct user input — a key or a mouse event — as opposed to a timer
-firing (`[:timer …]`), a `:tick`/`:blur`, or an async system event (`[:task-done …]` …).
+firing (`[:timer …]`), a focus change, or an async system event (`[:task-done …]` …).
 Used to keep the caret solid while you actively type/click: the blink resets on real
 input, then the idle `:cursor-blink` timer takes over once you stop."
   (cond
-    (= input :tick) false
     (= input :blur) false
     (= input :focus-in) false
     (record? input) false ; a UiEvent record — async, never a keystroke (a 30ms spy
@@ -821,32 +804,29 @@ debounce, since a note is stored with the line it sits on and the whole set hide
 moment the line count changes. O(1) per client until that client's own notes go stale."
   (fold (ed-live-eval-clients) m (fn (acc client) (ed-live-eval-call acc (:reanchor client) acc))))
 
-(defn- ed-idle-one-shots (m held)
+(defn- ed-idle-one-shots (m)
   "Every managed idle one-shot as `[name delay-ms due?]` — the timer, how long the quiet
 before it fires, and whether its work is pending now. Each is armed only while due; listing
 the NOT-due ones too is what lets `ed-sync-timers` drop every managed one-shot from one list,
 so none can be armed here and forgotten there.
 
-The idle beat is armed while any registered job has work pending ([[ed-idle-due?]]). Some are
-held-key-gated (eldoc, the check, the completion work — point/typing-driven, not worth
-recomputing on every repeat tick); the diff-hl gutter and the web mirror are not, since a
-missed key-up can leave `:held-key` stuck and would otherwise freeze them. The `:idle?`
-deadline still debounces — a repeating key resets the countdown. A pane resting between
+The idle beat is armed while any registered job has work pending ([[ed-idle-due?]]); the
+`:idle?` deadline debounces it — a repeating key resets the countdown. A pane resting between
 lines snaps once the scroll deltas stop. Every live-evaluating buffer's eval-on-type debounce
 is one timer each, so they arm and fire independently ([[ed-live-eval-clients]]); each is
 deferred-loaded — bound?-guarded + late-bound, the keymap idiom — so this core file never
-links any of them eagerly. The rest wait for a key that is not held."
-  (append [[:idle-recompute *diag-debounce-ms* (ed-idle-due? m held)]
+links any of them eagerly."
+  (append [[:idle-recompute *diag-debounce-ms* (ed-idle-due? m)]
             [:scroll-settle *scroll-settle-ms* (ed-any-pane-fractional? m)]
-            [:which-key *which-key-delay-ms* (and (not held) (:pending m) (not (:which-key m)))]
+            [:which-key *which-key-delay-ms* (and (:pending m) (not (:which-key m)))]
             [:undo-pause
               *undo-pause-ms*
-              (and (not held) (includes? *typing-commands* (:this-command m)) (not (:undo-break m)))]]
+              (and (includes? *typing-commands* (:this-command m)) (not (:undo-break m)))]]
     (map (ed-live-eval-clients)
       (fn (client)
         [(:timer client)
           *tutor-eval-debounce-ms*
-          (and (not held) (ed-live-eval-stale? m client))]))))
+          (ed-live-eval-stale? m client)]))))
 
 (defn- ed-feature-timers (m)
   "The timers features registered ([[register-timer-client]]) — git's background upstream
@@ -862,11 +842,10 @@ watch, the BEAM views' refresh — each asked whether it wants one now: name -> 
 replacement for the old arm-the-tick cascade. `:cursor-blink` is present while the window has focus; the
 idle one-shots — eldoc/diagnostics debounce (`:idle-recompute`), the which-key reveal
 delay, the undo-pause boundary — are present only while their work is pending
-(`ed-idle-one-shots`); the imperatively-managed `:key-repeat` is preserved untouched. A held
-key suppresses the idle one-shots (as the old held-key short-circuit did). Also clears the
+(`ed-idle-one-shots`). Also clears the
 `:which-key` reveal flag once no prefix is pending (what `ed-which-key-arm` used to do)."
   (let (m (if (:pending m) m (dissoc m :which-key))
-        one-shots (ed-idle-one-shots m (:held-key m))
+        one-shots (ed-idle-one-shots m)
         ;; the caret blinks only in a focused window: an unfocused one shows a hollow box,
         ;; still, and a background editor does no work on the blink beat
         managed (merge (if (:unfocused m) {} {:cursor-blink {:every *blink-ms* :idle? true}})
@@ -1227,7 +1206,7 @@ list until the reader gives up and retypes. A no-op when the cache is current."
 
 ;; the minibuffer is the model's own, so this job is the one row the model registers itself
 (register-idle-job :minibuffer-rerank
-  {:order 70 :run 'model/ed-mb-reask :stale? 'model/mb-cands-stale? :held-key-gated? true})
+  {:order 70 :run 'model/ed-mb-reask :stale? 'model/mb-cands-stale?})
 
 (defn ed-cache-mb-candidates (m)
   "Bring the open minibuffer's `:cand-cache` (`{:for <text> :cands …}`) up to date with the
