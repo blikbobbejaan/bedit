@@ -4,113 +4,92 @@
 in brood's `docs/devlog.md`; decisions in brood's `docs/decisions/`; the open backlog is
 [`../issues.md`](../issues.md). Read this to pick the work back up cold.
 
-## State when written — 2026-10-25, evening
+## State when written — 2026-10-26, early morning
 
-Everything below is committed and pushed. **No test was run on this machine** (the rule at the
-time; it now allows ordinary tests, see Traps); CI ran them, and both repos are green.
+Everything in brood and bedit is committed and pushed. Two new packages are committed
+LOCALLY only (no GitHub repo, not on hive) — creating those is the user's call.
 
 ### Goal (the user's asks this session)
 
-- Held keys "like other systems … it has to work really well", in the window, over
-  `--attach`, and in every terminal ("can you do it so that it works for everything").
-- A thorough review of the language-server client, fix issues, refactor for cleanliness;
-  then "can't we recover after the fact if two are started the same time? … and what
-  about the clearing out. can we make it slick".
-- In a find-file prompt, Backspace after `foo/` removes the whole `foo/` (Emacs).
-- Killing a buffer shows the buffer used before it (Emacs `other-buffer`).
+Work through the general-purpose gap analysis (`../brood/docs/general-purpose-gaps.md`):
+"1) fix this. 2) fix this. 3) a) what can we do here … j) … 4) fix this. and everything else".
+Answers given along the way: SQLite as a WASM component package; the error convention per
+"ROADMAP's plan" (which turned out to be stale — see Decisions).
 
-### Done — brood (`~/src/broodlang/brood`, origin/main)
+### Done — brood (origin/main, all via the worktree `~/.cache/brood-wt-defwarn`)
 
-- `296b4baa` GUI `Keyboard` per window (`crates/lisp/src/host/gui/backend/keyboard.rs`),
-  `gui/key-repeats` ({:delivered :dropped :delay :interval} ms).
-- `62470cda` (+ another session's fix `9366d5ef`/`6b660f4a`: `table/new`/`table/get`/
-  `table/put`, which my commit had wrong) — `--attach` client ships whether a key is held.
-- `2c58289f` kitty keyboard protocol in terminals.
-- `61bf93db` GUI: Shift let go mid-repeat ends `(` with its key-up (`KeyMessage::Restroke`).
-- `ccfc83d0` terminal held keys INFERRED where the protocol says nothing (tmux, legacy, text/
-  Enter/Tab/Backspace): `crates/lisp/src/builtins/terminal/native/keyboard.rs` `Inbox`,
-  `REPEAT_GAP` 70 ms, `RELEASE_AFTER` 140 ms; typed text never dropped (paste arrives as keys).
-- `35074a9c` `std/editor/lineedit.blsp` `lineedit-delete-backward`: in `:path` mode at end of
-  line after `/`, deletes the whole component.
-- Installed: `nest 0.43.0 (35074a9c)` (another session has pushed more since, e.g. `3caefacc`).
+- Crypto (ADR-448), UDP (ADR-449), TLS ALPN + HTTP/1.1 keep-alive (ADR-451), DAP server
+  `nest dap` (ADR-452), `nest profile` folded stacks, `std/tz` — earlier in the session.
+- `b6611b4b` tempo/new, tempo/parse, tempo/parse-span, resolver/resolve answer a failure, not
+  `[:ok]`/`[:error]` (ADR-310's own rule). Docs say gap 8 was already decided.
+- `519653f2` the large-project queue is done bar re-timing; `language.md` says how to make
+  the checker a CI gate.
+- `bdbf8232` + `613f35bb` **ADR-453**: WASI preview 2 by grant (`%wasm-load src grants`:
+  `:dirs` `[host guest]`/`[host guest :write]`, `:env`, `:args`, `:stdio`; never network),
+  interface exports (`iface#fn`, bare alias when unique), guest resources as tokens +
+  `%wasm-release`, enums/variants/records lower as they lift. Fixture: a real wit-bindgen
+  guest committed built (`tests/support/wasm-guest.wasm`, source beside it);
+  `tests/wasm_wasi_test.blsp`.
+- `fdd21746` **ADR-454**: `include-bytes`; an include resolves against the package of the
+  file naming it (dev now matches release). Same commit fixed main's red: the register
+  worker's direct self-call is revalidated after ADR-450 (an alias called the old body),
+  KI-303's archive section, `caar`..`cdddr` in bare-names + doc catalogue, `sv-seconds`
+  given the 400 rounds 128 calls need.
+- `89267d84` gaps 3 and 5 updated.
 
-### Done — bedit (`~/src/broodlang/bedit`, main = origin/main `994daa02`)
+### Done — packages (local git only)
 
-- `4c5e47a4`, `1ed1be6f` M-x latency shows key repeats.
-- `f0173fea` init keys via std `settings`; `42270ffd` LSP per server; `de79c686` fuzzy match
-  colours (these three were an earlier session's uncommitted work, finished and committed).
-- `5276d655` kill-buffer → `pool/ed-kill-replacement` (MRU, not shown elsewhere).
-- `03ae59d4` LSP server table `lsp/*lsp-server-specs*` (alternatives, root markers, add-ons,
-  shared servers + toolchain identity `lsp-commands/ed-lsp-identity`).
-- `eb8555b8` review fixes: entries keyed by CONNECTION (`:lsp-servers {conn entry}`),
-  `:lsp-synced {[conn uri] …}`, `:lsp-diags {path {conn [items raw]}}`; detach clears marks;
-  didClose for gone buffers (`ed-lsp-close-gone`); dead shared server detached whole.
-- `994daa02` merge servers started together (`ed-lsp-merge-into-host`, run when caps
-  arrive in `ed-ev-lsp-capabilities`); monitor each connection; new core registry
-  `model/register-down-handler` + `ed-run-down-handlers`, called from `input/ed-ev-down`
-  for a pid that backs no slot; `ed-lsp-server-down` clears entry/marks/pending lookups.
-- `1a35124d`, `3ebde1d8`, `be96fc3b` — CI had been red since `de79c686`; fixed: C-c C-c
-  committed in the repo of the buffer selected after closing *git-commit* (now
-  `gitcore/git-launch-op-in` with the message's root), the lost "does not offer code
-  actions" refusal, and stale/racy tests. **bedit CI green at `be96fc3b`.** All bedit
-  stashes dropped.
+- `~/src/broodlang/observe-otlp` (`a568d86`): OTLP/HTTP JSON provider for `observe` — logs,
+  errors as `exception.*` log records, metrics; `from-environment` reads `OTEL_*`. 12 tests.
+- `~/src/broodlang/sqlite` (`e473c69`): SQLite 3.50 as a component (`native/`, rusqlite
+  bundled, built with wasi-sdk 25 in `~/.local/share`; `make wasm`), a connection PROCESS
+  per handle, `open/execute/execute-batch/query/query-one/query-rows/transaction/close`.
+  12 tests, run with the worktree's nest. `:brood ">= 0.44.0"` — **needs a brood release with
+  ADR-453/454 before it can be used or published.**
 
 ## Next
 
-1. Brood's "suite with contracts armed" CI job is red on `tests/names_test.blsp` (10 of them,
-   `monitor: first argument must be a pid or a {:name :node}`) — another session's process
-   registry (ADR-445, `1eee8e88`). Not this session's; check whether it was fixed.
-2. `drive-git-menus` failed once under a DEBUG nest (Escape not dismissing a menu, then a
-   cascade) and passed on the next run and with the installed release nest. Likely ESC and
-   the next key read together by a slow build (legacy-terminal ambiguity). Watch it.
-3. The installed nest (`~/.local/bin`) is 35074a9c, older than brood main: the
-   `:cross-module-def` lint, GPU subpixel text and the terminal burst fix are not in it until
-   `make install` in brood (the primary checkout has another session's edits — use a worktree).
-4. The gap analysis (`../brood/docs/general-purpose-gaps.md`) recommends an order; nothing
-   from it is started.
-
-Done since the morning's handoff, all pushed: bedit `1a35124d`..`3bbcca40` (CI fixes, the two
-LSP limits, theme faces as a registry, `drive-lsp`, `drive-term` fixed); brood `9f4c54c3`
-(`:cross-module-def` lint), `d89d7410` (BEDIT_REF → bcea228c), `58d2aabd` (GPU subpixel
-text, byte-identical to the CPU painter's on an RTX 5060), `e32c3eff` (a burst of one key is
-presses, not a hold — `drive-mspc` was flaky from it), `b9cd1d03` (the gap analysis).
+1. Confirm brood CI is green at `89267d84` (or later). Main was red all evening from other
+   commits; the fixes are in `fdd21746`. `optional_defaults_test` failed once in CI and passes
+   here — watch it.
+2. Ask the user: create GitHub repos `broodlang/observe-otlp` and `broodlang/sqlite`, cut brood
+   0.44.0, publish both to hive.
+3. Gaps still open (`general-purpose-gaps.md`): M2 shared IC tables and the other runtime
+   memory items (benchmark-gated — the test machine); re-timing the 2026-10-23 load-path work;
+   a C embedding API; `:wasm-build` build-on-fetch; HTTP/2, gRPC, Redis, MySQL packages;
+   W3C `traceparent`.
+4. The installed nest (`~/.local/bin`, 0.43.0 `ad576651`) predates everything above;
+   `make install` from a clean worktree when wanted.
 
 ## Decisions
 
-- Terminal inference never drops typed text (no bracketed paste is enabled; a paste arrives
-  as keys). Tapped keys get no key-up in legacy terminals.
-- Shared LSP servers only for specs marked `:shared` (rust-analyzer, gopls, python,
-  typescript), only after the server's caps say `workspaceFolders` supported with change
-  notifications, and only when `ed-lsp-identity` (resolved command path + toolchain pin file
-  contents) matches. Expert, ruby-lsp, brood-lsp, clangd stay one process per project.
-- Root markers are tried in order up the whole tree (first marker wins over nearer later
-  ones), never at or above `$HOME`.
-- A dead server is said once and its projects marked tried; `M-x lsp-connect` is the retry.
+- **Gap 8 (errors) was a stale ROADMAP line.** ADR-310/315 chose failure VALUES over
+  `[:ok]`/`[:error]` tuples and rejected `result`/`unwrap` by name; building the tuple plan
+  would have reversed a recorded decision. Only the stragglers were converted.
+- WASI: clocks and randomness come with any grants map; the network never does.
+- A package ships a component by `include-bytes` (the package hash is the pin); no `:native`
+  manifest clause.
+- SQLite runs on `unix-none` (no locks): one handle per file, and the handle is a process.
 
 ## Traps
 
 - **No benchmarks, stress runs or heavy brood suites on this desktop** (global CLAUDE.md);
-  bedit's `nest test` and a single brood test file are fine. Push brood with `--no-verify` (its pre-push hook runs tests).
-- Brood work goes in a worktree (`git worktree add ~/.cache/brood-wt-X origin/main -b X`,
-  copy `config.mk`) with its OWN `target/` — **never symlink the primary checkout's**: other
-  sessions build there, and `target/debug/nest` was rebuilt from another tree under this
-  session twice (a lint that "found nothing", drivers that failed). Check `nest --version`
-  names your commit before trusting a run. Other sessions use the
-  primary checkout (it currently has another session's uncommitted edits — leave them).
-  Worktrees `brood-wt-perf`, `brood-wt-vcs`, `brood-b2d-handoff` are NOT this session's.
-- In a Bash call that also runs `nest`/`cargo`, `$(…)` shell variables can come out empty
-  (hook wrapper); use the Edit tool or literal line numbers.
-- When splicing files with `head -n N; …; tail -n +M`, check the boundary lines — one
-  dropped `(describe …` opener cost a round.
-- The checker does not see a binding used only inside a `#{…}` set literal (reports it
-  unused); build the set with `conj`.
+  bedit's `nest test` and a single brood test file are fine. Push brood with `--no-verify`.
+- Brood work goes in a worktree with its OWN `target/` — never the primary checkout's, which
+  other sessions rebuild. Check `nest --version` before trusting a run; `target/debug/brood`
+  is only rebuilt by `cargo build --bin brood`.
+- Brood ADR numbers collide across sessions: `git grep '^## ADR-NNN' origin/main` before
+  pushing. Next free after this session: 455.
+- Main's CI keeps only one pending run; rapid pushes cancel the ones queued behind. A red
+  run can hide behind a column of "cancelled".
+- The checker carries an argument's type through a function that may return it (`native-name`
+  returned `export` in its else branch): pass a typed value at the call site.
 - `nest format` takes no file arguments: `nest format --changed [--check]`.
-- bedit's primary checkout: update with stash push → `git merge --ff-only origin/main` →
-  `stash apply`, so another session's uncommitted edits survive.
 
 ## Environment
 
 - bedit `~/src/broodlang/bedit` on `main`, clean, equal to origin/main.
-- brood primary `~/src/broodlang/brood`: another session's uncommitted edits (README.md,
-  ROADMAP.md, breakage/…) — not this session's.
-- No background processes from this session are running.
+- brood primary `~/src/broodlang/brood`: other sessions' work — leave it. This session's
+  worktree is `~/.cache/brood-wt-defwarn` (branch `docs-wasm`, at origin/main); remove it with
+  `git worktree remove` when done.
+- Installed this session: Rust target `wasm32-wasip2`; wasi-sdk 25 in `~/.local/share`.
