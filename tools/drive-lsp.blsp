@@ -1,0 +1,110 @@
+(defmodule drive-lsp
+  "Language servers, driven end to end through a real `ui-run` and a real `brood-lsp`.
+
+A project with its own root marker inside another project's tree used to count as served by
+the outer project's server: autostart saw a live server whose root held the file and started
+nothing, and `M-x lsp-connect` said \"already connected\". The model tests pin the rule with a
+stand-in connection. This runs the real thing: the idle beat's autostart, two `brood-lsp`
+processes, their `initialize` answers arriving on the loop, and each file reaching the server
+rooted at its own project.
+
+    nest run tools/drive-lsp.blsp
+
+Needs `brood-lsp` on PATH; says so and passes when it is not, like a missing grammar."
+  (:use-internals bedit/input))
+
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(def *cols* 120)
+(def *rows* 40)
+(def *deadline-ms* 30000)
+
+;; A model cannot cross a process boundary (it holds ropes), so the assertions run INSIDE the
+;; loop's update fn and only the tally comes back out (`tools/drive-async.blsp`).
+(def *failures* (%table))
+
+(defn check (what ok)
+  (do
+    (io/puts (str (if ok "  ok  " "  FAIL ") what))
+    (when (not ok) (%table-put *failures* :n (inc (%table-get *failures* :n 0))))
+    ok))
+
+;; The display's `:poll`: whatever is in the mailbox (a server's reply, a task's answer), or
+;; nil when the wait runs out — a timed-out poll is what lets the idle beat fire, and the
+;; idle beat is what starts a server.
+(defn poll (ms) (receive (msg msg) (after (math/max 1 ms) nil)))
+
+(defn initialized-at? (m root)
+  "Whether a server rooted at `root` is filed and has answered `initialize` (its caps)."
+  (any? (vals (or (:lsp-servers m) {}))
+    (fn (entry) (and (includes? (:roots entry) root) (not (empty? (or (:caps entry) {})))))))
+
+(defn drive (m0 outer-file inner-file outer inner)
+  "Open `outer-file`, wait for its server; then open `inner-file` and wait for a SECOND server,
+rooted at `inner`. The phase rides on the model (`:drive-phase`)."
+  (let (t0 (os/now)
+        display {:enter (fn () nil)
+                 :leave (fn () nil)
+                 :size (fn () [*cols* *rows*])
+                 :draw (fn (frame) nil)
+                 :poll poll}
+        update (fn (m input cols rows)
+                 (let (next (input/ed-update m input cols rows)
+                       phase (or (:drive-phase next) :outer))
+                   (cond
+                     ;; the loop may hand over one more input after `:done`: nothing twice
+                     (= phase :finished) next
+                     (> (- (os/now) t0) *deadline-ms*)
+                       (do (check (str "the servers came up before the deadline (stuck at "
+                                    phase
+                                    ")")
+                             false)
+                         (assoc next :done true :drive-phase :finished))
+                     (and (= phase :outer) (initialized-at? next outer))
+                       (do (check "the outer project's server started and answered" true)
+                         (assoc (pool/ed-find-file next inner-file) :drive-phase :inner))
+                     (and (= phase :inner) (initialized-at? next inner))
+                       (let (servers (vals (:lsp-servers next))
+                             outer-entry (lsp/lsp-server-entry next outer-file)
+                             inner-entry (lsp/lsp-server-entry next inner-file))
+                         (do
+                           (check "the nested project got a server of its own"
+                             (= 2 (count servers)))
+                           (check "rooted at the nested project"
+                             (= [inner] (:roots inner-entry)))
+                           (check "the nested file reaches it, not the outer one"
+                             (not (= (:conn inner-entry) (:conn outer-entry))))
+                           (check "the outer file still reaches the outer server"
+                             (= [outer] (:roots outer-entry)))
+                           (doseq (entry servers) (lsp/lsp-shutdown (:conn entry)))
+                           (assoc next :done true :drive-phase :finished)))
+                     :else next))))
+    (editor/ui/ui-run (pool/ed-find-file m0 outer-file) view/ed-view update display)))
+
+(defn spit-project (dir name)
+  (do
+    (file/mkdir (path/join dir "src"))
+    (file/spit (path/join dir "project.blsp") (str "(project " (pr-str name) " :version \"0.1.0\")\n"))
+    (file/spit (path/join dir "src/main.blsp") "(defn main () (+ 1 2))\n")))
+
+(if (nil? (os/which "brood-lsp"))
+  (io/puts "drive-lsp: brood-lsp is not on PATH — nothing to drive (skipped)")
+  (let (_ (proc/register :editor (self))
+        outer (path/temp "bedit-drive-lsp-")
+        inner (path/join outer "tools/inner")
+        _ (spit-project outer "outer")
+        _ (spit-project inner "inner")
+        m0 (assoc (model/ed-init (editor/buffer/make-buffer "" "*scratch*")) :recent-files false))
+    (do
+      (check "the async paths are live (`:editor` registered, not headless)"
+        (not (model/ed-headless?)))
+      (io/puts "== a nested project gets its own language server")
+      (drive m0 (path/join outer "src/main.blsp") (path/join inner "src/main.blsp") outer inner)
+      (file/rmdir outer)
+      (io/puts "")
+      (if (= (%table-get *failures* :n 0) 0)
+        (io/puts "the nested project was served by its own server")
+        (error "drive-lsp: " (%table-get *failures* :n 0) " check(s) failed")))))
