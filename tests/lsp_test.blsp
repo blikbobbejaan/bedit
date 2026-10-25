@@ -13,6 +13,80 @@
   (:use-internals input) ; ed-event-handler — the table the loop routes by
   (:use model) ; ed-init / ed-set-buf / ed-current-buf — the sync hook is a model step
   (:use editor/buffer)) ; make-buffer / insert — the edit a sync is about
+
+(defn serving (m conn &optional (caps {}))
+  "`m` with `conn` filed as the server for its current buffer's file — the one
+`*lsp-servers*` names for the extension, rooted at the file's directory — saying `caps`.
+What `M-x lsp-connect` files, without spawning anything."
+  (let (file (buffer-file (ed-current-buf m))
+        key [(first (lsp-server-for file)) (path/dirname file)]
+        attached (ed-lsp-attach m key conn))
+    (assoc attached :lsp-servers (assoc (:lsp-servers attached) key {:conn conn :caps caps}))))
+
+(defn rust-model (text)
+  ;; a buffer whose FILE has a server configured (`.rs`): a buffer reaches a server only
+  ;; through its file's extension, never by being whichever buffer happens to be current
+  (model/ed-init (editor/buffer/make-buffer text "s.rs" "/tmp/s.rs")))
+
+(describe "lsp: one server per language — a buffer reaches its own or none"
+  (test "a file finds the server its extension names, rooted above it"
+    (let (m (serving (rust-model "fn main() {}") (self)))
+      (is (= (self) (ed-lsp-live m)))
+      (assert= ["rust-analyzer" "/tmp"] (:key (ed-lsp-server m)))))
+  (test "a file of another language does not reach it — wos next to a Brood server"
+    (let (m (serving (model/ed-init (editor/buffer/make-buffer "(fn f () 0)" "k.blsp" "/tmp/k.blsp"))
+              (self))
+          wos (ed-set-buf m (editor/buffer/make-buffer "(fn f () 0)" "k.wos" "/tmp/k.wos")))
+      (is (= (self) (ed-lsp-live m)))
+      (is (nil? (ed-lsp-live wos)))
+      (is (nil? (lsp-server-entry wos "/tmp/k.wos")))))
+  (test "a file outside the server's root does not reach it"
+    (let (m (serving (rust-model "") (self)))
+      (is (nil? (lsp-server-entry m "/elsewhere/s.rs")))))
+  (test "two servers side by side, each buffer its own"
+    (let (brood (serving (model/ed-init (editor/buffer/make-buffer "" "k.blsp" "/p/k.blsp"))
+                  :brood-conn)
+          both (serving (ed-set-buf brood (editor/buffer/make-buffer "" "s.rs" "/p/s.rs"))
+                 :rust-conn))
+      (assert= 2 (count (:lsp-servers both)))
+      (assert= :rust-conn (:conn (lsp-server-entry both "/p/s.rs")))
+      (assert= :brood-conn (:conn (lsp-server-entry both "/p/k.blsp")))))
+  (test "the deeper root wins when two hold the file"
+    (let (m (assoc (rust-model "")
+              :lsp-servers
+                {["rust-analyzer" "/p"] {:conn :outer} ["rust-analyzer" "/p/crate"] {:conn :inner}}))
+      (assert= :inner (:conn (lsp-server-entry m "/p/crate/src/s.rs")))
+      (assert= :outer (:conn (lsp-server-entry m "/p/other/s.rs")))))
+  (test "a root is a directory, not a prefix: /p/crate does not hold /p/crate2"
+    (is (lsp-under? "/p/crate/s.rs" "/p/crate"))
+    (is (not (lsp-under? "/p/crate2/s.rs" "/p/crate"))))
+  (test "capabilities land on the server that sent them"
+    (let (m (serving (rust-model "") :rust-conn)
+          m2 (ed-ev-lsp-capabilities m [:lsp-capabilities {:hoverProvider true} :rust-conn] 0 0 0)
+          stray (ed-ev-lsp-capabilities m [:lsp-capabilities {:hoverProvider true} :gone] 0 0 0))
+      (assert= {:hoverProvider true} (ed-lsp-caps m2))
+      (assert= m stray)))
+  (test "a new server forgets what was pushed to ITS files, and only those"
+    (let (m (assoc (rust-model "")
+              :lsp-synced {"file:///tmp/s.rs" {:token :a} "file:///tmp/k.blsp" {:token :b}})
+          m2 (ed-lsp-attach m ["rust-analyzer" "/tmp"] :rust-conn))
+      (assert= ["file:///tmp/k.blsp"] (into [] (keys (:lsp-synced m2))))))
+  (test "M-x lsp-servers names each server and marks this buffer's"
+    (let (m (assoc (rust-model "")
+              :lsp-servers
+                {["rust-analyzer" "/tmp"] {:conn (self)} ["brood-lsp" "/srv"] {:conn (self)}}))
+      (assert= "brood-lsp /srv · *rust-analyzer /tmp" (ed-lsp-servers-line m))
+      (assert= "lsp: no servers running" (:echo (cmd-lsp-servers (rust-model "") :key)))))
+  (test "M-x lsp-disconnect stops this buffer's server and leaves the others"
+    ;; stand-in connections that take the `[:shutdown]` themselves, rather than the test
+    ;; process — whose catch-all receives elsewhere in this file would read it
+    (let (sink (fn () (spawn (receive (_ :done) (after 30000 :done))))
+          brood (serving (model/ed-init (editor/buffer/make-buffer "" "k.blsp" "/p/k.blsp")) (sink))
+          both (serving (ed-set-buf brood (editor/buffer/make-buffer "" "s.rs" "/p/s.rs")) (sink))
+          after (cmd-lsp-disconnect both :key))
+      (assert= [["brood-lsp" "/p"]] (into [] (keys (:lsp-servers after))))
+      (is (includes? (:echo after) "rust-analyzer disconnected")))))
+
 (describe "lsp: completion-result shapes"
   (test "a CompletionItem[] vector yields its labels"
     (assert= (lsp-completion-labels [{:label "foo"} {:label "bar"}]) (list "foo" "bar")))
@@ -702,24 +776,25 @@
 
   (test "the idle beat never asks a server that does not offer signature help"
     ;; Expert is one, so in an Elixir buffer the argument hints cost exactly nothing
-    (let (m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1)")) :lsp :fake-conn)
-          expert (assoc m :lsp-caps {:codeActionProvider true :hoverProvider true}))
+    (let (expert (serving (rust-model "foo(1)")
+                   (self)
+                   {:codeActionProvider true :hoverProvider true}))
       (assert= (lsp-commands/ed-launch-signature expert) expert) ; not even a stamp
       (is (empty? (:lsp-pending (lsp-commands/ed-launch-signature expert) {})))))
 
   (test "the command says so rather than doing nothing"
-    (let (m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1)"))
-              :lsp (self) ; a live pid, so `ed-lsp-ensure` reads the connection as ready
-              :lsp-caps {:hoverProvider true}))
+    ;; a live pid, so `ed-lsp-ensure` reads the connection as ready
+    (let (m (serving (rust-model "foo(1)") (self) {:hoverProvider true}))
       (is (includes? (:echo (lsp-commands/cmd-lsp-signature-help m :key))
             "does not offer signature help"))
       (is (includes? (:echo (lsp-commands/cmd-lsp-code-action m :key))
             "does not offer code actions"))))
 
   (test "the idle beat asks once per position, and only where nothing else answers"
-    (let (m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1, 2)"))
-              :lsp (self) ; live, which is what the predicate asks
-              :lsp-caps {:signatureHelpProvider {:triggerCharacters ["("]}})
+    ;; live, which is what the predicate asks
+    (let (m (serving (rust-model "foo(1, 2)")
+              (self)
+              {:signatureHelpProvider {:triggerCharacters ["("]}})
           b (model/ed-current-buf m))
       (is (lsp-commands/ed-signature-due? m)) ; never asked here yet
       (let (asked (assoc m
@@ -730,7 +805,7 @@
                                               (editor/buffer/goto-char (model/ed-current-buf asked)
                                                 4)))))
       ;; no server, nothing to ask
-      (is (not (lsp-commands/ed-signature-due? (dissoc m :lsp))))))
+      (is (not (lsp-commands/ed-signature-due? (dissoc m :lsp-servers))))))
 
   ;; The predicate is the idle job's `:stale?` — what keeps the beat ARMED. True whenever
   ;; `:lsp` was set, it kept the beat firing on every debounce, forever, for a server that
@@ -739,11 +814,11 @@
   (test "a dead server, or one without signature help, never keeps the beat armed"
     (let (dead (spawn (fn () :done))
           _ (receive ([:never] nil) (after 50 nil))
-          m (assoc (model/ed-init (editor/buffer/make-buffer "foo(1, 2)"))
-              :lsp (self)
-              :lsp-caps {:signatureHelpProvider {:triggerCharacters ["("]}}))
-      (is (not (lsp-commands/ed-signature-due? (assoc m :lsp dead))))
-      (is (not (lsp-commands/ed-signature-due? (assoc m :lsp-caps {:hoverProvider true}))))))
+          signature {:signatureHelpProvider {:triggerCharacters ["("]}}
+          m (rust-model "foo(1, 2)"))
+      (is (lsp-commands/ed-signature-due? (serving m (self) signature))) ; the control
+      (is (not (lsp-commands/ed-signature-due? (serving m dead signature))))
+      (is (not (lsp-commands/ed-signature-due? (serving m (self) {:hoverProvider true}))))))
 
   (test "a mutating reply is rope-guarded: format edits after a buffer change drop"
     (let (me (self)
@@ -820,20 +895,20 @@
       (let (m (lsp-commands/cmd-lsp-connect (lspt-elixir-model) nil))
         (is (includes? (:echo m) lspt-missing))
         (is (includes? (:echo m) "not installed"))
-        (is (nil? (:lsp m)))))) ; nothing was spawned, so nothing to wait on later
+        (is (empty? (or (:lsp-servers m) {})))))) ; nothing was spawned, so nothing to wait on later
   (test "the lookup commands say the same thing instead of starting a doomed server"
     (binding (*lsp-servers* {"ex" [lspt-missing []]})
       (let ([m ready?] (lsp-commands/ed-lsp-ensure (lspt-elixir-model)))
         (refute ready?)
         (is (includes? (:echo m) "not installed"))
-        (is (nil? (:lsp m))))))
+        (is (empty? (or (:lsp-servers m) {}))))))
   (test "a dead connection on the model is not a connection"
     ;; a pid whose process is gone: every request would send into the void and wait out
     ;; its timeout, and `lsp-connect` would refuse to start a replacement
     (let (dead (spawn nil)
           _ (monitor dead)
           _ (receive ([:down ref pid reason] nil) (after 2000 nil)) ; its death, observed
-          m (assoc (lspt-elixir-model) :lsp dead))
+          m (serving (lspt-elixir-model) dead))
       (is (nil? (lsp/lsp-complete-source m))) ; no 1 s stall per Tab
       (let (m2 (lsp-commands/cmd-lsp-connect m nil))
         (is (not (includes? (:echo m2) "already connected")))))))
@@ -910,15 +985,15 @@
     (binding (*lsp-servers* {"ex" ["bedit-no-such-language-server" []]})
       (let (m (lspa-model "m.ex" "/tmp/m.ex")
             m2 (lsp-commands/ed-lsp-autostart m))
-        (is (nil? (:lsp m2)))
+        (is (empty? (or (:lsp-servers m2) {})))
         (assert= (:echo m2) (:echo m)))))
 
   (test "a connection already alive on the model is left alone"
     ;; a real pid, because `ed-lsp-live` asks whether the process is still there — a
     ;; keyword would read as dead and the autostart would go and start a second server
     (let (conn (spawn (receive (_ :done) (after 30000 :done)))
-          m (assoc (lspa-model "m.ex" "/tmp/m.ex") :lsp conn))
-      (assert= (:lsp (lsp-commands/ed-lsp-autostart m)) conn)
+          m (serving (lspa-model "m.ex" "/tmp/m.ex") conn))
+      (assert= (ed-lsp-live (lsp-commands/ed-lsp-autostart m)) conn)
       (exit conn :kill)))
 
   ;; Expert compiles the whole mix project before it answers anything, which is a real
@@ -938,9 +1013,9 @@
       (binding (*lsp-servers* {"ex" ["sh" []]})
         (let (dead (spawn (fn () :done))
               _ (receive ([:never] nil) (after 50 nil))
-              m (assoc (lspa-model "m.ex" "/tmp/m.ex") :lsp dead :lsp-caps {})
+              m (serving (lspa-model "m.ex" "/tmp/m.ex") dead)
               m2 (lsp-commands/ed-lsp-autostart m))
-          (is (nil? (:lsp m2)))
+          (is (empty? (:lsp-servers m2)))
           (is (includes? (:echo m2) "exited"))))))
 
   (test "autostart tries a server once per project root"
@@ -972,7 +1047,7 @@
   (test "an edit pushes the text; an idle beat over an unchanged buffer pushes nothing"
     (let (conn (recorder)
           m0 (ed-init (assoc (make-buffer "defmodule P do\nend\n") :file "/tmp/lsp-sync.ex"))
-          m (assoc m0 :lsp conn)
+          m (serving m0 conn)
           pushed (ed-lsp-push-text m)
           _ (ed-lsp-push-text pushed) ; nothing typed since
           _ (ed-lsp-push-text (ed-set-buf pushed (insert (ed-current-buf pushed) "x"))))
@@ -982,7 +1057,9 @@
   (test "no connection, or no file, is silent rather than an error"
     (let (m (ed-init (make-buffer "x")))
       (assert= (ed-lsp-push-text m) m) ; no :lsp
-      (let (conn (recorder) fileless (assoc m :lsp conn))
+      ;; a server running for SOME file does not make a fileless buffer one of its documents
+      (let (conn (recorder)
+            fileless (assoc m :lsp-servers {["expert" "/"] {:conn conn :caps {}}}))
         (assert= (ed-lsp-push-text fileless) fileless)
         (sleep 100)
         (assert= (sent-to conn) '())))))
@@ -1083,9 +1160,9 @@
                                         (msg (go (conj got msg)))
                                         (after 2000 :done))))
                           (go []))))
-          m0 (assoc (ed-init (assoc (make-buffer "defmodule P do\nend\n") :file "/tmp/lsp-inc.ex"))
-               :lsp conn
-               :lsp-caps {:textDocumentSync 2})
+          m0 (serving (ed-init (assoc (make-buffer "defmodule P do\nend\n") :file "/tmp/lsp-inc.ex"))
+               conn
+               {:textDocumentSync 2})
           m1 (ed-lsp-push-text m0)
           m2 (ed-lsp-push-text (ed-set-buf m1 (insert (ed-current-buf m1) "x")))
           _ (send conn [:what (self)])
@@ -1114,9 +1191,9 @@
                                         (msg (go (conj got msg)))
                                         (after 2000 :done))))
                           (go []))))
-          m0 (assoc (ed-init (assoc (make-buffer "x\n") :file "/tmp/lsp-full.ex"))
-               :lsp conn
-               :lsp-caps {:textDocumentSync 1})
+          m0 (serving (ed-init (assoc (make-buffer "x\n") :file "/tmp/lsp-full.ex"))
+               conn
+               {:textDocumentSync 1})
           m1 (ed-lsp-push-text m0)
           _ (ed-lsp-push-text (ed-set-buf m1 (insert (ed-current-buf m1) "y")))
           _ (send conn [:what (self)])
@@ -1149,8 +1226,8 @@
   (test "a buffer the server already has is asked about without its text, and cached"
     (let (conn (lspc-conn)
           buf (goto-char (assoc (make-buffer "defmo") :file "/tmp/lsp-c.ex") 5)
-          m (assoc (ed-init buf)
-              :lsp conn
+          ;; synced AFTER the server is filed: filing one forgets what was pushed to its files
+          m (assoc (serving (ed-init buf) conn)
               :lsp-synced {"file:///tmp/lsp-c.ex" {:buf buf :token :t}})
           answer (lsp/lsp-complete-source m))
       (assert= answer [0 "defmo" (list "defmodule") {:cache true}])
@@ -1159,7 +1236,7 @@
   (test "a buffer edited since the last sync sends its text along"
     (let (conn (lspc-conn)
           buf (goto-char (assoc (make-buffer "defmo") :file "/tmp/lsp-c.ex") 5)
-          m (assoc (ed-init buf) :lsp conn)
+          m (serving (ed-init buf) conn)
           _ (lsp/lsp-complete-source m))
       (assert= (:text (lspc-request)) "defmo"))))
 

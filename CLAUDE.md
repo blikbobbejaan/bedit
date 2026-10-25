@@ -244,7 +244,11 @@ src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, g
                             BLOCKS on that reply) and starts the server IN the project root, which
                             is how one that builds the project finds it. Elixir is Expert
                             (expert-lsp.org), which narrates its own startup — forwarded to
-                            *Messages*, because it answers nothing until its engine is up
+                            *Messages*, because it answers nothing until its engine is up.
+                            ONE SERVER PER LANGUAGE AND PROJECT ROOT (`:lsp-servers`,
+                            `lsp-server-entry`): a buffer reaches the server its extension names,
+                            or none — so wos source beside a running brood-lsp is never checked
+                            as Brood, and a .rs file gets rust-analyzer. M-x lsp-servers lists them
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
                             lsp-commands can register fold impls while lsp stays deferred

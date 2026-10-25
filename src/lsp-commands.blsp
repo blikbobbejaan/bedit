@@ -22,12 +22,14 @@ there is nothing to start — no file, no server configured, the server not inst
 an explanatory message already on `m2` (`ed-lsp-start` writes it)."
   (if (ed-lsp-live m)
     [m true]
-    (let ([m2 conn] (ed-lsp-start (dissoc m :lsp)))
+    (let ([m2 conn] (ed-lsp-start (ed-lsp-drop-dead m)))
       (if (nil? conn)
         [m2 false]
         ;; started, but the handshake has not finished: say so in the voice of the
         ;; feature that asked rather than reporting a connection it cannot use yet
-        [(message m2 "lsp: starting the server — run that again in a moment") false]))))
+        [(message m2
+           (str "lsp: starting " (first (:key (ed-lsp-server m2))) " — run that again in a moment"))
+          false]))))
 
 (defn- ed-imenu-label (s)
   "The imenu candidate text for a symbol `{:name :kind …}` — its (qualified) name with a
@@ -80,7 +82,7 @@ picker opens when the symbol list arrives."
       m2
       (let (buf (ed-current-buf m2)
             file (buffer-file buf)
-            conn (:lsp m2))
+            conn (ed-lsp-live m2))
         (ed-lsp-ask-server m2
           conn
           (lsp-symbols)
@@ -214,14 +216,21 @@ bedit's flattened shape — all the view needs — is not a thing a server recog
       :else m)))
 
 (defn ed-ev-lsp-capabilities (m input textrows cols rows)
-  "A connected server reporting what it can do (`[:lsp-capabilities caps]`), kept on
-`:lsp-caps`.
+  "A connected server reporting what it can do (`[:lsp-capabilities caps conn]`), kept on
+its own entry in `:lsp-servers` — the one whose connection `conn` sent it. A server that is
+no longer filed (disconnected meanwhile) has nowhere to keep them, and they are dropped.
 
 Worth keeping for one reason: it is the difference between \"this server does not offer
 that\" and a command that appears to do nothing. Expert advertises code actions, hover,
 definition and references and does NOT advertise signature help — so the argument hints
 are silent in Elixir and loud in Rust, and only its own answer here can say which."
-  (assoc m :lsp-caps (nth input 1 {})))
+  (let (caps (nth input 1 {})
+        conn (nth input 2 nil)
+        servers (or (:lsp-servers m) {})
+        key (seq/find (keys servers) (fn (k) (= (:conn (get servers k)) conn))))
+    (if (nil? key)
+      m
+      (assoc m :lsp-servers (assoc servers key (assoc (get servers key) :caps caps))))))
 
 (defn ed-ev-lsp-apply-edit (m input textrows cols rows)
   "A server asking to change files itself (`[:lsp-apply-edit wsedit]`) — what a code
@@ -245,7 +254,7 @@ to read before saving."
 is sent by [[ed-lsp-ask-server]], which syncs the document first, incrementally."
   (let (buf (ed-current-buf m)
         file (buffer-file buf))
-    {:conn (:lsp m)
+    {:conn (ed-lsp-live m)
      :uri (lsp/lsp-path->uri file)
      :lang (lsp/lsp-language-id file)
      :line (buffer-current-line buf)
@@ -385,7 +394,7 @@ often is), so neither arm excludes the other."
     (if (nil? (:command action))
       m1
       (ed-lsp-ask-server m1
-        (:lsp m1)
+        (ed-lsp-live m1)
         (lsp-execute-command)
         {:command (:command action) :arguments (:arguments action)}
         nil
@@ -517,7 +526,7 @@ a round-trip. They share the `:eldoc` slot, so letting both write it would make 
 depend on which reply landed last."
   (let (buf (ed-current-buf m))
     (and (ed-lsp-live m)
-      (lsp/lsp-capable? (:lsp-caps m) :signatureHelpProvider)
+      (lsp/lsp-capable? (ed-lsp-caps m) :signatureHelpProvider)
       (nil? (ed-mode-service buf :eldoc))
       (not (= [(buffer-point buf) (buffer-rope buf)] (:signature-at m))))))
 
@@ -545,7 +554,7 @@ your cursor not existing."
   (let ([m2 ready?] (ed-lsp-ensure m))
     (cond
       (not ready?) m2
-      (not (lsp/lsp-capable? (:lsp-caps m2) :codeActionProvider))
+      (not (lsp/lsp-capable? (ed-lsp-caps m2) :codeActionProvider))
         (message m2 "lsp: this server does not offer code actions")
       else
         (let (cx (ed-lsp-here m2)
@@ -568,7 +577,7 @@ the automatic path stands back, and for asking again after a message has covered
     (cond
       (not ready?) m2
       ;; said plainly, because the alternative is a key that appears to do nothing
-      (not (lsp/lsp-capable? (:lsp-caps m2) :signatureHelpProvider))
+      (not (lsp/lsp-capable? (ed-lsp-caps m2) :signatureHelpProvider))
         (message m2 "lsp: this server does not offer signature help")
       else (ed-lsp-signature-ask m2 "signature…"))))
 
@@ -663,14 +672,49 @@ applies the edits to every affected file (left modified for you to save)."
                             (message mm "rename cancelled")
                             (ed-lsp-do-rename mm new-name)))}))))
 
-;; ---- the connection: start, stop, keep the server told what the buffer holds ----------
+;; ---- the connections: one server per language and project root ------------------------
+;; `:lsp-servers` on the model is `{[command root] {:conn pid :caps map}}`, and a buffer
+;; talks to the entry `lsp/lsp-server-entry` finds for its file — the server its extension
+;; names, rooted where the file is. A `.blsp` buffer and a `.rs` buffer side by side each have
+;; their own; wos kernel source, which no server is configured for, reaches none. (One `:lsp`
+;; for everything was how brood-lsp came to check `.wos` files as Brood.)
+
+(defn ed-lsp-server (m)
+  "The server entry for the current buffer's file (`{:key :conn :caps}`), or nil."
+  (lsp/lsp-server-entry m (buffer-file (ed-current-buf m))))
+
 (defn ed-lsp-live (m)
-  "The model's LSP connection while its process is still alive, else nil. A server that
-died — or never started — leaves a pid on the model that every later request sends into
-the void and then waits out its timeout, so liveness is asked here rather than in six
+  "The current buffer's LSP connection while its process is still alive, else nil. A server
+that died — or never started — leaves a pid on the model that every later request sends
+into the void and then waits out its timeout, so liveness is asked here rather than in six
 request sites."
-  (let (conn (:lsp m))
-    (when (and conn (proc/alive? conn)) conn)))
+  (lsp/lsp-conn m (buffer-file (ed-current-buf m))))
+
+(defn ed-lsp-caps (m)
+  "What the current buffer's server said it can do (`initialize`'s capabilities), `{}`
+before it has said, or with no server."
+  (or (:caps (ed-lsp-server m)) {}))
+
+(defn- ed-lsp-uri-served? (m key uri)
+  "True when `uri` is a file the server under `key` serves."
+  (let (path (lsp/lsp-uri->path uri)
+        configured (lsp/lsp-server-for path))
+    (and configured (= (first configured) (first key)) (lsp/lsp-under? path (second key)))))
+
+(defn ed-lsp-attach (m key conn)
+  "`m` with connection `conn` filed as the server for `key` (`[command root]`), its
+capabilities not yet known — and every document recorded as pushed to that server's files
+forgotten, because a new server holds none of them, so nothing pushed before is a base."
+  (assoc m
+    :lsp-servers (assoc (or (:lsp-servers m) {}) key {:conn conn :caps {}})
+    :lsp-synced
+      (fold (keys (or (:lsp-synced m) {}))
+        (or (:lsp-synced m) {})
+        (fn (synced uri) (if (ed-lsp-uri-served? m key uri) (dissoc synced uri) synced)))))
+
+(defn ed-lsp-detach (m key)
+  "`m` without the server under `key`."
+  (assoc m :lsp-servers (dissoc (or (:lsp-servers m) {}) key)))
 
 (sig ed-lsp-root (string -> string))
 (defn ed-lsp-root (file)
@@ -681,10 +725,10 @@ any project — its own directory."
     (if (string? root) root dir)))
 
 (defn ed-lsp-start (m)
-  "Start the language server configured for the current buffer's file, store it on the
-model (`:lsp`) and register the completion source — `[m2 conn]`, with `conn` nil and an
-explanatory message on `m2` when there is nothing to start: the buffer has no file, no
-server is configured for its extension, or the server is not installed.
+  "Start the language server configured for the current buffer's file, file it under
+`:lsp-servers` (`ed-lsp-attach`) and register the completion source — `[m2 conn]`, with
+`conn` nil and an explanatory message on `m2` when there is nothing to start: the buffer has
+no file, no server is configured for its extension, or the server is not installed.
 
 Every message says `lsp:`, whichever feature asked — six of them share this one server
 (completion, imenu, goto, references, hover, rename), and what went wrong is the server's,
@@ -711,32 +755,66 @@ proc-spawn expert: No such file or directory` trace where a sentence belongs.
               ;; …and the sync that lets its request carry no text: run before the sources
               ;; are asked, as the edits since the last push
               (complete-at-point/complete-add-prepare! 'lsp-commands/ed-lsp-push-text)
-              ;; a new server holds no document yet, so nothing pushed to the last one is a base
-              [(message (assoc (dissoc m :lsp-synced) :lsp conn)
-                 (str "lsp: " cmd " connected for " root))
+              [(message (ed-lsp-attach m [cmd root] conn) (str "lsp: " cmd " connected for " root))
                 conn]))))))
+
+(defn- ed-lsp-drop-dead (m)
+  "`m` without the current buffer's server entry when its process is gone — a dead pid is
+not a connection, and keeping it would make every lookup report one."
+  (let (entry (ed-lsp-server m))
+    (if (and entry (not (proc/alive? (:conn entry)))) (ed-lsp-detach m (:key entry)) m)))
 
 (defcommand cmd-lsp-connect
   (m key)
-  "Start a language server for the current buffer's file type and turn its completions
+  "Start the language server for the current buffer's file type and turn its completions
 on (M-x lsp-connect). Looks the file extension up in `lsp/*lsp-servers*` (rust-analyzer,
-ruby-lsp, …), spawns it for the buffer's project root, stores the connection on the model
-(`:lsp`), and registers `lsp-complete-source` so Tab now also offers the server's
-candidates — merged with the mode and buffer-word sources. M-x lsp-disconnect stops it."
+ruby-lsp, …), spawns it for the buffer's project root, files the connection under
+`:lsp-servers` beside any other language's, and registers `lsp-complete-source` so Tab now
+also offers the server's candidates — merged with the mode and buffer-word sources. M-x
+lsp-disconnect stops it; M-x lsp-servers lists what is running."
   (if (ed-lsp-live m)
-    (message m "lsp: already connected (M-x lsp-disconnect first)")
-    ;; a `:lsp` whose process is gone is not a connection — drop it and start over,
-    ;; rather than report "already connected" about a pid nothing answers
-    (let ([m2 _] (ed-lsp-start (dissoc m :lsp))) m2)))
+    (message m
+      (str "lsp: "
+        (first (:key (ed-lsp-server m)))
+        " is already connected (M-x lsp-disconnect first)"))
+    (let ([m2 _] (ed-lsp-start (ed-lsp-drop-dead m))) m2)))
 
 (defcommand cmd-lsp-disconnect
   (m key)
-  "Stop the buffer's language server and drop its completion connection (M-x lsp-disconnect).
-The `lsp-complete-source` stays registered but no-ops with no connection on the model."
-  (let (conn (:lsp m))
-    (if (nil? conn)
-      (message m "lsp: not connected")
-      (do (lsp/lsp-shutdown conn) (message (dissoc m :lsp) "lsp: disconnected")))))
+  "Stop the current buffer's language server (M-x lsp-disconnect). Other languages' servers
+keep running; the completion source stays registered and asks nothing for a file with no
+server."
+  (let (entry (ed-lsp-server m))
+    (if (nil? entry)
+      (message m "lsp: no server for this buffer")
+      (do
+        (lsp/lsp-shutdown (:conn entry))
+        (message (ed-lsp-detach m (:key entry)) (str "lsp: " (first (:key entry)) " disconnected"))))))
+
+(defn ed-lsp-servers-line (m)
+  "The running servers in one line — `brood-lsp ~/src/bedit · rust-analyzer ~/src/tool` —
+the current buffer's marked `*`, a dead one `(exited)`; `\"\"` when none."
+  (let (mine (:key (ed-lsp-server m))
+        home (os/env "HOME"))
+    (string/join (map (sort-by (%map-pairs (or (:lsp-servers m) {})) (fn ([key _]) key))
+                   (fn ([key entry])
+                     (let (root (second key)
+                           shown (if (and home (lsp/lsp-under? root home))
+                                   (str "~" (string/substring root (string/length home)))
+                                   root))
+                       (str (if (= key mine) "*" "")
+                         (first key)
+                         " "
+                         shown
+                         (if (proc/alive? (:conn entry)) "" " (exited)")))))
+      " · ")))
+
+(defcommand cmd-lsp-servers
+  (m key)
+  "Say which language servers are running and which one this buffer uses, marked `*` (M-x
+lsp-servers — eglot's `eglot-list-connections`). One runs per language and project root."
+  (let (line (ed-lsp-servers-line m))
+    (message m (if (= line "") "lsp: no servers running" (str "lsp: " line)))))
 
 (defdyn *lsp-autostart* true)
 ;; Whether opening a file whose language has an installed server starts it.
@@ -775,15 +853,17 @@ server that wants it, and a change the buffer's splice log cannot account for.
 
 Also completion's prepare step (`complete-at-point/*completion-prepare*`) and the first
 thing every lookup does ([[ed-lsp-ask-server]]), so the request after it carries no text."
-  (let (conn (:lsp m)
-        buf (ed-current-buf m)
+  ;; THIS buffer's server, never another language's: a file no server is configured for
+  ;; (wos kernel source) is pushed nowhere, rather than to whichever server happens to run
+  (let (buf (ed-current-buf m)
         file (buffer-file buf)
+        conn (ed-lsp-live m)
         uri (when file (lsp/lsp-path->uri file))
         synced (when uri (get-in m [:lsp-synced uri])))
     (if (or (nil? conn) (nil? file) (and synced (= (buffer-rope buf) (buffer-rope (:buf synced)))))
       m
       (let (token (ref)
-            changes (when (and synced (lsp/lsp-incremental-sync? (:lsp-caps m)))
+            changes (when (and synced (lsp/lsp-incremental-sync? (ed-lsp-caps m)))
                       (lsp/lsp-content-changes (:buf synced) buf)))
         (lsp/lsp-sync conn
           uri
@@ -813,17 +893,21 @@ ONE try per server and project root (`:lsp-autostarted`). A server that dies —
 `rust-analyzer` stub for a component that is not installed passes `os/which` and exits at
 once — used to be respawned on every idle beat, a process every few hundred milliseconds
 with nothing typed. Now its death is said once, and `M-x lsp-connect` is the retry."
-  (let (file (buffer-file (ed-current-buf m)))
-    (if (or (not *lsp-autostart*) (ed-lsp-live m) (ed-headless?) (nil? file))
+  (let (file (buffer-file (ed-current-buf m))
+        srv (when file (lsp/lsp-server-for file)))
+    ;; per BUFFER: a running Brood server says nothing about whether this Rust file has
+    ;; one, so each language starts its own the first time one of its files settles
+    (if (or (not *lsp-autostart*) (nil? file) (nil? srv) (ed-lsp-live m) (ed-headless?))
       m
-      (let (srv (lsp/lsp-server-for file)
+      (let (entry (ed-lsp-server m)
             tried [(first srv) (ed-lsp-root file)])
         (cond
-          (nil? srv) m
-          ;; a connection this editor made, whose process is gone
-          (:lsp m)
-            (message (dissoc m :lsp :lsp-caps)
-              "lsp: the language server exited (M-x lsp-connect to start it again)")
+          ;; a connection this editor made for this file, whose process is gone
+          entry
+            (message (ed-lsp-detach m (:key entry))
+              (str "lsp: "
+                (first (:key entry))
+                " exited (M-x lsp-connect to start it again)"))
           (contains? (:lsp-autostarted m #{}) tried) m
           ;; not installed counts as the one try too: a `PATH` search on every idle beat,
           ;; in every buffer of a language whose server nobody installed, was the cost

@@ -20,8 +20,8 @@ correlation, completion-result shapes — is **pure** (`lsp-ingest`,
 without a server (tests/lsp_test.blsp); the connection process is a thin IO shell
 around it.
 
-Opt-in: no server runs until something calls `lsp-connect` and stores the pid on the
-model under `:lsp` (see `lsp-complete-source`). Enable per language by adding
+Opt-in: no server runs until something calls `lsp-connect` and files the pid on the
+model under `:lsp-servers` — one per language and project root (`lsp-server-entry`). Enable per language by adding
 `'lsp/lsp-complete-source` to `complete-at-point/*completion-sources*`.
 
 Framing is std's `jsonrpc`, which is **byte-accurate**: `Content-Length` is LSP's byte
@@ -191,7 +191,7 @@ before children, in document order."
 
 ;; ---- pure protocol: location / hover / edit shapes (goto, refs, hover, rename) ----
 
-(defn- lsp-uri->path (uri)
+(defn lsp-uri->path (uri)
   "The filesystem path of a `file://` `uri`, percent-decoded (the inverse of
 `lsp-path->uri`); `uri` unchanged if it has no scheme, and the raw path if it does not
 decode."
@@ -967,7 +967,7 @@ model drops a connection whose process is gone (`ed-lsp-live`)."
           :lsp-stopped (do
             ;; tell the editor what this server can do, so a command can say "this server
             ;; does not do that" instead of showing nothing and reading as broken
-            (send :editor [:lsp-capabilities (or (:caps state2) {})])
+            (send :editor [:lsp-capabilities (or (:caps state2) {}) (self)])
             (lsp-loop state2)))))))
 
 (defn- lsp-write-handshake (p frame)
@@ -977,8 +977,8 @@ model drops a connection whose process is gone (`ed-lsp-live`)."
 
 (defn lsp-connect (cmd cmd-args root-uri)
   "Spawn language server `cmd` (with `cmd-args`, a list/vector of strings) for project
-`root-uri` and return the connection process pid. Store it on the model under `:lsp` to
-turn `lsp-complete-source` on. `(lsp-shutdown conn)` stops it."
+`root-uri` and return the connection process pid. The editor files it under
+`:lsp-servers` (`lsp-commands/ed-lsp-attach`), which is what `lsp-server-entry` finds. `(lsp-shutdown conn)` stops it."
   (spawn (lsp-run cmd cmd-args root-uri)))
 
 (defn lsp-capable? (caps feature)
@@ -1098,9 +1098,46 @@ extension when unmapped, or \"\" when there's none."
 or `nil` if none."
   (get *lsp-servers* (lsp-extension path)))
 
+;; ---- which running server a file belongs to ---------------------------------
+;; The model keeps every server it started, `:lsp-servers` — `{[command root] {:conn :caps}}`,
+;; one per language and project root — and a file belongs to the one its extension names
+;; (`*lsp-servers*`) whose root it is under. There used to be ONE connection, `:lsp`, and
+;; every buffer with a file was pushed to it: open a `.blsp` file and brood-lsp started, then
+;; open wos kernel source and brood-lsp checked THAT as Brood (`unbound symbol: var` on every
+;; line), while a Rust file beside them never got rust-analyzer at all. A buffer now reaches
+;; its own server or none.
+
+(defn lsp-under? (file root)
+  "True when `file` is `root` or inside it — a directory, not a prefix: `/p/crate` does not
+hold `/p/crate2/x`. False for a buffer with no file."
+  (and (string? file)
+    (or (= file root)
+      (string/starts-with? file (if (string/ends-with? root "/") root (str root "/"))))))
+
+(defn lsp-server-entry (m file)
+  "The running server on model `m` that serves `file`, as its entry plus its `:key`
+(`{:key [command root] :conn :caps}`), or nil: the server configured for the file's
+extension, among those whose root holds the file — the deepest root when two do. Asks no
+disk and no process, so it is cheap enough for every frame; whether the connection is still
+alive is `lsp-conn`'s question."
+  (let (configured (when (string? file) (lsp-server-for file)))
+    (when configured
+      (let (command (first configured)
+            hits (seq/filter (%map-pairs (or (:lsp-servers m) {}))
+                   (fn ([key _]) (and (= (first key) command) (lsp-under? file (second key))))))
+        (when (not (empty? hits))
+          (let ([key entry] (last (sort-by hits (fn ([key _]) (string/length (second key))))))
+            (assoc entry :key key)))))))
+
+(defn lsp-conn (m file)
+  "The live connection that serves `file` (`lsp-server-entry`), or nil — nil too when that
+server's process has died, because a pid nothing answers costs every request its timeout."
+  (let (entry (lsp-server-entry m file))
+    (when (and entry (proc/alive? (:conn entry))) (:conn entry))))
+
 (defn lsp-complete-source (m)
   "The LSP completion source (a `complete-at-point/*completion-sources*` entry): `[start prefix
-labels opts]` from the server stored on the model under `:lsp`, or `nil` when LSP is off,
+labels opts]` from the buffer's own server (`lsp-conn`), or `nil` when none serves its file,
 the buffer has no file, or the server timed out. `complete` merges these with the mode and
 buffer-word sources.
 
@@ -1117,27 +1154,26 @@ before. Only a model that skipped that step sends the whole document along.
 A connection whose process has died counts as off: this source runs on every Tab, and a
 pid nothing answers would spend `*lsp-timeout-ms*` per press waiting for a reply that
 cannot come."
-  (let (conn (:lsp m))
-    (if (or (nil? conn) (not (proc/alive? conn)))
+  (let (buf (ed-current-buf m)
+        file (buffer-file buf)
+        conn (lsp-conn m file))
+    ;; no server for this file — or none alive — is no file to ask about either
+    (if (or (nil? conn) (nil? file))
       nil
-      (let (buf (ed-current-buf m)
-            file (buffer-file buf))
-        (if (nil? file)
-          nil
-          (let (uri (lsp-path->uri file)
-                [start prefix] (lsp-symbol-at-point buf)
-                synced (get-in m [:lsp-synced uri :buf])
-                request {:uri uri
-                         :lang (lsp-language-id file)
-                         :line (buffer-current-line buf)
-                         :char (buffer-column buf)}
-                answer (lsp-complete-sync conn
-                         (if (and synced (= (buffer-rope synced) (buffer-rope buf)))
-                           request
-                           (assoc request :text (buffer-text buf)))
-                         *lsp-timeout-ms*)
-                labels (:labels answer))
-            (cond
-              (not (:incomplete answer)) [start prefix labels {:cache true}]
-              (empty? labels) nil
-              :else [start prefix labels])))))))
+      (let (uri (lsp-path->uri file)
+            [start prefix] (lsp-symbol-at-point buf)
+            synced (get-in m [:lsp-synced uri :buf])
+            request {:uri uri
+                     :lang (lsp-language-id file)
+                     :line (buffer-current-line buf)
+                     :char (buffer-column buf)}
+            answer (lsp-complete-sync conn
+                     (if (and synced (= (buffer-rope synced) (buffer-rope buf)))
+                       request
+                       (assoc request :text (buffer-text buf)))
+                     *lsp-timeout-ms*)
+            labels (:labels answer))
+        (cond
+          (not (:incomplete answer)) [start prefix labels {:cache true}]
+          (empty? labels) nil
+          :else [start prefix labels])))))
