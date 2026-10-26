@@ -4,92 +4,56 @@
 in brood's `docs/devlog.md`; decisions in brood's `docs/decisions/`; the open backlog is
 [`../issues.md`](../issues.md). Read this to pick the work back up cold.
 
-## State when written — 2026-10-26, early morning
+## State when written — 2026-10-26, morning
 
-Everything in brood and bedit is committed and pushed. Two new packages are committed
-LOCALLY only (no GitHub repo, not on hive) — creating those is the user's call.
+Released and published; everything committed and pushed.
 
-### Goal (the user's asks this session)
-
-Work through the general-purpose gap analysis (`../brood/docs/general-purpose-gaps.md`):
-"1) fix this. 2) fix this. 3) a) what can we do here … j) … 4) fix this. and everything else".
-Answers given along the way: SQLite as a WASM component package; the error convention per
-"ROADMAP's plan" (which turned out to be stale — see Decisions).
-
-### Done — brood (origin/main, all via the worktree `~/.cache/brood-wt-defwarn`)
-
-- Crypto (ADR-448), UDP (ADR-449), TLS ALPN + HTTP/1.1 keep-alive (ADR-451), DAP server
-  `nest dap` (ADR-452), `nest profile` folded stacks, `std/tz` — earlier in the session.
-- `b6611b4b` tempo/new, tempo/parse, tempo/parse-span, resolver/resolve answer a failure, not
-  `[:ok]`/`[:error]` (ADR-310's own rule). Docs say gap 8 was already decided.
-- `519653f2` the large-project queue is done bar re-timing; `language.md` says how to make
-  the checker a CI gate.
-- `bdbf8232` + `613f35bb` **ADR-453**: WASI preview 2 by grant (`%wasm-load src grants`:
-  `:dirs` `[host guest]`/`[host guest :write]`, `:env`, `:args`, `:stdio`; never network),
-  interface exports (`iface#fn`, bare alias when unique), guest resources as tokens +
-  `%wasm-release`, enums/variants/records lower as they lift. Fixture: a real wit-bindgen
-  guest committed built (`tests/support/wasm-guest.wasm`, source beside it);
-  `tests/wasm_wasi_test.blsp`.
-- `fdd21746` **ADR-454**: `include-bytes`; an include resolves against the package of the
-  file naming it (dev now matches release). Same commit fixed main's red: the register
-  worker's direct self-call is revalidated after ADR-450 (an alias called the old body),
-  KI-303's archive section, `caar`..`cdddr` in bare-names + doc catalogue, `sv-seconds`
-  given the 400 rounds 128 calls need.
-- `89267d84` gaps 3 and 5 updated.
-
-### Done — packages (local git only)
-
-- `~/src/broodlang/observe-otlp` (`a568d86`): OTLP/HTTP JSON provider for `observe` — logs,
-  errors as `exception.*` log records, metrics; `from-environment` reads `OTEL_*`. 12 tests.
-- `~/src/broodlang/sqlite` (`e473c69`): SQLite 3.50 as a component (`native/`, rusqlite
-  bundled, built with wasi-sdk 25 in `~/.local/share`; `make wasm`), a connection PROCESS
-  per handle, `open/execute/execute-batch/query/query-one/query-rows/transaction/close`.
-  12 tests, run with the worktree's nest. `:brood ">= 0.44.0"` — **needs a brood release with
-  ADR-453/454 before it can be used or published.**
+- **brood v0.44.0** (tag on `bd75fb95`, merged into main as `0884b0b0`): WASI by grant
+  (ADR-453), `include-bytes` (ADR-454), typed parameters, sorted collections, process
+  registry and groups, `defapp`/`defstatem`, crypto, UDP, TLS ALPN, `nest dap`, std `vcs`,
+  `os/shell-split`, `path/substitute`. The CHANGELOG had recorded about a quarter of the 229
+  commits since 0.43.0; the release commit filled it in, including two **breaking** changes
+  (`gen/start-link`/`gen/start-named` gone, ADR-433; tempo/resolver answer failures).
+- **bedit v0.7.0** (`f85847ca`): the floor is brood 0.44.0 — the first release since v0.6.1
+  that a released toolchain can run. All 59 issues from the 2026-09-23 review are fixed.
+- **hive**: `observe-otlp 0.1.0` and `sqlite 0.1.0` published; repos
+  `broodlang/observe-otlp` and `broodlang/sqlite` created (public).
+- **path/substitute moved to brood std** (`efd919d1`): `path/expand-env`, `path/escape-env`,
+  `path/substitute`, `path/substitute-start` (Emacs's `substitute-in-file-name`; a `keep?`
+  predicate keeps path pure, ADR-234). bedit's `filename.blsp` is now the prompt's layer only.
 
 ## Next
 
-1. Confirm brood CI is green at `89267d84` (or later). Main was red all evening from other
-   commits; the fixes are in `fdd21746`. `optional_defaults_test` failed once in CI and passes
-   here — watch it.
-2. Ask the user: create GitHub repos `broodlang/observe-otlp` and `broodlang/sqlite`, cut brood
-   0.44.0, publish both to hive.
-3. Gaps still open (`general-purpose-gaps.md`): M2 shared IC tables and the other runtime
-   memory items (benchmark-gated — the test machine); re-timing the 2026-10-23 load-path work;
-   a C embedding API; `:wasm-build` build-on-fetch; HTTP/2, gRPC, Redis, MySQL packages;
-   W3C `traceparent`.
-4. The installed nest (`~/.local/bin`, 0.43.0 `ad576651`) predates everything above;
-   `make install` from a clean worktree when wanted.
+1. **The installed nest is 0.43.0 and can no longer load bedit** (`requires Brood >= 0.44.0`).
+   `make install` from a clean brood worktree at `v0.44.0` or later (GUI build) — ask first,
+   it is a long build on this desktop.
+2. `todo.md` is stale except one bug: a slight jitter when editing a markdown file. No commit
+   addresses it; reproduce before assuming it is gone.
+3. Brood gaps still open (`../brood/docs/general-purpose-gaps.md`): runtime memory items
+   (benchmark-gated — the test machine), re-timing the load-path work, a C embedding API,
+   `:wasm-build` build-on-fetch, HTTP/2 / gRPC / Redis / MySQL packages, W3C `traceparent`.
+4. `toolchain.blsp` (marker file → compile/test/run commands) was weighed for std and left
+   in bedit: mostly data, no second user yet. Revisit if one appears.
 
 ## Decisions
 
-- **Gap 8 (errors) was a stale ROADMAP line.** ADR-310/315 chose failure VALUES over
-  `[:ok]`/`[:error]` tuples and rejected `result`/`unwrap` by name; building the tuple plan
-  would have reversed a recorded decision. Only the stragglers were converted.
-- WASI: clocks and randomness come with any grants map; the network never does.
-- A package ships a component by `include-bytes` (the package hash is the pin); no `:native`
-  manifest clause.
-- SQLite runs on `unix-none` (no locks): one handle per file, and the handle is a process.
+- **bedit takes no package dependencies.** A feature is a brood abstraction with a thin bedit
+  layer, or wholly bedit; packages only as optional runtime installs (`M-x package-list`).
+- Brood releases are cut from the last CI-green commit and merged back, so another session's
+  untested push on main never rides into a tag.
+- Gap 8 (errors) was a stale ROADMAP line: failure VALUES (ADR-310/315), not tuples.
 
 ## Traps
 
-- **No benchmarks, stress runs or heavy brood suites on this desktop** (global CLAUDE.md);
-  bedit's `nest test` and a single brood test file are fine. Push brood with `--no-verify`.
-- Brood work goes in a worktree with its OWN `target/` — never the primary checkout's, which
-  other sessions rebuild. Check `nest --version` before trusting a run; `target/debug/brood`
-  is only rebuilt by `cargo build --bin brood`.
-- Brood ADR numbers collide across sessions: `git grep '^## ADR-NNN' origin/main` before
-  pushing. Next free after this session: 455.
-- Main's CI keeps only one pending run; rapid pushes cancel the ones queued behind. A red
-  run can hide behind a column of "cancelled".
-- The checker carries an argument's type through a function that may return it (`native-name`
-  returned `export` in its else branch): pass a typed value at the call site.
+- **No benchmarks, stress runs or heavy brood suites on this desktop**; bedit's per-file
+  `nest test` and a single brood test file are fine. Push brood with `--no-verify`.
+- Brood work goes in a worktree with its OWN `target/` (this session's:
+  `~/.cache/brood-wt-defwarn`, branches `path-substitute` / `release-*` — all merged; remove
+  with `git worktree remove` when done). Rebuild after every std edit: the binary embeds std.
+- `nest publish` can hit the http client's fixed 30 s timeout on a transient registry stall;
+  `nest search NAME` says whether it landed (releases are immutable) — then just retry.
+- Brood ADR numbers collide across sessions: `git grep '^## ADR-NNN' origin/main` first.
+  Next free: 455.
+- A release's CHANGELOG is checked only for its heading — read `git log vPREV..` and fill
+  in what is missing before tagging.
 - `nest format` takes no file arguments: `nest format --changed [--check]`.
-
-## Environment
-
-- bedit `~/src/broodlang/bedit` on `main`, clean, equal to origin/main.
-- brood primary `~/src/broodlang/brood`: other sessions' work — leave it. This session's
-  worktree is `~/.cache/brood-wt-defwarn` (branch `docs-wasm`, at origin/main); remove it with
-  `git worktree remove` when done.
-- Installed this session: Rust target `wasm32-wasip2`; wasi-sdk 25 in `~/.local/share`.
