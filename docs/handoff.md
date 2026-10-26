@@ -24,9 +24,7 @@ Released and published; everything committed and pushed.
 
 ## Next
 
-1. **The installed nest is 0.43.0 and can no longer load bedit** (`requires Brood >= 0.44.0`).
-   `make install` from a clean brood worktree at `v0.44.0` or later (GUI build) — ask first,
-   it is a long build on this desktop.
+1. The installed nest is 0.44.0 (`bd75fb95`, GUI build, from `~/.cache/brood-wt-defwarn`).
 2. `todo.md` is stale except one bug: a slight jitter when editing a markdown file. No commit
    addresses it; reproduce before assuming it is gone.
 3. Brood gaps still open (`../brood/docs/general-purpose-gaps.md`): runtime memory items
