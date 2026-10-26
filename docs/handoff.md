@@ -24,7 +24,7 @@ Released and published; everything committed and pushed.
 
 ## Next
 
-1. The installed nest is 0.44.0 (`bd75fb95`, GUI build, from `~/.cache/brood-wt-defwarn`).
+1. The installed nest is 0.44.0 (`bd75fb95`, GUI build); its worktree has been removed.
 2. `todo.md` is stale except one bug: a slight jitter when editing a markdown file. No commit
    addresses it; reproduce before assuming it is gone.
 3. Brood gaps still open (`../brood/docs/general-purpose-gaps.md`): runtime memory items
@@ -45,9 +45,8 @@ Released and published; everything committed and pushed.
 
 - **No benchmarks, stress runs or heavy brood suites on this desktop**; bedit's per-file
   `nest test` and a single brood test file are fine. Push brood with `--no-verify`.
-- Brood work goes in a worktree with its OWN `target/` (this session's:
-  `~/.cache/brood-wt-defwarn`, branches `path-substitute` / `release-*` — all merged; remove
-  with `git worktree remove` when done). Rebuild after every std edit: the binary embeds std.
+- Brood work goes in a worktree with its OWN `target/` (none is open from this session).
+  Rebuild after every std edit: the binary embeds std.
 - `nest publish` can hit the http client's fixed 30 s timeout on a transient registry stall;
   `nest search NAME` says whether it landed (releases are immutable) — then just retry.
 - Brood ADR numbers collide across sessions: `git grep '^## ADR-NNN' origin/main` first.
