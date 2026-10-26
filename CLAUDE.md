@@ -262,7 +262,8 @@ src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability 
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
                             lsp-commands can register fold impls while lsp stays deferred
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
-src/filename.blsp           a typed path read the Emacs way (`substitute-in-file-name`): the prompt
+src/filename.blsp           a typed path read the Emacs way (`substitute-in-file-name`, which is
+                            std's `path/substitute` — this is the prompt's layer over it): the prompt
                             shows the home as `~`, `//` or `/~/` restarts the path (the overridden
                             part painted dim — file-name-shadow), `$VAR`s expand, a name from the
                             disk goes on the line escaped (`$$`), a relative name is read under the
