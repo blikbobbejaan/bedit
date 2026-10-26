@@ -435,7 +435,9 @@ src/section.blsp            SECTION TREES (magit-section) as data: a tree render
 src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is a
                             `section` tree (brood ADR-388) — tree, rows and
                             visibility live ON THE BUFFER, faces come from the mode's
-                            `:section-faces` service as data (`:face-spans`), and TAB · n/p ·
+                            `:section-faces` service as data (`:face-spans`), a right margin
+                            (a log's author and age, Magit's) from `:section-margin` as
+                            `:right-margin` — the view narrows the text for it — and TAB · n/p ·
                             ^ · M-n/M-p · 1-4 · M-w are shared by every such buffer. A lazy
                             section (a status file whose diff was never fetched) asks the
                             mode's `:section-reload`
