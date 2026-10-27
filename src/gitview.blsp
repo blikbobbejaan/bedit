@@ -42,9 +42,10 @@ refreshes it."
               (fn (row) (any? h (fn (l) (string/starts-with? l (first row)))))))
     (if (nil? hit) "modified" (second hit))))
 
-(defn- gv-file-section (f lst)
+(defn- gv-file-section (f lst paint?)
   "The section for one parsed diff file `f` in list `lst`: its heading (the label, the
-path, `old -> new` for a rename), its hunks — or a binary file's `Binary files …` line."
+path, `old -> new` for a rename), its hunks — painted when `paint?` — or a binary file's
+`Binary files …` line."
   (let (old (:old-path f)
         new (:new-path f)
         path (or new old "?")
@@ -55,19 +56,70 @@ path, `old -> new` for a rename), its hunks — or a binary file's `Binary files
       (git-file-line label path orig)
       (if (empty? (:hunks f))
         (seq/filter (:headers f []) (fn (l) (string/starts-with? l "Binary files")))
-        (vcsproc/vcs-hunk-sections f {:path path :section lst}))
+        (vcsproc/vcs-hunk-sections f {:path path :section lst} paint?))
       {:key path})))
 
 (defn gv-file-sections (files lst)
   "The file sections of a parsed diff (`diff/parse-unified`), open by default — a commit is
 read file by file. `lst` is the working-tree list the diff is OF (`:unstaged`, `:staged`)
 or nil for a diff of history, which is what lets `s` / `u` / `k` act on it the way they
-act on the same hunk in *git-status*."
-  (into [] (map files (fn (f) (gv-file-section f lst)))))
+act on the same hunk in *git-status*. The first few thousand lines are painted
+(`diffpaint/paint-keys`), the rest keep the plain +/- colours."
+  (let (files (into [] files)
+        painted (diffpaint/paint-keys (map (range (count files)) (fn (i) [i (nth files i)]))))
+    (into []
+      (map (range (count files)) (fn (i) (gv-file-section (nth files i) lst (contains? painted i)))))))
 
 (defn- gv-empty (text)
   "A one-line note section, for a view with nothing in it."
   (section :note nil text))
+
+;; ---- showing a view OFF the loop -------------------------------------------------
+;; `git show` of a large commit, or `git diff` of a large work tree, takes as long as git
+;; takes, and painting its hunks (`diffpaint`) more. Both run in a task: the git call AND
+;; the tree, plain data in and out, and the buffer is shown when the answer lands. One view
+;; in flight at a time — asking for another drops the first answer as stale, because the
+;; reader has moved on to the newer one. Headless runs it inline.
+
+(defn- gv-land (m root name type opts verb answer)
+  "Show a finished view `answer` (`{:tree}`, or `{:failed result}` when git said no)."
+  (if (:failed answer)
+    (vcsproc/vcs-report-cmd m verb (:failed answer))
+    (sectionbuf/sb-show (assoc m :git-root root) name (:tree answer) type opts)))
+
+(check-allow :trusted
+  ;; `build` is the caller's own `() -> {:tree} | {:failed}`; the declaration is the contract
+  (sig gv-show-off-loop (model string string any map string fn -> model))
+  (defn- gv-show-off-loop (m root name type opts verb build)
+    "Run `build` — the git call and the tree it makes, `() -> {:tree} | {:failed result}` —
+in a task, and show its tree as buffer `name` of `type` with sectionbuf `opts` when it lands."
+    (if (ed-headless?)
+      (gv-land m root name type opts verb (build))
+      ;; the activity indicator says it is running (the reply row's label)
+      (assoc m
+        :git-view-proc (task/task build {:timeout *git-op-timeout-ms*})
+        :git-view-pending
+          {:root root
+           :name name
+           :type type
+           :opts opts
+           :verb verb
+           :from (ed-current-index m)}))))
+
+(register-task-reply :git-view-proc 'gitview/gv-apply-view nil "git")
+(defn gv-apply-view (m answer)
+  "Fold a view built off the loop into its buffer. A reader who has since moved to another
+buffer gets it BESIDE them (`:display`) rather than in place of where they now are."
+  (let (pending (:git-view-pending m)
+        m1 (dissoc m :git-view-proc :git-view-pending)
+        opts (:opts pending {})
+        moved? (not (= (ed-current-index m1) (:from pending)))
+        placed (if (and moved? (contains? #{:here :pop} (:action opts :here)))
+                 (assoc opts :action :display)
+                 opts))
+    (if (nil? answer)
+      (message m1 (str (:verb pending "git") " failed or timed out"))
+      (gv-land m1 (:root pending) (:name pending) (:type pending) placed (:verb pending) answer))))
 
 ;; ---- a commit: *git-revision* ----------------------------------------------------
 
@@ -112,18 +164,21 @@ the change it made, rather than as a combined diff nobody can read."
     (nil? root) (message m "not in a git repository")
     (or (nil? rev) (= rev "")) (message m "no commit here")
     :else
-      (let (r (git-git root
-                ["show"
-                  "--no-color" "--no-ext-diff" "--diff-merges=first-parent" gv-show-format rev]))
-        (if (not (= (:exit r) 0))
-          (vcsproc/vcs-report-cmd m (str "git show " rev) r)
-          (sectionbuf/sb-show (assoc m :git-root root)
-            "*git-revision*"
-            (gv-revision-tree rev (gv-parse-show (:stdout r "")))
-            :git-revision {:action action
-             :ctx {:root root :rev rev :reload 'gitview/git-revision-reload}
-             :line 1
-             :vis {}})))))
+      (gv-show-off-loop m
+        root
+        "*git-revision*"
+        :git-revision {:action action
+         :ctx {:root root :rev rev :reload 'gitview/git-revision-reload}
+         :line 1
+         :vis {}}
+        (str "git show " rev)
+        (fn ()
+          (let (r (git-git root
+                    ["show"
+                      "--no-color" "--no-ext-diff" "--diff-merges=first-parent" gv-show-format rev]))
+            (if (not (= (:exit r) 0))
+              {:failed r}
+              {:tree (gv-revision-tree rev (gv-parse-show (:stdout r "")))}))))))
 
 (defn git-revision-reload (m)
   "*git-revision*'s `:reload`: show the same commit again."
@@ -151,27 +206,33 @@ working-tree list it is a diff OF (`:unstaged` / `:staged`, nil for history), so
 `u` / `k` work on it as they do in *git-status*. `+` / `-` widen and narrow the context."
   (if (nil? root)
     (message m "not in a git repository")
+    (gv-show-off-loop m
+      root
+      "*git-diff*"
+      :git-diff {:action action
+       :ctx {:root root :args args :section lst :reload 'gitview/git-diff-reload}
+       :line 1}
+      "git diff"
+      (gv-diff-build root args lst))))
+
+(defn- gv-diff-build (root args lst)
+  "The `() -> {:tree} | {:failed}` that runs `git diff args` in `root` and makes its tree."
+  (fn ()
     (let (full (append ["diff" "--no-color" "--no-ext-diff"] args)
           r (git-git root full))
       (if (>= (:exit r) 2)
-        (vcsproc/vcs-report-cmd m "git diff" r)
-        (sectionbuf/sb-show (assoc m :git-root root)
-          "*git-diff*"
-          (gv-diff-tree (:stdout r "") lst (string/join (into ["git"] full) " "))
-          :git-diff {:action action
-           :ctx {:root root :args args :section lst :reload 'gitview/git-diff-reload}
-           :line 1})))))
+        {:failed r}
+        {:tree (gv-diff-tree (:stdout r "") lst (string/join (into ["git"] full) " "))}))))
 
 (defn git-diff-reload (m)
   "*git-diff*'s `:reload`: the same diff again, point kept."
   (let (c (sectionbuf/sb-ctx m))
-    (sectionbuf/sb-show m
+    (gv-show-off-loop m
+      (:root c)
       "*git-diff*"
-      (let (r (git-git (:root c) (append ["diff" "--no-color" "--no-ext-diff"] (:args c))))
-        (gv-diff-tree (:stdout r "")
-          (:section c)
-          (string/join (append ["git" "diff"] (:args c)) " ")))
-      :git-diff {:action :here})))
+      :git-diff {:action :here}
+      "git diff"
+      (gv-diff-build (:root c) (:args c) (:section c)))))
 
 (defn- gv-diff-args (m extra)
   "The diff menu's flags, then `extra`."
@@ -847,15 +908,27 @@ committed one."
     (keymap-bind [:enter] 'gitview/cmd-git-refs-visit) ; RET — the log of the ref at point
     (keymap-bind ["k"] 'gitrefs/cmd-git-branch-delete))) ; k — delete the ref at point
 (defn- git-view-layer (name doc keymap)
-  "A git view's layer: its keymap, the shared section faces, no mode-local M-x names."
-  {:name name :doc doc :keymap keymap :commands '() :section-faces 'gitsection/git-section-faces})
+  "A git view's layer: its keymap, the shared section faces and line backgrounds, no
+mode-local M-x names."
+  {:name name
+   :doc doc
+   :keymap keymap
+   :commands '()
+   :section-faces 'gitsection/git-section-faces
+   :section-bands 'gitsection/git-section-bands})
 
 (def git-revision-mode-layer
-  (git-view-layer 'git-revision
-    "A commit: RET goes to a line, a applies a hunk, v reverses it." gitview/git-revision-keymap))
+  ;; a diff's long lines wrap (`visual-line-mode`) rather than scroll the pane sideways —
+  ;; the tint of a wrapped line covers every row of it; M-x visual-line-mode turns it off
+  (assoc (git-view-layer 'git-revision
+           "A commit: RET goes to a line, a applies a hunk, v reverses it."
+           gitview/git-revision-keymap)
+    :visual-line true))
 (def git-diff-mode-layer
-  (git-view-layer 'git-diff
-    "A diff: s/u/k as in the status buffer; + / - more or less context." gitview/git-diff-keymap))
+  (assoc (git-view-layer 'git-diff
+           "A diff: s/u/k as in the status buffer; + / - more or less context."
+           gitview/git-diff-keymap)
+    :visual-line true))
 (def git-log-mode-layer
   ;; the author and age in the right margin, as Magit's log keeps them
   (assoc (git-view-layer 'git-log

@@ -1,0 +1,286 @@
+(defmodule diffpaint
+  "A diff hunk painted the way Magit and delta paint one: its code in the colours of its own
+language, and inside a changed line the words that changed (Magit's `refine-hunk`). Pure
+data — what to colour, as line-relative spans and ranges — so a section buffer's faces
+service turns it into faces and every VCS's hunks (git's, mur's) read alike.
+
+The two sides of a hunk are fontified separately, each as one snippet in the file's mode: the
+NEW side (context and added lines) and the OLD side (context and removed lines). A string or
+a comment that spans lines comes out right that way, which a line at a time would not.
+
+The changed words come from diffing a block of removed lines against the added lines after
+it, by token (`diff/seq` over words, runs of space and single punctuation). A block whose
+lines were rewritten wholesale is left alone: highlighting every word says nothing."
+  (:use model :only [ed-stamp ed-mode-service])
+  (:use editor/buffer :only [make-buffer]))
+
+(def *syntax-line-cap* 2000) ; a hunk longer than this keeps the plain +/- colours
+(def *paint-file-cap* 3000) ; a file whose hunks hold more lines than this is not painted
+(def *paint-buffer-cap* 8000) ; lines painted in one buffer, all its files together
+(def *refine-token-cap* 1600) ; differing removed × added tokens past which a block is not refined
+(def *refine-min-kept* 0.25) ; a block keeping fewer of its words than this was rewritten
+
+(defn paint? (file)
+  "Whether a parsed diff `file` is small enough to paint: a file whose hunks hold more than
+`*paint-file-cap*` lines (a lockfile, generated code) keeps the plain +/- colours, since
+painting is paid when the buffer opens."
+  (<= (file-lines file) *paint-file-cap*))
+
+(defn- file-lines (file)
+  "How many lines the hunks of a parsed diff `file` hold."
+  (fold (:hunks file []) 0 (fn (n hunk) (+ n (count (:lines hunk))))))
+
+(defn paint-keys (keyed)
+  "Which files of one buffer get painted: `keyed` is `[key file]` pairs in the order the
+buffer shows them, and the answer the set of keys whose file is `paint?` and still inside
+`*paint-buffer-cap*` lines counted over the painted files before it. A commit touching three
+hundred files paints the first few thousand lines and leaves the rest in plain +/-, rather
+than spending seconds on lines nobody has scrolled to.
+
+    (diffpaint/paint-keys [[:a {:hunks [{:lines [\"+x\"]}]}]])   → #{:a}"
+  (:keys (fold keyed
+           {:keys #{} :lines 0}
+           (fn (acc pair)
+             (let ([key file] pair
+                   n (file-lines file)
+                   total (+ (:lines acc) n))
+               (if (and (paint? file) (<= total *paint-buffer-cap*))
+                 {:keys (conj (:keys acc) key) :lines total}
+                 acc))))))
+(sig paint-keys (seqable -> set))
+
+;; A hunk's paint is a function of its path (the language) and its lines, so it is
+;; remembered by them: a status refresh — every `s`, `u`, `g` — rebuilds the tree, and every
+;; hunk that did not change answers here instead of being fontified and diffed again. Bounded
+;; (`defmemo`, compared by `=`): a different hunk of the same length differs within a line or
+;; two, so the lookup costs little next to one paint.
+(memo/defmemo hunk-paint
+  512
+  (path lines)
+  "`{:syntax :refine}` for the hunk `lines` of the file at `path`: `hunk-syntax` in the
+colours of the mode the file opens in, and `hunk-refine`. Remembered, so an unchanged hunk is
+painted once however often its buffer is rebuilt."
+  {:syntax (hunk-syntax (fontify-for path) lines) :refine (hunk-refine lines)})
+
+;; ---- the code's own colours -----------------------------------------------------
+
+(defn fontify-for (path)
+  "The `:fontify` service of the mode a file at `path` opens in, or nil when that mode has
+none (plain text) or there is no path."
+  (when (string? path)
+    (ed-mode-service (ed-stamp (assoc (make-buffer "" (path/basename path)) :file path)) :fontify)))
+
+(defn- sign-of (line)
+  "The ` ` / `+` / `-` / `\\` a hunk line starts with, \"\" for an empty one."
+  (if (empty? line) "" (string/substring line 0 1)))
+
+(defn- body-of (line)
+  "A hunk line without its ` ` / `+` / `-` sign."
+  (if (empty? line) "" (string/substring line 1 (string/length line))))
+
+(defn- split-spans (spans lengths)
+  "`spans` (`[start end face]`, ascending by start, over the lines of `lengths` joined by
+newlines) cut into one vector per line, each moved to its line's columns and then one to the
+right, past the sign the hunk line starts with. One walk: a span starts on or after the line
+the one before it started on."
+  (let (n (count lengths)
+        starts (into [] (seq/scan lengths 0 (fn (start length) (+ start length 1)))))
+    (letrec (pieces (fn (acc i from to face)
+                      ;; the span's piece on each line from `i` it reaches
+                      (if (or (>= i n) (>= (nth starts i) to))
+                        acc
+                        (let (start (nth starts i)
+                              lo (math/max from start)
+                              hi (math/min to (+ start (nth lengths i 0))))
+                          (pieces (if (< lo hi)
+                                    (assoc acc
+                                      i
+                                        (conj (get acc i [])
+                                          [(+ 1 (- lo start)) (+ 1 (- hi start)) face]))
+                                    acc)
+                            (inc i)
+                            from
+                            to
+                            face))))
+             walk (fn (spans i acc)
+                    (if (empty? spans)
+                      acc
+                      (let ([from to face] (first spans)
+                            ;; the line the span starts on: past every line that ends before it
+                            line (letrec (forward (fn (j)
+                                                    (if (and (< (inc j) n)
+                                                          (<= (nth starts (inc j)) from))
+                                                      (forward (inc j))
+                                                      j)))
+                                   (forward i)))
+                        (walk (rest spans) line (pieces acc line from to face))))))
+      (let (found (walk spans 0 {}))
+        (into [] (map (range n) (fn (i) (get found i []))))))))
+
+(defn- side-spans (fontify lines indices)
+  "The spans of the hunk `lines` at `indices`, fontified together as one snippet: a map from
+each index to its line's spans."
+  (let (bodies (map indices (fn (i) (body-of (nth lines i))))
+        ;; a highlighter that throws on a fragment (a hunk is rarely a whole form) means no
+        ;; colours for this hunk, not a diff that will not open
+        spans (check-allow :discarded-catch
+                (try (fontify (string/join bodies "\n")) (catch error nil))))
+    (if (not (or (list? spans) (vector? spans)))
+      {}
+      (into {} (seq/zip indices (split-spans (sort-by spans first) (map bodies string/length)))))))
+
+(defn hunk-syntax (fontify lines)
+  "Each of the hunk `lines`' syntax spans, line-relative (the sign is column 0), as a vector
+parallel to `lines`; nil when there is no `fontify` or the hunk is past `*syntax-line-cap*`.
+Each side is fontified with the context lines in it; a context line takes its colours from
+the new side.
+
+    (diffpaint/hunk-syntax (fn (src) [[0 3 :keyword]]) [\"+def x\"])   → [([1 4 :keyword])]"
+  (when (and fontify (<= (count lines) *syntax-line-cap*))
+    (let (indices (range (count lines))
+          on (fn (signs) (seq/filter indices (fn (i) (includes? signs (sign-of (nth lines i))))))
+          new-side (side-spans fontify lines (on [" " "+"]))
+          old-side (side-spans fontify lines (on [" " "-"])))
+      (into []
+        (map indices
+          (fn (i) (if (= (sign-of (nth lines i)) "-") (get old-side i []) (get new-side i []))))))))
+
+;; ---- the words that changed -----------------------------------------------------
+
+(def- word-rules [["\\w+" :word] ["\\s+" :space] ["." :punct]])
+
+(defn- line-tokens (lines indices)
+  "The tokens of the hunk `lines` at `indices`, in order, each `{:line :start :end :text
+:tag}` with its columns line-relative (past the sign)."
+  (mapcat indices
+    (fn (i)
+      (map (regex/tokens word-rules (body-of (nth lines i)))
+        (fn (token) (assoc token :line i :start (inc (:start token)) :end (inc (:end token))))))))
+
+(defn- runs (lines)
+  "The `[removed added]` index blocks of the hunk `lines`: each run of `-` lines with the run
+of `+` lines straight after it."
+  (letrec (sign (fn (i) (if (< i (count lines)) (sign-of (nth lines i)) ""))
+           take-run (fn (i s acc) (if (= (sign i) s) (take-run (inc i) s (conj acc i)) acc))
+           walk (fn (i acc)
+                  (cond
+                    (>= i (count lines)) acc
+                    (= (sign i) "-")
+                      (let (removed (take-run i "-" [])
+                            added (take-run (+ i (count removed)) "+" []))
+                        (walk (+ i (count removed) (count added))
+                          (if (empty? added) acc (conj acc [removed added]))))
+                    :else (walk (inc i) acc))))
+    (walk 0 [])))
+
+(defn- changed-tokens (ops removed added)
+  "The removed and added tokens `ops` (a `diff/seq` over their texts) did not keep, as
+`[removed-changed added-changed kept]`."
+  (letrec (walk (fn (ops r a out-r out-a kept)
+                  (if (empty? ops)
+                    [out-r out-a kept]
+                    (case (first (first ops))
+                      :keep
+                        (walk (rest ops)
+                          (rest r)
+                          (rest a)
+                          out-r
+                          out-a
+                          (if (= (:tag (first r)) :space) kept (inc kept)))
+                      :delete (walk (rest ops) (rest r) a (conj out-r (first r)) out-a kept)
+                      (walk (rest ops) r (rest a) out-r (conj out-a (first a)) kept)))))
+    (walk ops removed added [] [] 0)))
+
+(defn- ranges-by-line (tokens)
+  "Changed `tokens` as `{line [[from to] …]}`, a token touching the one before it joined
+into one range."
+  (fold tokens
+    {}
+    (fn (acc token)
+      (let (line (:line token)
+            have (get acc line [])
+            prior (last have))
+        (assoc acc
+          line
+            (if (and prior (= (second prior) (:start token)))
+              (conj (into [] (but-last have)) [(first prior) (:end token)])
+              (conj have [(:start token) (:end token)])))))))
+
+(defn- words (tokens)
+  "How many of `tokens` are not space."
+  (count (seq/reject tokens (fn (token) (= (:tag token) :space)))))
+
+(defn- common-ends (removed added)
+  "`[prefix suffix]`: how many tokens `removed` and `added` share at their start and, of
+what is left, at their end — taken off before diffing, since a changed line mostly keeps
+both and the diff costs the product of what remains."
+  (let (nr (count removed)
+        na (count added)
+        same? (fn (i j) (= (:text (nth removed i)) (:text (nth added j)))))
+    (letrec (prefix (fn (k) (if (and (< k nr) (< k na) (same? k k)) (prefix (inc k)) k))
+             suffix (fn (p k)
+                      (if (and (< (+ p k) nr) (< (+ p k) na) (same? (- nr k 1) (- na k 1)))
+                        (suffix p (inc k))
+                        k)))
+      (let (p (prefix 0)) [p (suffix p 0)]))))
+
+(defn hunk-refine (lines)
+  "The words that changed in the hunk `lines`: `{line [[from to] …]}`, line-relative (the sign
+is column 0), for each block of removed lines and the added lines after it — unless the block
+was rewritten wholesale (fewer than `*refine-min-kept*` of its words kept) or what differs is
+too big to diff (`*refine-token-cap*`, once the shared start and end are off).
+
+    (diffpaint/hunk-refine [\"-let x = 1\" \"+let x = 2\"])   → {0 [[9 10]] 1 [[9 10]]}"
+  (fold (runs lines)
+    {}
+    (fn (acc block)
+      (let ([removed-lines added-lines] block
+            removed (into [] (line-tokens lines removed-lines))
+            added (into [] (line-tokens lines added-lines))
+            [prefix suffix] (common-ends removed added)
+            removed-middle (seq/subvec removed prefix (- (count removed) suffix))
+            added-middle (seq/subvec added prefix (- (count added) suffix)))
+        (if (> (* (count removed-middle) (count added-middle)) *refine-token-cap*)
+          acc
+          (let ([out-r out-a kept-middle] (changed-tokens (diff/seq (map removed-middle :text)
+                                                            (map added-middle :text))
+                                            removed-middle added-middle)
+                kept (+ kept-middle
+                       (words (seq/subvec removed 0 prefix))
+                       (words (seq/subvec removed (- (count removed) suffix) (count removed)))))
+            (if (< kept (* *refine-min-kept* (math/max 1 (math/max (words removed) (words added)))))
+              acc
+              (merge acc (ranges-by-line out-r) (ranges-by-line out-a)))))))))
+
+;; ---- putting a background under ranges of a line's spans ---------------------------
+
+(defn- face-at (spans column)
+  "The face `spans` give `column`, or nil."
+  (let (span (seq/find spans (fn (span) (and (<= (first span) column) (< column (second span))))))
+    (when span (nth span 2))))
+
+(defn- with-bg (face bg)
+  "`face` (a face map, a registered face's name, or nil) with `bg`'s background."
+  (merge (cond (keyword? face) (or (editor/face/face face) {}) (map? face) face :else {}) bg))
+
+(defn overlay (spans ranges bg)
+  "`spans` (`[from to face]`, line-relative, not overlapping) with `bg` (a face map holding a
+`:bg`) merged over every column `ranges` (`[[from to] …]`) covers — tiled again, so the result
+does not overlap either, as a line's spans must not.
+
+    (diffpaint/overlay [[0 4 {:fg \"#f00\"}]] [[2 6]] {:bg \"#000\"})   → [[0 2 {:fg \"#f00\"}] [2 4 {:fg \"#f00\" :bg \"#000\"}] [4 6 {:bg \"#000\"}]]"
+  (if (empty? ranges)
+    spans
+    (let (cuts (sort (seq/distinct (mapcat (append spans ranges)
+                                     (fn (span) [(first span) (second span)])))))
+      (into []
+        (seq/keep (seq/zip (but-last cuts) (rest cuts))
+          (fn (pair)
+            (let ([from to] pair
+                  face (face-at spans from)
+                  covered? (any? ranges
+                             (fn (bounds) (and (<= (first bounds) from) (< from (second bounds))))))
+              (cond
+                covered? [from to (with-bg face bg)]
+                face [from to face]
+                :else nil))))))))

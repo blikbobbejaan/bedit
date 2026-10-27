@@ -30,35 +30,54 @@ the upstream moved."
 section says what it is."
   (git-file-line (if (= lst :untracked) nil (git-entry-label e lst)) (:path e) (:orig-path e)))
 
-(defn- git-file-section (e lst diffs)
-  "The section for file `e` in list `section`. Folded by default; its hunks are there when
-the collection fetched its diff (it was open), and it is marked `:lazy?` when it was not,
-so TAB knows to fetch rather than to unfold nothing."
+(defn- git-file-section (e lst diff fetched? paint?)
+  "The section for file `e` in list `lst`. Folded by default; its hunks are there when its
+`diff` was fetched (it was open), painted when `paint?`, and it is marked `:lazy?` when it
+was never asked for (`fetched?` false), so TAB knows to fetch rather than to unfold nothing."
   (let (path (:path e)
-        diff (get-in diffs [lst path])
         value {:path path
                :orig-path (:orig-path e)
                :section lst
                :x (:x e)
                :y (:y e)
-               :lazy? (nil? diff)}
+               :lazy? (not fetched?)}
         children (cond
                    (nil? diff) []
                    ;; a conflict's combined diff has `@@@` hunks the two-way parser does not
                    ;; read — shown as it is, which is what a conflict looks like
                    (string? diff) (seq/reject (string/split diff "\n") empty?)
-                   :else (vcsproc/vcs-hunk-sections diff {:path path :section lst})))
+                   :else (vcsproc/vcs-hunk-sections diff {:path path :section lst} paint?)))
     (section :file value (git-file-heading e lst) children {:key path :hidden true})))
 
-(defn- git-list-section (type title entries diffs)
-  "One of the four file lists, or nil when it has no files."
+(defn- git-list-section (type title entries diffs painted)
+  "One of the four file lists, or nil when it has no files. `painted` is the set of
+`[list path]` whose hunks the buffer's budget paints (`diffpaint/paint-keys`)."
   (if (empty? entries)
     nil
     (section type
       nil
       (str title " (" (count entries) ")")
-      (into [] (map entries (fn (e) (git-file-section e type diffs))))
+      (into []
+        (map entries
+          (fn (e)
+            (let (diff (get-in diffs [type (:path e)]))
+              (git-file-section e
+                type
+                diff
+                (not (nil? diff))
+                (contains? painted [type (:path e)]))))))
       {:separator true})))
+
+(defn- git-painted (diffs lists)
+  "The `[list path]` keys whose hunks get painted: the parsed diffs of `lists` (`[list
+entries]` in the order the status shows them), under one budget for the whole buffer."
+  (diffpaint/paint-keys (mapcat lists
+                          (fn (pair)
+                            (let ([lst entries] pair)
+                              (seq/keep entries
+                                (fn (e)
+                                  (let (diff (get-in diffs [lst (:path e)]))
+                                    (when (map? diff) [[lst (:path e)] diff])))))))))
 
 (defn- git-commits-section (type title commits &optional (count? true))
   "A section of commits (unpushed / unpulled / recent), or nil when there are none."
@@ -147,21 +166,20 @@ history."
         diffs (:diffs collected {})
         conflicted (seq/filter entries git-conflicted?)
         plain (seq/reject entries git-conflicted?)
-        upstream (get-in collected [:head :upstream]))
+        upstream (get-in collected [:head :upstream])
+        untracked (seq/filter plain git-untracked?)
+        unstaged (seq/filter plain git-unstaged?)
+        staged (seq/filter plain git-staged?)
+        painted (git-painted diffs
+                  [[:untracked untracked] [:unstaged unstaged] [:staged staged]]))
     (section :status
       nil
       nil
       (seq/reject [(git-headers-section (:branch collected) (:head collected {}))
-                    (git-list-section :unmerged "Unmerged paths" conflicted diffs)
-                    (git-list-section :untracked
-                      "Untracked files"
-                      (seq/filter plain git-untracked?)
-                      diffs)
-                    (git-list-section :unstaged
-                      "Unstaged changes"
-                      (seq/filter plain git-unstaged?)
-                      diffs)
-                    (git-list-section :staged "Staged changes" (seq/filter plain git-staged?) diffs)
+                    (git-list-section :unmerged "Unmerged paths" conflicted diffs painted)
+                    (git-list-section :untracked "Untracked files" untracked diffs painted)
+                    (git-list-section :unstaged "Unstaged changes" unstaged diffs painted)
+                    (git-list-section :staged "Staged changes" staged diffs painted)
                     (git-commits-section :unpushed
                       (str "Unpushed to " upstream)
                       (:unpushed collected '()))
@@ -204,15 +222,16 @@ collection must fetch a diff for. A file's id is `[[:status nil] [section nil] [
     {}
     (fn (acc f) (assoc acc (or (:new-path f) (:old-path f)) f))))
 
-(defn- git-section-diffs (root section paths)
+(defn- git-section-diffs (root section paths &optional (pathspec []))
   "The diffs of list `section`'s open files `paths`, `{path diff}`, or nil for a list with
-no diffs to fetch. A tracked list is ONE `git diff` split by path; an unmerged file's
+no diffs to fetch. A tracked list is ONE `git diff` split by path (limited to `pathspec`
+when one is given — one file's diff, fetched when TAB opens it); an unmerged file's
 combined diff is kept as text, because its `@@@` hunks are not what the two-way parser
 reads; an untracked file is diffed against nothing, one at a time."
   (let (stdout (fn (args) (:stdout (git-git root args) "")))
     (case section
-      :unstaged (git-diff-by-path (stdout ["diff" "--no-ext-diff"]))
-      :staged (git-diff-by-path (stdout ["diff" "--cached" "--no-ext-diff"]))
+      :unstaged (git-diff-by-path (stdout (into ["diff" "--no-ext-diff"] pathspec)))
+      :staged (git-diff-by-path (stdout (into ["diff" "--cached" "--no-ext-diff"] pathspec)))
       :unmerged (into {} (map paths (fn (path) [path (stdout ["diff" "--no-ext-diff" "--" path])])))
       :untracked
         (into {}
@@ -276,17 +295,12 @@ task: plain data in, plain data out, no model and no rope."
 
 ;; ---- showing it ------------------------------------------------------------------
 
-(defn- git-status-line-links (rows root)
-  "The 0-based-line → `{:file :line}` map for *git-status*: every file heading links to its
-file — the pointer cursor, hover underline and click that *Tests* rows have (the SHARED
-`results/line-links-loc`)."
-  (fold (range (count rows))
-    {}
-    (fn (acc i)
-      (let (row (nth rows i))
-        (if (and row (:heading? row) (= (:type row) :file))
-          (assoc acc i {:file (path/join root (:path (:value row))) :line 1})
-          acc)))))
+(defn git-status-link (row ctx)
+  "The *git-status* `:section-link` service: a file heading links to its file — the pointer
+cursor, hover underline and click that *Tests* rows have (the SHARED
+`results/line-links-loc`); nothing else links."
+  (when (and (:heading? row) (= (:type row) :file))
+    {:file (path/join (:root ctx) (:path (:value row))) :line 1}))
 
 (defn- git-first-file-line (rows)
   "The 1-based line of the first file heading, else of the first list heading, else 1."
@@ -298,21 +312,19 @@ file — the pointer cursor, hover underline and click that *Tests* rows have (t
       (>= j 0) (inc j)
       :else 1)))
 
-(defn- git-render-status (m root collected &optional (line nil) (action :here))
-  "PURE: fold a finished `git-collect-status` into `*git-status*` for repo `root`. `line`
-places point — a 1-based number, nil (the first file on a first open, else where it was),
-or `(rows -> line)` (see `git-stay-in-section`). `action` is `:here` when the reader asked
-for the buffer, `:none` for a refresh behind them, which must not move their pane."
-  (let (fresh? (nil? (ed-buffer-index-by-name m "*git-status*"))
-        m1 (sectionbuf/sb-show (assoc m :git-root root)
-             "*git-status*"
-             (git-status-tree collected)
-             :git-status {:action action
-              :ctx {:root root}
-              :line (if (and (nil? line) fresh?) git-first-file-line line)})
-        i (ed-buffer-index-by-name! m1 "*git-status*")
-        b (ed-buf-at m1 i))
-    (ed-set-buf-at m1 i (assoc b :line-links (git-status-line-links (:section-rows b) root)))))
+(defn- git-render-status (m root collected &optional (line nil) (action :here) (tree nil))
+  "PURE: fold a finished `git-collect-status` into `*git-status*` for repo `root` — its
+`tree` when the task built it already, else built here. `line` places point — a 1-based
+number, nil (the first file on a first open, else where it was), or `(rows -> line)` (see
+`git-stay-in-section`). `action` is `:here` when the reader asked for the buffer, `:none` for
+a refresh behind them, which must not move their pane."
+  (let (fresh? (nil? (ed-buffer-index-by-name m "*git-status*")))
+    (sectionbuf/sb-show (assoc m :git-root root)
+      "*git-status*"
+      (or tree (git-status-tree collected))
+      :git-status {:action action
+       :ctx {:root root}
+       :line (if (and (nil? line) fresh?) git-first-file-line line)})))
 
 (defn- git-status-focus (m)
   "`:here` when the reader is looking at *git-status* (or it is not open yet, so this is the
@@ -334,7 +346,11 @@ synchronously."
     (if (model/ed-headless?)
       (git-render-status m root (git-collect-status (git-status-inputs m root)) line act)
       (let (inputs (git-status-inputs m root)
-            job (task (fn () (git-collect-status inputs)) {:timeout *git-op-timeout-ms*})
+            ;; the tree too — painting its hunks is work the loop need not wait for
+            job (task (fn ()
+                        (let (collected (git-collect-status inputs))
+                          {:collected collected :tree (git-status-tree collected)}))
+                  {:timeout *git-op-timeout-ms*})
             ;; the first open has nothing to show yet; a refresh keeps what is on screen
             ;; rather than blanking it, because a flicker back to "Loading" on every `g`
             ;; is worse than a stale half-second
@@ -360,15 +376,16 @@ synchronously."
 
 ;; the *git-status* buffer's eight subprocesses — 17 s on a mix project, so not on the loop
 (register-task-reply :git-status-proc 'gitstatus/git-apply-show-status nil "git status")
-(defn git-apply-show-status (m collected)
-  "Fold a finished status collection into the buffer. A nil answer (the task errored or
-timed out) says so rather than rendering an empty repo, which is what a blank `entries`
-would look like — a clean working tree, confidently wrong."
-  (let (line (:git-status-line m)
+(defn git-apply-show-status (m answer)
+  "Fold a finished status collection (`{:collected :tree}`) into the buffer. A nil answer
+(the task errored or timed out) says so rather than rendering an empty repo, which is what a
+blank `entries` would look like — a clean working tree, confidently wrong."
+  (let (collected (:collected answer)
+        line (:git-status-line m)
         action (:git-status-action m :here)
         m1 (dissoc m :git-status-proc :git-status-line :git-status-action))
     (cond
-      (nil? collected) (message m1 "git status failed or timed out")
+      (nil? answer) (message m1 "git status failed or timed out")
       ;; an answer about a repo the reader has since left
       (not (= (:root collected) (:git-root m1))) m1
       ;; `:here` was decided when the refresh STARTED; if the reader has since moved to
@@ -378,7 +395,8 @@ would look like — a clean working tree, confidently wrong."
           (:root collected)
           collected
           line
-          (if (= :here (git-status-focus m1)) action :none)))))
+          (if (= :here (git-status-focus m1)) action :none)
+          (:tree answer)))))
 
 (defn- git-list-of (row)
   "The file list (`:unstaged` / `:staged` / `:untracked` / `:unmerged`) a status row is
@@ -810,8 +828,86 @@ hunk, the file (an untracked one is deleted — git has no copy), a list, or a s
 
 (defn git-status-reload (m)
   "The status buffer's `:section-reload`: TAB opened a file whose diff was never fetched,
-so fetch it — a refresh, with the visibility TAB just set."
-  (git-refresh m))
+so fetch it — that file's diff alone (`git-fetch-lazy`), not the whole status again."
+  (git-fetch-lazy m))
+
+;; ---- one file's diff, when TAB opens it ------------------------------------------
+;; A status shows its files folded and fetches a file's hunks only when it is opened. That
+;; fetch is ONE `git diff -- path` (the list's kind of diff, for that file), in a task, and
+;; its hunks are spliced under the file's heading (`sectionbuf/sb-splice`) — not the eight
+;; subprocesses and the whole re-render of a refresh. One fetch is in flight at a time; a
+;; file opened meanwhile is fetched when it lands, because the landing looks again.
+
+(defn- git-lazy-open-file (b)
+  "`[id value]` of the first file open in status buffer `b` whose diff was never fetched, or
+nil."
+  (let (tree (:section-tree b))
+    (when tree
+      (first (seq/keep (git-open-files (or (:section-vis b) {}))
+               (fn (open)
+                 (let ([lst path] open
+                       id [[:status nil] [lst nil] [:file path]]
+                       s (section-at tree id))
+                   (when (and s (= true (:lazy? (:value s)))) [id (:value s)]))))))))
+
+(defn git-file-diff-section (root value)
+  "The section of status file `value` with its diff fetched — the one `git diff` its list
+calls for, limited to the file (and the name it was renamed from). Safe in a task: plain
+data in and out."
+  (let (lst (:section value)
+        path (:path value)
+        pathspec (into ["--"] (if (:orig-path value) [(:orig-path value) path] [path]))
+        diff (get (or (git-section-diffs root lst [path] pathspec) {}) path)
+        paint? (and (map? diff) (contains? (diffpaint/paint-keys [[path diff]]) path)))
+    (git-file-section value lst diff true paint?)))
+
+(defn- git-splice-file (m answer)
+  "Put a fetched file section (`{:root :id :section}`) into *git-status* in place of the
+lazy one it was fetched for — unless the status has since moved on (another repo, or a
+refresh that fetched it already)."
+  (let (i (ed-buffer-index-by-name m "*git-status*"))
+    (if (nil? i)
+      m
+      (let (b (ed-buf-at m i)
+            tree (:section-tree b)
+            id (:id answer)
+            s (when tree (section-at tree id)))
+        (if (or (nil? s)
+              (not (= true (:lazy? (:value s))))
+              (not (= (:root answer) (get-in b [:section-ctx :root]))))
+          m
+          (sectionbuf/sb-splice m
+            i
+            id
+            (section-replace tree id (:section answer))
+            (or (:section-vis b) {})))))))
+
+(defn git-fetch-lazy (m)
+  "Fetch the diff of a file open in *git-status* that has none yet, and splice it in — off
+the loop, one at a time (headless: inline, every such file)."
+  (let (i (ed-buffer-index-by-name m "*git-status*")
+        b (when i (ed-buf-at m i))
+        found (when b (git-lazy-open-file b))
+        root (when b (get-in b [:section-ctx :root])))
+    (cond
+      (or (nil? found) (nil? root)) m
+      ;; in flight: its landing looks again
+      (:git-file-proc m) m
+      :else
+        (let ([id value] found
+              fetch (fn () {:root root :id id :section (git-file-diff-section root value)}))
+          (if (model/ed-headless?)
+            (git-fetch-lazy (git-splice-file m (fetch)))
+            (assoc m :git-file-proc (task fetch {:timeout *git-op-timeout-ms*})))))))
+
+(register-task-reply :git-file-proc 'gitstatus/git-apply-file-diff nil "git diff")
+(defn git-apply-file-diff (m answer)
+  "Fold one fetched file diff into *git-status*, then fetch the next open file still
+without one."
+  (let (m1 (dissoc m :git-file-proc))
+    (if (nil? answer)
+      (message m1 "git diff failed or timed out")
+      (git-fetch-lazy (git-splice-file m1 answer)))))
 
 (defn git-visit-location (m root)
   "The file and line to jump to from point in a git section buffer, `{:file :line}`, or nil
@@ -917,6 +1013,8 @@ the conflict at point, `C-c ^ n` / `C-c ^ p` move between them."
   {:name 'git-status
    :doc "The working tree (Magit-style): s/u/k stage, unstage, discard; c commits; ? every menu."
    :keymap gitstatus/git-status-keymap
+   ;; a hunk's long lines wrap rather than scroll the pane sideways, as in *git-revision*
+   :visual-line true
    ;; buffer-local M-x names (a layer's `:commands` leave the global set): the ones that only
    ;; mean something with a status buffer under them
    :commands '("git-stage" "git-stage-all"
@@ -929,6 +1027,8 @@ the conflict at point, `C-c ^ n` / `C-c ^ p` move between them."
    ;; file row, and a commit subject that reads `foo.c:12` is not a link
    :line-loc 'results/line-links-only-loc
    :section-faces 'gitsection/git-section-faces
+   :section-link 'gitstatus/git-status-link
+   :section-bands 'gitsection/git-section-bands
    :section-reload 'gitstatus/git-status-reload})
 
 (register-type-layers :git-status
