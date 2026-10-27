@@ -148,10 +148,10 @@
   ;; language thinks it MAY do — so they travel together and are placed apart: the answer
   ;; under the form, the type at it (`playground-core/pg-set-note`).
   (test "a value, with its type carried alongside rather than inside"
-    (let (note (liveeval/result-note {:ok true :value "3" :ms 0} "(+ 1 2)"))
+    (let (note (liveeval/result-note {:ok true :value "\"1\"" :ms 0} "(str 1)"))
       (assert= (:kind note) :info)
-      (assert= (:text note) "=> 3")
-      (assert= (:hint note) ": 3")))
+      (assert= (:text note) "=> \"1\"")
+      (is (string/starts-with? (or (:hint note) "") ": "))))
 
   (test "no source, no type — the value alone"
     (let (note (liveeval/result-note {:ok true :value "3" :ms 0}))
@@ -218,7 +218,11 @@
 ;; to be read, the reason a trace is empty.
 (describe "liveeval/report-lines — a whole reply, for a pane"
   (test "the value, with its derived type when the source is at hand"
-    (assert= (first (liveeval/report-lines {:ok true :value "3" :ms 0} "(+ 1 2)")) "=> 3   : 3")
+    (is (string/starts-with? (first (liveeval/report-lines {:ok true :value "\"1\"" :ms 0}
+                                      "(str 1)"))
+          "=> \"1\"   : "))
+    ;; a type that only repeats the value is not said twice
+    (assert= (first (liveeval/report-lines {:ok true :value "3" :ms 0} "(+ 1 2)")) "=> 3")
     (assert= (first (liveeval/report-lines {:ok true :value "3" :ms 0})) "=> 3"))
 
   ;; The half `printed-note` mangles: it trims the output and puts it on one line, so three
@@ -935,7 +939,8 @@
   ;; type hint, keyed by `hint-key` — and the hint is asserted separately below rather than
   ;; conflated into the count, which is what would let one of the two linger unnoticed.
   (test "deleting a form takes its result — and its type hint — with it"
-    (let (m1 (playground/ed-playground-launch (pg-open "(+ 1 2)\n(* 3 4)\n"))
+    ;; `(str 1)`, not arithmetic: a constant sum is typed as its own value, which is not shown
+    (let (m1 (playground/ed-playground-launch (pg-open "(+ 1 2)\n(str 1)\n"))
           m2 (playground/ed-playground-launch (retext m1 "(+ 1 2)\n")))
       (assert= (sort (seq/filter (map (pg-notes m1) first) int?)) '(0 1))
       (assert= (sort (seq/filter (map (pg-notes m2) first) int?)) '(0))
@@ -1325,3 +1330,98 @@
           spans (playground/spy-fontify src))
       (assert= (count spans) 3)
       (is (every? spans (fn (span) (string? (:fg (nth span 2)))))))))
+
+;; ---- the quiet window: a new error waits until you stop typing --------------------------
+;; An electric pair makes every prefix of a form a complete one, so `(dbl ` runs as `(dbl )`
+;; and fails. The form at point, once changed, is in a window that holds a NEW error until
+;; you pause or move off it; a success lands at once, and an error already showing stays.
+
+(defn- qw-live (text point)
+  ;; `text` launched live with point at `point`, from a session at generation 1
+  (def *sent* [])
+  (update (sp-launch sp-spec (pg-goto (pg-open text) point)) :playground merge {:sandbox-gen 1}))
+
+(defn- qw-reply (m reply)
+  ;; answer the latest request with `reply`
+  (playground/playground-sandbox-reply m (assoc reply :id (first (last *sent*))) 1))
+
+(describe "a new error waits while you type its form"
+  :isolated (test "an error for the form at point is held as the pending `…`"
+    (let (m (qw-reply (qw-live "(dbl )\n" 3) {:ok false :error "dbl: expected 1 argument"})
+          note (get (pg-notes m) 0))
+      (assert= (:kind note) :running)
+      (assert= (:text note) "…")
+      (is (not (nil? (get-in (pg-buf-of m) [:playground-quiet :held]))))
+      (assert= (playground/quiet-timer m) {:after playground-core/*quiet-ms* :idle? true})))
+
+  :isolated (test "the pause lands it, as the error it was"
+    (let (m (playground/quiet-reveal (qw-reply (qw-live "(dbl )\n" 3)
+                                       {:ok false :error "dbl: expected 1 argument"}))
+          note (get (pg-notes m) 0))
+      (assert= (:kind note) :fail)
+      (is (includes? (:text note) "expected 1 argument"))
+      (is (nil? (:playground-quiet (pg-buf-of m))))
+      (is (nil? (playground/quiet-timer m)))))
+
+  :isolated (test "moving off the form lands it too"
+    (let (m (qw-reply (qw-live "(+ 1 2)\n(dbl )\n" 10) {:ok false :error "boom"})
+          moved (playground/playground-on-move (pg-goto m 0)))
+      (assert= (:kind (get (pg-notes m) 1)) :running)
+      (assert= (:kind (get (pg-notes moved) 1)) :fail)))
+
+  :isolated (test "a result that succeeds is not held"
+    (let (m (qw-reply (qw-live "(+ 1 2)\n" 3) {:ok true :value "3" :ms 0}))
+      (assert= (:text (get (pg-notes m) 0)) "=> 3")))
+
+  :isolated (test "a form that was already showing an error shows the next one at once"
+    (let (shown (playground/quiet-reveal (qw-reply (qw-live "(dbl )\n" 3) {:ok false :error "one"}))
+          _ (def *sent* [])
+          edited (sp-launch sp-spec (pg-goto (pg-type shown 5 "x") 5))
+          m (qw-reply edited {:ok false :error "unbound symbol: x"}))
+      (assert= (:kind (get (pg-notes m) 0)) :fail)
+      (is (includes? (:text (get (pg-notes m) 0)) "unbound symbol"))))
+
+  :isolated (test "a reply for a form you typed past is dropped on the pause, not landed"
+    (let (m (qw-reply (qw-live "(dbl )\n" 3) {:ok false :error "boom"})
+          ;; typed on before the window closed: the held answer is about text that is gone
+          typed (pg-type m 5 "2")
+          revealed (playground/quiet-reveal typed))
+      (is (nil? (:playground-quiet (pg-buf-of revealed))))
+      (is (not (= (:kind (get (pg-notes revealed) 0)) :fail)))))
+
+  ;; Typing somewhere else launches before any move is seen. Revealed AFTER the launch read
+  ;; the notes it carries, the unchanged form kept its `…` for good.
+  :isolated (test "typing in another form lands the held error, and it stays landed"
+    (let (m (qw-reply (qw-live "(+ 1 2)\n(dbl )\n" 10) {:ok false :error "boom"})
+          _ (def *sent* [])
+          elsewhere (sp-launch sp-spec (pg-goto (pg-type m 3 "0") 3)))
+      (assert= (:kind (get (pg-notes elsewhere) 1)) :fail)
+      (is (includes? (:text (get (pg-notes elsewhere) 1)) "boom"))))
+
+  :isolated (test "a form you have just FIXED holds its next new error again"
+    (let (shown (playground/quiet-reveal (qw-reply (qw-live "(dbl )\n" 3) {:ok false :error "one"}))
+          _ (def *sent* [])
+          fixed (qw-reply (sp-launch sp-spec (pg-goto (pg-type shown 5 "2") 6))
+                  {:ok true :value "4" :ms 0})
+          _ (def *sent* [])
+          broken (qw-reply (sp-launch sp-spec (pg-goto (pg-type fixed 6 " x") 8))
+                   {:ok false :error "unbound symbol: x"}))
+      (assert= (:text (get (pg-notes fixed) 0)) "=> 4")
+      (assert= (:text (get (pg-notes broken) 0)) "…"))))
+
+(describe "the checker's findings stay off the lines being typed"
+  (test "the index drops a window's lines and keeps the rest"
+    (assert= (model/ed-without-quiet-lines {0 '(:a) 2 '(:b) 3 '(:c)} [1 2]) {0 '(:a) 3 '(:c)})
+    (assert= (model/ed-without-quiet-lines {0 '(:a)} nil) {0 '(:a)})))
+
+(describe "the playground's chrome says nothing it need not"
+  (test "a type that only repeats the value is not shown beside it"
+    (is (nil? (liveeval/value-hint "(+ 1 2)" "3")))
+    (is (nil? (:hint (liveeval/result-note {:ok true :value "3"} "(+ 1 2)")))))
+  (test "a form that is only evaluating is not `not ready`"
+    (let (m (pg-do (pg-open "(+ 1 2)\n(+ 1\n")
+              (fn (b)
+                (annotate b
+                  :eol-notes {0 {:kind :running :text "evaluating…" :line 0}
+                   1 {:kind :incomplete :text "unclosed list" :line 1}}))))
+      (assert= (playground-core/broken-count (pg-buf-of m)) 1))))

@@ -71,6 +71,7 @@ that would re-derive it never runs; the text is already what it last parsed.
      :welcome \"…\"                    ; a new buffer's text
      :open-message \"…\"               ; or 'sym, (m booting?) -> what [[open]] says
      :restart-message \"…\"            ; what [[restart]] says
+     :quiet-ms 1200                  ; optional: hold a NEW error while its form is typed
      :spy-faces [[test text role] …]} ; the pane's colouring — see [[spy-fontify]]
 
 Symbols, resolved at call time, for the same reason a keymap names a command symbol: a
@@ -555,8 +556,11 @@ buffer is back at the launch's rope with its notes anchored to a line count that
 exists — the whole buffer's results vanish, and [[ed-stale?]] (the same rope comparison)
 sees nothing to re-evaluate. The editor sat there showing no output until the next real
 edit. Asking whether the notes are stamped against THIS rope is the same O(1) test and
-cannot drift from what it is guarding."
-  (let (b (pg-buf spec m))
+cannot drift from what it is guarding.
+
+The keystroke is also what opens the quiet window, provisionally (see the quiet window)."
+  (let (m (pg-quiet-on-edit spec m)
+        b (pg-buf spec m))
     (cond
       (nil? b) m
       (not (results/eol-notes-stale? b)) m
@@ -697,6 +701,140 @@ parsed it (the form's extent is not known yet; a moment later it is)."
             [(pg-evaluated spec m i src (nth deps i {})) next-id pending])
           next)))))
 
+;; ---- the quiet window: a new error waits until you stop typing ---------------------
+;; Every pause evaluates, and an electric pair makes every prefix of a form a complete one:
+;; `(defn` is `(defn )` and RUNS — `fn: missing parameter list` — and `(dbl ` is `(dbl )`,
+;; `expected 1 argument`. Each is true and none is news; it is what typing looks like. So
+;; the form at point, once you have changed it, is in a QUIET WINDOW: a new error for it
+;; is held (`liveeval/typing-note`, the pending `…`) and the checker's findings on its lines
+;; are kept out of the margin (`model/ed-without-quiet-lines`). Results that SUCCEED land at
+;; once — that is the point of evaluating as you type. The window closes when you pause
+;; (`:quiet-ms`, [[quiet-timer]]) or move off the form ([[on-move]]), and everything it held
+;; lands then, exactly as it would have.
+;;
+;; An error the form was already showing is not held: you are looking at it, and holding
+;; its update would make a form you are FIXING look fixed for a second.
+;;
+;; The window is the buffer's `:playground-quiet` — `{:region :src :lines :erring? :held}` —
+;; and `:quiet-lines`, the generic `[from to]` the diagnostics index reads. Opt-in by the
+;; spec's `:quiet-ms`: the tutorial grades what you type and has no such window.
+
+(def *quiet-ms*
+  ;; How long after your last key a held error waits — long enough to outlast the gap
+  ;; between words, short enough that a real mistake is on screen by the time you look.
+  1200)
+
+(defn- pg-note-within (b lo hi)
+  ;; The note the form now at `[lo hi]` was showing before this edit, or nil — found by its
+  ;; end marker, which every edit inside the form has carried along with the text.
+  (let (hit (seq/find (or (:playground-notes b) {})
+              (fn (kv)
+                (let (end (buffer-marker b [:pg-end (first kv)])) (and end (>= end lo) (<= end hi))))))
+    (when hit (:note (second hit)))))
+
+(defn- pg-erring? (b lo hi old i)
+  ;; Was the form at `[lo hi]` (index `i`) showing an ERROR before this edit? Its note says
+  ;; so, unless that note is still PENDING (`evaluating…`, or a held `…`) — a fast run of
+  ;; edits replaces an error with `evaluating…` before the next answer is back — and then
+  ;; the window this one replaces (`old`) remembers. A success in between clears it: a form
+  ;; you have just FIXED is not one you are looking at an error on.
+  (let (note (pg-note-within b lo hi))
+    (if (and note (not (results/note-pending? (:kind note))))
+      (= true (:error? note))
+      (= true (and old (= (:region old) i) (:erring? old))))))
+
+(defn- pg-quiet-window (spec m b srcs spans evaluated rope)
+  ;; The window this launch opens, or nil: the form at point, when this playground keeps
+  ;; one (`:quiet-ms`), is the buffer you are in, and the form's text is not what the
+  ;; session last evaluated — you changed it. A replay (a fresh session) changed nothing.
+  (let (i (form-index-in spans (:point b 0)))
+    (when (and (has? spec :quiet-ms)
+            (not (:playground-replay b))
+            (= (:name (ed-current-buf m)) (buffer-name spec))
+            i
+            (not (= (get srcs i) (evaluated-src evaluated i))))
+      (let ([lo hi] (nth spans i)
+            old (:playground-quiet b))
+        {:region i
+         :src (get srcs i)
+         :lines [(results/line-of rope lo) (results/line-of rope hi)]
+         :erring? (pg-erring? b lo hi old i)}))))
+
+(defn- pg-reindex-diagnostics (spec m)
+  ;; The checker's findings re-indexed against the window as it now stands
+  ;; (`model/ed-without-quiet-lines` reads it) — from the list the model kept, so nothing is
+  ;; re-checked. Only while this playground is the buffer those findings are about.
+  (if (and (= (:name (ed-current-buf m)) (buffer-name spec)) (:diag-rope m))
+    (ed-set-diagnostics m (or (:diagnostics m) '()) (:diag-rope m))
+    m))
+
+(defn- pg-set-quiet (spec m quiet)
+  ;; Open (or move) the window: `quiet` on the buffer, its lines where the diagnostics
+  ;; index looks, and the index redone when those lines moved — a finding that landed a
+  ;; moment before the window opened is about the typing all the same.
+  (let (b (pg-buf spec m)
+        moved? (not (= (:lines quiet) (:quiet-lines b)))
+        m1 (pg-update-buf spec
+             m
+             (fn (bb) (assoc bb :playground-quiet quiet :quiet-lines (:lines quiet)))))
+    (if moved? (pg-reindex-diagnostics spec m1) m1)))
+
+(defn- pg-quiet-on-edit (spec m)
+  ;; The KEYSTROKE opens the window, provisionally, on the line being typed: the checker's
+  ;; idle beat (120ms) lands before the launch (250ms) that knows the form, and its findings
+  ;; on `(dbl ` would otherwise flash up for the gap. No `:region` yet, so nothing is held
+  ;; on it; the launch replaces it with the form's own window.
+  (let (b (ed-current-buf m))
+    (if (and (has? spec :quiet-ms)
+          b
+          (= (:name b) (buffer-name spec))
+          (not (= (buffer-rope b) (:playground-rope b))))
+      (let (line (buffer-current-line b)
+            lines (:quiet-lines b))
+        (if (and lines (>= line (first lines)) (<= line (second lines)))
+          m
+          (pg-set-quiet spec m (assoc (or (:playground-quiet b) {}) :lines [line line]))))
+      m)))
+
+(defn- pg-reveal-if-left (spec m)
+  ;; A launch is a move too: when point is no longer in the form whose error the window
+  ;; holds, that error lands FIRST — before the launch reads the notes it carries forward.
+  ;; Revealed after, the launch rebuilt the notes from the buffer as it was, and the form
+  ;; (unchanged, so never re-sent) carried its `…` on for good. Found by the held form's
+  ;; own marker and text, with no parse; a form whose text has gone is past holding, and
+  ;; [[reveal-quiet]] drops its answer.
+  (let (b (pg-buf spec m))
+    (if (or (nil? b) (nil? (get-in b [:playground-quiet :held :request])))
+      m
+      (let (request (get-in b [:playground-quiet :held :request])
+            span (pg-intact-region b (buffer-rope b) (:region request) (:src request))
+            point (buffer-point b))
+        (if (and span (>= point (first span)) (<= point (second span)))
+          m
+          (reveal-quiet spec m))))))
+
+(defn reveal-quiet (spec m)
+  "Close this playground's quiet window: the error it held lands — note, pane, the
+language's hooks — through the same path any reply takes, provided its form still holds the
+text that was sent (it is silently dropped otherwise: you typed past it, and the launch for
+what you typed has its own answer). The checker's findings on the window's lines come back
+too, re-indexed from the list the model kept. `m` untouched when there is no window."
+  (let (b (pg-buf spec m))
+    (if (or (nil? b) (nil? (:playground-quiet b)))
+      m
+      (let (m1 (pg-update-buf spec m (fn (bb) (dissoc bb :playground-quiet :quiet-lines)))
+            held (:held (:playground-quiet b)))
+        (pg-reindex-diagnostics spec
+          (if (and held (second (pg-answering spec b (:request held))))
+            (pg-land-reply spec m1 (:request held) (:reply held))
+            m1))))))
+
+(defn quiet-timer (spec m)
+  "The quiet window's timer, for `model/register-timer-client`: an idle one-shot `:quiet-ms`
+after the last key while a window is open, nil otherwise. Firing it is [[reveal-quiet]]."
+  (let (b (pg-buf spec m))
+    (when (and b (:playground-quiet b)) {:after (get spec :quiet-ms) :idle? true})))
+
 (defn ed-launch (spec m)
   "The debounce landed: re-evaluate the forms this edit could have changed the answer of —
 the ones whose own text moved, plus the ones that use what those define ([[launch-plan]]).
@@ -709,7 +847,8 @@ flight wears `⋯ evaluating…` rather than nothing, so a rebuild never flashes
 blank on its way to the same answer. A form nothing could reach (all of them, when the edit
 was whitespace the parser ignores or an edit undone) is re-stamped with its last note where
 it now sits — a form that moved takes its note with it."
-  (let (b (pg-buf spec m))
+  (let (m (pg-reveal-if-left spec m)
+        b (pg-buf spec m))
     (if (nil? b)
       m
       (let (text (buffer-text b)
@@ -733,14 +872,16 @@ it now sits — a form that moved takes its note with it."
             ;; reply landing puts it back. A launch that recorded what it asked for would
             ;; leave a lost reply invisible forever.
             evaluated (pg-unevaluate (liveeval/settled (:aligned realigned)) stale)
-            m0 (pg-launch-reset spec
-                 m
-                 pairs
-                 stale
-                 {:playground-rope rope
-                  :playground-spans spans
-                  :playground-deps deps
-                  :playground-evaluated evaluated})
+            quiet (pg-quiet-window spec m b srcs spans (:aligned realigned) rope)
+            reset (pg-launch-reset spec
+                    m
+                    pairs
+                    stale
+                    {:playground-rope rope
+                     :playground-spans spans
+                     :playground-deps deps
+                     :playground-evaluated evaluated})
+            m0 (if quiet (pg-set-quiet spec reset quiet) reset)
             step (pg-form-step spec
                    b
                    srcs
@@ -804,6 +945,30 @@ their own reply and not each other's). Nil when no form holds it any more."
     (seq/min-by (seq/filter (range total) (fn (k) (= (src-at k) sent)))
       (fn (k) (math/abs (- k i0))))))
 
+(defn- pg-answering (spec b request)
+  ;; `[view i]`: the buffer as a reply finds it ([[pg-reply-view]]) and the form that still
+  ;; holds what `request` sent ([[answering-form]]), nil when none does.
+  (let (view (pg-reply-view spec b)
+        {:text text :spans spans} view
+        src-at (fn (k)
+                 (let (span (nth spans k nil))
+                   (when span (string/substring text (first span) (second span))))))
+    [view (answering-form src-at (count spans) (:region request) (:src request))]))
+
+(defn- pg-hold? (b request note reply)
+  ;; Is this answer a NEW error for the form being typed — one the quiet window holds? The
+  ;; request must be the window's own send (its form and text), the note an error that is
+  ;; not a timeout (that is the session, not your typing), and the form must not have been
+  ;; showing an error already: an error you were already looking at is not news, and
+  ;; hiding its update would make a form you are FIXING look fixed.
+  (let (q (:playground-quiet b))
+    (and q
+      (= (:region request) (:region q))
+      (= (:src request) (:src q))
+      (:error? note)
+      (not (get reply :timeout))
+      (not (:erring? q)))))
+
 (defn- pg-land-reply (spec m request reply)
   ;; Accepted when THE FORM's source is still the one that was sent. The test used to be
   ;; the whole buffer's rope, which dropped every reply the moment you typed anywhere — and
@@ -813,22 +978,39 @@ their own reply and not each other's). Nil when no form holds it any more."
   (let (b (pg-buf spec m))
     (if (nil? b)
       m
-      (let ({:text text :spans spans :deps deps} (pg-reply-view spec b)
-            src-at (fn (k)
-                     (let (span (nth spans k nil))
-                       (when span (string/substring text (first span) (second span)))))
+      (let ([view i] (pg-answering spec b request)
+            {:text text :spans spans :deps deps} view
             i0 (:region request)
-            i (answering-form src-at (count spans) i0 (:src request))
-            src (when i (src-at i)))
-        (if (nil? i)
-          (do
-            (log/warn (str (get spec :buffer)
-                        ": reply "
-                        (get reply :id)
-                        " dropped — form "
-                        i0
-                        " no longer holds the text that was sent; it re-evaluates on the next idle beat"))
-            m)
+            src (when i (let ([lo hi] (nth spans i)) (string/substring text lo hi)))
+            data (form-data spec m)
+            note (when i (svc-form spec :note-of (list reply src) data i)))
+        (cond
+          (nil? i)
+            (do
+              (log/warn (str (get spec :buffer)
+                          ": reply "
+                          (get reply :id)
+                          " dropped — form "
+                          i0
+                          " no longer holds the text that was sent; it re-evaluates on the next idle beat"))
+              m)
+          ;; A new error while you are typing the form: recorded as evaluated (the session
+          ;; did run it), painted as the pending `…`, and the reply kept whole for
+          ;; [[reveal-quiet]] to land through this very function — note, pane and hooks —
+          ;; once you stop.
+          (pg-hold? b request note reply)
+            (pg-update-buf spec
+              (pg-evaluated spec
+                (pg-set-note spec
+                  m
+                  i0
+                  (liveeval/typing-note)
+                  (pg-placement (buffer-rope b) text spans)
+                  i)
+                i
+                src
+                (nth deps i {}))
+              (fn (bb) (assoc-in bb [:playground-quiet :held] {:request request :reply reply})))
           ;; Stamped under the key its own REQUEST was made with (`i0`) and anchored at the
           ;; slot the form now occupies (`i`). Under `i` alone it would land on whatever key
           ;; the launch gave a different form — because `i0` and `i` differ exactly when the
@@ -841,19 +1023,23 @@ their own reply and not each other's). Nil when no form holds it any more."
           ;;
           ;; Then the language's own two hooks: `:on-verdict` for this answer, `:after-reply`
           ;; for whatever it derives from the buffer as a whole.
-          (let (data (form-data spec m)
-                note (svc-form spec :note-of (list reply src) data i)
-                landed (workings/show (get spec :spy)
-                         (pg-evaluated spec
-                           (pg-set-note spec m i0 note (pg-placement (buffer-rope b) text spans) i)
+          else
+            (let (landed (workings/show (get spec :spy)
+                           (pg-evaluated spec
+                             (pg-set-note spec
+                               m
+                               i0
+                               note
+                               (pg-placement (buffer-rope b) text spans)
+                               i)
+                             i
+                             src
+                             (nth deps i {}))
                            i
-                           src
-                           (nth deps i {}))
-                         i
-                         (form-index-in spans (:point b 0))
-                         reply
-                         src))
-            (pg-hook spec :after-reply (pg-hook spec :on-verdict landed i note (nth data i nil)))))))))
+                           (form-index-in spans (:point b 0))
+                           reply
+                           src))
+              (pg-hook spec :after-reply (pg-hook spec :on-verdict landed i note (nth data i nil)))))))))
 
 (defn sandbox-reply (spec m reply gen)
   "Fold one reply into the model. A reply this playground never sent, one from a superseded
@@ -899,6 +1085,18 @@ so the pane documents whatever language the buffer is in."
               (do (log/warn (str "playground: doc-at service failed: " (error-message e))) nil))))
       '())))
 
+(defn- pg-left-quiet (spec m b)
+  ;; Moving off the form a quiet window is open on closes it ([[reveal-quiet]]). Asked only
+  ;; while the extents are exact — the rope is the one the last launch parsed — because a
+  ;; moving rope is you TYPING, and typing is what the window waits out; the launch after
+  ;; it re-opens the window on wherever you are.
+  (let (q (:playground-quiet b))
+    (if (and q
+          (= (buffer-rope b) (:playground-rope b))
+          (not (= (form-index-in (or (:playground-spans b) []) (:point b 0)) (:region q))))
+      (reveal-quiet spec m)
+      m)))
+
 (defn on-move (spec m)
   "The `:on-move` hook, whenever point or the text moved: keep the pane following the cursor
 from form to form and showing the docs of whatever it is on, with no re-evaluation.
@@ -914,10 +1112,12 @@ holds the form it was on. That is not an approximation to apologise for: typing 
 does not change which form you are in, and the debounce re-parses ~150ms later and corrects
 the boundary case for free. The DOCS still track the cursor throughout — a token scan and an
 image lookup — which is the half you want while typing a call."
-  (let (b (ed-current-buf m))
-    (if (not (and b (= (:name b) (buffer-name spec))))
+  (let (b0 (ed-current-buf m))
+    (if (not (and b0 (= (:name b0) (buffer-name spec))))
       m
-      (let (spy (get spec :spy)
+      (let (m (pg-left-quiet spec m b0)
+            b (ed-current-buf m)
+            spy (get spec :spy)
             docs (doc-at-point b)
             moved? (not (= docs (workings/at-point-lines spy m)))
             m1 (if moved? (workings/at-point spy m docs) m)
@@ -1031,11 +1231,13 @@ a silent no-op is the wrong answer to \"please try again\"."
 (defn broken-count (buf)
   "How many of this buffer's forms cannot run yet — a syntax error (`:broken`) or a form
 still being typed (`:incomplete`). Both are \"not ready\", and the difference between them
-matters at the form and not in a count."
+matters at the form and not in a count.
+
+Not a form that is merely EVALUATING (`:running`) or HELD: both are ready. Counting every
+pending kind put `1 form not ready` on the mode line for the round trip of every send — a
+chip that blinked on each pause of the keyboard, about nothing."
   (count (seq/filter (or (results/eol-notes-any buf) {})
-           (fn ([_ note])
-             (let (kind (:kind note))
-               (or (= kind :broken) (results/note-pending? kind)))))))
+           (fn ([_ note]) (let (kind (:kind note)) (or (= kind :broken) (= kind :incomplete)))))))
 
 (defn modeline (m buf)
   "The playground's status-bar chip — `1 form not ready` — or `\"\"` when everything parses.

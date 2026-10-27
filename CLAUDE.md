@@ -343,7 +343,9 @@ src/sandbox-events.blsp     routes the shared sandbox's UiEvents to every client
                             them (an `impl` is per record type, so one client can't own them)
 src/playground-core.blsp    the live-evaluating buffer as a MECHANISM, parameterised by a
                             language spec: form diffing, the marker-anchored notes, the
-                            launch plan, the reply fold, the pane following the cursor —
+                            launch plan, the reply fold, the pane following the cursor, the
+                            QUIET WINDOW (a new error for the form you are typing, and the
+                            checker's findings on its lines, wait until you pause or move off) —
                             everything about a playground that is not about a language.
                             Three clients: the two playgrounds and the tutorial (a box is
                             its form, lesson data rides `:form-data`)
