@@ -1,0 +1,100 @@
+(defmodule drive-terraform
+  "Terraform, driven end to end through a real `ui-run` and a real `terraform-ls`.
+
+The model tests pin which server row a `.tf` file reaches and that the row is inert without a
+server. This runs the real thing: the idle beat's autostart launching `terraform-ls serve` in
+the module's root (`.terraform.lock.hcl`), its `initialize` answer arriving on the loop, and
+the findings it publishes for a broken file landing in the model's diagnostics, the same path
+every other language's findings take to the underline and the gutter.
+
+    nest run tools/drive-terraform.blsp
+
+Needs `terraform-ls` on PATH; says so and passes when it is not, like a missing grammar."
+  (:use-internals bedit/input))
+
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(def *cols* 120)
+(def *rows* 40)
+(def *deadline-ms* 30000)
+
+;; A model cannot cross a process boundary (it holds ropes), so the assertions run INSIDE the
+;; loop's update fn and only the tally comes back out (`tools/drive-async.blsp`).
+(def *failures* (%table))
+
+(defn check (what ok)
+  (do
+    (io/puts (str (if ok "  ok  " "  FAIL ") what))
+    (when (not ok) (%table-put *failures* :n (inc (%table-get *failures* :n 0))))
+    ok))
+
+;; The display's `:poll`: whatever is in the mailbox (a server's reply, a task's answer), or
+;; nil when the wait runs out — a timed-out poll is what lets the idle beat fire, and the
+;; idle beat is what starts a server.
+(defn poll (ms) (receive (message message) (after (math/max 1 ms) nil)))
+
+(defn initialized? (m root)
+  "Whether a server rooted at `root` is filed and has answered `initialize` (its caps)."
+  (any? (vals (or (:lsp-servers m) {}))
+    (fn (entry) (and (includes? (:roots entry) root) (not (empty? (or (:caps entry) {})))))))
+
+(defn drive (m0 file root)
+  "Open `file`, wait for terraform-ls to come up rooted at `root`, then for its findings on the
+broken block the file holds. The phase rides on the model (`:drive-phase`)."
+  (let (started (os/now)
+        display {:enter (fn () nil)
+                 :leave (fn () nil)
+                 :size (fn () [*cols* *rows*])
+                 :draw (fn (frame) nil)
+                 :poll poll}
+        update (fn (m input cols rows)
+                 (let (next (input/ed-update m input cols rows)
+                       phase (or (:drive-phase next) :starting))
+                   (cond
+                     ;; the loop may hand over one more input after `:done`: nothing twice
+                     (= phase :finished) next
+                     (> (- (os/now) started) *deadline-ms*)
+                       (do (check (str "terraform-ls answered before the deadline (stuck at "
+                                    phase
+                                    ")")
+                             false)
+                         (assoc next :done true :drive-phase :finished))
+                     (and (= phase :starting) (initialized? next root))
+                       (do (check "terraform-ls started in the module's root and answered" true)
+                         (assoc next :drive-phase :diagnosing))
+                     (and (= phase :diagnosing) (not (empty? (or (:diagnostics next) []))))
+                       (do
+                         (check "its findings on the broken block reached the model's diagnostics"
+                           true)
+                         (check "the server is filed under the terraform-ls row"
+                           (= "terraform-ls" (:spec (lsp/lsp-server-entry next file))))
+                         (doseq (entry (vals (:lsp-servers next))) (lsp/lsp-shutdown (:conn entry)))
+                         (assoc next :done true :drive-phase :finished))
+                     :else next))))
+    (editor/ui/ui-run (pool/ed-find-file m0 file) view/ed-view update display)))
+
+(if (nil? (os/which "terraform-ls"))
+  (io/puts "drive-terraform: terraform-ls is not on PATH — nothing to drive (skipped)")
+  (let (_ (proc/register :editor (self))
+        ;; the grammars as `main` declares them, so the buffer is coloured as it would be
+        _ (grammars/declare-user-grammars)
+        root (path/temp "bedit-drive-terraform-")
+        file (path/join root "main.tf")
+        _ (file/mkdir root)
+        ;; the root marker, and a block with an unclosed brace for the server to report on
+        _ (file/spit (path/join root ".terraform.lock.hcl") "# This file is maintained automatically\n")
+        _ (file/spit file "variable \"region\" {\n  default = \"eu-west-1\"\n\nresource \"aws_s3_bucket\" \"logs\" {\n  bucket = var.region\n}\n")
+        m0 (assoc (model/ed-init (editor/buffer/make-buffer "" "*scratch*")) :recent-files false))
+    (do
+      (check "the async paths are live (`:editor` registered, not headless)"
+        (not (model/ed-headless?)))
+      (io/puts "== a .tf file reaches terraform-ls and its findings come back")
+      (drive m0 file root)
+      (file/rmdir root)
+      (io/puts "")
+      (if (= (%table-get *failures* :n 0) 0)
+        (io/puts "terraform-ls served the module end to end")
+        (error "drive-terraform: " (%table-get *failures* :n 0) " check(s) failed")))))
