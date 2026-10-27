@@ -63,7 +63,10 @@ after a delimiter?"
 ;; character in Brood — measured 7.4 s on a 44k-line buffer, once per edit, which the idle
 ;; preview pays on every pause in typing. Searching the rope natively for the prefix and
 ;; reading the word at each hit that sits on a word start reads only those words: 22 ms for
-;; `def` on the same buffer, 7 ms for a prefix that occurs nowhere.
+;; `def` on the same buffer, 7 ms for a prefix that occurs nowhere. That is Tab's fallback
+;; now: the preview reads a word index built off the loop (see "the buffer's word index"
+;; below), cut by a native `regex/split` rather than a walk in Brood, and Tab reads it too
+;; whenever it is current.
 (defn- complete-prefix-words (buf prefix)
   "Every word of `buf` that starts with `prefix` (non-empty), with duplicates — read at
 each occurrence of `prefix` that begins a word, through to the next delimiter."
@@ -128,7 +131,7 @@ current buffer that start with `prefix` and aren't exactly it, sorted."
   ;; loop for a second, repeatedly, while you type. So the preview is the instant guess and
   ;; Tab is the considered answer that may go and ask.
   (list 'complete-at-point/complete-source-mode
-    'complete-at-point/complete-source-buffer-words))
+    'complete-at-point/complete-source-index-words))
 
 (def *preview-min-prefix* 3)
 ;; Emacs' `completion-preview-minimum-symbol-length`. Below three characters almost
@@ -271,93 +274,155 @@ is \"\" when point does not follow a word character."
         start (+ line-start (complete-prefix-start line offset)))
     [start (string/substring line (- start line-start) offset)]))
 
-;; ---- remembering the words between pauses ----------------------------------------
+;; ---- the buffer's word index, built off the loop -----------------------------------
 ;; The preview asks for the words starting with the word before point on every pause in
-;; typing, and typing that word is exactly what changes between two pauses: `def` becomes
-;; `defn`. Every word starting with `defn` started with `def`, and the only word typing
-;; changed is the one being typed — so the words found last time, filtered, are the answer,
-;; with that one word swapped for what it is now. The model keeps the last answer on
-;; `:completion-words`; a model is where it can live, because a rope cannot be put in a
-;; table and the answer is only good for the rope it was read from.
+;; typing. A prefix search answers one prefix and has to run again for the next — and a new
+;; word started means a search of the whole rope, on the loop. So the preview reads an
+;; INDEX instead: every distinct word of the buffer with how often it occurs, bucketed by
+;; its first character, on the model's `:word-index` with the rope it was read from.
+;;
+;; The index is built OFF the loop (a task capturing the rope; the rope stays behind, only
+;; the buckets cross back) and kept until the text changes. A change the buffer's splice log
+;; can account for moves it along in place: the words around the changed stretch are taken
+;; out as they read before and put back as they read now, which costs the edit rather than
+;; the buffer. Anything the log cannot say — another buffer, a wholesale replace, a paste
+;; past `*complete-index-inline-max*` — is a rebuild, off the loop again. The loop only
+;; ever filters one bucket.
 
-(defn- complete-word-end (rope i)
-  "The end of the completion word that runs on from char `i` of `rope`."
-  (text/skip-forward rope i *complete-word-delimiters* false))
+(def- *complete-word-pattern* "[ \t\n\r,()\\[\\]{}\";'`~^@#]+")
+;; one or more `*complete-word-delimiters*`, as a regex: what `regex/split` cuts a text into
+;; words with natively. tests/complete_test.blsp pins the two to the same set.
 
-(defn- complete-typed-into-word? (splices start own-end)
-  "Whether `splices` (`buffer-splices-since`, oldest first; nil when the log cannot say) are
-all insertions of word characters into the word at `[start own-end)` — typing that word and
-nothing else, so every other word of the buffer is as it was."
-  (letrec (go (fn (remaining end)
-                (if (empty? remaining)
-                  true
-                  (let ([lo hi repl] (first remaining))
-                    (if (and (= lo hi)
-                          (>= lo start)
-                          (<= lo end)
-                          (not (any? (string/->list repl)
-                                 (fn (c) (includes? *complete-word-delimiters* c)))))
-                      (go (rest remaining) (+ end (string/length repl)))
-                      false)))))
-    (and (not (nil? splices)) (go splices own-end))))
+(def *complete-index-inline-max* 8192)
+;; The most text (chars, before or after the edit) an index is moved along by on the loop;
+;; past it the edit is a paste worth a rebuild off the loop.
 
-(defn- complete-remove-one (words word)
-  "`words` without the first occurrence of `word`."
-  (let (at (index-of words word))
-    (if (< at 0) words (append (take words at) (drop words (inc at))))))
+(defn- complete-text-words (text)
+  "The completion words of `text`, in order, with duplicates."
+  (seq/filter (regex/split *complete-word-pattern* text) (fn (w) (not (= w "")))))
 
-(defn complete-words-for (m buf start prefix)
-  "`[words entry]`: every word of `buf` starting with `prefix` (which starts at `start`),
-with duplicates — and the `entry` to remember on the model's `:completion-words` for the
-next ask.
+(defn- complete-bucket-add (buckets word n)
+  "`buckets` with `word`'s count moved by `n`, a word whose count reaches zero dropped — and a
+bucket left empty with it, so an index moved along equals one built afresh."
+  (let (key (string/substring word 0 1)
+        bucket (get buckets key {})
+        total (+ (get bucket word 0) n)
+        moved (if (<= total 0) (dissoc bucket word) (assoc bucket word total)))
+    (if (empty? moved) (dissoc buckets key) (assoc buckets key moved))))
 
-The words remembered last time are reused, filtered, when this prefix EXTENDS that one at the
-same start and the buffer either still holds the same rope or has only had characters typed
-into the word at `start` since ([[complete-typed-into-word?]] over the buffer's splice log):
-the word being typed is swapped for what it reads now. Anything else — a deletion, a paste
-elsewhere, a different word — scans the rope again."
-  (let (rope (buffer-rope buf)
-        cached (:completion-words m)
-        own-end (complete-word-end rope start)
-        own (text/slice rope start own-end)
-        reused (cond
-                 (not (and (map? cached)
-                        (= (:start cached) start)
-                        (string/starts-with? prefix (:prefix cached))))
-                   nil
-                 (= (:rope cached) rope) (:words cached)
-                 (complete-typed-into-word? (buffer-splices-since (assoc buf :rope (:rope cached))
-                                              buf)
-                   start
-                   (:own-end cached))
-                   (cons own (complete-remove-one (:words cached) (:own cached)))
-                 :else nil)
-        words (if (nil? reused)
-                (complete-prefix-words buf prefix)
-                (seq/filter reused (fn (w) (string/starts-with? w prefix)))))
-    [words {:rope rope :start start :prefix prefix :words words :own own :own-end own-end}]))
+(defn complete-index-buckets (text)
+  "The word index of `text`: first character -> `{word count}` for every completion word.
 
-(defn complete-words-refresh (m)
-  "`m` remembering the words that start with the word before point (`:completion-words`, see
-[[complete-words-for]]) — what the idle preview runs before it asks its sources, so the
-buffer-word source finds its answer there. Unchanged when no word precedes point."
+    (complete-at-point/complete-index-buckets \"ab ac ab b\")   → {\"a\" {\"ab\" 2, \"ac\" 1}, \"b\" {\"b\" 1}}"
+  (fold (seq/frequencies (complete-text-words text))
+    {}
+    (fn (acc [word n]) (complete-bucket-add acc word n))))
+
+(defn- complete-buckets-move (buckets text n)
+  "`buckets` with every word of `text` counted `n` more times."
+  (fold (complete-text-words text) buckets (fn (acc word) (complete-bucket-add acc word n))))
+
+(defn complete-index-advance (index buf)
+  "`index` (a `:word-index`) moved onto `buf`'s text through the buffer's splice log, or nil
+when it cannot be: the log does not reach the index's rope (another buffer, too much history,
+a wholesale replace) or the edit is longer than `*complete-index-inline-max*`. The words the
+edit touched — the changed stretch widened to the words it cuts — come out as they read in the
+old text and go back as they read in the new."
+  (let (old (:rope index)
+        rope (buffer-rope buf)
+        splices (buffer-splices-since (assoc buf :rope old) buf))
+    (cond
+      (nil? splices) nil
+      (empty? splices) (assoc index :rope rope)
+      :else
+        (let ([lo old-hi new-hi] (ed-splices-cover splices)
+              from (text/skip-backward old lo *complete-word-delimiters* false)
+              old-end (text/skip-forward old old-hi *complete-word-delimiters* false)
+              new-end (text/skip-forward rope new-hi *complete-word-delimiters* false))
+          (when (<= (math/max (- old-end from) (- new-end from)) *complete-index-inline-max*)
+            {:rope rope
+             :buckets (complete-buckets-move (complete-buckets-move (:buckets index)
+                                               (text/slice old from old-end)
+                                               -1)
+                        (text/slice rope from new-end)
+                        1)})))))
+
+(defn complete-index-words (index prefix)
+  "The distinct words in `index` that start with `prefix` (non-empty) — one bucket filtered."
+  (seq/filter (keys (get (:buckets index) (string/substring prefix 0 1) {}))
+    (fn (w) (string/starts-with? w prefix))))
+
+(defn- complete-current-index (m buf)
+  "The model's `:word-index` when it was read from `buf`'s text, else nil."
+  (let (index (:word-index m))
+    (when (and index (= (:rope index) (buffer-rope buf))) index)))
+
+(defn complete-index-refresh (m)
+  "`m` with a `:word-index` for the current buffer's text, when a word long enough to preview
+precedes point — what the idle preview runs before it asks its sources. Kept when current,
+moved along when the splice log can ([[complete-index-advance]]), else rebuilt: in a task off
+the loop (`:word-index-proc`, one at a time, its reply folded by
+[[complete-apply-word-index]]), or inline with no loop to reply to (a test, a batch run)."
   (let (buf (ed-current-buf m)
+        rope (buffer-rope buf)
+        index (:word-index m)
+        [_ prefix] (complete-word-before-point buf))
+    (cond
+      (< (string/length prefix) *preview-min-prefix*) m
+      (complete-current-index m buf) m
+      :else
+        (let (advanced (when index (complete-index-advance index buf)))
+          (cond
+            advanced (assoc m :word-index advanced)
+            (:word-index-proc m) m
+            (ed-headless?)
+              (assoc m
+                :word-index {:rope rope :buckets (complete-index-buckets (text/->string rope))})
+            :else
+            ;; the task captures the rope; only the buckets come back
+              (assoc m
+                :word-index-proc (task/task (fn () (complete-index-buckets (text/->string rope))))
+                :word-index-building rope))))))
+
+(defn complete-apply-word-index (m buckets)
+  "Fold a finished index build (`buckets`, nil when it failed) onto the model as the
+`:word-index` of the rope it was read from. The preview is marked stale when that is still the
+current text, so the next beat shows what the index answers."
+  (let (rope (:word-index-building m)
+        m1 (dissoc m :word-index-proc :word-index-building))
+    (cond
+      (nil? buckets) m1
+      (= rope (buffer-rope (ed-current-buf m1)))
+        (dissoc (assoc m1 :word-index {:rope rope :buckets buckets}) :completion-preview-at)
+      :else (assoc m1 :word-index {:rope rope :buckets buckets}))))
+
+(register-task-reply :word-index-proc 'complete-at-point/complete-apply-word-index nil nil)
+
+(defn complete-source-index-words (m)
+  "The preview's buffer-word source: the distinct words of the current buffer that start with
+the word before point, read from the `:word-index` — nil while there is no index for this text
+yet, because the preview must never search the buffer on the loop."
+  (let (buf (ed-current-buf m)
+        index (complete-current-index m buf)
         [start prefix] (complete-word-before-point buf))
-    (if (= prefix "")
-      m
-      (assoc m :completion-words (second (complete-words-for m buf start prefix))))))
+    (when (and index (not (= prefix "")))
+      [start prefix (completion-candidates-of (complete-index-words index prefix) prefix)])))
 
 (defn complete-source-buffer-words (m)
   "The baseline source: the distinct words of the current buffer that start with the
-word before point. `nil` when there's no word before point. Reads the words the model
-remembers (`:completion-words`) when they still answer this prefix."
+word before point. `nil` when there's no word before point. Reads the `:word-index` when it is
+the current text's; Tab is a request, so without one it searches the rope for the prefix."
   (let (buf (ed-current-buf m)
+        index (complete-current-index m buf)
         [start prefix] (complete-word-before-point buf))
     (if (= prefix "")
       nil
       [start
         prefix
-        (completion-candidates-of (first (complete-words-for m buf start prefix)) prefix)])))
+        (completion-candidates-of (if index
+                                    (complete-index-words index prefix)
+                                    (complete-prefix-words buf prefix))
+          prefix)])))
 
 ;; ---- applying a completion --------------------------------------------------
 

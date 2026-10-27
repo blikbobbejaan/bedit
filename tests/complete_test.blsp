@@ -76,7 +76,8 @@
 (describe "the inline completion preview"
   (defn- pv (text)
     "The preview for a buffer whose point is at the end of `text`."
-    (completion-preview (ed-init (goto-char (make-buffer text) (string/length text)))))
+    (completion-preview (complete-index-refresh (ed-init (goto-char (make-buffer text)
+                                                           (string/length text))))))
 
   (test "the remainder of the top candidate, not the whole word"
     ;; what is painted sits AFTER the cursor, so it must not repeat what is already typed
@@ -117,14 +118,14 @@
   ;; second would block the editor loop for a second, repeatedly.
   (test "the preview's sources never include a server"
     (is (not (includes? *preview-sources* 'lsp/lsp-complete-source)))
-    (is (includes? *preview-sources* 'complete-at-point/complete-source-buffer-words)))
+    (is (includes? *preview-sources* 'complete-at-point/complete-source-index-words)))
 
   ;; M-n / M-p — Emacs' `completion-preview-next-candidate`. The first suggestion is a
   ;; guess; cycling is how you say "nearly, the one after it" without abandoning what you
   ;; have typed to open a popup and read a list.
   (test "M-n walks to the next candidate, M-p back"
     (let (m (ed-init (goto-char (make-buffer "alpha alphabet alphabetical\nalp") 31))
-          m1 (assoc m :completion-preview (completion-preview m))
+          m1 (assoc m :completion-preview (completion-preview (complete-index-refresh m)))
           m2 (preview-handle m1 :meta-n)
           m3 (preview-handle m2 :meta-p))
       (assert= (:text (:completion-preview m1)) "ha")
@@ -142,7 +143,7 @@
 
   (test "accepting takes the candidate you cycled to, not the first"
     (let (m (ed-init (goto-char (make-buffer "alpha alphabet alphabetical\nalp") 31))
-          m1 (assoc m :completion-preview (completion-preview m))
+          m1 (assoc m :completion-preview (completion-preview (complete-index-refresh m)))
           m2 (preview-handle (preview-handle m1 :meta-n) :meta-n)
           m3 (cmd-complete m2 :tab))
       (assert= (buffer-text (ed-current-buf m3)) "alpha alphabet alphabetical\nalphabetical")))
@@ -340,48 +341,69 @@
           (sort (seq/filter (map (reflect/global-names) str)
                   (fn (s) (string/starts-with? s prefix)))))))))
 
-;; the idle preview runs `complete-words-refresh` on every pause; typing the word extends
-;; the prefix, and the remembered words — filtered, the typed word swapped — must be
-;; exactly what a fresh scan of the new text finds
-(defn- cw-model (text) (ed-init (goto-char (make-buffer text) (string/length text))))
-(defn- cw-type (m s) (ed-set-buf m (insert (ed-current-buf m) s)))
-(defn- cw-words (m)
-  (let (buf (ed-current-buf m)
-        [start prefix] (complete-at-point/complete-word-before-point buf))
-    (sort (first (complete-words-for m buf start prefix)))))
-(defn- cw-fresh (m) (cw-words (dissoc m :completion-words)))
+;; The idle preview reads a word index of the buffer (`:word-index`) instead of searching
+;; the rope on the loop. It is built once per text, moved along by the splice log as you
+;; type, and must always agree with an index built afresh from the text it claims to be.
+(defn- wi-model (text) (ed-init (goto-char (make-buffer text) (string/length text))))
+(defn- wi-edit (m f) (ed-set-buf m (f (ed-current-buf m))))
+(defn- wi-fresh (m) (complete-index-buckets (buffer-text (ed-current-buf m))))
 
-(describe "completion: the words before point are remembered between pauses"
-  (test "typing into the word reuses the remembered words and agrees with a fresh scan"
-    (let (m (complete-words-refresh (cw-model "define defn defmacro deftest\ndef"))
-          typed (cw-type m "n"))
-      (is (= (:prefix (:completion-words m)) "def"))
-      (assert= (cw-words typed) (cw-fresh typed))
-      (assert= (cw-words typed) (list "defn" "defn"))))
-  (test "the remembered words ARE what typing reads (a planted word survives the filter)"
-    ;; a word only the memo holds proves the answer came from it, not from a rescan
-    (let (m (complete-words-refresh (cw-model "defn\ndef"))
-          planted (update m
-                    :completion-words assoc
-                    :words (cons "defnplanted" (:words (:completion-words m))))
-          typed (cw-type planted "n"))
-      (is (includes? (cw-words typed) "defnplanted"))
-      (is (not (includes? (cw-fresh typed) "defnplanted")))))
-  (test "point moving back into the word (a shorter prefix) scans again"
-    (let (m (complete-words-refresh (cw-model "alpha alps\nalph"))
-          back (ed-set-buf m (backward-char (ed-current-buf m))))
-      (assert= (cw-words back) (cw-fresh back))))
-  (test "an edit elsewhere is not mistaken for typing the word"
-    (let (m (complete-words-refresh (cw-model "\ndef"))
-          ;; a new matching word appears ABOVE point: the remembered words cannot know it
-          elsewhere (ed-set-buf m
-                      (goto-char (insert (goto-char (ed-current-buf m) 0) "defaults ") 13)))
-      (assert= (cw-words elsewhere) (cw-fresh elsewhere))
-      (is (includes? (cw-words elsewhere) "defaults"))))
-  (test "a delimiter typed ends the word: the new prefix is a different word"
-    (let (m (complete-words-refresh (cw-model "foo foobar\nfoo"))
-          spaced (cw-type m " fo"))
-      (assert= (cw-words spaced) (cw-fresh spaced))))
-  (test "the preview's refresh leaves the words on the model"
-    (let (m (ed-refresh-preview (cw-model "alpha alphabet\nalp")))
-      (assert= (:prefix (:completion-words m)) "alp"))))
+(describe "completion: the buffer's word index"
+  (test "the word regex cuts at exactly the delimiter set"
+    (let (chars (map (range 33 127) string/int->char))
+      (doseq (c chars)
+        (assert= (complete-at-point/complete-text-words (str "a" c "b"))
+          (if (includes? *complete-word-delimiters* c) (list "a" "b") (list (str "a" c "b")))))))
+  (test "built once per text: a second refresh keeps the same index"
+    (let (m (complete-index-refresh (wi-model "define defn defmacro\ndef"))
+          again (complete-index-refresh m))
+      (is (= (:rope (:word-index m)) (buffer-rope (ed-current-buf m))))
+      (is (= (:word-index again) (:word-index m)))))
+  (test "a short word before point builds nothing"
+    (is (nil? (:word-index (complete-index-refresh (wi-model "define\nde"))))))
+  (test "typing moves the index along the splice log, agreeing with a fresh build"
+    (let (m (complete-index-refresh (wi-model "define defn defmacro\ndef"))
+          ;; a word only the old index holds proves the new one was moved, not rebuilt
+          planted (assoc-in m [:word-index :buckets "z"] {"zplanted" 1})
+          typed (complete-index-refresh (wi-edit planted (fn (b) (insert b "nx")))))
+      (assert= (get-in typed [:word-index :buckets "z"]) {"zplanted" 1})
+      (assert= (dissoc (get-in typed [:word-index :buckets]) "z") (wi-fresh typed))
+      (assert= (:rope (:word-index typed)) (buffer-rope (ed-current-buf typed)))))
+  (test "an edit elsewhere that splits and joins words is counted exactly"
+    (let (m (complete-index-refresh (wi-model "alpha beta gamma\nalp"))
+          ;; join `alpha beta` into `alphabeta`, then type on at point
+          joined (wi-edit m (fn (b) (goto-char (delete-char (goto-char b 5)) 20)))
+          moved (complete-index-refresh (wi-edit joined (fn (b) (insert b "h")))))
+      (assert= (get-in moved [:word-index :buckets]) (wi-fresh moved))
+      (is (includes? (complete-index-words (:word-index moved) "alph") "alphabeta"))))
+  (test "a deleted word leaves the index"
+    (let (m (complete-index-refresh (wi-model "zebra\nzeb"))
+          gone (complete-index-refresh (wi-edit m
+                                         (fn (b)
+                                           (insert (goto-char (replace-region b 0 6 "") 3) "z")))))
+      (assert= (complete-index-words (:word-index gone) "zeb") (list "zebz"))))
+  (test "another buffer's text is a rebuild, never a move"
+    (let (m (complete-index-refresh (wi-model "alphabet\nalp"))
+          other (ed-set-buf m (goto-char (make-buffer "omega\nome") 9))
+          rebuilt (complete-index-refresh other))
+      (assert= (get-in rebuilt [:word-index :buckets]) (wi-fresh rebuilt))))
+  (test "the preview's source reads the index and nothing else"
+    (let (m (wi-model "alphabet alpine\nalp"))
+      (is (nil? (complete-source-index-words m)))
+      (assert= (nth (complete-source-index-words (complete-index-refresh m)) 2)
+        (list "alphabet" "alpine"))))
+  (test "a finished build folds onto the rope it was read from and re-arms the preview"
+    (let (m (wi-model "alphabet\nalp")
+          rope (buffer-rope (ed-current-buf m))
+          folded (complete-apply-word-index (assoc m
+                                              :word-index-proc :handle
+                                              :word-index-building rope
+                                              :completion-preview-at [0 rope])
+                   (complete-index-buckets "alphabet alp")))
+      (is (= (:rope (:word-index folded)) rope))
+      (is (nil? (:word-index-proc folded)))
+      (is (nil? (:completion-preview-at folded)))))
+  (test "the preview's refresh leaves the index on the model"
+    (let (m (ed-refresh-preview (wi-model "alpha alphabet\nalp")))
+      (is (not (nil? (:word-index m))))
+      (assert= (:text (:completion-preview m)) "ha"))))

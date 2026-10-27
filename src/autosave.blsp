@@ -7,6 +7,7 @@ warned about once when it does (`cmd-save` then asks before overwriting).
 Policy over the pool, run on the idle beat (`input/ed-timer-fire`) so it costs a keystroke
 nothing; the knowledge of \"changed since we last agreed\" lives in `std/editor/buffer`."
   (:use editor/buffer) ; buffer-file / buffer-modified? / find-file-buffer / buffer-file-changed?
+  (:use editor/pane) ; pane-leaf-paths / pane-payload-at — which buffers are on screen
   (:use model)) ; ed-buf-at / ed-set-buf-at / ed-map-panes / message — the pool it walks
 
 ;; ---- auto-save --------------------------------------------------------------
@@ -104,34 +105,81 @@ Raises if the file cannot be read — the callers report."
 ;; last agreed" lives in `std/editor/buffer` (`:file-mtime`, `buffer-file-changed?`);
 ;; this is the policy over it, run on the idle beat so it costs a keystroke nothing.
 
+;; Asking the disk is a stat per buffer, and the idle beat follows every pause in typing: a
+;; session with a hundred files open paid a hundred stats each time. So a beat asks about the
+;; buffers on SCREEN — the ones a stale text would mislead you in right now — and the rest take
+;; turns, a few every `*auto-revert-interval-ms*` (Emacs's `auto-revert-interval`), never more
+;; than `*auto-revert-max-per-beat*` stats in all. A buried buffer is still reverted; within a
+;; few rounds rather than on the next beat, and certainly before it is shown again.
+
+(def *auto-revert-interval-ms* 5000)
+(def *auto-revert-max-per-beat* 8)
+
+(defn- ed-file-buffer? (m i)
+  (not (nil? (buffer-file (ed-buf-at m i)))))
+
+(defn ed-auto-revert-candidates (m now-ms)
+  "`[indices model']`: the pool indices of the file buffers this beat asks the disk about, at
+most `*auto-revert-max-per-beat*` — every one shown in a pane, then, once per
+`*auto-revert-interval-ms*`, the next of the rest in turn from `:auto-revert-cursor` (wrapping
+round the pool). `model'` carries the cursor moved past the ones taken and the round's time
+(`:auto-revert-at`)."
+  (let (layout (:layout m)
+        size (count (:buffers m))
+        shown (seq/distinct (seq/filter (map (pane-leaf-paths layout)
+                                          (fn (path) (:buffer (pane-payload-at layout path))))
+                              (fn (i) (and (int? i) (< i size) (ed-file-buffer? m i)))))
+        visible (take shown *auto-revert-max-per-beat*)
+        room (- *auto-revert-max-per-beat* (count visible))
+        due? (>= (- now-ms (or (:auto-revert-at m) 0)) *auto-revert-interval-ms*))
+    (if (or (not due?) (<= room 0) (= size 0))
+      [visible m]
+      (let (start (math/mod (or (:auto-revert-cursor m) 0) size)
+            ;; one lap of the pool at most, from the cursor
+            [hidden next] (fold (range size)
+                            [[] start]
+                            (fn (acc step)
+                              (let ([taken cursor] acc
+                                    i (math/mod (+ start step) size))
+                                (if (or (>= (count taken) room)
+                                      (includes? visible i)
+                                      (not (ed-file-buffer? m i)))
+                                  (if (>= (count taken) room) acc [taken (inc i)])
+                                  [(conj taken i) (inc i)])))))
+        [(append visible hidden) (assoc m :auto-revert-cursor next :auto-revert-at now-ms)]))))
+
+(defn- ed-revert-if-changed (m i)
+  "Pool buffer `i` checked against its file: reverted when it is clean, warned about when it
+is not (see [[ed-revert-changed-files]]), unchanged when the disk agrees."
+  (let (b (ed-buf-at m i)
+        f (buffer-file b))
+    (if (or (nil? f) (not (buffer-file-changed? b)))
+      m
+      (let (now (file/mtime f))
+        (cond
+          (not (buffer-modified? b))
+            (try
+              (message (ed-revert-at m i) (str "reverted " f " (changed on disk)"))
+              (catch e
+                (do
+                  (log/warn (str "auto-revert of " f " failed: " (error-message e)))
+                  m)))
+          (= (:disk-warned b) now) m
+          else
+            (message (assoc m :buffers (assoc (:buffers m) i (assoc b :disk-warned now)))
+              (str f " changed on disk — save will ask; M-x revert-buffer to reload")))))))
+
 (sig ed-revert-changed-files (model -> model))
 (defn ed-revert-changed-files (m)
-  "For every file buffer whose file was written since it last agreed with the buffer
+  "For the file buffers this beat asks about ([[ed-auto-revert-candidates]]: the ones on
+screen, and the rest in turn) whose file was written since it last agreed with the buffer
 (`buffer-file-changed?`): a buffer with NO unsaved changes is reverted in place (Emacs
 `global-auto-revert-mode`) with a note in the echo area; one WITH unsaved changes is left
 alone and warned about once per on-disk version (`:disk-warned` remembers the mtime told
 about), since `cmd-save` will ask before overwriting. A revert that fails (the file
 unreadable now) is logged and skipped. Runs on the idle beat."
-  (fold (range (count (:buffers m)))
-    m
-    (fn (acc i)
-      (let (b (ed-buf-at acc i)
-            f (buffer-file b))
-        (if (or (nil? f) (not (buffer-file-changed? b)))
-          acc
-          (let (now (file/mtime f))
-            (cond
-              (not (buffer-modified? b))
-                (try
-                  (message (ed-revert-at acc i) (str "reverted " f " (changed on disk)"))
-                  (catch e
-                    (do
-                      (log/warn (str "auto-revert of " f " failed: " (error-message e)))
-                      acc)))
-              (= (:disk-warned b) now) acc
-              else
-                (message (assoc acc :buffers (assoc (:buffers acc) i (assoc b :disk-warned now)))
-                  (str f " changed on disk — save will ask; M-x revert-buffer to reload")))))))))
+  (let ([indices stepped] (ed-auto-revert-candidates m (os/now)))
+    (fold indices stepped ed-revert-if-changed)))
 
 ;; ---- registration: both ride the idle beat, after the launches ----------------------
 ;; Neither arms the beat (no `:stale?`) — an edit does, and the sidecars and the disk check
