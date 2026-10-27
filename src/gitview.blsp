@@ -75,51 +75,222 @@ act on the same hunk in *git-status*. The first few thousand lines are painted
   (section :note nil text))
 
 ;; ---- showing a view OFF the loop -------------------------------------------------
-;; `git show` of a large commit, or `git diff` of a large work tree, takes as long as git
-;; takes, and painting its hunks (`diffpaint`) more. Both run in a task: the git call AND
-;; the tree, plain data in and out, and the buffer is shown when the answer lands. One view
-;; in flight at a time — asking for another drops the first answer as stale, because the
-;; reader has moved on to the newer one. Headless runs it inline.
+;; Blame on a long file, `git show` of a large commit, a log of a busy repo: each takes as
+;; long as git takes, and parsing and painting what it printed (`diffpaint`) more. So every
+;; view runs its git call AND builds its tree in a task — plain data in and out — and the
+;; editor never waits on it. Its buffer is shown AT ONCE, Magit-style: a `Loading…` line, or
+;; the contents it already has when the reader refreshes the view they are looking at (`g`,
+;; `+`), because a flash back to `Loading…` on every refresh is worse than a stale moment.
+;; The finished tree is folded into the buffer when the answer lands.
+;;
+;; One request in flight PER VIEW (a slot each, below): a commit opened from a log that is
+;; still loading must not drop the log, but a second blame asked for before the first landed
+;; replaces it — the reader has moved on, so the first is cancelled. An answer is folded only
+;; into the buffer it was asked for: the buffer carries its request's handle (`:git-view-token`)
+;; until the answer lands, so one for a buffer the reader killed, or that a newer request
+;; re-pointed, is dropped. C-g cancels every view in flight (only `git` READS run here, with
+;; optional locks off, so killing one leaves nothing half-done) and says so in the buffer.
+;; Headless takes the same path with the build run inline.
 
-(defn- gv-land (m root name type opts verb answer)
-  "Show a finished view `answer` (`{:tree}`, or `{:failed result}` when git said no)."
-  (if (:failed answer)
-    (vcsproc/vcs-report-cmd m verb (:failed answer))
-    (sectionbuf/sb-show (assoc m :git-root root) name (:tree answer) type opts)))
+(def- gv-view-slots
+  ;; the model field each view parks its in-flight task on
+  [:git-revision-proc
+    :git-diff-proc :git-log-proc :git-reflog-proc :git-blame-proc :git-refs-proc :git-blob-proc])
 
-(check-allow :trusted
-  ;; `build` is the caller's own `() -> {:tree} | {:failed}`; the declaration is the contract
-  (sig gv-show-off-loop (model string string any map string fn -> model))
-  (defn- gv-show-off-loop (m root name type opts verb build)
-    "Run `build` — the git call and the tree it makes, `() -> {:tree} | {:failed result}` —
-in a task, and show its tree as buffer `name` of `type` with sectionbuf `opts` when it lands."
-    (if (ed-headless?)
-      (gv-land m root name type opts verb (build))
-      ;; the activity indicator says it is running (the reply row's label)
-      (assoc m
-        :git-view-proc (task/task build {:timeout *git-op-timeout-ms*})
-        :git-view-pending
-          {:root root
-           :name name
-           :type type
-           :opts opts
-           :verb verb
-           :from (ed-current-index m)}))))
+(def- gv-loading-text "Loading…\n")
 
-(register-task-reply :git-view-proc 'gitview/gv-apply-view nil "git")
-(defn gv-apply-view (m answer)
-  "Fold a view built off the loop into its buffer. A reader who has since moved to another
-buffer gets it BESIDE them (`:display`) rather than in place of where they now are."
-  (let (pending (:git-view-pending m)
-        m1 (dissoc m :git-view-proc :git-view-pending)
-        opts (:opts pending {})
-        moved? (not (= (ed-current-index m1) (:from pending)))
-        placed (if (and moved? (contains? #{:here :pop} (:action opts :here)))
-                 (assoc opts :action :display)
-                 opts))
-    (if (nil? answer)
-      (message m1 (str (:verb pending "git") " failed or timed out"))
-      (gv-land m1 (:root pending) (:name pending) (:type pending) placed (:verb pending) answer))))
+(defn- gv-git (root args)
+  "`git args` in `root` for a view: a read, so it takes no optional lock (the index refresh a
+diff may otherwise write) — a view cancelled mid-run leaves no `index.lock` behind."
+  (git-git root args {:env {"GIT_OPTIONAL_LOCKS" "0"}}))
+
+(defn- gv-ctx-of (opts old)
+  "The `:section-ctx` a view's buffer carries while it loads: the new request's (so `g` retries
+it), else the one it had."
+  (if (contains? opts :ctx) (:ctx opts) (and old (:section-ctx old))))
+
+(defn- gv-open (m spec token)
+  "Show the view's buffer NOW, carrying `token`: a `Loading…` placeholder (read-only, in the
+view's type, keeping the folds and the ctx so `g` on it retries), or — a refresh of the view
+the reader is in — the contents it has. `[model kept?]`."
+  (let (name (:name spec)
+        opts (:opts spec {})
+        i (ed-buffer-index-by-name m name)
+        old (if (nil? i) nil (ed-buf-at m i))
+        action (:action opts :here)
+        kept? (and (not (nil? old)) (= i (ed-current-index m)) (= action :here))
+        m1 (if kept? m (ed-display-buffer m name gv-loading-text (:type spec) {:action action}))
+        j (ed-buffer-index-by-name! m1 name)
+        placed (ed-buf-at m1 j)
+        ;; a placeholder is read-only like the view it stands for, whatever its mode
+        fresh (if kept?
+                placed
+                (merge (assoc (set-read-only placed true)
+                         :section-ctx (gv-ctx-of opts old)
+                         :section-vis (and old (:section-vis old)))
+                  (:props spec {}))))
+    [(ed-set-buf-at m1 j (assoc fresh :git-view-token token)) kept?]))
+
+(defn- gv-buffer-ours (m pending token)
+  "The pool index of `pending`'s buffer when it is still the one request `token` opened, else
+nil — killed, or re-pointed by a newer request."
+  (let (i (ed-buffer-index-by-name m (:name pending)))
+    (if (and i (= (:git-view-token (ed-buf-at m i)) token)) i nil)))
+
+(defn- gv-note (m pending text)
+  "Say `text` in `pending`'s placeholder in place of `Loading…` — a failure, a cancel — so no
+buffer is left loading forever. The ctx stays, so `g` asks again. A buffer that kept its
+contents (a refresh) keeps them; one that is no longer this request's is left alone."
+  (let (i (if (:name pending) (gv-buffer-ours m pending (:token pending)) nil))
+    (if (or (nil? i) (:kept? pending))
+      m
+      (let (b (ed-buf-at m i)
+            m1 (ed-display-buffer m
+                 (:name pending)
+                 (str text "\n")
+                 (:type pending)
+                 {:action (if (= i (ed-current-index m)) :here :none)})
+            j (ed-buffer-index-by-name! m1 (:name pending)))
+        (ed-set-buf-at m1
+          j
+          (merge (assoc (set-read-only (ed-buf-at m1 j) true) :section-ctx (:section-ctx b))
+            (:props pending {})))))))
+
+(sig gv-forget (model keyword -> model))
+(defn- gv-forget (m slot)
+  "`m` with view `slot` free: no handle, no pending request."
+  (assoc (dissoc m slot) :git-view-pending (dissoc (:git-view-pending m {}) slot)))
+
+(sig gv-supersede (model keyword any -> model))
+(defn- gv-supersede (m slot name)
+  "Free view `slot` for a new request for buffer `name`: the one in flight is cancelled, and its
+buffer says so when the new request will not take it over (it names another buffer)."
+  (let (handle (get m slot)
+        pending (get (:git-view-pending m {}) slot))
+    (if (nil? handle)
+      m
+      (do
+        (when (not (= handle :inline)) (task/cancel handle))
+        (gv-forget (if (= (:name pending) name)
+                     m
+                     (gv-note m pending (str (:verb pending) ": replaced by a newer request")))
+          slot)))))
+
+(defn gv-launch (m spec)
+  "Run a view off the loop. `spec`: `:slot` (one of `gv-view-slots`), `:name` / `:type` / `:opts`
+of the section buffer it fills (`sectionbuf/sb-show`'s; no `:name` when it is not known until
+git answers — the version before this one), `:props` set on the placeholder, `:root`, `:verb`
+(what a failure is reported as), and `:build`: `() -> answer`, run in the task —
+- `{:tree t}` the view's section tree
+- `{:text s :blob {:root :path :rev}}` a file as it was at a revision
+- `{:failed result :verb v}` git said no (`:verb` overriding the spec's)
+- `{:note s}` nothing to show, and why
+- `{:visit file}` the work-tree file is the answer"
+  (let (slot (:slot spec)
+        headless? (ed-headless?)
+        free (gv-supersede m slot (:name spec))
+        handle (if headless? :inline (task/task (:build spec) {:timeout *git-op-timeout-ms*}))
+        [opened kept?] (if (:name spec)
+                         (gv-open free spec handle)
+                         [(message free (str (:verb spec) "…")) false])
+        pending {:name (:name spec)
+                 :type (:type spec)
+                 :opts (:opts spec {})
+                 :props (:props spec {})
+                 :root (:root spec)
+                 :verb (:verb spec)
+                 :kept? kept?
+                 :token handle
+                 :from (ed-current-index m)}
+        launched (assoc opened
+                   slot handle
+                   :git-view-pending (assoc (:git-view-pending opened {}) slot pending)))
+    (if headless? (gv-apply-view launched [:task-done handle ((:build spec))]) launched)))
+
+(doseq (slot gv-view-slots)
+  (register-task-reply slot
+    'gitview/gv-apply-view
+    nil
+    "git"
+    {:folds-event? true :cancel-on-quit? true :on-quit 'gitview/gv-quit}))
+
+(defn gv-apply-view (m event)
+  "Fold a view's answer — the whole `[:task-done handle answer]` / `[:task-error …]` /
+`[:task-timeout …]` event, since the handle says which view it is — into the buffer it was
+asked for. One whose buffer has been killed or re-pointed since is dropped; a failure or
+timeout is said in the buffer and the echo area."
+  (let (handle (nth event 1)
+        slot (seq/find gv-view-slots (fn (s) (and (not (nil? (get m s))) (= (get m s) handle))))
+        pending (if (nil? slot) nil (get (:git-view-pending m {}) slot))
+        m1 (if (nil? slot) m (gv-forget m slot)))
+    (cond
+      (nil? pending) m1
+      (and (:name pending) (nil? (gv-buffer-ours m1 pending handle))) m1
+      (not (= (first event) :task-done))
+        (let (text (str (:verb pending) " failed or timed out"))
+          (message (gv-note m1 pending text) text))
+      :else (gv-land m1 pending (nth event 2)))))
+
+(defn gv-quit (m)
+  "C-g's clean-up for the views (`:on-quit`): every view whose task it just cancelled says so
+in its buffer, rather than reading `Loading…` for ever."
+  (fold (:git-view-pending m {})
+    m
+    (fn (acc entry)
+      (let ([slot pending] entry)
+        (if (nil? (get acc slot))
+          (gv-forget (gv-note acc pending (str (:verb pending) ": cancelled — g to retry"))
+            slot)
+          acc)))))
+
+(defn- gv-action (m pending)
+  "Where a landing view goes: its buffer in place — selected when the reader is on it, else
+quietly where it is shown (`:none`) — or, with no placeholder, where it was asked for, beside
+the reader when they have moved on since."
+  (let (i (if (:name pending) (ed-buffer-index-by-name m (:name pending)) nil)
+        asked (:action (:opts pending) :here))
+    (cond
+      (not (nil? i)) (if (= i (ed-current-index m)) :here :none)
+      (= (ed-current-index m) (:from pending)) asked
+      :else :display)))
+
+(defn- gv-land (m pending answer)
+  "Show a view's finished `answer` (see `gv-launch`)."
+  (cond
+    (nil? answer) (message m (str (:verb pending) " returned nothing"))
+    (:failed answer)
+      (let (r (:failed answer)
+            verb (or (:verb answer) (:verb pending)))
+        (vcsproc/vcs-report-cmd (gv-note m
+                                  pending
+                                  (str verb " failed: " (first (vcsproc/vcs-summary r))))
+          verb r))
+    (:note answer) (message m (:note answer))
+    (:visit answer) (pool/ed-pop-to-file m (:visit answer) 1)
+    (:blob answer) (gv-land-blob m pending (:blob answer) (:text answer))
+    :else
+      (sectionbuf/sb-show (assoc m :git-root (:root pending))
+        (:name pending)
+        (:tree answer)
+        (:type pending)
+        (assoc (:opts pending) :action (gv-action m pending)))))
+
+(defn- gv-blob-type (root path)
+  "The buffer type `path` (relative to `root`) opens in — its own mode, so an old version is
+coloured like the file."
+  (editor/layers/buffer-type-for (assoc (make-buffer "" path) :file (path/join root path))))
+
+(defn- gv-land-blob (m pending blob text)
+  "Show `text`, `blob`'s file (`{:root :path :rev}`) as it was at its revision: read-only, and
+remembering where it came from so `C-c g p` / `C-c g n` step on from it."
+  (let (name (gv-blob-name (:path blob) (:rev blob))
+        m1 (ed-display-buffer m
+             name
+             text
+             (gv-blob-type (:root blob) (:path blob))
+             {:action (gv-action m pending)})
+        i (ed-buffer-index-by-name! m1 name))
+    (ed-set-buf-at m1 i (assoc (set-read-only (ed-buf-at m1 i) true) :blob blob))))
 
 ;; ---- a commit: *git-revision* ----------------------------------------------------
 
@@ -164,21 +335,24 @@ the change it made, rather than as a combined diff nobody can read."
     (nil? root) (message m "not in a git repository")
     (or (nil? rev) (= rev "")) (message m "no commit here")
     :else
-      (gv-show-off-loop m
-        root
-        "*git-revision*"
-        :git-revision {:action action
-         :ctx {:root root :rev rev :reload 'gitview/git-revision-reload}
-         :line 1
-         :vis {}}
-        (str "git show " rev)
-        (fn ()
-          (let (r (git-git root
-                    ["show"
-                      "--no-color" "--no-ext-diff" "--diff-merges=first-parent" gv-show-format rev]))
-            (if (not (= (:exit r) 0))
-              {:failed r}
-              {:tree (gv-revision-tree rev (gv-parse-show (:stdout r "")))}))))))
+      (gv-launch m
+        {:slot :git-revision-proc
+         :name "*git-revision*"
+         :type :git-revision
+         :opts {:action action
+                :ctx {:root root :rev rev :reload 'gitview/git-revision-reload}
+                :line 1
+                :vis {}}
+         :root root
+         :verb (str "git show " rev)
+         :build (fn ()
+                  (let (r (gv-git root
+                            ["show"
+                              "--no-color" "--no-ext-diff" "--diff-merges=first-parent"
+                              gv-show-format rev]))
+                    (if (not (= (:exit r) 0))
+                      {:failed r}
+                      {:tree (gv-revision-tree rev (gv-parse-show (:stdout r "")))})))})))
 
 (defn git-revision-reload (m)
   "*git-revision*'s `:reload`: show the same commit again."
@@ -200,39 +374,40 @@ the change it made, rather than as a combined diff nobody can read."
       (into [(section :meta nil nil [title] {:separator true})]
         (if (empty? fs) [(gv-empty "(no changes)")] fs)))))
 
+(defn- gv-launch-diff (m root args lst opts)
+  "Run `git diff args` in `root` off the loop into *git-diff*, with sectionbuf `opts`."
+  (gv-launch m
+    {:slot :git-diff-proc
+     :name "*git-diff*"
+     :type :git-diff
+     :opts opts
+     :root root
+     :verb "git diff"
+     :build (fn ()
+              (let (full (append ["diff" "--no-color" "--no-ext-diff"] args)
+                    r (gv-git root full))
+                (if (>= (:exit r) 2)
+                  {:failed r}
+                  {:tree (gv-diff-tree (:stdout r "") lst (string/join (into ["git"] full) " "))})))}))
+
 (defn git-show-diff (m root args lst &optional (action :pop))
   "Show `git diff args` of `root` in *git-diff*, as files and hunks. `lst` names the
 working-tree list it is a diff OF (`:unstaged` / `:staged`, nil for history), so `s` /
 `u` / `k` work on it as they do in *git-status*. `+` / `-` widen and narrow the context."
   (if (nil? root)
     (message m "not in a git repository")
-    (gv-show-off-loop m
+    (gv-launch-diff m
       root
-      "*git-diff*"
-      :git-diff {:action action
+      args
+      lst
+      {:action action
        :ctx {:root root :args args :section lst :reload 'gitview/git-diff-reload}
-       :line 1}
-      "git diff"
-      (gv-diff-build root args lst))))
-
-(defn- gv-diff-build (root args lst)
-  "The `() -> {:tree} | {:failed}` that runs `git diff args` in `root` and makes its tree."
-  (fn ()
-    (let (full (append ["diff" "--no-color" "--no-ext-diff"] args)
-          r (git-git root full))
-      (if (>= (:exit r) 2)
-        {:failed r}
-        {:tree (gv-diff-tree (:stdout r "") lst (string/join (into ["git"] full) " "))}))))
+       :line 1})))
 
 (defn git-diff-reload (m)
   "*git-diff*'s `:reload`: the same diff again, point kept."
   (let (c (sectionbuf/sb-ctx m))
-    (gv-show-off-loop m
-      (:root c)
-      "*git-diff*"
-      :git-diff {:action :here}
-      "git diff"
-      (gv-diff-build (:root c) (:args c) (:section c)))))
+    (gv-launch-diff m (:root c) (:args c) (:section c) {:action :here})))
 
 (defn- gv-diff-args (m extra)
   "The diff menu's flags, then `extra`."
@@ -434,20 +609,25 @@ graph drawn when the args ask for it, the refs decorated in full so each label c
 for what it is (`gitsection/git-ref-labels`). Point starts on the newest commit."
   (if (nil? root)
     (message m "not in a git repository")
-    (let (n (or limit *git-log-limit*)
-          r (git-git root
-              (append ["log" "--no-color" git-log-format "--decorate=full"]
-                (if (gv-limited? args) [] [(str "-n" n)])
-                args)))
-      (if (not (= (:exit r) 0))
-        (vcsproc/vcs-report-cmd m title r)
-        (sectionbuf/sb-show (assoc m :git-root root)
-          "*git-log*"
-          (gv-log-tree (git-parse-log (:stdout r "")) (gv-log-heading root args))
-          :git-log {:action action
-           :line 2
-           :vis {}
-           :ctx {:root root :args args :title title :limit n :reload 'gitview/git-log-reload}})))))
+    (let (n (or limit *git-log-limit*))
+      (gv-launch m
+        {:slot :git-log-proc
+         :name "*git-log*"
+         :type :git-log
+         :opts {:action action
+                :line 2
+                :vis {}
+                :ctx {:root root :args args :title title :limit n :reload 'gitview/git-log-reload}}
+         :root root
+         :verb title
+         :build (fn ()
+                  (let (r (gv-git root
+                            (append ["log" "--no-color" git-log-format "--decorate=full"]
+                              (if (gv-limited? args) [] [(str "-n" n)])
+                              args)))
+                    (if (not (= (:exit r) 0))
+                      {:failed r}
+                      {:tree (gv-log-tree (git-parse-log (:stdout r "")) (gv-log-heading root args))})))}))))
 
 (defn git-log-reload (m)
   "*git-log*'s `:reload`: the same log again."
@@ -522,6 +702,10 @@ renames."
 
 ;; ---- the reflog --------------------------------------------------------------------
 
+(defn- gv-here-or-pop (m name)
+  "`:here` when the reader is already in buffer `name` (a refresh), else `:pop`."
+  (if (= (buffer-name (ed-current-buf m)) name) :here :pop))
+
 (defcommand cmd-git-reflog
   (m key)
   "Where HEAD has been (l r), newest first, as commits you can show, reset to or pick —
@@ -529,14 +713,23 @@ the thing you want after a reset you regret, and the reason a `--hard` is surviv
   (let (root (git-resolve-root m))
     (if (nil? root)
       (message m "not in a git repository")
-      (let (r (git-git root
-                ["reflog" "--no-color" "-n" "100" "--format=%h%x00%gd%x00%gs%x00%an%x00%ar"]))
-        (if (not (= (:exit r) 0))
-          (vcsproc/vcs-report-cmd m "git reflog" r)
-          (sectionbuf/sb-show (assoc m :git-root root)
-            "*git-reflog*"
-            (gv-log-tree (git-parse-log (:stdout r "")) "Reflog for HEAD")
-            :git-log {:action :pop :line 2 :vis {} :ctx {:root root :reload 'gitview/git-reflog-reload}}))))))
+      (gv-launch m
+        {:slot :git-reflog-proc
+         :name "*git-reflog*"
+         :type :git-log
+         :opts {:action (gv-here-or-pop m "*git-reflog*")
+                :line 2
+                :vis {}
+                :ctx {:root root :reload 'gitview/git-reflog-reload}}
+         :root root
+         :verb "git reflog"
+         :build (fn ()
+                  (let (r (gv-git root
+                            ["reflog"
+                              "--no-color" "-n" "100" "--format=%h%x00%gd%x00%gs%x00%an%x00%ar"]))
+                    (if (not (= (:exit r) 0))
+                      {:failed r}
+                      {:tree (gv-log-tree (git-parse-log (:stdout r "")) "Reflog for HEAD")})))}))))
 
 (defn git-reflog-reload (m) "*git-reflog*'s `:reload`." (cmd-git-reflog m nil))
 
@@ -636,17 +829,22 @@ the first row."
 (defn git-show-blame (m root path rev line)
   "Blame `path` (relative to `root`) at `rev` (nil: the work tree) in *git-blame*, point on
 the chunk holding `line`."
-  (let (r (git-git root (append ["blame" "--porcelain" "-w"] (if rev [rev] []) ["--" path]))
-        again? (= (buffer-name (ed-current-buf m)) "*git-blame*"))
-    (if (not (= (:exit r) 0))
-      (vcsproc/vcs-report-cmd m "blame" r)
-      (sectionbuf/sb-show (assoc m :git-root root)
-        "*git-blame*"
-        (gv-blame-tree (gv-parse-blame (:stdout r "")))
-        :git-blame {:action (if again? :here :pop)
-         :vis {}
-         :ctx {:root root :path path :rev rev :reload 'gitview/git-blame-reload}
-         :line (gv-blame-line-of line)}))))
+  (gv-launch m
+    {:slot :git-blame-proc
+     :name "*git-blame*"
+     :type :git-blame
+     :opts {:action (gv-here-or-pop m "*git-blame*")
+            :vis {}
+            :ctx {:root root :path path :rev rev :reload 'gitview/git-blame-reload}
+            :line (gv-blame-line-of line)}
+     :root root
+     :verb "blame"
+     :build (fn ()
+              (let (r (gv-git root
+                        (append ["blame" "--porcelain" "-w"] (if rev [rev] []) ["--" path])))
+                (if (not (= (:exit r) 0))
+                  {:failed r}
+                  {:tree (gv-blame-tree (gv-parse-blame (:stdout r "")))})))}))
 
 (defn git-blame-reload (m)
   "*git-blame*'s `:reload`."
@@ -785,17 +983,22 @@ name), then the tags."
   (m key)
   "Every branch, remote branch and tag (y) — RET shows one's log, `b` checks it out, `k`
 deletes it."
-  (let (root (git-resolve-root m)
-        r (if (nil? root) nil (git-git root gv-refs-argv)))
-    (cond
-      (nil? root) (message m "not in a git repository")
-      (not (= (:exit r) 0)) (vcsproc/vcs-report-cmd m "git for-each-ref" r)
-      :else
-        (sectionbuf/sb-show (assoc m :git-root root)
-          "*git-refs*"
-          (gv-refs-tree (gv-parse-refs (:stdout r "")))
-          :git-refs {:action (if (= (buffer-name (ed-current-buf m)) "*git-refs*") :here :pop)
-           :ctx {:root root :reload 'gitview/git-refs-reload}}))))
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (gv-launch m
+        {:slot :git-refs-proc
+         :name "*git-refs*"
+         :type :git-refs
+         :opts {:action (gv-here-or-pop m "*git-refs*")
+                :ctx {:root root :reload 'gitview/git-refs-reload}}
+         :root root
+         :verb "git for-each-ref"
+         :build (fn ()
+                  (let (r (gv-git root gv-refs-argv))
+                    (if (not (= (:exit r) 0))
+                      {:failed r}
+                      {:tree (gv-refs-tree (gv-parse-refs (:stdout r "")))})))}))))
 
 (defn git-refs-reload (m) "*git-refs*'s `:reload`." (cmd-git-refs m nil))
 
@@ -816,21 +1019,35 @@ deletes it."
   "The buffer name of `path` at `rev` — Magit's `file.~rev~`."
   (str (path/basename path) ".~" rev "~"))
 
+(defn- gv-blob-answer (root path rev)
+  "Run in a view's task: `path` at `rev` as a `gv-launch` answer — its text, or git's no."
+  (let (r (gv-git root ["show" (str rev ":" path)]))
+    (if (not (= (:exit r) 0))
+      {:failed r :verb (str "git show " rev ":" path)}
+      {:text (:stdout r "") :blob {:root root :path path :rev rev}})))
+
+(defn- gv-launch-blob (m o verb name build)
+  "Run `build` (a `gv-launch` answer for a version of origin `o`'s file) off the loop. `name`
+is the buffer it fills when the revision is already known (a placeholder shows at once), nil
+when git has first to say which version it is."
+  (gv-launch m
+    (merge {:slot :git-blob-proc :opts {:action :here} :root (:root o) :verb verb :build build}
+      (if (nil? name)
+        {}
+        {:name name
+         :type (gv-blob-type (:root o) (:path o))
+         ;; a C-c g p on the placeholder steps from the version it is loading
+         :props {:blob o}}))))
+
 (defn git-show-blob (m root path rev)
   "Open `path` (relative to `root`) as it was at `rev`: read-only, in the file's own mode so
 it is coloured like the file, remembering where it came from so `C-c g p` / `C-c g n` can
 step to the version before or after."
-  (let (r (git-git root ["show" (str rev ":" path)]))
-    (if (not (= (:exit r) 0))
-      (vcsproc/vcs-report-cmd m (str "git show " rev ":" path) r)
-      (let (name (gv-blob-name path rev)
-            type (editor/layers/buffer-type-for (assoc (make-buffer "" name)
-                                                  :file (path/join root path)))
-            m1 (pool/ed-display-buffer m name (:stdout r "") type {:action :here})
-            i (ed-buffer-index-by-name! m1 name))
-        (ed-set-buf-at m1
-          i
-          (assoc (set-read-only (ed-buf-at m1 i) true) :blob {:root root :path path :rev rev}))))))
+  (gv-launch-blob m
+    {:root root :path path :rev rev}
+    (str "git show " rev ":" path)
+    (gv-blob-name path rev)
+    (fn () (gv-blob-answer root path rev))))
 
 (defn- gv-blob-origin (m)
   "`{:root :path :rev}` for the current buffer: a blob buffer's own, or the work-tree file
@@ -853,18 +1070,24 @@ step to the version before or after."
 (defcommand cmd-git-blob-previous
   (m key)
   "The version of this file before the one shown (C-c g p) — from the work tree, the last
-committed one."
+committed one. Which version that is is git's to say, so the search and the show both run
+off the loop, and the buffer opens when they land."
   (let (o (gv-blob-origin m))
     (if (nil? o)
       (message m "this buffer is not a file in a git repository")
-      (let (hashes (git-lines (:root o)
-                     (append ["log" "--format=%h" "-n" "2"]
-                       (if (:rev o) [(:rev o)] [])
-                       ["--" (:path o)]))
-            target (if (:rev o) (second hashes) (first hashes)))
-        (if (nil? target)
-          (message m "no earlier version")
-          (git-show-blob m (:root o) (:path o) target))))))
+      (gv-launch-blob m
+        o
+        "git log"
+        nil
+        (fn ()
+          (let (hashes (git-lines (:root o)
+                         (append ["log" "--format=%h" "-n" "2"]
+                           (if (:rev o) [(:rev o)] [])
+                           ["--" (:path o)]))
+                target (if (:rev o) (second hashes) (first hashes)))
+            (if (nil? target)
+              {:note "no earlier version"}
+              (gv-blob-answer (:root o) (:path o) target))))))))
 
 (defcommand cmd-git-blob-next
   (m key)
@@ -874,16 +1097,21 @@ committed one."
       (nil? o) (message m "this buffer is not a file in a git repository")
       (nil? (:rev o)) (message m "this is the work tree — there is nothing newer")
       :else
-        (let (target (first (git-lines (:root o)
-                              ["log"
-                                "--reverse"
-                                "--format=%h"
-                                (str (:rev o) "..HEAD")
-                                "--"
-                                (:path o)])))
-          (if (nil? target)
-            (pool/ed-pop-to-file m (path/join (:root o) (:path o)) 1)
-            (git-show-blob m (:root o) (:path o) target))))))
+        (gv-launch-blob m
+          o
+          "git log"
+          nil
+          (fn ()
+            (let (target (first (git-lines (:root o)
+                                  ["log"
+                                    "--reverse"
+                                    "--format=%h"
+                                    (str (:rev o) "..HEAD")
+                                    "--"
+                                    (:path o)])))
+              (if (nil? target)
+                {:visit (path/join (:root o) (:path o))}
+                (gv-blob-answer (:root o) (:path o) target))))))))
 
 ;; The git VIEWS (src/gitview.blsp): a commit, a diff, a log, blame, the refs — section
 ;; buffers with the common keys, plus each one's own.

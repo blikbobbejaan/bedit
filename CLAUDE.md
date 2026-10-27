@@ -562,7 +562,10 @@ src/gitview.blsp            the git VIEWS, section buffers acted on in place: *g
                             SPC peeks, + doubles; A/V/X/r i act on the commit at point), the
                             reflog, *git-blame* (chunks per commit; b blames the version
                             before), *git-refs* (y), a file at a revision and C-c g p / n to
-                            step through its history
+                            step through its history. Every view runs git, parses and paints OFF
+                            the loop (a slot each): its buffer opens at once — `Loading…`, or what
+                            it held on a refresh — and the tree lands when git answers; a reply
+                            for a killed or re-asked buffer is dropped, C-g cancels
 src/smerge.blsp             conflicts resolved IN the file, Emacs's smerge: C-c ^ n/p between
                             conflicts, u/l/a/b keep upper / lower / both / base
 src/diffhl.blsp             diff-hl change gutter: per-line added/modified/deleted against the

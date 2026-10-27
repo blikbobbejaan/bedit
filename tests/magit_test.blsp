@@ -866,3 +866,126 @@
       (assert= (file/slurp (path/join dir "a.txt")) "edited\n")
       (mg-key asked "y")
       (assert= (file/slurp (path/join dir "a.txt")) "a\n"))))
+
+;; The views off the loop. `ed-headless?` is true under test, so these bind `*ui-loop*` to
+;; the test process — the shape the real loop takes — and the task's reply comes HERE.
+;; `mg-reply` receives it: a barrier on the reply itself, never a sleep.
+
+(defn- mg-off-loop (thunk)
+  "Run `thunk` as the loop would: its git views go off it, their replies to this process."
+  (binding (*ui-loop* (self)) (thunk)))
+
+(defn- mg-reply (handle)
+  "View task `handle`'s reply event, as the loop's dispatcher would hand it on."
+  (receive
+    ([:task-done ^handle v] [:task-done handle v])
+    ([:task-error ^handle e] [:task-error handle e])
+    ([:task-timeout ^handle] [:task-timeout handle])
+    (after 30000 (error "mg-reply: the view's task never answered"))))
+
+(defn- mg-text-of (m name)
+  "The text of pool buffer `name`, or nil when there is none."
+  (let (i (ed-buffer-index-by-name m name)) (if (nil? i) nil (buffer-text (ed-buf-at m i)))))
+
+(describe "magit: a view opens at once and fills when git answers"
+  (test "the log is shown and selected immediately, a placeholder until the reply folds in"
+    (let (dir (mg-repo "async-log" {"a.txt" "a\n"})
+          m0 (mg-status dir)
+          m (mg-off-loop (fn () (gitview/git-show-log m0 dir [] "git log" nil :here)))
+          handle (:git-log-proc m))
+      (assert= (buffer-name (ed-current-buf m)) "*git-log*")
+      (assert= (buffer-text (ed-current-buf m)) "Loading…\n")
+      (is (not (nil? handle)))
+      (assert= (:git-view-token (ed-current-buf m)) handle)
+      (let (landed (gitview/gv-apply-view m (mg-reply handle)))
+        (assert= (:git-log-proc landed) nil)
+        (assert= (buffer-name (ed-current-buf landed)) "*git-log*")
+        (is (includes? (buffer-text (ed-current-buf landed)) "base"))
+        (assert= (:subject (:value (sectionbuf/sb-at landed))) "base"))))
+  (test "a refresh of the view you are in keeps its contents while it loads"
+    (let (dir (mg-repo "async-keep" {"a.txt" "a\n"})
+          shown (gitview/git-show-log (mg-status dir) dir [] "git log" nil :here)
+          before (buffer-text (ed-current-buf shown))
+          m (mg-off-loop (fn () (gitview/git-log-reload shown))))
+      (assert= (buffer-text (ed-current-buf m)) before)
+      (gitview/gv-apply-view m (mg-reply (:git-log-proc m)))))
+  (test "two views load at once — a commit opened beside a loading log does not drop it"
+    (let (dir (mg-repo "async-two" {"a.txt" "a\n"})
+          m0 (mg-status dir)
+          m1 (mg-off-loop (fn () (gitview/git-show-log m0 dir [] "git log" nil :here)))
+          m2 (mg-off-loop (fn () (gitview/git-show-revision m1 dir "HEAD" :display)))
+          log-reply (mg-reply (:git-log-proc m2))
+          rev-reply (mg-reply (:git-revision-proc m2))
+          landed (gitview/gv-apply-view (gitview/gv-apply-view m2 rev-reply) log-reply))
+      (is (includes? (mg-text-of landed "*git-log*") "base"))
+      (is (includes? (mg-text-of landed "*git-revision*") "base"))))
+  (test "a reply superseded by a newer request for the same view is dropped"
+    (let (dir (mg-repo "async-stale" {"a.txt" "a\n" "b.txt" "b\n"})
+          m0 (mg-status dir)
+          first-ask (mg-off-loop (fn () (gitview/git-show-blame m0 dir "a.txt" nil 1)))
+          old (:git-blame-proc first-ask)
+          second-ask (mg-off-loop (fn () (gitview/git-show-blame first-ask dir "b.txt" nil 1)))
+          new (:git-blame-proc second-ask)
+          ;; what the cancelled first task WOULD have said, had it answered
+          stale (gitview/gv-apply-view second-ask [:task-done old {:note "stale"}]))
+      (is (not (= old new)))
+      (assert= stale second-ask)
+      (let (landed (gitview/gv-apply-view second-ask (mg-reply new)))
+        (is (includes? (mg-text-of landed "*git-blame*") "b"))
+        (assert= (:path (:section-ctx (ed-current-buf landed))) "b.txt"))))
+  (test "a reply for a buffer killed while it loaded is dropped, and frees its slot"
+    (let (dir (mg-repo "async-killed" {"a.txt" "a\n"})
+          m0 (mg-status dir)
+          m (mg-off-loop (fn () (gitview/cmd-git-refs m0 nil)))
+          killed (ed-kill-buffer-named m "*git-refs*")
+          landed (gitview/gv-apply-view killed (mg-reply (:git-refs-proc killed))))
+      (assert= (mg-text-of landed "*git-refs*") nil)
+      (assert= (:git-refs-proc landed) nil)
+      (assert= (:git-view-pending landed) {})))
+  (test "git's error shows in the buffer and the echo area"
+    (let (dir (mg-repo "async-error" {"a.txt" "a\n"})
+          m0 (mg-status dir)
+          m (mg-off-loop (fn () (gitview/git-show-blame m0 dir "missing.txt" nil 1)))
+          landed (gitview/gv-apply-view m (mg-reply (:git-blame-proc m))))
+      (is (includes? (:echo landed) "blame failed"))
+      (is (includes? (mg-text-of landed "*git-blame*") "blame failed"))
+      ;; `g` on it asks again: the request's ctx stayed
+      (assert= (:path (:section-ctx (ed-current-buf landed))) "missing.txt")))
+  (test "a timed-out view says so rather than loading for ever"
+    (let (dir (mg-repo "async-timeout" {"a.txt" "a\n"})
+          m0 (mg-status dir)
+          m (mg-off-loop (fn () (gitview/git-show-log m0 dir [] "git log" nil :here)))
+          handle (:git-log-proc m)
+          _ (mg-reply handle)
+          landed (gitview/gv-apply-view m [:task-timeout handle]))
+      (is (includes? (mg-text-of landed "*git-log*") "failed or timed out"))
+      (assert= (:git-log-proc landed) nil)))
+  (test "C-g cancels a loading view and its buffer says so"
+    (let (dir (mg-repo "async-quit" {"a.txt" "a\n"})
+          m0 (mg-status dir)
+          m (mg-off-loop (fn () (gitview/git-show-log m0 dir [] "git log" nil :here)))
+          [quit cancelled?] (model/ed-cancel-quit-jobs m))
+      (is cancelled?)
+      (assert= (:git-log-proc quit) nil)
+      (assert= (:git-view-pending quit) {})
+      (is (includes? (mg-text-of quit "*git-log*") "cancelled"))
+      (is (not (model/ed-busy? quit)))))
+  (test "a file at a revision opens at once as a read-only placeholder that knows its origin"
+    (let (dir (mg-repo "async-blob" {"f.txt" "one\n"})
+          m0 (mg-status dir)
+          m (mg-off-loop (fn () (gitview/git-show-blob m0 dir "f.txt" "HEAD")))
+          b (ed-current-buf m))
+      (assert= (buffer-name b) "f.txt.~HEAD~")
+      (assert= (:rev (:blob b)) "HEAD")
+      (let (landed (gitview/gv-apply-view m (mg-reply (:git-blob-proc m))))
+        (assert= (buffer-text (ed-current-buf landed)) "one\n")))))
+
+(describe "magit: a view asked for again while it loads"
+  (test "the second request takes over the same buffer, still loading — no stray note"
+    (let (dir (mg-repo "async-again" {"a.txt" "a\n"})
+          m0 (mg-status dir)
+          m1 (mg-off-loop (fn () (gitview/git-show-log m0 dir [] "git log" nil :here)))
+          m2 (mg-off-loop (fn () (gitview/git-log-reload m1))))
+      (assert= (buffer-text (ed-current-buf m2)) "Loading…\n")
+      (let (landed (gitview/gv-apply-view m2 (mg-reply (:git-log-proc m2))))
+        (is (includes? (mg-text-of landed "*git-log*") "base"))))))
