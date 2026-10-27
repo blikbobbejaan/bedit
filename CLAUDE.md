@@ -203,19 +203,28 @@ src/lisp-modes.blsp         the other Lisps: `deflisp` (a special-form set + a f
                             wos kernel source
 src/languages.blsp          `deflanguage` declares a tree-sitter language from ONE spec
                             (faces, indent, heredocs, formatter) and generates its whole
-                            service set — checked against
+                            service set — show-paren (`tsbrackets`) included — checked against
                             editor/treesit/language-contract, so an incomplete language
                             fails at load rather than at the keypress that needed it.
                             Ruby / Elixir / Python / Rust / JavaScript / TypeScript / TSX /
                             Go / C / Terraform + HCL (two modes over one `:hcl` grammar,
                             told apart by `:type`; only Terraform's files take `terraform
-                            fmt`), each naming where its grammar lives (`:grammar`, for
-                            M-x grammar-install) — a spec may extend another's (TypeScript
-                            is JavaScript's, Terraform HCL's). `deflexer` is its sibling for
-                            the line-lexer languages (a pattern + a `lex-*` stem): env, shell,
-                            Dockerfile, JSON / YAML / TOML / Makefile / INI / commit. And
-                            org-mode (`org`'s spans and outline, folding, TODO cycling, heading
-                            motion)
+                            fmt`), shell (bash), JSON, TOML, YAML and Dockerfile, each naming
+                            where its grammar lives (`:grammar`, for M-x grammar-install) — a
+                            spec may extend another's (TypeScript is JavaScript's, Terraform
+                            HCL's). A language that had a line lexer first keeps it as its
+                            `:fallback`: a buffer opened while the grammar is missing is typed
+                            as the lexer's stand-in (`model/ed-grammar-fallback`) and becomes
+                            the parsed mode when the grammar arrives (`ed-grammars-arrived`);
+                            JSON stays lexed past a megabyte (`:fallback-above`). `deflexer`
+                            is its sibling for the line-lexer languages (a pattern + a `lex-*`
+                            stem): env, JSON5, Makefile / INI / commit. And org-mode (`org`'s
+                            spans and outline, folding, TODO cycling, heading motion)
+src/tsbrackets.blsp         show-paren over a tree-sitter parse: a bracket is a delimiter
+                            TOKEN, its partner the matching token under the same parent (so a
+                            `(` in a string matches nothing), read off the held tree when the
+                            buffer keeps one — every `deflanguage`'s `:bracket-match` /
+                            `:bracket-match-tree`
 src/org.blsp                Org text: `org-spans` (the colouring), heading levels, where a
                             subtree ends, the TODO cycle. Pure; languages.blsp's org-mode
                             is the mode over it (moved from brood's std by ADR-417)
@@ -237,11 +246,12 @@ src/gutter.blsp             the line-number gutter text-mode names as its `:gutt
                             marks (● ✓ ✗ ⚠) read through one precedence table that both
                             paints and resolves a click
 src/grammars.blsp           tree-sitter grammars the runtime was not built with: where they
-                            live (~/.config/bedit/grammars), loading them at startup, and
+                            live (~/.config/bedit/grammars), declaring them at startup, and
                             M-x grammar-list / grammar-reload / grammar-install: what is
                             installed (ABI, path), fetching and building a declared one off
                             the loop, and a live swap — drop a new .so in and reload, no
-                            restart
+                            restart. An install or reload retypes every open line-lexer
+                            stand-in as its parsed mode (`model/ed-grammars-arrived`)
 src/formatter.blsp          M-x format-buffer + format-on-save: the language's own
                             formatter (mix format, black, rubocop), declared per language
                             and run over the FILE, so a failing formatter costs nothing
