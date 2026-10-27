@@ -699,11 +699,11 @@ dispatched normally (Emacs' dismiss-and-process)."
 ;; dispatched like the press it repeats: a chord's last key repeats as itself (C-x o o o,
 ;; which repeat-mode answers), and a mode's `:post-key` guards see every one.
 ;;
-;; bedit keeps no state about a held key: every repeat is a real press, which keeps the
-;; caret solid (`model/ed-real-input?`). Every timer that waits for a pause is `:idle?`,
+;; bedit keeps no state about a held key: every repeat is a real press (and the window
+;; restarts its caret blink on it). Every timer that waits for a pause is `:idle?`,
 ;; and `ui-run` holds those while a key is down, the delay before the first repeat
-;; included, so the idle beat, a live-eval debounce, the typing undo boundary and the
-;; caret blink all wait for the key to come up.
+;; included, so the idle beat, a live-eval debounce and the typing undo boundary all
+;; wait for the key to come up.
 
 (defn ed-key-step (m input textrows textcols)
   "Route one key through normal dispatch, then re-clamp scroll (vertical + horizontal so a
@@ -725,23 +725,26 @@ clamp, so a veto's restored point is what the viewport follows."
   "True if `input` is a named-timer firing — a `[:timer name]` vector (ADR-102)."
   (and (vector? input) (= (first input) :timer)))
 
-(defn- ed-timer-fire (m name textrows textcols cols rows)
-  "Service the fired timer `name`: `:idle-recompute` runs the debounced eldoc cache + diagnostics check; `:which-key` reveals
-the prefix panel; `:undo-pause` closes the typing run (next edit starts a fresh undo
-group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
+(def- *cosmetic-timers*
+  ;; The timers whose firing changes only how the frame LOOKS — the spinner frame, the
+  ;; scrollbar's opacity — and nothing any other part of the turn reads: no text, no
+  ;; point, no scroll, no pane. `ed-update` folds them through `ed-cosmetic-fire` alone
+  ;; and skips the rest of the pipeline (timer sync, post steps, span refresh, the hosted
+  ;; propagate, the collab chain), which on a 16 ms fade tick was a whole editor turn for
+  ;; an opacity that only had to drop. Each one keeps its own timer honest: the fade drops
+  ;; itself when it reaches zero, the hold by starting the fade; the spinner is dropped by
+  ;; the turn that finishes the work (`model/ed-sync-timers`), which is never a cosmetic
+  ;; one. The caret blink is not here at all: the window blinks it (brood ADR-469).
+  #{:spinner :scrollbar-hold :scrollbar-fade})
+
+(defn- ed-cosmetic-timer? (input)
+  "True if `input` fires one of the [[*cosmetic-timers*]]."
+  (and (ed-timer-event? input) (contains? *cosmetic-timers* (nth input 1))))
+
+(defn- ed-cosmetic-fire (m name)
+  "Service a fired [[*cosmetic-timers*]] entry: `:spinner` advances the activity frame,
+`:scrollbar-hold` starts the thumb's fade and `:scrollbar-fade` ticks it down."
   (cond
-    ;; the idle debounce: eldoc, the diagnostics check, a large completion source's
-    ;; re-rank, the off-the-loop diff-hl launch, the web-mirror push… — all the work too
-    ;; costly for the per-key path, run once activity settles. Each is a row its module
-    ;; registered (`model/register-idle-job`), run in the table's order.
-    ;; In a live loop the beat runs in slices so a key never waits for all of it; headless
-    ;; (tests, a batch run) it runs whole, as before.
-    (= name :idle-recompute) (if (ed-headless?) (ed-run-idle-jobs m) (ed-run-idle-slice m 0))
-    (= name :idle-continue) (ed-run-idle-slice m (or (:idle-resume m) 0))
-    ;; a timer a feature registered (`model/register-timer-client`) — git's upstream watch,
-    ;; a displayed BEAM view re-asking its node
-    (contains? (ed-timer-clients) name)
-      (ed-call-deferred m (get-in (ed-timer-clients) [name :fire]) m)
     ;; the activity spinner: advance the frame, nothing else. The segment reads the
     ;; counter; when the work finishes `ed-sync-timers` drops this timer entirely.
     (= name :spinner)
@@ -749,18 +752,6 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
             next (if (int? n) (inc n) 1))
         ; the field is `any` off the model, like every other read
         (assoc m :spin (math/mod next 1000)))
-    (= name :which-key) (ed-which-key-reveal m)
-    ;; the glide stopped: ease every pane onto a whole line (`scroll/ed-glide-scroll-step`)
-    (= name :scroll-settle) (assoc m :scroll-gliding true)
-    (= name :scroll-glide) (ed-glide-scroll-step m)
-    (= name :undo-pause) (ed-break-undo-run m)
-    ;; A live-evaluating buffer's debounce landed: the tutorial's lesson boxes, the Brood
-    ;; playground, the Elixir playground. Re-evaluate the forms this edit could have
-    ;; changed the answer of. All three are rows in `model/ed-live-eval-clients` — each
-    ;; deferred-loaded and late-bound, the keymap idiom — so a fourth language that
-    ;; evaluates as you type is a table entry rather than another arm here.
-    (includes? (map (ed-live-eval-clients) :timer) name) (ed-live-eval-launch m name)
-    (= name :cursor-blink) (collab-decay-tags (assoc m :blink-on? (not (:blink-on? m))))
     ;; The overlay scrollbar: the quiet hold ends by starting the fade ticker, which ticks
     ;; the visibility budget down; dragging pins the thumb, and hitting zero hides it and
     ;; stops the timer so the editor idles again (no wakeups at rest).
@@ -772,6 +763,38 @@ group); `:cursor-blink` toggles the caret. An unknown name is a no-op."
           (if (<= budget 0)
             (ed-drop-timer (assoc m :sb-fade 0) :scrollbar-fade)
             (assoc m :sb-fade budget))))
+    else m))
+
+(defn- ed-timer-fire (m name textrows textcols cols rows)
+  "Service the fired timer `name`: `:idle-recompute` runs the debounced eldoc cache + diagnostics check; `:which-key` reveals
+the prefix panel; `:undo-pause` closes the typing run (next edit starts a fresh undo
+group); a cosmetic one (the caret, the spinner, the scrollbar) is `ed-cosmetic-fire`'s. An
+unknown name is a no-op."
+  (cond
+    ;; the idle debounce: eldoc, the diagnostics check, a large completion source's
+    ;; re-rank, the off-the-loop diff-hl launch, the web-mirror push… — all the work too
+    ;; costly for the per-key path, run once activity settles. Each is a row its module
+    ;; registered (`model/register-idle-job`), run in the table's order.
+    ;; In a live loop the beat runs in slices so a key never waits for all of it; headless
+    ;; (tests, a batch run) it runs whole, as before.
+    (= name :idle-recompute) (if (ed-headless?) (ed-run-idle-jobs m) (ed-run-idle-slice m 0))
+    (= name :idle-continue) (ed-run-idle-slice m (or (:idle-resume m) 0))
+    ;; a timer a feature registered (`model/register-timer-client`) — git's upstream watch,
+    ;; a displayed BEAM view re-asking its node, a collaborator's name tag fading
+    (contains? (ed-timer-clients) name)
+      (ed-call-deferred m (get-in (ed-timer-clients) [name :fire]) m)
+    (contains? *cosmetic-timers* name) (ed-cosmetic-fire m name)
+    (= name :which-key) (ed-which-key-reveal m)
+    ;; the glide stopped: ease every pane onto a whole line (`scroll/ed-glide-scroll-step`)
+    (= name :scroll-settle) (assoc m :scroll-gliding true)
+    (= name :scroll-glide) (ed-glide-scroll-step m)
+    (= name :undo-pause) (ed-break-undo-run m)
+    ;; A live-evaluating buffer's debounce landed: the tutorial's lesson boxes, the Brood
+    ;; playground, the Elixir playground. Re-evaluate the forms this edit could have
+    ;; changed the answer of. All three are rows in `model/ed-live-eval-clients` — each
+    ;; deferred-loaded and late-bound, the keymap idiom — so a fourth language that
+    ;; evaluates as you type is a table entry rather than another arm here.
+    (includes? (map (ed-live-eval-clients) :timer) name) (ed-live-eval-launch m name)
     else m))
 
 ;; ---- inbound system / async events (the loop's event bus) -------------------
@@ -1040,7 +1063,9 @@ recording is captured too and trimmed by `cmd-end-kbd-macro`."
         (not (= input :close))
         (or (not (vector? input)) (= (first input) :text))
         (not (record? input)))
-    (assoc m :macro-recording (into (:macro-recording m) (list input))) ; keep it a vector
+    ;; `conj` appends to the vector in place of the old one-element `into`, which built a
+    ;; list and walked it per key
+    (assoc m :macro-recording (conj (:macro-recording m) input))
     m))
 
 (def *view-resume-keys*
@@ -1092,7 +1117,7 @@ failure on the paint side (the `render error` frame)."
 window's close/blur, a `UiEvent` record, an inbound `[:tag …]` system event, or — anything
 else — a key."
   (cond
-    ;; a named timer fired (ADR-102): debounce / which-key / undo / blink / glide. Must
+    ;; a named timer fired (ADR-102): debounce / which-key / undo / spinner / glide. Must
     ;; precede `ed-system-event?` — `[:timer …]` is a vector but isn't in the event-handler
     ;; registry, so it'd otherwise fall through to key dispatch.
     (ed-timer-event? input) (ed-timer-fire m0 (nth input 1) textrows textcols cols rows)
@@ -1103,7 +1128,8 @@ else — a key."
     ;; the window lost focus (`:blur`): the caret goes hollow, and a composition left showing
     ;; goes with it — not every input method says it ended
     (= input :blur) (assoc (dissoc m0 :preedit) :unfocused true)
-    ;; and back: the caret is solid again (brood ADR-441's `:focus-in`)
+    ;; and back: the caret is solid again (brood ADR-441's `:focus-in`), and the window
+    ;; blinks it again (it held it shown while unfocused, brood ADR-469)
     (= input :focus-in) (dissoc m0 :unfocused)
     ;; Text that is more than one key's worth (an input method's commit, a compose sequence,
     ;; brood ADR-441): each character takes the key path, as though typed, so the minibuffer,
@@ -1194,8 +1220,12 @@ try: a propagate error here must not recurse into another echo)."
       (theme/gui-only gui/title win title))
     (assoc result :window-title title)))
 
-(defn ed-update (m input cols rows)
-  "ui-run update: fold one key into the next model, then keep point on screen.
+(defn- ed-key-up? (input)
+  "True if `input` is a key's release (`[:key-up k]`)."
+  (and (vector? input) (= (first input) :key-up)))
+
+(defn- ed-update-turn (m input cols rows)
+  "The whole update: fold one key into the next model, then keep point on screen.
 A `[:resize cols rows]` event just re-clamps the scroll to the new viewport and lets
 the loop re-render (it isn't a command, so it doesn't touch the keymap or echo); a
 `[:mouse …]` event is handled by `ed-mouse` (left-click selects the window under it,
@@ -1235,6 +1265,34 @@ a large file. They run debounced on the idle beat instead (`ed-timer-fire :idle-
                          cols
                          rows)
                        (catch e (ed-recover m0 e input)))))))
+
+(defn ed-update (m input cols rows)
+  "ui-run update: fold one input into the next model — the whole pipeline
+([[ed-update-turn]]) unless the input can change nothing it would act on. Three can't:
+
+- a key's release (`[:key-up k]`): bedit keeps no state about a held key (the desktop
+  repeats it, brood ADR-441, and `ui-run` holds the idle timers while one is down), so `m`
+  comes back as it was;
+- our OWN edit echoed back by a hosted buffer's process (`hosted/hosted-own-echo?`): the
+  pool already has it, so `m` comes back as it was;
+- a [[*cosmetic-timers*]] beat (the spinner, the scrollbar fade): only the
+  field it animates changes ([[ed-cosmetic-fire]]).
+
+Handing `m` back untouched is what lets `ui-run`'s `=` test see a turn that changed nothing
+and draw nothing; before this our own echo cost every keystroke on a hosted buffer a second
+full update and a second frame.
+
+Only a model that has had one full turn takes the short path (`:timers-synced?`, set by
+`model/ed-sync-timers`): the model `main` starts the loop with was built outside it, and its
+idle beat — the git summary, diff-hl, the diagnostics — is armed by the first full turn. When
+the first input was a cosmetic tick, that turn never came, and an editor left alone at launch never
+showed its branch."
+  (cond
+    (not (:timers-synced? m)) (ed-update-turn m input cols rows)
+    (ed-key-up? input) m
+    (hosted-own-echo? m input) m
+    (ed-cosmetic-timer? input) (ed-cosmetic-fire m (nth input 1))
+    else (ed-update-turn m input cols rows)))
 
 ;; The loop's update contract, in types. `assoc` answers `vector | map` — a receiver's
 ;; type does not survive an update — so the closing `(assoc result :window-title title)`

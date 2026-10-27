@@ -151,11 +151,177 @@
     (let (ops (text-ops-where (ed-view (m-of "# Title") 80 24)
                 (fn (s) (includes? s "Title"))))
       (is (> (count ops) 0))
-      (is (every? ops (fn (op) (nil? (nth op 4 nil))))))))
+      (is (every? ops (fn (op) (nil? (nth op 4 nil)))))))
+
+  ;; The restart is what keeps typing in a long document from re-lexing the 200-line
+  ;; lead-in above the band on every key: the band's own first line, unless a fence above
+  ;; it is still open.
+  (test "the restart is the line itself, or the fence still open above it"
+    (let (src "prose\n```\ncode\n```\nmore\n```\nopen\n")
+      (assert= (lex-markdown/markdown-fontify-restart src 0) 0)
+      (assert= (lex-markdown/markdown-fontify-restart src (index-of src "code")) 6)
+      (assert= (lex-markdown/markdown-fontify-restart src (index-of src "more"))
+        (index-of src "more"))
+      (assert= (lex-markdown/markdown-fontify-restart src (index-of src "open"))
+        (index-of src "```\nopen"))
+      (is (not (nil? (ed-mode-service (cur (md-cm "x" 0)) :fontify-restart))))))
+
+  (test "a windowed band colours as the whole document does, a fence open far above it"
+    ;; prose, then a fence opening 40 lines up whose code runs through the band, then prose
+    (let (text (str (string/join (map (range 20) (fn (i) (str "**p" i "**"))) "\n")
+                 "\n```\n"
+                 (string/join (map (range 120) (fn (i) (str "code *" i "*"))) "\n")
+                 "\n```\n*after*\n")
+          buf (cur (md-cm text 0))
+          start (text/line->char (buffer-rope buf) 60)
+          end (text/line->char (buffer-rope buf) 80)
+          inside (fn (spans)
+                   (seq/filter (into [] spans)
+                     (fn (s) (and (>= (first s) start) (< (first s) end)))))
+          windowed (ed-window-spans buf
+                     (ed-mode-service buf :fontify)
+                     (ed-mode-service buf :fontify-restart)
+                     60
+                     80))
+      (is (not (empty? (inside windowed))))
+      (assert= (inside windowed) (inside (lex-markdown/markdown-spans text)))))
+
+  (test "an edit inside a cached band re-lexes it to what a fresh lex of its lines gives"
+    (let (text (string/join (map (range 200) (fn (i) (str "line *" i "* `x`"))) "\n")
+          m (ed-refresh-spans (md-cm text 0) 80 24)
+          pane-path (:path (ed-selected-pane (:panes (ed-body-layout m 80 24))))
+          before (get (:span-cache m) pane-path)
+          edited (ed-refresh-spans (ed-set-buf m (insert (cur m) "**b** ")) 80 24)
+          after (get (:span-cache edited) pane-path)
+          buf (cur edited))
+      (is (not (= (:spans before) (:spans after))))
+      (assert= (:rope after) (buffer-rope buf))
+      (assert= (:spans after)
+        (ed-window-spans buf
+          (ed-mode-service buf :fontify)
+          (ed-mode-service buf :fontify-restart)
+          (:blo after)
+          (:bhi after))))))
 
 ;; A model whose current buffer is `text` opened under `file` (name = file), point 0.
 (defn file-cm (text file)
   (ed-init (make-buffer text file file)))
+
+;; A lexer mode with a `:line-lexer` colours its band from the lines it kept (`linecache`,
+;; brood ADR-471) rather than from a lead-in above the band. Whatever was kept, the band must
+;; be what a lex of the WHOLE document gives for its lines — at any depth, after any edit.
+(describe "line-lexer modes: a band from the line cache is a whole-document lex"
+  (sig lc-model (string string int -> any))
+  (defn lc-model (text file top)
+    ;; `text` opened as `file`, scrolled to line `top` with point a few lines below it
+    (let (m (ed-init (make-buffer text file file))
+          buf (ed-current-buf m))
+      (ed-set-top (ed-set-buf m (goto-char buf (text/line->char (buffer-rope buf) (+ top 5)))) top)))
+
+  (defn lc-at-line (m line)
+    ;; point moved to the start of `line`, the scroll left where it was
+    (ed-set-buf m (goto-char (cur m) (text/line->char (buffer-rope (cur m)) line))))
+
+  (defn lc-entry (m)
+    (get (:span-cache m) (:path (ed-selected-pane (:panes (ed-body-layout m 80 24))))))
+
+  (defn lc-in (spans rope blo bhi)
+    ;; the spans starting on lines [blo, bhi), as a vector; a zero-width one (an empty line
+    ;; inside a fence) paints nothing, and the whole-document lex leaves out the last one
+    (let (lo (text/line->char rope blo)
+          hi (if (>= bhi (text/line-count rope)) (text/length rope) (text/line->char rope bhi)))
+      (into []
+        (seq/filter (into [] spans)
+          (fn (span) (let ([s e _] span) (and (< s e) (>= s lo) (< s hi))))))))
+
+  (defn lc-check (m whole)
+    ;; refresh the bands, assert the selected pane's is a line band equal to `whole` (the
+    ;; mode's whole-document lexer) over its lines; answer the refreshed model
+    (let (refreshed (ed-refresh-spans m 80 24)
+          entry (lc-entry refreshed)
+          buf (cur refreshed)
+          rope (buffer-rope buf)
+          band (lc-in (:spans entry) rope (:blo entry) (:bhi entry)))
+      (is (:line? entry))
+      (assert= (:rope entry) rope)
+      (assert= band (lc-in (whole (buffer-text buf)) rope (:blo entry) (:bhi entry)))
+      refreshed))
+
+  (def lc-markdown
+    (str (string/join (map (range 20) (fn (i) (str "**p" i "** `c`"))) "\n")
+      "\n```\n"
+      (string/join (map (range 120) (fn (i) (str "code *" i "*"))) "\n")
+      "\n```\n"
+      (string/join (map (range 60) (fn (i) (str "# h" i "\n- *after* " i))) "\n")
+      "\n"))
+
+  (test "markdown: a fence opened far above the band colours it as code"
+    (let (m (lc-check (lc-model lc-markdown "x.md" 80) lex-markdown/markdown-spans))
+      (is (> (count (:spans (lc-entry m))) 0))))
+
+  (test "markdown: an edit inside the fence, a line inserted and a line deleted"
+    (let (m (lc-check (lc-model lc-markdown "x.md" 60) lex-markdown/markdown-spans)
+          typed (lc-check (press m ["*" "x" "*"]) lex-markdown/markdown-spans)
+          split (lc-check (press typed [:enter :enter]) lex-markdown/markdown-spans)
+          joined (lc-check (press split [:backspace :backspace :backspace])
+                   lex-markdown/markdown-spans))
+      (is (not (= (buffer-text (cur joined)) lc-markdown)))))
+
+  (test "markdown: a fence opened ABOVE the band recolours it, and closing it again restores it"
+    (let (m (lc-check (lc-model lc-markdown "x.md" 150) lex-markdown/markdown-spans)
+          opened (lc-check (ed-set-buf m (insert (cur (lc-at-line m 3)) "```\n"))
+                   lex-markdown/markdown-spans)
+          closed (lc-check (ed-set-buf opened (delete-char (cur (lc-at-line opened 3)) 4))
+                   lex-markdown/markdown-spans))
+      ;; the fence a hundred lines down now OPENS one, and the band below it is code
+      (is (not (= (:spans (lc-entry opened)) (:spans (lc-entry m)))))
+      (assert= (buffer-text (cur closed)) lc-markdown)
+      (assert= (:spans (lc-entry closed)) (:spans (lc-entry m)))))
+
+  (test "markdown: an edit below the band keeps the band itself"
+    ;; the old entry is tagged: a band re-lexed is a fresh entry without the tag
+    (let (m (lc-check (lc-model lc-markdown "x.md" 10) lex-markdown/markdown-spans)
+          path (:path (ed-selected-pane (:panes (ed-body-layout m 80 24))))
+          tagged (assoc-in m [:span-cache path :kept] true)
+          below (ed-refresh-spans (ed-set-buf tagged
+                                    (insert (cur (lc-at-line tagged 230)) "*more*"))
+                  80 24)
+          after (lc-entry below))
+      (is (:kept after))
+      (assert= (:rope after) (buffer-rope (cur below)))
+      ;; …and an edit INSIDE it does not
+      (is (not (:kept (lc-entry (lc-check (press (lc-at-line below 15) ["x"])
+                                  lex-markdown/markdown-spans)))))))
+
+  (def lc-org
+    (str "#+TITLE: Notes\n* TODO first :work:\n"
+      "#+BEGIN_SRC sh\n"
+      (string/join (map (range 100) (fn (i) (str "echo " i " # *not* org"))) "\n")
+      "\n#+END_SRC\n"
+      (string/join (map (range 50) (fn (i) (str "** DONE h" i "\n- [X] *item* " i))) "\n")
+      "\n"))
+
+  (test "org: a #+BEGIN_ block opened far above the band, edited inside and removed"
+    (let (m (lc-check (lc-model lc-org "notes.org" 60) org/org-spans)
+          typed (lc-check (press m ["*" "b" "*" :enter]) org/org-spans)
+          ;; the `#+BEGIN_SRC` line itself is line 2: drop it, and the block's lines are org
+          unblocked (lc-check (ed-set-buf typed (delete-char (cur (lc-at-line typed 2)) 15))
+                      org/org-spans))
+      (is (not (includes? (buffer-text (cur unblocked)) "BEGIN_SRC")))))
+
+  (test "json: a stateless line lexer, edited and with lines inserted"
+    (let (text (str "{\n"
+                 (string/join (map (range 150) (fn (i) (str "  \"k" i "\": [" i ", true, \"s\"],")))
+                   "\n")
+                 "\n}\n")
+          m (lc-check (lc-model text "x.json" 70) lex-configs/json-spans)
+          typed (lc-check (press m ["\"" "z" "\"" ":" " " "1" :enter]) lex-configs/json-spans))
+      (is (contains? (:line-caches typed) 0))))
+
+  (test "a killed buffer's line cache goes, and the ones above it shift down"
+    (let (m {:line-caches {0 :a 1 :b 2 :c}})
+      (assert= (:line-caches (linecache/ed-drop-line-cache-slot m 1)) {0 :a 1 :c})
+      (assert= (linecache/sweep-line-caches {0 :a 3 :d} 2) {0 :a}))))
 
 (describe "editor env-mode / docker-mode: more language modes"
   ;; Two more fontify-only modes, registered the same way as markdown-mode — a `.env`
@@ -1044,6 +1210,21 @@
     (let (m (ed-launch-eldoc (blsp-cm "(map 1 cons)" 5)))
       (assert= (:eldoc-point m) 5) ; computed AT point (hint may be nil/some)
       (is (nil? (:eldoc-proc m)))))
+  (test "brood eldoc reads only the top-level form around point, to the end of point's line"
+    (let (rope (text/from-string "(defn a (x) x)\n(map f\n  xs)\n(b)"))
+      ;; point after `(map ` on line 2: the form starts at 15, the line ends at 22
+      (assert= (brood-mode/brood-eldoc-region rope 20) [15 22])
+      ;; the hint from the slice is the hint from the whole text
+      (assert= (eldoc-hint brood-mode/brood-eldoc brood-mode/brood-eldoc-region rope 20)
+        (brood-mode/brood-eldoc (text/->string rope) 20))
+      (is (includes? (eldoc-hint brood-mode/brood-eldoc brood-mode/brood-eldoc-region rope 20)
+            "map"))))
+  (test "a string holding an open paren does not start the eldoc region"
+    (let (rope (text/from-string "(a \"(\" (map f"))
+      (assert= (first (brood-mode/brood-eldoc-region rope 13)) 0)))
+  (test "a mode with no eldoc region gets the whole text"
+    (let (rope (text/from-string "abc"))
+      (assert= (eldoc-hint (fn (text pos) [text pos]) nil rope 2) ["abc" 2])))
   (test "ed-apply-eldoc stores the hint against the point it was computed at"
     (let (m0 (blsp-cm "(+ 1 2)" 3)
           m (assoc m0

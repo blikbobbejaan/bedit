@@ -43,14 +43,36 @@ thrown turn opened is left to the kernel's least-recently-used bound."
   "A fresh tree handle for the whole document `rope` in tree-sitter language `lang`, or nil."
   (or-nil (fn () (editor/treesit/open-tree rope lang))))
 
-(defn- tree-update (tree rope lang)
-  ;; nil edits: the kernel derives the change by comparing the two ropes — exact for any
-  ;; single contiguous edit, and a sound covering edit for several
-  (or-nil (fn () (editor/treesit/update-tree tree rope lang nil))))
+(defn- splice-edits (rope buf)
+  "The edits that turned `rope` into `buf`'s text, as the kernel's reparse takes them —
+`[start old-end new-end]` per splice, oldest first, each against the text the one before it
+left — read from the buffer's own splice log (`buffer-splices-since`), or nil when the log
+cannot account for the change (it overflowed, or the text was replaced wholesale)."
+  (let (splices (buffer-splices-since (assoc buf :rope rope) buf))
+    (when (and splices (not (empty? splices)))
+      (into []
+        (map splices (fn ([lo hi replacement]) [lo hi (+ lo (string/length replacement))]))))))
+
+(defn- tree-update (tree from-rope buf lang)
+  ;; Told the edits when the buffer's splice log knows them, so the kernel need not find the
+  ;; change by comparing `from-rope` with the new text — a scan of both ropes per keystroke.
+  ;; Without them (nil) it compares, which is exact for one contiguous edit and sound for
+  ;; several. Edits that do not fit the two texts are an error rather than a wrong tree, and
+  ;; that falls back to the comparison too.
+  (let (rope (buffer-rope buf)
+        edits (splice-edits from-rope buf)
+        told (when edits (or-nil (fn () (editor/treesit/update-tree tree rope lang edits)))))
+    (or told (or-nil (fn () (editor/treesit/update-tree tree rope lang nil))))))
 
 (defn tree-free (tree)
   "Drop `tree`'s handle now (nil-safe)."
   (when tree (or-nil (fn () (editor/treesit/free-tree tree)))))
+
+(defn tree-alive? (tree)
+  "Whether `tree`'s handle is still held — not freed, not evicted (`editor/treesit/tree-alive?`,
+which builds nothing: the check made per event, where asking `tree-changed-ranges` would
+build its vector only to test it for nil). False on a runtime without tree handles."
+  (= true (or-nil (fn () (editor/treesit/tree-alive? tree)))))
 
 (defn tree-changed-ranges (tree)
   "`editor/treesit/tree-changes` of `tree`: `[[start end] …]`, `true` for a fresh parse, nil
@@ -74,6 +96,14 @@ entry `editor/treesit/fontify-tree` may be asked about, since its offsets are th
   (let (entry (syntax-tree-entry m idx))
     (when (and entry (= (:rope entry) (buffer-rope buf))) entry)))
 
+(defn held-tree-for (entry buf lang)
+  "`entry`'s tree handle when it was parsed as `lang` from exactly `buf`'s rope, else nil —
+the one test before a held tree is passed to a structural query (`editor/treesit/point-*`,
+`indent-column`), whose offsets must be that text's. A command reads the entry off the
+model once and asks this of the buffer it is moving in, which an edit in the same command
+may already have moved past the tree."
+  (when (and entry (= (:lang entry) lang) (= (:rope entry) (buffer-rope buf))) (:tree entry)))
+
 (defn- without-entry (m idx)
   (assoc m :syntax-trees (dissoc (or (:syntax-trees m) {}) idx)))
 
@@ -96,14 +126,14 @@ An entry whose handle is gone (evicted, or freed by a turn that a render failure
 back) counts as none: updating from it would be a full parse anyway, on the loop, so a small
 buffer reopens and a large one waits for `treewarm`."
   (let (held (syntax-tree-entry m idx)
-        entry (when (and held (tree-changed-ranges (:tree held))) held)
+        entry (when (and held (tree-alive? (:tree held))) held)
         lang (ed-mode-service buf :ts-lang)
         rope (buffer-rope buf))
     (cond
       (or (nil? lang) (nil? (ed-mode-service buf :ts-faces))) (without-entry m idx)
       (and entry (= (:lang entry) lang) (= (:rope entry) rope)) m
       (and entry (= (:lang entry) lang))
-        (let (updated (tree-update (:tree entry) rope lang))
+        (let (updated (tree-update (:tree entry) (:rope entry) buf lang))
           (if (nil? updated)
             (without-entry m idx)
             (assoc-in m

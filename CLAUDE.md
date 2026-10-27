@@ -114,6 +114,11 @@ src/syntaxtree.blsp         the tree-sitter parse each pool buffer KEEPS (brood 
                             span refresh, freed on kill; panes colour a band from it
                             (`fontify-tree`) and keep a band its `tree-changes` left alone. A
                             runtime without tree handles keeps the slice path
+src/linecache.blsp          the line-state highlight cache a LEXER mode keeps (brood ADR-471):
+                            a mode's `:line-lexer` builder (markdown's fence, org's #+BEGIN_
+                            block, the `lex-*` formats stateless), `:line-caches` by pool index,
+                            threaded by the span refresh, dropped on kill; an edit re-lexes the
+                            lines it touched, exact at any depth — no lead-in, no restart
 src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd).
                             Every key is ONE `settings/define` (std `settings`, brood ADR-428):
                             its default, type and doc give the check, the fallback
@@ -437,7 +442,8 @@ src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is
                             visibility live ON THE BUFFER, faces come from the mode's
                             `:section-faces` service as data (`:face-spans`), a right margin
                             (a log's author and age, Magit's) from `:section-margin` as
-                            `:right-margin` — the view narrows the text for it — and TAB · n/p ·
+                            `:right-margin` — the view narrows the text for it — line backgrounds
+                            (a diff's tinted lines) from `:section-bands` as `:line-bands`, and TAB · n/p ·
                             ^ · M-n/M-p · 1-4 · M-w are shared by every such buffer. A lazy
                             section (a status file whose diff was never fetched) asks the
                             mode's `:section-reload`
@@ -459,7 +465,15 @@ src/vcsproc.blsp            what every VCS's command line shares: the PROCESS LO
                             and `vcs-launch` (OFF the loop, for the network), `vcs-report-cmd`,
                             `vcs-confirm`, a unified diff's faces, and a file's hunks as
                             sections (`vcs-hunk-sections`, std's `diff`) with the file line a
-                            diff line is (`vcs-hunk-line`) — git's and mur's diffs are one tree
+                            diff line is (`vcs-hunk-line`) — git's and mur's diffs are one tree,
+                            painted alike (`vcs-hunk-spans`, `vcs-hunk-band`: tinted lines, a
+                            hunk heading bar, the changed words)
+src/diffpaint.blsp          a diff hunk painted as Magit and delta paint one, as data: its code in
+                            its language's colours (each side of the hunk fontified as one snippet
+                            by the file's own mode) and the WORDS a changed line changed (a block
+                            of `-` lines diffed against the `+` lines after it, by token, std's
+                            `diff/seq`). vcsproc's hunk sections carry it; the faces services
+                            turn it into spans. Capped, since it is paid when the buffer opens
 src/mur.blsp                the TOP of the mur porcelain (git.blsp's counterpart): `:use`s every
                             mur module, and holds its menus — C-x M-g (and ? in *mur-status*)
                             every mur verb, C-c g mur about this file — both reached through

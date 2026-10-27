@@ -18,8 +18,8 @@ The model is a map threaded through the `ui-run` loop:
   :pending   the active prefix sub-keymap mid-chord (e.g. after C-x), else nil
   :echo      the one-line echo area (the latest message, newlines flattened)
   :status    the mode-line message
-  :done      set to quit; :timers the named timers (ADR-102: blink, debounce,
-             which-key, undo-pause, scroll glide); :blink-on? the caret on/off phase
+  :done      set to quit; :timers the named timers (ADR-102: debounce, which-key,
+             undo-pause, scroll glide)
 
 The whole loop runs in one process, so buffers live in the model directly. `message`
 is the editor's echo primitive — like Emacs `message`, it writes to *both* the
@@ -44,10 +44,15 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 (defdyn *blink-ms* 530)
 (def *spinner-ms* 120) ; the activity-spinner beat — fast enough to read as motion, and
 ;; armed only while a job is in flight, so an idle editor still runs one timer, not two
-;; The cursor-blink half-period (Emacs `blink-cursor-interval` ≈ 0.5s): an idle
-;; `:cursor-blink` timer (ADR-102) toggles `:blink-on?` this often once typing
-;; settles, and a real keystroke forces the caret solid (`ed-real-input?`). Idle, so
-;; the caret stays solid while you type and only blinks at rest.
+;; The cursor-blink half-period (Emacs `blink-cursor-interval` ≈ 0.5s). The caret op
+;; carries it (`editor/display/cursor-blink`, brood ADR-469) and the GUI window blinks the
+;; caret on its own clock, restarting it shown on every key, click and caret move — so no
+;; turn of the loop runs per toggle and the caret stays solid while you type.
+
+(defdyn *blink-cursor-blinks* 10)
+;; How many on/off cycles the caret blinks at rest before it stays solid (Emacs
+;; `blink-cursor-blinks`, same default); the window counts them. A model's
+;; `:blink-cursor-blinks` (the init file's setting, `config`) wins; 0 blinks forever.
 
 (def *diag-debounce-ms* 120)
 ;; The tutorial's eval-on-type debounce (`:tutor-eval`): a shade slower than the diag
@@ -189,8 +194,7 @@ minibuffer/prefix."
    ;; outright (std/editor/ui.blsp) — it runs `cmd-quit`, which asks about unsaved work
    ;; first, exactly as C-x C-c does.
    :close-is-input? true
-   :blink-on? true
-   :timers {:cursor-blink {:every *blink-ms* :idle? true}}})
+   :timers {}})
 
 ;; ---- the selected pane + its buffer ---------------------------------------
 ;; A pane's payload is `{:buffer <pool index> :top <scroll> :point <window-local cursor>
@@ -212,13 +216,20 @@ minibuffer/prefix."
   "`buf` with its cursor made **window-local**: pane `point`/`mark` override the pooled buffer's
 (nil `point` keeps the buffer's own), clamped into range so a stale offset — left by an edit in
 another view of the same buffer — can't index past EOF and crash the renderer. The one seam that
-decouples the cursor from the shared buffer."
+decouples the cursor from the shared buffer.
+
+`buf` ITSELF when it already carries that cursor — the common case, since `ed-set-buf`
+writes the pane's cursor to the pool too and [[ed-sync-window-point]] does after every
+event. That keeps `ed-current-buf` free and identity-stable across the twenty-odd times a
+turn asks for it: no map built per call, and a memo keyed on the buffer is a pointer test."
   (if (nil? point)
     buf
-    (let (n (buffer-length buf))
-      (assoc buf
-        :point (math/max 0 (math/min point n))
-        :mark (if (nil? mark) nil (math/max 0 (math/min mark n)))))))
+    (let (n (buffer-length buf)
+          clamped-point (math/max 0 (math/min point n))
+          clamped-mark (if (nil? mark) nil (math/max 0 (math/min mark n))))
+      (if (and (= clamped-point (:point buf)) (= clamped-mark (:mark buf)))
+        buf
+        (assoc buf :point clamped-point :mark clamped-mark)))))
 
 (sig ed-current-pane (model -> map))
 (defn ed-current-pane (m)
@@ -718,16 +729,24 @@ map, optionally `:idle? true`). See ADR-102."
 (defn ed-real-input? (input)
   "True if `input` is direct user input — a key or a mouse event — as opposed to a timer
 firing (`[:timer …]`), a focus change, or an async system event (`[:task-done …]` …).
-Used to keep the caret solid while you actively type/click: the blink resets on real
-input, then the idle `:cursor-blink` timer takes over once you stop."
+Real input marks the web mirror dirty and breaks a collab follow; a timer, a focus change
+or an async event does neither."
   (cond
     (= input :blur) false
     (= input :focus-in) false
     (record? input) false ; a UiEvent record — async, never a keystroke (a 30ms spy
-    ; flush must not pin the caret solid or dirty the web mirror)
+    ; flush must not dirty the web mirror)
     ;; a mouse event, and text an input method committed or is composing (ADR-441)
     (vector? input) (any? [:mouse :text :preedit] (fn (tag) (= (first input) tag)))
     else true))
+
+(sig ed-blink-count (model -> int))
+(defn ed-blink-count (m)
+  "How many times the caret blinks at rest before it stays solid: the model's
+`:blink-cursor-blinks` (the init setting) or [[*blink-cursor-blinks*]]; 0 blinks forever, and
+so does a value that is not a count."
+  (let (limit (or (:blink-cursor-blinks m) *blink-cursor-blinks*))
+    (if (and (int? limit) (> limit 0)) limit 0)))
 
 (sig ed-sync-timers (model -> model))
 
@@ -856,16 +875,14 @@ watch, the BEAM views' refresh — each asked whether it wants one now: name -> 
 
 (defn ed-sync-timers (m)
   "Reconcile `:timers` (ADR-102) with the model after each event — the declarative
-replacement for the old arm-the-tick cascade. `:cursor-blink` is present while the window has focus; the
+replacement for the old arm-the-tick cascade. The
 idle one-shots — eldoc/diagnostics debounce (`:idle-recompute`), the which-key reveal
 delay, the undo-pause boundary — are present only while their work is pending
 (`ed-idle-one-shots`). Also clears the
 `:which-key` reveal flag once no prefix is pending (what `ed-which-key-arm` used to do)."
   (let (m (if (:pending m) m (dissoc m :which-key))
         one-shots (ed-idle-one-shots m)
-        ;; the caret blinks only in a focused window: an unfocused one shows a hollow box,
-        ;; still, and a background editor does no work on the blink beat
-        managed (merge (if (:unfocused m) {} {:cursor-blink {:every *blink-ms* :idle? true}})
+        managed (merge
                   ;; The spinner frame, ticking ONLY while an announced job is in flight. A
                   ;; timer armed unconditionally is an editor that never goes idle — this one
                   ;; appears with the work and drops itself with it, the `:scrollbar-fade`
@@ -883,9 +900,13 @@ delay, the undo-pause boundary — are present only while their work is pending
         ;; list would fire once and never again.
         kept (apply dissoc
                (or (:timers m) {})
-               :cursor-blink :spinner
-               :scroll-glide (append (keys (ed-timer-clients)) (map one-shots first))))
-    (assoc m :timers (merge kept managed))))
+               :spinner :scroll-glide
+               (append (keys (ed-timer-clients)) (map one-shots first))))
+    ;; `:timers-synced?` says this model has been reconciled at least once: until it has, no
+    ;; input may take `input/ed-update`'s short path, since a model built outside the loop (the
+    ;; one `main` starts with) would otherwise never arm its idle beat while only a cosmetic
+    ;; timer fired
+    (assoc m :timers (merge kept managed) :timers-synced? true)))
 
 ;; ---- overlay scrollbar fade (macOS-style auto-hide) -------------------------
 ;; The scrollbar thumb is hidden at rest. Any scroll wakes it to full opacity
@@ -1012,6 +1033,29 @@ one left."
     m
     (fn (acc [_ step]) (ed-call-deferred acc (:run step) acc))))
 
+(defn ed-sync-window-point (m)
+  "The model with the selected pane's window-local cursor also written to its pool buffer,
+when the two differ — the copy-back `ed-set-buf` makes, done for the moves that do not pass
+through it: selecting another pane on the same buffer, a hosted push that rewrote the pool
+copy. The pool's `:point` stays what it always was, the SAVED DEFAULT a fresh view opens at
+(and now, as in Emacs, the point of the window last selected on it); what this buys is that
+`ed-current-buf` answers the pool buffer itself for the rest of the turn and the next
+([[ed-with-window-point]]) instead of building a copy per call. O(1) when they agree."
+  (let (pane (ed-current-pane m)
+        i (:buffer pane)
+        point (:point pane))
+    (if (or (nil? point) (not (int? i)) (< i 0) (>= i (count (:buffers m))))
+      m
+      (let (pooled (ed-buf-at m i)
+            windowed (ed-with-window-point pooled point (:mark pane)))
+        (if (and (= (:point windowed) (:point pooled)) (= (:mark windowed) (:mark pooled)))
+          m
+          (ed-set-buf-at m i windowed))))))
+
+;; the selected pane's cursor rides on its pool buffer too (`ed-sync-window-point`), so the
+;; next turn's `ed-current-buf` is the pool buffer itself — first, so every later hook and
+;; the view read it
+(register-post-step :window-point {:order 5 :run 'model/ed-sync-window-point})
 ;; buffer recency (Emacs's `buffer-list` order): whatever buffer is current after this event
 ;; moves to the head — the one place every path that switches a buffer (C-x b, RET in dired,
 ;; a results jump, a pane click) passes through
@@ -1027,20 +1071,16 @@ model) — recomputing them per keystroke makes a large buffer crawl. So this re
 nothing directly; it reconciles `:timers` (`ed-sync-timers`) with the new model
 state — arming the eldoc/diagnostics debounce, the which-key delay, and the undo-pause
 boundary when each is due — and the timers' firing (in `input/ed-timer-fire`) does the
-work; then runs the registered post-step hooks (`ed-run-post-steps`). A real keystroke/click
-also forces the caret solid (`ed-real-input?`), so it only blinks at rest. Finally refreshes
+work; then runs the registered post-step hooks (`ed-run-post-steps`). Finally refreshes
 the open minibuffer's memoized candidate list (`ed-cache-mb-candidates`) so the view/input
 read it cheaply."
-  (let (real (ed-real-input? input)
-        ;; a real keystroke/click forces the caret solid AND, while a web mirror is
-        ;; running, marks the snapshot dirty so the idle beat republishes it once (debounced
-        ;; off the hot key path — `ed-sync-timers` arms `:idle-recompute`, `web-publish!`
-        ;; fires there). Timer/blink/system events don't dirty it, so the mirror only
-        ;; refreshes after actual edits/moves.
-        touched (cond
-                  (not real) m
-                  (:server m) (assoc m :blink-on? true :web-dirty true)
-                  else (assoc m :blink-on? true))
+  (let (
+        ;; while a web mirror is running, a real keystroke/click marks the snapshot dirty
+        ;; so the idle beat republishes it once (debounced off the hot key path —
+        ;; `ed-sync-timers` arms `:idle-recompute`, `web-publish!` fires there). Timer and
+        ;; system events don't dirty it, so the mirror only refreshes after actual
+        ;; edits/moves.
+        touched (if (and (:server m) (ed-real-input? input)) (assoc m :web-dirty true) m)
         stepped (ed-run-post-steps (ed-sync-timers touched))
         mb (:minibuffer stepped))
     ;; Bring the candidate list up to date with the typed text: a small source ranks here on
@@ -1511,13 +1551,42 @@ without end. Returns the model."
       (update m :buffers into [(ed-stamp (capped (insert (ed-log-buffer nm) line)))])
       (update m :buffers assoc idx (capped (ed-append-end (ed-buf-at m idx) line))))))
 
+(defdyn *message-log-max* 1000)
+;; How many lines `*Messages*` keeps (Emacs `message-log-max`, same default): past that the
+;; oldest go, so a session that runs for days does not carry every echo it ever showed.
+
+(sig ed-trim-head-lines (buffer int -> buffer))
+(defn ed-trim-head-lines (buf limit)
+  "`buf` with its oldest lines dropped so at most `limit` remain (a final newline ends the
+last line rather than starting another). A no-op at or under `limit`; one cut at the head
+— a rope splice — when over. A read-only buffer is unlocked for the cut and re-locked."
+  (let (rope (buffer-rope buf)
+        length (text/length rope)
+        lines (buffer-line-count buf)
+        ;; a buffer ending in a newline has an empty line after it, which is not a line kept
+        complete (if (and (> length 0) (= (text/slice rope (dec length) length) "\n"))
+                   (dec lines)
+                   lines)
+        excess (- complete limit))
+    (if (<= excess 0)
+      buf
+      (let (cut (text/line->char rope excess))
+        (if (read-only? buf)
+          (set-read-only (replace-region (set-read-only buf false) 0 cut "") true)
+          (replace-region buf 0 cut ""))))))
+
 (defn message (m s)
   "Log `s` to the editor's default sink: append it as a line to `*Messages*`
 (`ed-append-named`, creating it if needed) *and* show it (flattened to one line) in
 the echo area. Never disturbs the current buffer's point. The editor's primary output
 — commands print here, never the console; categorised logs route elsewhere (see
-`ed-append-named` + the log routes)."
-  (assoc (ed-append-named m "*Messages*" s) :echo (one-line s)))
+`ed-append-named` + the log routes). `*Messages*` keeps its newest
+[[*message-log-max*]] lines."
+  (let (logged (ed-append-named m "*Messages*" s)
+        i (or (ed-buffer-index-by-name logged "*Messages*") (error "message: no *Messages* buffer"))
+        messages (ed-buf-at logged i)
+        trimmed (ed-trim-head-lines messages *message-log-max*))
+    (assoc (if (= trimmed messages) logged (ed-set-buf-at logged i trimmed)) :echo (one-line s))))
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
 ;; The editing core: every command that changes the text goes through `ed-try-edit`

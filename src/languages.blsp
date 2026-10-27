@@ -75,8 +75,10 @@ hand-written name."
     `(do
        (defn ~fontify (text)
          (editor/treesit/fontify text (get ~spec :lang) (get ~spec :faces)))
-       (defn ~indent (text bol)
-         (editor/treesit/indent-column text (get ~spec :lang) bol (get ~spec :indent)))
+       ;; `tree`: the buffer's held tree for exactly `text`, when the caller has one
+       ;; (`commands/ed-indent-target`) — the indenter walks it instead of parsing `text`
+       (defn ~indent (text bol &optional (tree nil))
+         (editor/treesit/indent-column text (get ~spec :lang) bol (get ~spec :indent) tree))
        (defn ~restart (src pos)
          (let (hd (get ~spec :heredocs))
            (if (nil? hd) pos (editor/treesit/column0-restart src pos hd))))
@@ -155,7 +157,8 @@ which feels broken, in one language, much later."
 ;; syntax colouring. The `:file-pattern` is matched against the file's basename, so a
 ;; bare `Dockerfile` / `.env` (no extension) triggers; both restart at the viewport's own
 ;; line (`editor/highlight/line-restart`: line-oriented, no cross-line lexer state, so the
-;; 200-line backscan above the band is never lexed).
+;; 200-line backscan above the band is never lexed) and keep each line's spans as a memo
+;; (`:line-lexer`, a stateless one — brood ADR-471).
 
 (def env-mode-layer
   {:name 'env
@@ -163,6 +166,7 @@ which feels broken, in one language, much later."
    ;; carries no extension, so anchor on `.env` with an optional `.suffix`.
    :file-pattern "(^|/)\\.env(\\.[^/]+)?$"
    :fontify 'lex-dotenv/env-spans
+   :line-lexer 'lex-dotenv/env-line-lexer
    :fontify-restart 'editor/highlight/line-restart})
 
 (register-language-mode 'languages/env-mode-layer :env)
@@ -178,6 +182,7 @@ which feels broken, in one language, much later."
   {:name 'shell
    :file-pattern "[.](sh|bash|zsh|ksh|dash)$|(^|/)[.]?(bashrc|bash_profile|bash_aliases|bash_login|bash_logout|zshrc|zshenv|zprofile|zlogin|profile|xprofile|xinitrc)$|(^|/)PKGBUILD$"
    :fontify 'lex-shell/shell-spans
+   :line-lexer 'lex-shell/shell-line-lexer
    :fontify-restart 'editor/highlight/line-restart
    :comment "# "})
 
@@ -190,6 +195,7 @@ which feels broken, in one language, much later."
    ;; `Dockerfile`, `Dockerfile.dev`, `*.dockerfile`, and Podman's `Containerfile`.
    :file-pattern "(^|/)(Dockerfile|Containerfile)([.][^/]+)?$|[.]dockerfile$"
    :fontify 'lex-dockerfile/dockerfile-spans
+   :line-lexer 'lex-dockerfile/dockerfile-line-lexer
    :fontify-restart 'editor/highlight/line-restart})
 
 (register-language-mode 'languages/docker-mode-layer :docker)
@@ -710,13 +716,16 @@ directive, unless a block comment opens above it in this window."
 ;; ---- the configuration formats: tables over std's `editor/lexer` ---------------------
 ;; Fontify-only layers like env-mode and docker-mode; the lexing is `lex-configs`'.
 ;; The `:file-pattern` matches the file's basename, so the extensionless names
-;; (`Makefile`, `COMMIT_EDITMSG`, `.gitconfig`) trigger too. Line-oriented: each restarts at
-;; the viewport's own line (`editor/highlight/line-restart`), so a keystroke lexes the band alone.
+;; (`Makefile`, `COMMIT_EDITMSG`, `.gitconfig`) trigger too. Line-oriented: each but the commit
+;; message is a stateless `:line-lexer` (brood ADR-471), so the pane keeps each line's spans
+;; as a memo on its text and a keystroke lexes the line it changed; the long-line slice path
+;; restarts at the viewport's own line (`editor/highlight/line-restart`).
 
 (def json-mode-layer
   {:name 'json
    :file-pattern "\\.(json|jsonc|json5|jsonl|webmanifest)$|(^|/)\\.(babelrc|eslintrc|prettierrc)$"
    :fontify 'lex-configs/json-spans
+   :line-lexer 'lex-configs/json-line-lexer
    :fontify-restart 'editor/highlight/line-restart
    :comment-syntax "// "})
 
@@ -726,6 +735,7 @@ directive, unless a block comment opens above it in this window."
   {:name 'yaml
    :file-pattern "\\.(ya?ml)$|(^|/)\\.(clang-format|yamllint)$"
    :fontify 'lex-configs/yaml-spans
+   :line-lexer 'lex-configs/yaml-line-lexer
    :fontify-restart 'editor/highlight/line-restart
    :comment-syntax "# "})
 
@@ -735,6 +745,7 @@ directive, unless a block comment opens above it in this window."
   {:name 'toml
    :file-pattern "\\.toml$|(^|/)(Cargo|Pipfile|poetry)\\.lock$"
    :fontify 'lex-configs/toml-spans
+   :line-lexer 'lex-configs/toml-line-lexer
    :fontify-restart 'editor/highlight/line-restart
    :comment-syntax "# "})
 
@@ -744,6 +755,7 @@ directive, unless a block comment opens above it in this window."
   {:name 'makefile
    :file-pattern "(^|/)(GNUmakefile|Makefile|makefile)$|\\.(mk|make)$"
    :fontify 'lex-configs/makefile-spans
+   :line-lexer 'lex-configs/makefile-line-lexer
    :fontify-restart 'editor/highlight/line-restart
    :comment-syntax "# "})
 
@@ -753,6 +765,7 @@ directive, unless a block comment opens above it in this window."
   {:name 'ini
    :file-pattern "\\.(ini|cfg|conf|properties|gitconfig|gitmodules|editorconfig|npmrc|service|desktop)$|(^|/)\\.(gitconfig|gitmodules|editorconfig|npmrc|hgrc)$"
    :fontify 'lex-configs/ini-spans
+   :line-lexer 'lex-configs/ini-line-lexer
    :fontify-restart 'editor/highlight/line-restart
    :comment-syntax "# "})
 
@@ -772,11 +785,13 @@ directive, unless a block comment opens above it in this window."
 ;; (src/folds.blsp) — this mode supplies what a fold covers (`:fold-extent`) and the keys.
 ;; Prose wraps, as in markdown: an Org paragraph is one long line.
 
-(defn org-fold-extent (lines line)
+(defn org-fold-extent (rope line)
   "Org's `:fold-extent`: the last line of the subtree under the heading at `line` of
-`lines`, or nil when `line` is not a heading."
-  (when (org/heading-level (nth lines line ""))
-    (org/subtree-end lines line)))
+`rope`, or nil when `line` is not a heading. Reads only the subtree's lines."
+  (let (line-count (text/line-count rope)
+        line-at (fn (index) (wrap/rope-line-text rope index)))
+    (when (and (< line line-count) (org/heading-level (line-at line)))
+      (org/subtree-end-by line-at line-count line))))
 
 (defn- org-current-line (buf) (wrap/line-text buf (editor/buffer/buffer-current-line buf)))
 
@@ -820,18 +835,22 @@ directive, unless a block comment opens above it in this window."
     (model/message m "not on a heading")
     (org-replace-line m org/cycle-todo)))
 
-(defn- org-heading-from (lines line step)
-  ;; the nearest heading line from `line` in direction `step`, or nil
+(defn- org-heading-from (rope line-count line step)
+  ;; the nearest heading line from `line` in direction `step`, or nil — reading the lines it
+  ;; passes, not the document
   (let (next (+ line step))
     (cond
-      (or (< next 0) (>= next (count lines))) nil
-      (org/heading-level (nth lines next)) next
-      else (org-heading-from lines next step))))
+      (or (< next 0) (>= next line-count)) nil
+      (org/heading-level (wrap/rope-line-text rope next)) next
+      else (org-heading-from rope line-count next step))))
 
 (defn- org-heading-move (m step none)
   (let (buf (model/ed-current-buf m)
-        lines (string/split (editor/buffer/buffer-text buf) "\n")
-        target (org-heading-from lines (editor/buffer/buffer-current-line buf) step))
+        rope (editor/buffer/buffer-rope buf)
+        target (org-heading-from rope
+                 (text/line-count rope)
+                 (editor/buffer/buffer-current-line buf)
+                 step))
     (if (nil? target)
       (model/message m none)
       (model/ed-set-buf m
@@ -899,6 +918,9 @@ directive, unless a block comment opens above it in this window."
   {:name 'org
    :file-pattern "\\.org$"
    :fontify 'org/org-spans
+   :line-lexer 'org/org-line-lexer
+   ;; the band's first line, or the `#+BEGIN_` above it still open — not 200 lines of lead-in
+   :fontify-restart 'org/org-fontify-restart
    :visual-line true
    :fold-extent 'languages/org-fold-extent
    :on-move 'languages/org-on-move

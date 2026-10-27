@@ -14,7 +14,9 @@ of the cursor's source line in view (`aside/scroll-to-line`; nothing
 re-renders — `:lines` from the last render answers where a source line landed). The
 RENDER runs on the idle beat (`:on-idle`), once typing settles, and only when the text or
 the pane's width changed since the last one: a whole-document render on every key would
-be the jitter the highlighter's per-key band already cost once.
+be the jitter the highlighter's per-key band already cost once. And it runs in a TASK
+(`launch`): the rope is captured, the text built and rendered off the loop, and the answer
+folded in when it lands (`apply-render`), so a long document never pauses the editor.
 
 **The pane is an `aside`**: shown beside the page, refreshed in place keeping its scroll
 (`:keep-scroll` — the follow places it), latched closed when you close it, brought back
@@ -24,13 +26,15 @@ only by the command. Killing the markdown buffer takes the preview with it
 **State**, under the model's `:mdpreview` map: `aside`'s `:aside-shown?`/`:aside-closed?`,
 plus `:rope` (the text last rendered — O(1) to compare, so \"did it change?\" is free),
 `:width` (the columns it was rendered to) and `:render` (the last `markdown-render`
-result, for `:lines`)."
+result, for `:lines`), `:pending` (`{:rope :width}` of a render in flight); and the
+model's `:mdpreview-proc`, that render's task."
   (:use model) ; ed-current-buf / message
   (:use interactive) ; defcommand
   (:use aside) ; the pane discipline: refresh / reopen / scroll-to-line / pane-of
   (:use editor/buffer) ; buffer-rope / buffer-text / buffer-current-line
   (:use editor/layers) ; request-close — take the pane with the buffer
-  (:use lex-markdown)) ; markdown-render / markdown-rendered-line
+  (:use lex-markdown) ; markdown-render / markdown-rendered-line
+  (:use task)) ; task — the idle beat's render runs off the loop
 (def *buffer-name* "*Markdown Preview*")
 
 (def *spec* {:key :mdpreview :buffer mdpreview/*buffer-name* :type :markdown-preview})
@@ -51,16 +55,70 @@ never laid out. The command opens the pane BEFORE the first render so it is meas
   (and (= (get-in m [:mdpreview :rope]) (buffer-rope buf))
     (= (get-in m [:mdpreview :width]) (pane-width m))))
 
+(sig show (model map -> model))
+(defn- show (m rendered)
+  "Put `rendered` — `{:rope :width :render}`, a render of that text at that width — in an
+open pane (never opening one), remember it, and keep the cursor's line in view."
+  (let (remembered (assoc m :mdpreview (merge (:mdpreview m) rendered))
+        refreshed (aside/refresh *spec* remembered (:render rendered) false {:keep-scroll true}))
+    (follow refreshed (ed-current-buf refreshed))))
+
 (sig render (model buffer bool -> model))
 (defn render (m buf force)
   "Render `buf` into the pane (opening it with `force`, else only refreshing one already
-up) and remember what was rendered, then keep the cursor's line in view."
+up) and remember what was rendered, then keep the cursor's line in view. On the loop: what
+the command does, because you asked and are waiting; the idle beat renders in a task
+(`launch`)."
   (let (width (pane-width m)
         r (markdown-render (buffer-text buf) width)
         m1 (assoc m
              :mdpreview (merge (:mdpreview m) {:rope (buffer-rope buf) :width width :render r}))
         m2 (aside/refresh *spec* m1 r force {:keep-scroll true}))
     (follow m2 buf)))
+
+(sig launch (model buffer -> model))
+(defn launch (m buf)
+  "Render `buf` OFF the loop: a task over the rope (captured, not flattened here — the text
+is built in the task) at the pane's width, its answer folded in by `apply-render`. A render
+already in flight is left to land; its fold launches the next one if the text moved on
+meanwhile. Headless there is no loop to answer to, so it renders in place.
+
+The render reads the whole document, so on the loop it was a pause on every idle beat of a
+long file — the jitter the highlighter's per-key band already cost once, moved one clock
+over."
+  (cond
+    (:mdpreview-proc m) m
+    (ed-headless?) (render m buf false)
+    else
+    ;; the rope rides INTO the task in its closure, but a rope cannot travel in a
+    ;; message, so the answer is the render alone: what it is of stays here, under
+    ;; `:pending`, until it lands
+      (let (rope (buffer-rope buf)
+            width (pane-width m)
+            job (task (fn () (markdown-render (text/->string rope) width))))
+        (-> m
+          (assoc :mdpreview-proc job)
+          (assoc-in [:mdpreview :pending] {:rope rope :width width})))))
+
+(sig apply-render (model any -> model))
+(defn apply-render (m result)
+  "A finished off-loop render (`launch`): `result` is the `markdown-render` of the text and
+width `launch` left under `:pending`, shown when it is one (a failed task leaves the last
+render up), the slot cleared — and, when the current buffer is still a markdown buffer
+whose text or pane width moved on while the task ran, the next render launched, since no
+later beat is promised to ask."
+  (let (pending (get-in m [:mdpreview :pending])
+        cleared (-> m
+                  (dissoc :mdpreview-proc)
+                  (assoc :mdpreview (dissoc (or (:mdpreview m) {}) :pending)))
+        shown (if (and (map? result) pending) (show cleared (assoc pending :render result)) cleared)
+        buf (ed-current-buf shown))
+    (if (and (map? result)
+          (= (ed-buf-mode-name buf) "markdown")
+          (aside/open? *spec* shown)
+          (not (fresh? shown buf)))
+      (launch shown buf)
+      shown)))
 
 (sig follow (model buffer -> model))
 (defn follow (m buf)
@@ -87,7 +145,7 @@ beat's."
   "markdown-mode's `:on-idle`: re-render an open preview once typing settles, if the
 text or the pane's width moved since the last render. Never opens one."
   (let (buf (ed-current-buf m))
-    (if (or (not (aside/open? *spec* m)) (fresh? m buf)) m (render m buf false))))
+    (if (or (not (aside/open? *spec* m)) (fresh? m buf)) m (launch m buf))))
 
 (defn markdown-on-close (buf)
   "markdown-mode's `:on-close`: killing the buffer takes its preview with it. The hook is
@@ -109,3 +167,7 @@ Opening clears the latch a closed pane leaves, because this is you asking."
           m2 (aside/scroll-to-line *spec* m1 0))
       (message (render m2 (ed-current-buf m2) false)
         "markdown preview — follows the cursor; C-c C-p closes it"))))
+
+;; ---- registration ---------------------------------------------------------------
+;; the idle beat's render lands here; a failed one (`:failed`) leaves the last render up
+(register-task-reply :mdpreview-proc 'mdpreview/apply-render :failed nil)
