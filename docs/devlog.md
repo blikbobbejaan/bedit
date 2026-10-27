@@ -493,3 +493,16 @@ Makefile, INI/git config and `COMMIT_EDITMSG` are fontify-only layers over brood
 table-driven mode costs ~1.4 ms per matched line (brood's devlog has the profile and the
 30% that was recoverable in Brood); a large YAML band is slow to re-lex until the engine
 changes — a design decision recorded there, not hidden here.
+
+### 2026-10-27 — a section buffer paints in one pass (the suite's 2 GB red)
+
+The suite's peak went from 1.5 GB to past the runner's 2 GB limit, in bedit's CI and
+brood's downstream smoke. The cause was `web_fuzz_session_test` on a fresh checkout, not a
+leak: its git-status walk opens the root commit, whose diff is every file in the repository
+(~95 000 lines). `sectionbuf`'s rewrite (`12df11e4`) built a render's paints and absolute
+spans with a `conj` onto a vector per line and per span. A `conj` copies the vector, so a
+render cost O(lines²). In a single-commit repo that one render ran past 6 GB. Both builders
+now gather a list and make the vector once: the same walk peaks at 944 MB, against 1.0 GB
+before the rewrite. Guard: `section_test` "a 20 000-line section paints every line, in
+order", which hits the 2 GB limit in under a second on the `12df11e4` builders. Still heavy
+and worth its own look: a 95 000-line commit view holds about 900 MB live, as it did before.
