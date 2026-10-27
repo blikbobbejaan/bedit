@@ -144,12 +144,16 @@
     (let (m0 (ruby-model "def f\nend\n")
           rope (buffer-rope (ed-current-buf m0))
           warmed (tree-open rope :ruby)
-          m1 (treewarm/ed-apply-tree-warm (assoc m0 :tree-warm-index 0)
-               {:tree warmed :rope rope :lang :ruby})
+          ;; the reply is the tree alone — a rope cannot cross a message — and the rope and
+          ;; language it was launched over wait in the model
+          launched (fn (m) (assoc m :tree-warm-index 0 :tree-warm-rope rope :tree-warm-lang :ruby))
+          m1 (treewarm/ed-apply-tree-warm (launched m0) {:tree warmed})
           spare (tree-open rope :ruby)
-          m2 (treewarm/ed-apply-tree-warm (assoc m1 :tree-warm-index 0)
-               {:tree spare :rope rope :lang :ruby}))
+          m2 (treewarm/ed-apply-tree-warm (launched m1) {:tree spare}))
       (is (= (:tree (syntax-tree-entry m1 0)) warmed))
+      (is (= (:rope (syntax-tree-entry m1 0)) rope))
+      (assert= (:lang (syntax-tree-entry m1 0)) :ruby)
+      (is (nil? (:tree-warm-rope m1)))
       (is (= (:tree (syntax-tree-entry m2 0)) warmed))
       (is (nil? (tree-changed-ranges spare)))
       (is (nil? (:tree-warm-index m2))))))
@@ -219,3 +223,169 @@
         (is (not (ed-tree-warm-stale? (assoc m :tree-warm-proc :running))))
         (is (not (ed-tree-warm-stale? held)))
         (is (not (ed-tree-warm-stale? (edited-at held 0 "x = 1\n"))))))))
+
+;; An edit that then asks the tree about what it just changed — RET's indent, each line of a
+;; region reindent after the first — follows the held tree to the edited text (one incremental
+;; update) instead of the indenter parsing the document, and hands the model that tree.
+(describe "syntaxtree: an edit that indents follows the held tree"
+  (test "RET indents as a text parse does, and the refresh keeps the tree RET left"
+    (let (m (refreshed (ruby-model "def f\n1\nend\n"))
+          before (syntax-tree-entry m 0)
+          before-one (ed-set-buf m (goto-char (ed-current-buf m) 6))
+          returned (commands/cmd-newline-and-indent before-one nil)
+          buf (ed-current-buf returned)
+          entry (syntax-tree-entry returned 0)
+          by-text (commands/ed-indent-target (insert (goto-char (ed-current-buf m) 6) "\n")))
+      (assert= by-text 2)
+      (assert= (buffer-text buf) "def f\n\n  1\nend\n")
+      (assert= (buffer-point buf) 9)
+      ;; the entry is current for the edited text, on a new handle, and the refresh keeps it
+      (is (= (:rope entry) (buffer-rope buf)))
+      (is (tree-alive? (:tree entry)))
+      (is (not (= (:tree entry) (:tree before))))
+      (is (= (:tree (syntax-tree-entry (refreshed returned) 0)) (:tree entry)))
+      ;; the tree the command began with is the committed turn's to free
+      (is (tree-alive? (:tree before)))
+      (ed-release-dropped-trees m returned)
+      (is (not (tree-alive? (:tree before))))
+      (is (tree-alive? (:tree entry)))))
+
+  (test "a region reindent over the followed tree answers as one over the text"
+    (let (text "def f\n1\nif x\n2\nend\nend\n"
+          region (fn (m)
+                   (ed-set-buf m (assoc (ed-current-buf m) :mark 0 :point (string/length text))))
+          held (refreshed (ruby-model text))
+          over-tree (commands/cmd-indent-region (region held) nil)
+          over-text (commands/cmd-indent-region (region (ruby-model text)) nil)
+          entry (syntax-tree-entry over-tree 0))
+      (is (nil? (syntax-tree-entry (ruby-model text) 0)))
+      (assert= (buffer-text (ed-current-buf over-tree)) "def f\n  1\n  if x\n    2\n  end\nend\n")
+      (assert= (buffer-text (ed-current-buf over-tree)) (buffer-text (ed-current-buf over-text)))
+      (is (= (:rope entry) (buffer-rope (ed-current-buf over-tree))))
+      (is (= (:tree (syntax-tree-entry (refreshed over-tree) 0)) (:tree entry))))))
+
+;; A buffer past `*tree-sync-max*` is reparsed off the loop. These tests make a small one
+;; count as large and run as a loop would (`*ui-loop*` bound, so `ed-headless?` is false),
+;; then hand each reply to the fold the way the dispatcher would.
+(defn off-loop (thunk)
+  (binding (*tree-sync-max* 10 *ui-loop* (self)) (thunk)))
+(defn landed (m)
+  ;; the in-flight reparse's reply, folded in and refreshed — as its turn would be
+  (let (job (:tree-reparse-proc m)
+        reply (receive
+                ([:task-done ^job value] value)
+                (after 5000 :timeout)))
+    (refreshed (ed-apply-tree-reparse m reply))))
+(defn whole-spans (m tree)
+  (let (buf (ed-current-buf m))
+    (tree-spans tree (ed-mode-service buf :ts-faces) 0 (buffer-length buf))))
+
+(describe "syntaxtree: a large buffer's tree is reparsed off the loop"
+  (test "a burst of edits launches one reparse; the follow-up lands the latest text's tree"
+    (off-loop
+      (fn ()
+        (let (m0 (refreshed (ruby-model (big-ruby 40)))
+              base (:tree (syntax-tree-entry m0 0))
+              m1 (refreshed (edited-at m0 0 "x"))
+              first-job (:tree-reparse-proc m1)
+              m2 (refreshed (edited-at m1 1 "y"))
+              m3 (refreshed (edited-at m2 2 " = 1\n"))
+              m4 (landed m3)
+              m5 (landed m4)
+              entry (syntax-tree-entry m5 0)
+              fresh (tree-open (buffer-rope (ed-current-buf m5)) :ruby))
+          (is (not (nil? first-job)))
+          ;; the keys behind the first one queued nothing: the same job, the same old tree
+          (is (= (:tree-reparse-proc m2) first-job))
+          (is (= (:tree-reparse-proc m3) first-job))
+          (is (= (:tree (syntax-tree-entry m3 0)) base))
+          ;; the first landing was a text behind, so one follow-up went out from its tree
+          (is (= (:rope (syntax-tree-entry m4 0)) (buffer-rope (ed-current-buf m1))))
+          (is (not (nil? (:tree-reparse-proc m4))))
+          (is (not (= (:tree-reparse-proc m4) first-job)))
+          ;; and its landing is current, with nothing left in flight
+          (is (= (:rope entry) (buffer-rope (ed-current-buf m5))))
+          (is (nil? (:tree-reparse-proc m5)))
+          (assert= (whole-spans m5 (:tree entry)) (whole-spans m5 fresh))
+          (tree-free fresh)))))
+
+  (test "a superseded tree is freed by the turn that lands its successor, not before"
+    (off-loop
+      (fn ()
+        (let (m0 (refreshed (ruby-model (big-ruby 40)))
+              base (:tree (syntax-tree-entry m0 0))
+              m1 (refreshed (edited-at m0 0 "x"))
+              m2 (refreshed (edited-at m1 1 "y")))
+          ;; a turn while the reparse runs keeps the tree it reads from
+          (ed-release-dropped-trees m1 m2)
+          (is (tree-alive? base))
+          (let (m3 (landed m2)
+                middle (:tree (syntax-tree-entry m3 0)))
+            (ed-release-dropped-trees m2 m3)
+            (is (not (tree-alive? base)))
+            (let (m4 (landed m3))
+              (ed-release-dropped-trees m3 m4)
+              (is (not (tree-alive? middle)))
+              (is (tree-alive? (:tree (syntax-tree-entry m4 0))))))))))
+
+  (test "while the tree is behind, the band's colours are carried past the edit"
+    (off-loop
+      (fn ()
+        (let (m0 (refreshed (ruby-model (big-ruby 40)))
+              m1 (refreshed (edited-at m0 0 "x = 1\n"))
+              band (band-of m1)
+              caught (landed m1))
+          (is (has-span? (:spans (band-of m0)) 0 3))
+          (is (not (nil? (:tree-reparse-proc m1))))
+          ;; not dropped to a slice: the tree's own spans, six chars on
+          (is (:shifted? band))
+          (is (= (:rope band) (buffer-rope (ed-current-buf m1))))
+          (is (has-span? (:spans band) 6 9))
+          ;; once the tree lands it colours the band again
+          (is (:tree? (band-of caught)))
+          (is (not (:shifted? (band-of caught))))
+          (is (has-span? (:spans (band-of caught)) 6 9))))))
+
+  (test "a structural command on a behind tree answers as on a fresh one, catching it up once"
+    (let (text "def f\n1\nend\ndef g\nend\n"
+          by-text (buffer-point (ed-current-buf (commands/cmd-forward-sexp (ed-set-buf (ruby-model (str "x = 1\n"
+                                                                                                     text))
+                                                                             (goto-char (ed-current-buf (ruby-model (str "x = 1\n"
+                                                                                                                      text)))
+                                                                               6))
+                                                  nil))))
+      (off-loop
+        (fn ()
+          (let (m1 (refreshed (edited-at (refreshed (ruby-model text)) 0 "x = 1\n"))
+                base (:tree (syntax-tree-entry m1 0))
+                moved (commands/cmd-forward-sexp m1 nil)
+                entry (syntax-tree-entry moved 0))
+            (assert= by-text 17)
+            (assert= (buffer-point (ed-current-buf moved)) by-text)
+            ;; caught up: the model holds a current tree, a new handle
+            (is (= (:rope entry) (buffer-rope (ed-current-buf moved))))
+            (is (not (= (:tree entry) base)))
+            ;; and the reparse that was in flight lands on a tree no longer the buffer's
+            (let (job (:tree-reparse-proc moved)
+                  reply (receive
+                          ([:task-done ^job value] value)
+                          (after 5000 :timeout))
+                  after (ed-apply-tree-reparse moved reply))
+              (is (= (:tree (syntax-tree-entry after 0)) (:tree entry)))
+              (is (not (tree-alive? (:tree reply))))))))))
+
+  (test "headless, a large buffer is still updated on the loop"
+    (binding (*tree-sync-max* 10)
+      (let (m (refreshed (edited-at (refreshed (ruby-model (big-ruby 40))) 0 "x")))
+        (is (nil? (:tree-reparse-proc m)))
+        (is (= (:rope (syntax-tree-entry m 0)) (buffer-rope (ed-current-buf m)))))))
+
+  (test "a reparse in flight follows the pool shift, and aims at nothing when its buffer is killed"
+    (let (reparsing (fn (index killed)
+                      (get-in (ed-drop-syntax-tree-slot (assoc (ruby-model "")
+                                                          :tree-reparse {:index index})
+                                killed)
+                        [:tree-reparse :index])))
+      (assert= (reparsing 2 1) 1)
+      (assert= (reparsing 0 1) 0)
+      (is (nil? (reparsing 1 1))))))

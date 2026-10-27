@@ -113,7 +113,10 @@ src/syntaxtree.blsp         the tree-sitter parse each pool buffer KEEPS (brood 
                             `:syntax-trees` by pool index, updated incrementally per edit by the
                             span refresh, freed on kill; panes colour a band from it
                             (`fontify-tree`) and keep a band its `tree-changes` left alone. A
-                            runtime without tree handles keeps the slice path
+                            runtime without tree handles keeps the slice path. Past
+                            `*tree-sync-max*` (250 KB) the update runs OFF the loop, one in
+                            flight, coalescing a burst; meanwhile the band is carried (spans
+                            shifted past the edits) and a structural key catches the tree up once
 src/linecache.blsp          the line-state highlight cache a LEXER mode keeps (brood ADR-471):
                             a mode's `:line-lexer` builder (markdown's fence, org's #+BEGIN_
                             block, the `lex-*` formats stateless), `:line-caches` by pool index,

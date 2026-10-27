@@ -17,18 +17,41 @@ from costs a full reparse and is never wrong, because a handle carries its own t
 update diffs the two ropes.
 
 A handle is freed in ONE place, after a turn commits (`ed-release-dropped-trees`, which
-`input/ed-update` calls): every handle the model held before the turn and not after. Nothing
-else here frees, so a turn that throws and is rolled back still names live handles; what a
-thrown turn opened is left to the kernel's least-recently-used bound."
-  (:use editor/buffer) ; buffer-rope / buffer-length
-  (:use model)) ; ed-buf-at / ed-mode-service
+`input/ed-update` calls): every handle the model held before the turn and not after. The one
+exception is a handle a command opened and then replaced itself, within the turn
+(`follow-held-tree`, which RET and a region reindent advance the tree with as they edit) —
+named by nothing else, it is freed at once. Nothing else frees, so a turn that throws and is
+rolled back still names live handles; what a thrown turn opened is left to the kernel's
+least-recently-used bound.
+
+A buffer past `*tree-sync-max*` is brought up to date OFF the loop instead
+([[ed-apply-tree-reparse]]): one reparse in flight at a time, launched from the newest tree
+when the last one lands, so a burst of typing costs one or two reparses rather than one per
+key. While it runs the entry is BEHIND the text: the bands it coloured are carried across the
+edits by shifting their spans (`panes`), and a structural command catches the tree up once,
+synchronously ([[ed-catch-up-syntax-tree]]). The tree the reparse started from is held for
+as long as it runs, so a turn that drops it meanwhile does not free it under the task."
+  (:use editor/buffer) ; buffer-rope / buffer-length / buffer-splices-since
+  (:use model) ; ed-buf-at / ed-mode-service / ed-headless? / register-task-reply
+  (:use task)) ; task — a large buffer's reparse runs off the loop
 
 (defdyn *tree-open-max*
   ;; The largest buffer whose FIRST tree is opened on the loop. A cold whole-document parse
   ;; of 250 KB costs ~650 ms; below about 40 KB it is imperceptible. A larger buffer keeps
   ;; the windowed slice path until `treewarm` has opened its tree in a task; after that
-  ;; every update is incremental and cheap at any size.
+  ;; every update is incremental (see `*tree-sync-max*` for where it runs).
   40000)
+
+(defdyn *tree-sync-max*
+  ;; The largest buffer whose tree is brought up to date ON the loop, synchronously, per
+  ;; edit. An incremental reparse is not free: tree-sitter re-walks the regions a keystroke
+  ;; leaves in error, and on Rust it grows about linearly with the document — one typed
+  ;; character measured 0.3 ms at 20 KB and 50 KB, 0.55 ms at 100 KB, 1.4 ms at 200 KB,
+  ;; 2.1 ms at 400 KB, 3.3 ms at 800 KB, 7.6 ms at 1.6 MB and 11.3 ms at 2.3 MB (installed
+  ;; nest 0.44.0, 2026-10-27). Past this a reparse runs off the loop and lands as its own
+  ;; turn (`ed-apply-tree-reparse`); below it the ~1.5 ms is cheaper than that extra turn
+  ;; and the shifted, briefly-stale colouring it buys.
+  250000)
 
 ;; ---- the editor/treesit tree API ------------------------------------------------
 ;; Each answers nil when the call raises (a language whose grammar is not loaded), which
@@ -53,16 +76,17 @@ cannot account for the change (it overflowed, or the text was replaced wholesale
       (into []
         (map splices (fn ([lo hi replacement]) [lo hi (+ lo (string/length replacement))]))))))
 
-(defn- tree-update (tree from-rope buf lang)
+(defn- tree-update-to (tree rope lang edits)
   ;; Told the edits when the buffer's splice log knows them, so the kernel need not find the
-  ;; change by comparing `from-rope` with the new text — a scan of both ropes per keystroke.
+  ;; change by comparing the tree's text with `rope` — a scan of both ropes per keystroke.
   ;; Without them (nil) it compares, which is exact for one contiguous edit and sound for
   ;; several. Edits that do not fit the two texts are an error rather than a wrong tree, and
-  ;; that falls back to the comparison too.
-  (let (rope (buffer-rope buf)
-        edits (splice-edits from-rope buf)
-        told (when edits (or-nil (fn () (editor/treesit/update-tree tree rope lang edits)))))
+  ;; that falls back to the comparison too. Reads no model: an off-loop reparse runs it.
+  (let (told (when edits (or-nil (fn () (editor/treesit/update-tree tree rope lang edits)))))
     (or told (or-nil (fn () (editor/treesit/update-tree tree rope lang nil))))))
+
+(defn- tree-update (tree from-rope buf lang)
+  (tree-update-to tree (buffer-rope buf) lang (splice-edits from-rope buf)))
 
 (defn tree-free (tree)
   "Drop `tree`'s handle now (nil-safe)."
@@ -96,6 +120,13 @@ entry `editor/treesit/fontify-tree` may be asked about, since its offsets are th
   (let (entry (syntax-tree-entry m idx))
     (when (and entry (= (:rope entry) (buffer-rope buf))) entry)))
 
+(defn behind-syntax-tree? (m idx buf)
+  "Whether pool buffer `idx` holds a tree parsed from an OLDER text than `buf`'s — after the
+refresh's sync, a large buffer whose reparse runs off the loop ([[ed-sync-syntax-trees]]).
+Its bands are shifted across the edits rather than recoloured until the tree lands."
+  (let (entry (syntax-tree-entry m idx))
+    (and (not (nil? entry)) (not (= (:rope entry) (buffer-rope buf))))))
+
 (defn held-tree-for (entry buf lang)
   "`entry`'s tree handle when it was parsed as `lang` from exactly `buf`'s rope, else nil —
 the one test before a held tree is passed to a structural query (`editor/treesit/point-*`,
@@ -116,11 +147,125 @@ cached band is suspect."
       (assoc (or (:syntax-trees m) {})
         idx {:tree tree :rope rope :lang lang :from-rope nil :changes true})))
 
+(defn- advanced-entry (entry buf lang)
+  "`entry` brought up to `buf`'s rope by an incremental update of its tree — a NEW handle,
+`entry`'s left alone — or nil when the update fails."
+  (let (updated (tree-update (:tree entry) (:rope entry) buf lang))
+    (when updated
+      {:tree updated
+       :rope (buffer-rope buf)
+       :lang lang
+       :from-rope (:rope entry)
+       :changes (tree-changed-ranges updated)})))
+
+(defn follow-held-tree (entry buf lang origin)
+  "`entry` (a held tree entry, or nil) brought up to `buf`'s rope, for a command that edits
+and then asks the tree about what it just edited — RET's indent, each line of a region
+reindent after the first. Without it those queries miss the tree (it was parsed from the
+text BEFORE the edit) and parse the whole document; with it each costs an incremental
+update of the splices the edit made.
+
+The handle it replaces is freed, unless it is `origin` — the tree the model held when the
+command began, which only a committed turn may free (`ed-release-dropped-trees`): every
+other handle a chain of follows passes through was opened by this command and is named by
+nothing else. Nil when there is no entry, it is not a `lang` tree, its handle is gone, or
+the update fails; the caller then reads the text."
+  (cond
+    (or (nil? entry) (not (= (:lang entry) lang))) nil
+    (= (:rope entry) (buffer-rope buf)) entry
+    (not (tree-alive? (:tree entry))) nil
+    else
+      (let (next (advanced-entry entry buf lang))
+        (when (not (= (:tree entry) origin)) (tree-free (:tree entry)))
+        next)))
+
+(defn ed-adopt-syntax-tree (m idx entry)
+  "`m` with `entry` — a tree a command brought up to pool buffer `idx`'s edited text
+([[follow-held-tree]]) — as that buffer's tree, so the next refresh finds it current and
+does not re-apply the same edit. The entry it replaces is freed once the turn commits. Nil
+`entry` leaves `m` as it was."
+  (if (nil? entry) m (assoc-in m [:syntax-trees idx] entry)))
+
+(sig ed-catch-up-syntax-tree (model any -> (tuple model any)))
+(defn ed-catch-up-syntax-tree (m idx)
+  "`[m entry]`: pool buffer `idx`'s tree entry brought up to its text NOW, synchronously, and
+`m` holding it — for a structural command (C-M-f, TAB's indent, C-M-h), which asks the tree
+about the text as it stands. A large buffer's tree trails the text while its reparse runs
+off the loop; a deliberate key pays one incremental update rather than the whole-document
+parse a query without a tree costs. The reparse in flight lands on a tree that is no longer
+the buffer's and is freed. The entry as it was when there is nothing to catch up, no tree,
+or the update fails."
+  (let (entry (syntax-tree-entry m idx)
+        buf (when (and (int? idx) (< idx (count (:buffers m)))) (ed-buf-at m idx))
+        lang (when buf (ed-mode-service buf :ts-lang)))
+    (if (or (nil? buf)
+          (nil? entry)
+          (nil? lang)
+          (not (= (:lang entry) lang))
+          (= (:rope entry) (buffer-rope buf))
+          (not (tree-alive? (:tree entry))))
+      [m entry]
+      (let (advanced (advanced-entry entry buf lang))
+        (if (nil? advanced) [m entry] [(assoc-in m [:syntax-trees idx] advanced) advanced])))))
+
+;; ---- the off-loop reparse of a large buffer ----------------------------------------
+;; One in flight for the whole editor: `:tree-reparse-proc` is its task, `:tree-reparse` what
+;; it was launched over — the pool index, the tree it starts from (`:base`), that tree's rope,
+;; the rope it parses and the language. A rope cannot cross a message, so they wait here and
+;; the reply carries the new handle and its change ranges alone (as `treewarm`'s does).
+
+(defn- reparse-off-loop? (buf)
+  ;; headless (a test, a batch run) has no loop to land a reply on, and stays synchronous
+  (and (> (buffer-length buf) *tree-sync-max*) (not (ed-headless?))))
+
+(defn- launch-reparse (m idx entry buf lang)
+  "`m` with a task bringing `entry`'s tree up to `buf`'s rope in flight. The edits are read
+from the splice log here, on the loop (a walk of rope handles); the task captures the rope
+and parses it."
+  (let (tree (:tree entry)
+        rope (buffer-rope buf)
+        edits (splice-edits (:rope entry) buf)
+        job (task (fn ()
+                    (let (updated (tree-update-to tree rope lang edits))
+                      {:tree updated :changes (when updated (tree-changed-ranges updated))}))))
+    (assoc m
+      :tree-reparse-proc job
+      :tree-reparse {:index idx :base tree :from-rope (:rope entry) :rope rope :lang lang})))
+
+(sig ed-apply-tree-reparse (model any -> model))
+(defn ed-apply-tree-reparse (m result)
+  "A finished off-loop reparse: its tree becomes the buffer's entry when the entry is still
+the one it started from — else something caught the buffer up meanwhile (a structural
+command), killed it or reopened it, and the new handle is freed. The tree it replaces is
+dropped from the model and freed when this turn commits. The buffer has usually moved on
+while it ran; this turn's refresh then launches the next reparse from this tree, over the
+edits since ([[ed-sync-syntax-trees]]). A failed reparse drops the entry, so `treewarm`
+opens a fresh tree off the loop rather than the loop retrying one that failed."
+  (let (flight (or (:tree-reparse m) {})
+        idx (:index flight)
+        tree (when (map? result) (:tree result))
+        cleared (assoc m :tree-reparse-proc nil :tree-reparse nil)
+        entry (when (int? idx) (syntax-tree-entry cleared idx))
+        ours? (and (not (nil? entry)) (= (:tree entry) (:base flight))))
+    (cond
+      (and (nil? tree) ours?) (without-entry cleared idx)
+      (nil? tree) cleared
+      (or (not ours?) (not (tree-alive? tree))) (do (tree-free tree) cleared)
+      else
+        (assoc-in cleared
+          [:syntax-trees idx]
+          {:tree tree
+           :rope (:rope flight)
+           :lang (:lang flight)
+           :from-rope (:from-rope flight)
+           :changes (:changes result)}))))
+
 (defn- synced-entry (m idx buf)
   "`m` with pool buffer `idx`'s tree brought up to `buf`'s rope: kept when current, updated
 incrementally from the old tree when the rope moved, opened when there is none and the
 buffer is small enough to parse on the loop, dropped when the buffer is no longer a
-tree-sitter one.
+tree-sitter one. A buffer past `*tree-sync-max*` is updated off the loop instead: a reparse
+is launched when none is in flight, and the entry stays behind until it lands.
 
 An entry whose handle is gone (evicted, or freed by a turn that a render failure then rolled
 back) counts as none: updating from it would be a full parse anyway, on the loop, so a small
@@ -132,17 +277,11 @@ buffer reopens and a large one waits for `treewarm`."
     (cond
       (or (nil? lang) (nil? (ed-mode-service buf :ts-faces))) (without-entry m idx)
       (and entry (= (:lang entry) lang) (= (:rope entry) rope)) m
+      (and entry (= (:lang entry) lang) (reparse-off-loop? buf))
+        (if (:tree-reparse-proc m) m (launch-reparse m idx entry buf lang))
       (and entry (= (:lang entry) lang))
-        (let (updated (tree-update (:tree entry) (:rope entry) buf lang))
-          (if (nil? updated)
-            (without-entry m idx)
-            (assoc-in m
-              [:syntax-trees idx]
-              {:tree updated
-               :rope rope
-               :lang lang
-               :from-rope (:rope entry)
-               :changes (tree-changed-ranges updated)})))
+        (let (advanced (advanced-entry entry buf lang))
+          (if (nil? advanced) (without-entry m idx) (assoc-in m [:syntax-trees idx] advanced)))
       (> (buffer-length buf) *tree-open-max*) (without-entry m idx)
       else
         (let (opened (tree-open rope lang))
@@ -161,7 +300,10 @@ date, and every entry whose index fell off the end of the pool dropped."
         (if (and (int? idx) (< idx pool-size)) (synced-entry acc idx (ed-buf-at acc idx)) acc)))))
 
 (defn- held-trees (m)
-  (map (vals (or (:syntax-trees m) {})) (fn (entry) (:tree entry))))
+  ;; the entries' trees, and the one a reparse in flight is reading from
+  (let (entries (map (vals (or (:syntax-trees m) {})) (fn (entry) (:tree entry)))
+        base (get-in m [:tree-reparse :base]))
+    (if (nil? base) entries (cons base entries))))
 
 (defn ed-release-dropped-trees (before after)
   "`after`, once every tree handle `before` held and `after` does not has been freed — the one
@@ -176,23 +318,32 @@ releasing first is harmless."
           (doseq (tree held) (when (not (includes? kept tree)) (tree-free tree)))
           after)))))
 
-(defn- shift-warm-index (m killed)
-  "`m` with its in-flight warm's `:tree-warm-index` following pool slot `killed`'s removal."
-  (let (index (:tree-warm-index m))
-    (cond
-      (not (int? index)) m
-      (= index killed) (assoc m :tree-warm-index nil)
-      (> index killed) (assoc m :tree-warm-index (dec index))
-      else m)))
+(defn- shifted-slot (index killed)
+  ;; where an in-flight job aimed at pool slot `index` aims once slot `killed` is removed:
+  ;; nil when it is the one killed
+  (cond
+    (not (int? index)) index
+    (= index killed) nil
+    (> index killed) (dec index)
+    else index))
+
+(defn- shift-in-flight (m killed)
+  "`m` with its in-flight warm's `:tree-warm-index` and reparse's `:index` following pool
+slot `killed`'s removal."
+  (let (warmed (assoc m :tree-warm-index (shifted-slot (:tree-warm-index m) killed))
+        flight (:tree-reparse m))
+    (if (nil? flight)
+      warmed
+      (assoc warmed :tree-reparse (assoc flight :index (shifted-slot (:index flight) killed))))))
 
 (defn ed-drop-syntax-tree-slot (m killed)
   "Drop pool slot `killed`'s tree ahead of its removal from the pool (freed once the turn
 commits), and shift the entries above it down one — mirroring the pool shift, as
 `hosted/hosted-drop-slot` does for `:hosted`, so every surviving tree stays with its
-document. A warm in flight (`treewarm`) is re-aimed the same way: at the buffer it was
-warming, or at none when that is the one killed, so its tree is freed on arrival rather than
-installed on a neighbour."
-  (let (cleared (shift-warm-index (without-entry m killed) killed)
+document. A warm (`treewarm`) or reparse in flight is re-aimed the same way: at the buffer
+it was working on, or at none when that is the one killed, so its tree is freed on arrival
+rather than installed on a neighbour."
+  (let (cleared (shift-in-flight (without-entry m killed) killed)
         trees (:syntax-trees cleared))
     (if (nil? trees)
       cleared
@@ -202,3 +353,8 @@ installed on a neighbour."
             {}
             (fn (acc [index entry])
               (assoc acc (if (> index killed) (dec index) index) entry)))))))
+
+;; ---- registration ---------------------------------------------------------------
+;; the reply carries the reparsed tree and its change ranges, and clears the slot either
+;; way; upkeep nobody waits on, so it has no activity label
+(register-task-reply :tree-reparse-proc 'syntaxtree/ed-apply-tree-reparse :failed nil)

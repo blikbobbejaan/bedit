@@ -412,13 +412,29 @@ possibly show — its horizontal scroll plus its width — plus `ed-fontify-edge
     (- total (text/line->char rope line))
     (- (text/line->char rope (inc line)) (text/line->char rope line))))
 
+;; Asked up to three times an event for the same window (the band's lines, its cover check,
+;; the windowed lex), and each answer is two rope lookups per visible line: remembered per
+;; `[rope lo hi cap]`, where an unchanged rope is the same handle and `=` is immediate.
+(memo/defmemo ed-long-lines-in?
+  8
+  (rope lo hi cap)
+  "Whether any line in `[lo, hi)` of `rope` is longer than `cap` characters — the memoised
+half of [[ed-long-lines?]], public only because `defmemo` defines a public function."
+  (let (line-count (text/line-count rope)
+        total (text/length rope)
+        from (math/max 0 lo)
+        to (math/min line-count hi)
+        window-chars (if (>= from to)
+                       0
+                       (- (if (>= to line-count) total (text/line->char rope to))
+                         (text/line->char rope from))))
+    ;; a window holding no more than `cap` characters cannot hold a line longer than it
+    (and (> window-chars cap)
+      (any? (range from to) (fn (line) (> (ed-line-length rope line-count total line) cap))))))
+
 (defn- ed-long-lines? (buf lo hi)
   "Whether any line in `[lo, hi)` is longer than `*fontify-line-cap*`."
-  (let (rope (buffer-rope buf)
-        nlines (buffer-line-count buf)
-        total (buffer-length buf))
-    (any? (range (math/max 0 lo) (math/min nlines hi))
-      (fn (line) (> (ed-line-length rope nlines total line) *fontify-line-cap*)))))
+  (ed-long-lines-in? (buffer-rope buf) lo hi *fontify-line-cap*))
 
 (defn- ed-clipped-line-ranges (buf lo hi clip)
   "The char range `[start end]` of each line in `[lo, hi)`, clipped to its first `clip`
@@ -620,6 +636,93 @@ of the tree, not a parse."
       (< (:bhi entry) (buffer-line-count buf))
       (let (band-end (ed-line-start-char buf (:bhi entry)))
         (every? changes (fn (range-pair) (>= (first range-pair) band-end)))))))
+
+;; A large buffer's tree is reparsed off the loop (`syntaxtree/*tree-sync-max*`), so for a
+;; key or two after an edit it is BEHIND the text and cannot colour it. The band it last
+;; coloured is carried across the edits instead: the splice log says what each edit
+;; replaced, and a span moves with the text it covers — so typing never drops colour to a
+;; slice lex, and the tree recolours the band once it lands.
+
+(sig ed-shift-offset (int int int int -> int))
+(defn- ed-shift-offset (offset lo hi added)
+  ;; `offset` across a splice that replaced `[lo, hi)` with `added` chars: unmoved before it,
+  ;; shifted by the length change after it, and to the end of the new text inside it. An
+  ;; offset AT an insertion stays before it — right for a span's end, which then does not
+  ;; swallow what is typed after it; a span's start uses [[ed-shift-start]]
+  (cond
+    (<= offset lo) offset
+    (>= offset hi) (+ offset (- added (- hi lo)))
+    else (+ lo added)))
+
+(sig ed-shift-start (int int int int -> int))
+(defn- ed-shift-start (offset lo hi added)
+  ;; a span's start: as `ed-shift-offset`, except that text inserted AT it goes before it —
+  ;; a line typed above a `def` leaves the keyword a keyword rather than growing it upward
+  (if (and (= offset lo) (= lo hi)) (+ offset added) (ed-shift-offset offset lo hi added)))
+
+(defn ed-shift-spans (spans splices)
+  "`[start end face]` `spans` carried across `splices` (`[lo hi replacement]`, oldest first,
+each against the text the one before it left, as `buffer-splices-since` gives them): a span
+after an edit moves by its length change, one an insertion lands inside grows over it (text
+inserted at its start or end stays outside it), one
+a deletion swallows is dropped.
+
+    (panes/ed-shift-spans [[0 3 :keyword] [4 7 :name]] [[1 1 \"ab\"]])   → [[0 5 :keyword] [6 9 :name]]"
+  (fold splices
+    spans
+    (fn (current splice)
+      (let ([lo hi replacement] splice
+            added (string/length replacement))
+        (fold current
+          []
+          (fn (out span)
+            (let ([start end face] span
+                  from (ed-shift-start start lo hi added)
+                  to (ed-shift-offset end lo hi added))
+              (if (< from to) (conj out [from to face]) out))))))))
+
+(defn- ed-band-end-char (rope line-count line)
+  ;; the char offset `line` starts at in `rope`, or its end for a line past the last
+  (if (>= line line-count) (text/length rope) (text/line->char rope line)))
+
+(defn- ed-behind-tree-band (m pane buf old top vrows)
+  "`old` — a band the buffer's tree coloured, or one already carried — carried to `buf`'s
+text while its tree is behind (`syntaxtree/behind-syntax-tree?`): its spans shifted across
+the edits since ([[ed-shift-spans]]) and its line range moved with them, marked `:shifted?`
+(and no longer `:tree?`) so the tree recolours it when it lands rather than letting it
+survive as its own. Nil when there is no such band or tree, the splice log cannot say what
+the edits were, or the carried band no longer holds the viewport — the caller slices."
+  (when (and old
+          (or (:tree? old) (:shifted? old))
+          (behind-syntax-tree? m (get-in pane [:payload :buffer]) buf))
+    (let (old-rope (:rope old)
+          splices (when (not (= old-rope (buffer-rope buf)))
+                    (buffer-splices-since (assoc buf :rope old-rope) buf)))
+      (cond
+        ;; nothing moved since it was carried (point moved, the tree still out)
+        (= old-rope (buffer-rope buf)) (when (ed-band-contains? old buf top vrows) old)
+        ;; the log cannot account for the edits: nothing to carry the spans with
+        (nil? splices) nil
+        else
+          (let (old-lines (text/line-count old-rope)
+                rope (buffer-rope buf)
+                lines (buffer-line-count buf)
+                carry (fn (offset)
+                        (fold splices
+                          offset
+                          (fn (at splice)
+                            (let ([lo hi replacement] splice)
+                              (ed-shift-offset at lo hi (string/length replacement))))))
+                start (carry (ed-band-end-char old-rope old-lines (:blo old)))
+                end (carry (ed-band-end-char old-rope old-lines (:bhi old)))
+                carried {:rope rope
+                         :blo (text/char->line rope start)
+                         :bhi (if (>= end (text/length rope)) lines (text/char->line rope end))
+                         :src nil
+                         :base 0
+                         :shifted? true
+                         :spans (ed-shift-spans (:spans old) splices)})
+            (when (ed-band-contains? carried buf top vrows) carried))))))
 
 (defn- ed-pane-tree (m pane buf)
   "`[tree-entry faces]` for `pane`'s buffer when it has a current tree and its mode a face
@@ -823,11 +926,14 @@ mode does not fontify."
       (let (top (ed-pane-top pane buf)
             vrows (ed-pane-vrows pane buf))
         ;; as `ed-pane-spans`: the unchanged band is recognised before the restart lookup
-        (if (ed-band-hits? old buf top vrows)
+        ;; …but a carried band is only kept by `ed-behind-tree-band`, while the tree is out
+        (if (and (ed-band-hits? old buf top vrows) (not (:shifted? old)))
           [old caches]
           (let ([tree-entry faces] (or (ed-pane-tree m pane buf) [nil nil])
-                builder (when (nil? faces) (buffer-line-lexer buf)))
+                carried (when (nil? faces) (ed-behind-tree-band m pane buf old top vrows))
+                builder (when (and (nil? faces) (nil? carried)) (buffer-line-lexer buf)))
             (cond
+              carried [carried caches]
               ;; the edit left this band's text and colouring alone: re-stamp it with the
               ;; rope it now serves, keeping its spans (the view memo keys on that vector)
               (and faces (ed-tree-band-survives? old tree-entry buf top vrows))

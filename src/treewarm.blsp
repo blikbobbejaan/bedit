@@ -15,9 +15,12 @@ names none of it."
   "True when the current buffer is one the loop will not open a tree for itself
 (`syntaxtree/*tree-open-max*`), none is held for it, and no warm is already in flight —
 the tree this warm opens. An edit to a buffer that HAS a tree never makes it stale: the
-loop updates that tree itself."
+loop updates that tree itself. Nor is a text a warm already failed on (`:tree-warm-failed`):
+this predicate arms the idle beat, and one that stayed true after a failure would fire it
+again after every beat, forever."
   (let (buf (ed-current-buf m))
     (and (not (:tree-warm-proc m))
+      (not (= (buffer-rope buf) (:tree-warm-failed m)))
       (ed-mode-service buf :ts-faces)
       (ed-mode-service buf :ts-lang)
       (> (buffer-length buf) *tree-open-max*)
@@ -32,8 +35,10 @@ previous tree to reparse from — and on a 250 KB Elixir file it is ~650 ms. The
 tree itself only for a buffer under `syntaxtree/*tree-open-max*`; a larger one keeps the
 windowed slice path, and its structural queries parse the text, until this task's tree
 arrives. The handle lives in a runtime-wide registry, so the task's handle is valid in the
-editor process; the reply carries it back with the rope it was parsed from and the pool
-index it belongs to.
+editor process; the reply carries it back alone. A rope cannot cross a message (a task may
+CAPTURE one, never return one — a warm that returned its rope died in `task` and no large
+buffer ever got a tree), so the rope it was parsed from, its language and the pool index it
+belongs to wait in the model beside the in-flight task.
 
 Runs on the idle beat beside the diff-hl and diagnostics launches, and for the same
 reason."
@@ -46,32 +51,41 @@ reason."
           job (task (fn ()
                       (check-allow :discarded-catch
                         (try
-                          {:tree (tree-open rope lang) :rope rope :lang lang}
+                          {:tree (tree-open rope lang)}
                           (catch _ :failed))))))
-      (assoc m :tree-warm-proc job :tree-warm-index (ed-current-index m)))))
+      (assoc m
+        :tree-warm-proc job
+        :tree-warm-index (ed-current-index m)
+        :tree-warm-rope rope
+        :tree-warm-lang lang))))
 
 (sig ed-apply-tree-warm (model any -> model))
 (defn ed-apply-tree-warm (m result)
   "A finished warm: install the tree it opened as that pool buffer's — unless the loop has one
 for it by now, or the handle did not survive the trip, in which case it is freed — and clear
-the in-flight handle. If the buffer moved on while it ran, the tree is still a sound base:
-the next refresh updates it from its rope to the buffer's."
+the in-flight handle and what it was launched over. If the buffer moved on while it ran, the
+tree is still a sound base: the next refresh updates it from its rope to the buffer's."
   (let (idx (:tree-warm-index m)
         tree (when (map? result) (:tree result))
-        cleared (assoc m :tree-warm-proc nil :tree-warm-index nil))
+        cleared (assoc m
+                  :tree-warm-proc nil
+                  :tree-warm-index nil
+                  :tree-warm-rope nil
+                  :tree-warm-lang nil))
     (cond
-      (nil? tree) cleared
+      (nil? tree) (assoc cleared :tree-warm-failed (:tree-warm-rope m))
       (or (not (int? idx))
         (>= idx (count (:buffers cleared)))
         (syntax-tree-entry cleared idx)
         (not (tree-alive? tree)))
         (do (tree-free tree) cleared)
-      else (install-syntax-tree cleared idx tree (:rope result) (:lang result)))))
+      else (install-syntax-tree cleared idx tree (:tree-warm-rope m) (:tree-warm-lang m)))))
 
 ;; ---- registration ---------------------------------------------------------------
 ;; the reply carries the tree the task opened, and clears the slot either way
 (register-task-reply :tree-warm-proc 'treewarm/ed-apply-tree-warm nil nil)
 
-;; no `:stale?`: a warm never ARMS the beat on its own — it rides one the edit armed, beside
-;; the diff-hl and diagnostics launches
-(register-idle-job :tree-warm {:order 90 :run 'treewarm/ed-launch-tree-warm})
+;; `:stale?` ARMS the beat: a large file opened and only read has no edit to arm one, and a
+;; beat it merely rode never came, so its first structural query paid the parse on a keypress
+(register-idle-job :tree-warm
+  {:order 90 :run 'treewarm/ed-launch-tree-warm :stale? 'treewarm/ed-tree-warm-stale?})
