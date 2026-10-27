@@ -210,8 +210,10 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             Go / C / Terraform + HCL (two modes over one `:hcl` grammar,
                             told apart by `:type`; only Terraform's files take `terraform
                             fmt`), each naming where its grammar lives (`:grammar`, for
-                            M-x grammar-install), plus the lexer-only layers: env, shell,
-                            Dockerfile, JSON / YAML / TOML / Makefile / INI / commit, and
+                            M-x grammar-install) — a spec may extend another's (TypeScript
+                            is JavaScript's, Terraform HCL's). `deflexer` is its sibling for
+                            the line-lexer languages (a pattern + a `lex-*` stem): env, shell,
+                            Dockerfile, JSON / YAML / TOML / Makefile / INI / commit. And
                             org-mode (`org`'s spans and outline, folding, TODO cycling, heading
                             motion)
 src/org.blsp                Org text: `org-spans` (the colouring), heading levels, where a
