@@ -112,7 +112,8 @@ src/treewarm.blsp           a large tree-sitter buffer's parse warmed off the lo
 src/syntaxtree.blsp         the tree-sitter parse each pool buffer KEEPS (brood ADR-443):
                             `:syntax-trees` by pool index, updated incrementally per edit by the
                             span refresh, freed on kill; panes colour a band from it
-                            (`fontify-tree`) and keep a band its `tree-changes` left alone. A
+                            (`fontify-tree`, with the mode's injections) and keep a band its
+                            `tree-changes` left alone. A
                             runtime without tree handles keeps the slice path. Past
                             `*tree-sync-max*` (250 KB) the update runs OFF the loop, one in
                             flight, coalescing a burst; meanwhile the band is carried (spans
@@ -121,7 +122,9 @@ src/linecache.blsp          the line-state highlight cache a LEXER mode keeps (b
                             a mode's `:line-lexer` builder (markdown's fence, org's #+BEGIN_
                             block, the `lex-*` formats stateless), `:line-caches` by pool index,
                             threaded by the span refresh, dropped on kill; an edit re-lexes the
-                            lines it touched, exact at any depth — no lead-in, no restart
+                            lines it touched, exact at any depth — no lead-in, no restart. A
+                            mode's `:line-band-pass` then sees the band: what spans lines, as
+                            markdown's fences coloured as their language (brood ADR-489)
 src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd).
                             Every key is ONE `settings/define` (std `settings`, brood ADR-428):
                             its default, type and doc give the check, the fallback
@@ -202,8 +205,8 @@ src/lisp-modes.blsp         the other Lisps: `deflisp` (a special-form set + a f
                             Clojure, Scheme, Fennel; `lisp-indent-with` (Emacs's rule);
                             wos kernel source
 src/languages.blsp          `deflanguage` declares a tree-sitter language from ONE spec
-                            (faces, indent, heredocs, formatter) and generates its whole
-                            service set — show-paren (`tsbrackets`) included — checked against
+                            (faces, indent, heredocs, injections, formatter) and generates its
+                            whole service set — show-paren (`tsbrackets`) included — checked against
                             editor/treesit/language-contract, so an incomplete language
                             fails at load rather than at the keypress that needed it.
                             Ruby / Elixir / Python / Rust / JavaScript / TypeScript / TSX /
@@ -216,7 +219,12 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             `:fallback`: a buffer opened while the grammar is missing is typed
                             as the lexer's stand-in (`model/ed-grammar-fallback`) and becomes
                             the parsed mode when the grammar arrives (`ed-grammars-arrived`);
-                            JSON stays lexed past a megabyte (`:fallback-above`). `deflexer`
+                            JSON stays lexed past a megabyte (`:fallback-above`). `:injections`
+                            (brood ADR-489) is the code embedded in a language — a Terraform
+                            heredoc named BASH / JSON / PY, a Dockerfile `RUN` line as shell,
+                            Elixir's `~H` as HEEx (heex-mode) — coloured with the embedded
+                            language's OWN spec's faces, found per frame (`language-faces`), so
+                            a missing language or grammar keeps the host's colours. `deflexer`
                             is its sibling for the line-lexer languages (a pattern + a `lex-*`
                             stem): env, JSON5, Makefile / INI / commit. And org-mode (`org`'s
                             spans and outline, folding, TODO cycling, heading motion)
@@ -224,7 +232,9 @@ src/tsbrackets.blsp         show-paren over a tree-sitter parse: a bracket is a 
                             TOKEN, its partner the matching token under the same parent (so a
                             `(` in a string matches nothing), read off the held tree when the
                             buffer keeps one — every `deflanguage`'s `:bracket-match` /
-                            `:bracket-match-tree`
+                            `:bracket-match-tree`. A pair in the middle of its parent (an HCL
+                            block's braces) is found among the parent's children, anonymous
+                            tokens included (`node-children` all?), with no length cap
 src/org.blsp                Org text: `org-spans` (the colouring), heading levels, where a
                             subtree ends, the TODO cycle. Pure; languages.blsp's org-mode
                             is the mode over it (moved from brood's std by ADR-417)
@@ -239,8 +249,10 @@ src/mail-message.blsp       Internet mail messages: RFC 5322 headers, the MIME p
 src/lex-*.blsp              the lexical highlighters, each a pure `[start end face]` span fn
                             for a `:fontify` service: `lex-configs` (JSON / YAML / TOML /
                             Makefile / INI / commit, as `editor/lexer` tables), `lex-shell`,
-                            `lex-dotenv`, `lex-dockerfile`, `lex-markdown` (spans, and the
-                            rendering mdpreview paints). std's `editor/*` until brood ADR-417
+                            `lex-dotenv`, `lex-dockerfile`, `lex-markdown` (spans, a fence
+                            coloured as its info string's language over the whole fence —
+                            `markdown-fence-pass`, kept by body text — and the rendering
+                            mdpreview paints). std's `editor/*` until brood ADR-417
 src/gutter.blsp             the line-number gutter text-mode names as its `:gutter-*`
                             services: the number column, the diff-hl bar, and the margin
                             marks (● ✓ ✗ ⚠) read through one precedence table that both
