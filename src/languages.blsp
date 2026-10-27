@@ -66,6 +66,13 @@ when `M-x grammar-install` or `grammar-reload` brings the grammar (`model/ed-gra
 `:fallback-above` is a size in characters past which the lexer serves even with the grammar —
 JSON's, where a held tree of a large machine-written file costs more than it buys.
 
+`:injections` is the code EMBEDDED in the language (brood ADR-489): a vector of injection
+rules, `[{:content {:kind :template_literal :parent :heredoc_template} :lang-from
+:heredoc_identifier :aliases {\"BASH\" :bash}}]` — which nodes hold another language's text
+and how its language is named. The embedded language's faces are its own `deflanguage`'s,
+found when a frame asks (`spec-injections`); one with no spec or no grammar keeps this
+language's colours. Checked at registration like the face table.
+
 `:interpreters` lists the `#!` program names that select the mode for a file with no telling
 name, as `deflexer`'s does.
 
@@ -95,7 +102,14 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
     `(do
        (def ~spec-name ~spec)
        (defn ~(generated "-fontify") (text)
-         (editor/treesit/fontify text (get ~spec-ref :lang) (get ~spec-ref :faces)))
+         (editor/treesit/fontify text
+           (get ~spec-ref :lang)
+           (get ~spec-ref :faces)
+           true
+           (languages/spec-injections ~spec-ref)))
+       ;; the embedded languages' injection spec, built per call: an injected language's
+       ;; faces are ITS spec's, and it may be registered after this one
+       (defn ~(generated "-ts-injections") () (languages/spec-injections ~spec-ref))
        ;; `tree`: the buffer's held tree for exactly `text`, when the caller has one
        ;; (`commands/ed-indent-target`) — the indenter walks it instead of parsing `text`, which
        ;; is then the buffer's rope: only the lines it inspects are read (brood ADR-483)
@@ -117,11 +131,13 @@ The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared ba
             :indent '~(qualified "-indent")
             :restart '~(qualified "-restart")
             :faces '~(qualified "-ts-faces")
+            :injections '~(qualified "-ts-injections")
             :bracket-match '~(qualified "-bracket-match")}))
        ;; the line-lexer stand-in a buffer is typed as while the grammar is missing; nil
        ;; for a language with no `:fallback`
        (def ~(generated "-fallback-layer") (languages/fallback-layer '~name ~spec-ref))
        (languages/declare-definitions ~spec-ref)
+       (languages/register-spec ~spec-ref '~spec-ref)
        (languages/declare-grammar ~spec-ref)
        (languages/register-fallback ~spec-ref '~(qualified "-fallback-layer"))
        (doseq (program (get ~spec-ref :interpreters []))
@@ -179,9 +195,68 @@ file of the language opened without one can say how to get it."
     (when (not (nil? grammar))
       (grammars/declare-grammar (get spec :lang) grammar))))
 
+;; ---- injections: another language's code inside this one (brood ADR-489) ---------------
+;; A spec's `:injections` is the RULES of an ADR-489 injection spec: which nodes hold which
+;; language's text. The faces are not written there. Each embedded language colours with the
+;; table its own `deflanguage` declares, looked up when a frame asks, so the shell inside a
+;; Terraform heredoc follows shell-mode's table and a language registered later is found.
+
+(defn register-spec (spec spec-ref)
+  "Record that `spec-ref` (the `<name>-spec` global's symbol) is the spec of the tree-sitter
+language `(:lang spec)`, where `language-faces` finds an embedded language's table. Stored
+as the symbol and resolved per lookup, so a re-evaluated spec is the one read."
+  (registry/put! :languages/specs (get spec :lang) spec-ref))
+
+(defn language-faces (lang)
+  "The face table of the `deflanguage` whose grammar is `lang`, or nil when none is
+registered — an embedded language with no table keeps its host's colours."
+  (let (spec-ref (registry/lookup :languages/specs lang))
+    (when spec-ref (get (reflect/eval spec-ref) :faces))))
+
+(defn- rule-languages (rule)
+  ;; every language a rule can name: its fixed `:lang`, or its aliases' targets
+  (if (get rule :lang) [(get rule :lang)] (vals (or (get rule :aliases) {}))))
+
+(defn injection-spec (rules faces-of)
+  "The injection spec `{:rules :faces}` for `rules`, each named language's table from
+`(faces-of lang)`. A language with no table is left out: a rule fixed to it is dropped, an
+alias to it removed. Nil when no rule is left, which a fontify reads as no injections."
+  (let (faces (fold (mapcat rules rule-languages)
+                {}
+                (fn (acc lang)
+                  (if (contains? acc lang)
+                    acc
+                    (let (table (faces-of lang)) (if table (assoc acc lang table) acc)))))
+        kept (seq/keep rules
+               (fn (rule)
+                 (cond
+                   (get rule :lang) (when (contains? faces (get rule :lang)) rule)
+                   (get rule :aliases)
+                     (assoc rule
+                       :aliases
+                         (into {}
+                           (seq/filter (get rule :aliases)
+                             (fn ([_ lang]) (contains? faces lang)))))
+                   else rule))))
+    (when (not (empty? kept)) {:rules (vec kept) :faces faces})))
+
+(defn spec-injections (spec)
+  "The injection spec a `deflanguage` spec's `:injections` rules make with the registered
+languages' tables (`injection-spec`), or nil for a language that embeds none."
+  (let (rules (get spec :injections))
+    (when (not (empty? rules)) (injection-spec rules language-faces))))
+
+(defn injection-rule-problems (rules)
+  "What is malformed in a `deflanguage`'s `:injections` rules (`editor/treesit/injection-problems`),
+each named language given an empty table: whether the language has a real one is a question
+for the frame, when every language has registered."
+  (let (placeholder (into {} (map (mapcat rules rule-languages) (fn (lang) [lang {}]))))
+    (editor/treesit/injection-problems {:rules rules :faces placeholder})))
+
 (defn language-layer (name spec refs)
   "The mode layer for a `deflanguage`, checked against `editor/treesit/language-contract`.
-`refs` names the generated services: `{:fontify :indent :restart :faces :bracket-match}`.
+`refs` names the generated services: `{:fontify :indent :restart :faces :injections
+:bracket-match}`.
 
 Raises on an incomplete language rather than registering one. A mode missing `:indent`
 would register happily and simply do nothing on RET — a failure that surfaces as a key
@@ -196,6 +271,9 @@ by someone opening a file."
                ;; (`syntaxtree`, brood ADR-443): `:fontify` takes text, and a view that
                ;; keeps the document's parse asks the tree with the same table instead
                :ts-faces (:faces refs)
+               ;; a fn answering the injection spec the held tree is coloured with — the
+               ;; same one `:fontify` passes — for a language whose spec embeds others
+               :ts-injections (when (get spec :injections) (:injections refs))
                :file-pattern (get spec :pattern)
                :fontify (:fontify refs)
                :indent (:indent refs)
@@ -224,11 +302,17 @@ by someone opening a file."
                :grammar-fallback (when (fallback-type spec)
                                    {:type (fallback-type spec) :above (get spec :fallback-above)})}
         gaps (editor/treesit/missing-services layer)
-        face-problems (editor/treesit/face-table-problems (get spec :faces)))
+        face-problems (editor/treesit/face-table-problems (get spec :faces))
+        injection-problems (injection-rule-problems (get spec :injections [])))
     (when (not (empty? gaps))
       (error "deflanguage " name ": missing required service(s) " (->string gaps)))
     (when (not (empty? face-problems))
       (error "deflanguage " name ": malformed face table: " (string/join face-problems "; ")))
+    (when (not (empty? injection-problems))
+      (error "deflanguage "
+        name
+        ": malformed injections: "
+        (string/join injection-problems "; ")))
     layer))
 
 ;; ---- the line-lexer modes: env, JSON5 and the configuration formats -------------------
