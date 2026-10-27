@@ -207,7 +207,9 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             editor/treesit/language-contract, so an incomplete language
                             fails at load rather than at the keypress that needed it.
                             Ruby / Elixir / Python / Rust / JavaScript / TypeScript / TSX /
-                            Go / C, each naming where its grammar lives (`:grammar`, for
+                            Go / C / Terraform + HCL (two modes over one `:hcl` grammar,
+                            told apart by `:type`; only Terraform's files take `terraform
+                            fmt`), each naming where its grammar lives (`:grammar`, for
                             M-x grammar-install), plus the lexer-only layers: env, shell,
                             Dockerfile, JSON / YAML / TOML / Makefile / INI / commit, and
                             org-mode (`org`'s spans and outline, folding, TODO cycling, heading
@@ -398,7 +400,8 @@ src/tutor-workings.blsp     the tutorial's *Workings* pane: the per-box cascade 
                             tutorial owns the box parser and passes the index — acyclic)
 src/tutor-lessons.blsp      the tutorial's CONTENT only — the lessons vector (grow the course here)
 src/toolchain.blsp          the project TYPE as data: marker file -> which commands compile,
-                            test, run and REPL here (mix / nest / cargo / npm / go / make),
+                            test, run and REPL here (mix / nest / cargo / npm / go /
+                            terraform / make),
                             and which tasks it can list. projects.blsp derives its root
                             markers from this table, so a language is ONE edit
 src/results.blsp            the results-buffer abstraction behind *Tests* / *Run* / *compilation* /

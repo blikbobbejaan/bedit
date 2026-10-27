@@ -1,0 +1,185 @@
+;; Terraform and HCL (src/languages.blsp): two modes over ONE tree-sitter grammar
+;; (tree-sitter-grammars/tree-sitter-hcl), plus Terraform's language server row
+;; (src/lsp.blsp) and toolchain row (src/toolchain.blsp). The parsed half needs
+;; `~/.config/bedit/grammars/libtree-sitter-hcl.so` (M-x grammar-install hcl) and SKIPS
+;; without it, as every runtime-loaded language's tests do.
+(defmodule terraform-test
+  (:use test)
+  (:use model)
+  (:use projects) ; *project-markers*
+  (:use editor/buffer))
+
+(purge-stale-temp "bedit-tf-")
+
+;; loaded here, at file load, so the `when`s below see what is installed
+(grammars/load-user-grammars)
+
+(defn- tf-model (text file) (ed-init (make-buffer text file file)))
+(defn- tf-buffer (text file) (ed-current-buf (tf-model text file)))
+(defn- tf-press (m keys) (fold keys m (fn (acc k) (input/ed-update acc k 80 24))))
+
+(defn- face-at (spans src needle)
+  "The face of the span that starts exactly where `needle` first occurs in `src`, or nil."
+  (let (at (index-of src needle)
+        hit (seq/find spans (fn (span) (= (first span) at))))
+    (when hit (nth hit 2))))
+
+(defn- face-of (name) (editor/face/face name))
+
+(describe "the modes, chosen by file name"
+  (test "Terraform's extensions open in terraform-mode, OpenTofu's and test files too"
+    (doseq (file ["main.tf" "prod.tfvars" "main.tofu" "tests/s3.tftest.hcl" "s3.tofutest.hcl"])
+      (assert= (ed-buf-mode-name (tf-buffer "" file)) "terraform")))
+  (test "a plain .hcl file is hcl-mode, and a .tf.json file stays JSON"
+    (assert= (ed-buf-mode-name (tf-buffer "" "packer.pkr.hcl")) "hcl")
+    (assert= (ed-buf-mode-name (tf-buffer "" "nomad.hcl")) "hcl")
+    (assert= (ed-buf-mode-name (tf-buffer "" "main.tf.json")) "json"))
+  (test "both parse with the one grammar, which says where it lives"
+    (assert= (ed-mode-service (tf-buffer "" "main.tf") :ts-lang) :hcl)
+    (assert= (ed-mode-service (tf-buffer "" "x.hcl") :ts-lang) :hcl)
+    (assert= (grammars/grammar-source :hcl)
+      "https://github.com/tree-sitter-grammars/tree-sitter-hcl"))
+  (test "a comment is a #"
+    (assert= (ed-mode-service (tf-buffer "" "main.tf") :comment-syntax) "# ")
+    (assert= (ed-mode-service (tf-buffer "" "x.hcl") :comment-syntax) "# ")))
+
+(describe "the formatter"
+  (test "terraform fmt formats a Terraform file; plain HCL has none"
+    (assert= (formatter/format-command-for (tf-buffer "" "/srv/infra/main.tf"))
+      ["terraform" "fmt" "/srv/infra/main.tf"])
+    (is (nil? (formatter/format-command-for (tf-buffer "" "/srv/infra/nomad.hcl")))))
+  ;; terraform is a real binary; with it installed, run it the way M-x format-buffer does
+  (when (os/which "terraform")
+    (test "terraform fmt over the file aligns the equals signs"
+      (let (path (str (temp-dir "bedit-tf-") ".tf")
+            _ (file/spit path "locals {\n  a = 1\n  bbb = 2\n}\n")
+            result (formatter/format-run (formatter/format-job (tf-buffer "" path))))
+        (is (first result))
+        (assert= (file/slurp path) "locals {\n  a   = 1\n  bbb = 2\n}\n")))))
+
+(describe "the fontify restart"
+  (test "the previous column-0 line that starts a block"
+    (let (src "locals {\n  a = 1\n}\n\nresource \"x\" \"y\" {\n  b = 2\n}\n")
+      (assert= (languages/hcl-fontify-restart src (index-of src "  b"))
+        (index-of src "resource"))))
+  (test "a heredoc opened above declines the cut — its body may hold anything at column 0"
+    (let (src "a = <<EOT\nresource \"x\" \"y\" {\nEOT\nb = {\n  c = 2\n}\n")
+      (assert= (languages/hcl-fontify-restart src (index-of src "  c")) 0))))
+
+;; terraform-fmt-clean (`terraform fmt -check`)
+(def tf-src
+  "# The log bucket.\nterraform {\n  required_providers {\n    aws = {\n      source  = \"hashicorp/aws\"\n      version = \"~> 5.0\"\n    }\n  }\n}\n\nvariable \"environment\" {\n  type    = string\n  default = \"staging\"\n\n  validation {\n    condition     = contains([\"staging\", \"production\"], var.environment)\n    error_message = \"Must be staging or production.\"\n  }\n}\n\nlocals {\n  // tags every resource carries\n  tags = {\n    Environment = var.environment\n    Count       = 3\n    Enabled     = true\n    Owner       = null\n  }\n  names = [for name in var.names : upper(name) if name != \"\"]\n  zones = [\n    \"a\",\n    \"b\",\n  ]\n}\n\n/* the bucket itself */\nresource \"aws_s3_bucket\" \"logs\" {\n  bucket = \"logs-${var.environment}-${local.tags.Count}\"\n  tags = merge(\n    local.tags,\n    { Name = \"logs\" },\n  )\n\n  lifecycle {\n    prevent_destroy = true\n  }\n}\n\nresource \"aws_iam_policy\" \"read\" {\n  policy = <<-EOT\n    {\n      \"Bucket\": \"${aws_s3_bucket.logs.id}\"\n    }\n  EOT\n}\n\noutput \"bucket_arn\" {\n  value = aws_s3_bucket.logs.arn\n}\n")
+
+(when (grammars/grammar-loaded? :hcl)
+  (describe "terraform, parsed"
+    (def tf-spans (languages/terraform-fontify tf-src))
+
+    (test "comments, all three spellings"
+      (assert= (face-at tf-spans tf-src "# The log") (face-of :syntax/comment))
+      (assert= (face-at tf-spans tf-src "// tags") (face-of :syntax/comment))
+      (assert= (face-at tf-spans tf-src "/* the bucket") (face-of :syntax/comment)))
+    (test "a block's labels are strings, as is a plain string value"
+      (assert= (face-at tf-spans tf-src "\"aws_s3_bucket\"") (face-of :syntax/string))
+      (assert= (face-at tf-spans tf-src "\"logs\" {") (face-of :syntax/string))
+      (assert= (face-at tf-spans tf-src "\"hashicorp/aws\"") (face-of :syntax/string)))
+    (test "a template string: its text is a string, `${` and `}` are not, the inside is code"
+      (assert= (face-at tf-spans tf-src "logs-$") (face-of :syntax/string))
+      (assert= (face-at tf-spans tf-src "${var.environment}") (face-of :syntax/special))
+      (is (nil? (face-at tf-spans tf-src "var.environment}"))))
+    (test "a heredoc: its marker and its body are strings, its interpolation is not"
+      (assert= (face-at tf-spans tf-src "<<-EOT") (face-of :syntax/string))
+      (assert= (face-at tf-spans tf-src "EOT\n    {") (face-of :syntax/string))
+      (assert= (face-at tf-spans tf-src "{\n      \"Bucket\"") (face-of :syntax/string))
+      (assert= (face-at tf-spans tf-src "${aws_s3") (face-of :syntax/special)))
+    (test "numbers, booleans and null"
+      (assert= (face-at tf-spans tf-src "3\n") (face-of :syntax/number))
+      (assert= (face-at tf-spans tf-src "true\n    Owner") (face-of :syntax/special))
+      (assert= (face-at tf-spans tf-src "null") (face-of :syntax/special)))
+    (test "a for expression's for / in / if are keywords"
+      (assert= (face-at tf-spans tf-src "for name") (face-of :syntax/keyword))
+      (assert= (face-at tf-spans tf-src "in var.names") (face-of :syntax/keyword))
+      (assert= (face-at tf-spans tf-src "if name") (face-of :syntax/keyword)))
+
+    ;; Every line where `terraform fmt` put it — but a heredoc's body: it is TEXT, and the
+    ;; indenter has no way to leave a line inside a string alone (std's `indent-column`
+    ;; answers a level for every line), so those three are not asked.
+    (test "it indents every line where terraform fmt put it — blocks, objects, lists, calls"
+      (let (buf (tf-buffer tf-src "main.tf")
+            indent (ed-mode-service buf :indent)
+            lines (string/split tf-src "\n")
+            body-first (inc (count (string/split (string/substring tf-src
+                                                   0
+                                                   (index-of tf-src "<<-EOT"))
+                                     "\n")))
+            body (into #{} (range (dec body-first) (+ body-first 2)))
+            rows (seq/filter (range (count lines))
+                   (fn (i)
+                     (and (not (= (string/trim (nth lines i "")) "")) (not (contains? body i)))))
+            bol-of (fn (i) (fold (range i) 0 (fn (a k) (+ a (string/length (nth lines k "")) 1))))
+            want (into []
+                   (map rows
+                     (fn (i)
+                       (let (line (nth lines i ""))
+                         (- (string/length line) (string/length (string/triml line)))))))
+            got (into [] (map rows (fn (i) (indent tf-src (bol-of i))))))
+        (assert= (count body) 3)
+        (is (> (count want) 40))
+        (assert= got want)))
+    (test "RET after a block's `{` indents the new line, though nothing parses yet"
+      (let (text "resource \"aws_s3_bucket\" \"logs\" {"
+            m (tf-model text "main.tf")
+            at-end (ed-set-buf m (goto-char (ed-current-buf m) (string/length text)))
+            entered (tf-press at-end [:enter]))
+        (assert= (buffer-text (ed-current-buf entered)) (str text "\n  "))))
+
+    ;; `:definitions` is every block: C-M-a in a nested block stops at it, and outside one at
+    ;; the resource — `resource "aws_s3_bucket" "logs"`, labels and all
+    (test "C-M-a lands on the enclosing block, the deepest one"
+      (assert= (editor/treesit/point-defun-start tf-src :hcl (index-of tf-src "prevent_destroy"))
+        (index-of tf-src "lifecycle {"))
+      (assert= (editor/treesit/point-defun-start tf-src :hcl (index-of tf-src "bucket ="))
+        (index-of tf-src "resource \"aws_s3_bucket\" \"logs\""))
+      (assert= (editor/treesit/point-defun-start tf-src :hcl (index-of tf-src "error_message"))
+        (index-of tf-src "validation {")))
+    (test "C-M-e lands just past the block's closing brace"
+      (let (start (index-of tf-src "output \"bucket_arn\""))
+        (assert= (editor/treesit/point-defun-end tf-src :hcl (+ start 10))
+          (dec (string/length tf-src)))))))
+
+(describe "terraform-ls"
+  (test "a Terraform file reaches it; a plain .hcl file reaches no server"
+    (assert= ["terraform-ls"] (into [] (map (lsp/lsp-specs-for "/p/main.tf") :name)))
+    (assert= ["terraform-ls"] (into [] (map (lsp/lsp-specs-for "/p/prod.tfvars") :name)))
+    (assert= ["terraform-ls"] (into [] (map (lsp/lsp-specs-for "/p/main.tofu") :name)))
+    (assert= [] (lsp/lsp-specs-for "/p/nomad.hcl")))
+  (test "HashiCorp's server first, OpenTofu's when only it is installed — both `serve`"
+    (assert= [["terraform-ls" ["serve"]] ["tofu-ls" ["serve"]]]
+      (:commands (lsp/lsp-spec-named "terraform-ls"))))
+  (test "the language ids both servers accept"
+    (assert= (lsp/lsp-language-id "/p/main.tf") "terraform")
+    (assert= (lsp/lsp-language-id "/p/prod.tfvars") "terraform-vars"))
+  (test "it starts in the root module — the folder holding the lock file"
+    (let (top (temp-dir "bedit-tf-")
+          module (path/join top "modules/bucket"))
+      (file/mkdir module)
+      (file/spit (path/join top ".terraform.lock.hcl") "")
+      (assert= top
+        (lsp-commands/ed-lsp-root (lsp/lsp-spec-named "terraform-ls") (path/join module "main.tf")))))
+  ;; the row is inert until a server is installed: nothing resolves, so nothing is spawned
+  (when (and (nil? (os/which "terraform-ls")) (nil? (os/which "tofu-ls")))
+    (test "with neither server installed there is nothing to start"
+      (is (nil? (lsp-commands/ed-lsp-command (lsp/lsp-spec-named "terraform-ls")))))))
+
+(describe "the Terraform toolchain"
+  (test "a root module — the lock file `terraform init` wrote — is a Terraform project"
+    (let (dir (temp-dir "bedit-tf-"))
+      (file/mkdir dir)
+      (file/spit (path/join dir ".terraform.lock.hcl") "")
+      (let (toolchain (toolchain/detect dir))
+        (assert= (:id toolchain) :terraform)
+        (assert= (:compile toolchain) "terraform validate")
+        (assert= (:test toolchain) "terraform test")
+        (assert= (:run toolchain) "terraform plan")
+        (assert= (:repl toolchain) "terraform console"))))
+  (test "the lock file does not make a project root — root modules sit in subfolders"
+    (refute (includes? *project-markers* ".terraform.lock.hcl"))))
