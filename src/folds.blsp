@@ -43,15 +43,99 @@ flattened and split."
   (let (last (extent-service rope line))
     (if (and (int? last) (> last line)) last nil)))
 
-;; Memoised on the text, the folded lines and the mode's service: asked by the row table,
-;; the scroll clamp and the cursor on every frame of a folded buffer.
-(defmemo hidden-from 4 (rope extent-service folded)
-  "The set of lines the folds at `folded` hide in `rope`."
-  (fold folded
-    #{}
-    (fn (hidden line)
-      (let (last (extent-in extent-service rope line))
-        (if (or (nil? last) (not (int? line))) hidden (into hidden (range (inc line) (inc last))))))))
+;; ---- the hidden set, kept across edits ---------------------------------------------
+;; Asked by the row table, the scroll clamp and the cursor on every frame of a folded
+;; buffer, so it is remembered. Keyed on the rope alone it was rebuilt on every edit — every
+;; fold's extent asked again, each reading its subtree — though typing outside a fold changes
+;; no fold. So the last few answers are kept with the FOLDS they came from (`[heading last]`
+;; ranges), and an answer for an earlier rope of the same buffer is MOVED across an edit the
+;; buffer's splice log places outside every fold: the folds below the edit shift by the lines
+;; it added, the rest stand, and no extent is asked. An extent reads its heading's line
+;; through the line after its last (Org's subtree ends where the next heading starts), so an
+;; edit touching none of those lines cannot change it. Any other edit asks the extents again.
+
+(def- *hidden-capacity* 4)
+
+(def- *hidden-recent* '())
+;; `{:rope :service :folded :ranges :hidden}`, newest first, at most `*hidden-capacity*` — the
+;; bounded global store `defmemo` keeps, with each answer's ranges beside it
+
+(defn- ranges-from (rope extent-service folded)
+  ;; `[heading last]` for each fold at `folded` — `last` the heading itself for one that folds
+  ;; nothing now, which an edit below it can still change
+  (map folded
+    (fn (line) [line (or (extent-in extent-service rope line) line)])))
+
+;; check-allow: a range's lines are line numbers — an extent's ints, or those moved by a
+;; difference of two line counts — which the checker reads back out of the tuple as `number`
+(check-allow :type-mismatch
+  (defn- ranges-hidden (ranges)
+    ;; the lines `ranges` hide
+    (fold ranges #{} (fn (hidden [line last]) (into hidden (range (inc line) (inc last)))))))
+
+(defn- moved-ranges (entry buf folded)
+  "`entry`'s ranges carried onto `buf`'s text — `[ranges shifted?]` — or nil when they cannot
+be: the splice log does not reach `entry`'s rope, the edit touches a fold (its heading through
+the line after its last), or the folds are not where `folded` says they are now."
+  (let (old (:rope entry)
+        splices (buffer-splices-since (assoc buf :rope old) buf)
+        cover (when splices (ed-splices-cover splices)))
+    (when cover
+      (let ([lo old-hi _] cover
+            from-line (text/char->line old lo)
+            to-line (text/char->line old old-hi)
+            delta (- (buffer-line-count buf) (text/line-count old))
+            ranges (:ranges entry))
+        (when (not (any? ranges
+                     (fn ([line last]) (and (<= from-line (inc last)) (>= to-line line)))))
+          (let (shifted? (and (not (= delta 0))
+                           (any? ranges (fn (range) (> (first range) to-line))))
+                moved (if shifted?
+                        (map ranges
+                          (fn ([line last])
+                            (if (> line to-line) [(+ line delta) (+ last delta)] [line last])))
+                        ranges))
+            ;; the folds the markers hold now are the ones carried, moved as the text moved
+            (when (= (map moved first) folded) [moved shifted?])))))))
+
+(defn- carried-entry (buf extent-service folded)
+  "A remembered answer for `extent-service` moved across the edit since onto `buf`'s text
+([[moved-ranges]]): the new entry, or nil when none can be."
+  (letrec (go (fn (entries)
+                (if (empty? entries)
+                  nil
+                  (let (entry (first entries)
+                        carried (when (= (:service entry) extent-service)
+                                  (moved-ranges entry buf folded)))
+                    (if (nil? carried)
+                      (go (rest entries))
+                      (let ([ranges shifted?] carried)
+                        {:rope (buffer-rope buf)
+                         :service extent-service
+                         :folded folded
+                         :ranges ranges
+                         :hidden (if shifted? (ranges-hidden ranges) (:hidden entry))}))))))
+    (go *hidden-recent*)))
+
+(defn- hidden-entry (buf extent-service folded)
+  "The remembered answer for `buf`'s folds: the one for this very text, else one moved across
+the edit since ([[carried-entry]]), else asked of the extents afresh — remembered either way."
+  (let (rope (buffer-rope buf)
+        same (seq/find *hidden-recent*
+               (fn (entry)
+                 (and (= (:rope entry) rope)
+                   (= (:service entry) extent-service)
+                   (= (:folded entry) folded)))))
+    (or same
+      (let (entry (or (carried-entry buf extent-service folded)
+                    (let (ranges (ranges-from rope extent-service folded))
+                      {:rope rope
+                       :service extent-service
+                       :folded folded
+                       :ranges ranges
+                       :hidden (ranges-hidden ranges)})))
+        (def *hidden-recent* (take (cons entry *hidden-recent*) *hidden-capacity*))
+        entry))))
 
 (defn hidden-lines (buf)
   "The lines of `buf` its folds hide — `#{}` for a buffer with none, which is nearly all."
@@ -59,7 +143,7 @@ flattened and split."
         extent-service (ed-mode-service buf :fold-extent))
     (if (or (empty? folded) (nil? extent-service))
       #{}
-      (hidden-from (buffer-rope buf) extent-service folded))))
+      (:hidden (hidden-entry buf extent-service folded)))))
 
 (sig extent (buffer int -> (or nil int)))
 (defn extent (buf line)
