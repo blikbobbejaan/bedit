@@ -1,0 +1,180 @@
+(defmodule tsbrackets
+  "Bracket matching (show-paren) for a tree-sitter language — the `:bracket-match` service
+every `deflanguage` mode gets, and `:bracket-match-tree`, its form over the buffer's held tree.
+
+brood-mode matches brackets with its reader (`editor/highlight/bracket-match`); a language
+the reader cannot read had nothing. Matching characters would be wrong where it matters
+most — a `(` in a string, a `}` in a comment, bash's `case` arm `1)`, which opens nothing —
+so a bracket here is a DELIMITER TOKEN of the parse: an anonymous leaf (`(`, `{`, `$(`,
+`%{`, `[[`) that ends with an opener or begins with a closer. Its partner is the matching
+token under the same parent node, which is how every grammar writes a delimited
+construct: the `arguments` node is `( … )`, the `block` node `{ … }`.
+
+Nearly every pair is the parent's first and last token, which two chain queries confirm
+(`%tree-sitter-tree-chain`, O(depth)) whatever the size of what lies between. A pair in the
+middle of its parent — HCL's `resource \"x\" \"y\" { … }`, bash's `name() { … }` — is found by
+walking the parent's own text between its named children, each candidate confirmed by its
+chain, within `*scan-budget*` characters. A token whose partner is missing is `:unmatched`
+only when the parse holds an error; in a tree without one, a lone `)` is the grammar's own
+use of the character (a `case` arm) and matches nothing.
+
+A match is `[opener closer]` (the offsets to paint, the opener's first), `[at :unmatched]`,
+or nil away from a bracket — `editor/highlight/bracket-match`'s shape, so the view paints
+either alike.")
+
+(defdyn *scan-budget*
+  ;; the most characters one match walks between a parent's named children before giving up
+  ;; (no highlight, never a false red) — the view's own window each side of point
+  4000)
+
+(def- closer-of {"(" ")" "[" "]" "{" "}"})
+(def- opener-of {")" "(" "]" "[" "}" "{"})
+
+(defn- or-nil (thunk)
+  ;; the error IS the answer: a language without a loaded grammar has no parse
+  (check-allow :discarded-catch
+    (try (thunk) (catch _ nil))))
+
+(defn- same-node? (a b)
+  (and (= (:kind a) (:kind b)) (= (:start a) (:start b)) (= (:end a) (:end b))))
+
+(defn- delimiter-in (chain)
+  "The delimiter a chain ends at: `[leaf parent]`, where `parent` is the node the leaf
+delimits — above any wrapper node of the leaf's own extent (HCL's `block_start` around its
+`{`) — or nil when the chain does not end at an anonymous leaf with a parent."
+  (let (leaf (last chain))
+    (when (and leaf (not (:named leaf)) (not (:container leaf)))
+      (letrec (outermost (fn (i)
+                           (let (above (when (> i 0) (nth chain (dec i))))
+                             (if (and above
+                                   (= (:start above) (:start leaf))
+                                   (= (:end above) (:end leaf)))
+                               (outermost (dec i))
+                               i))))
+        (let (top (outermost (dec (count chain))))
+          (when (> top 0) [leaf (nth chain (dec top))]))))))
+
+(defn- reader-text (reader from to) ((:slice reader) from to))
+
+(defn- token-at (reader offset)
+  "The delimiter whose bracket character sits at `offset`: `{:at :char :leaf :parent :open?}`,
+or nil when the character there is not a bracket or not a delimiter token."
+  (when (and (>= offset 0) (< offset (:length reader)))
+    (let (c (reader-text reader offset (inc offset)))
+      (when (or (contains? closer-of c) (contains? opener-of c))
+        (let (found (delimiter-in ((:chain reader) offset)))
+          (when found
+            (let ([leaf parent] found
+                  text (reader-text reader (:start leaf) (:end leaf))
+                  open? (contains? closer-of c))
+              ;; an opener ends its token (`$(`), a closer begins its own (`))`)
+              (when (if open? (= offset (dec (:end leaf))) (= offset (:start leaf)))
+                {:at offset :char c :leaf leaf :parent parent :open? open? :text text}))))))))
+
+(defn- partner? (reader token candidate-offset)
+  "Whether `candidate-offset` holds the bracket that pairs with `token`: the matching character
+on a delimiter token of the same parent."
+  (let (found (token-at reader candidate-offset))
+    (and found
+      (not (= (:open? found) (:open? token)))
+      (= (:char found)
+        (if (:open? token) (get closer-of (:char token)) (get opener-of (:char token))))
+      (same-node? (:parent found) (:parent token)))))
+
+(defn- edge-partner (reader token)
+  "The partner when it is the parent's last token (for an opener) or first (for a closer):
+the shape nearly every delimited node has. Nil otherwise."
+  (let (parent (:parent token))
+    (if (:open? token)
+      (let (found (delimiter-in ((:chain reader) (dec (:end parent)))))
+        (when found
+          (let (at (:start (first found)))
+            (when (partner? reader token at) at))))
+      (let (found (delimiter-in ((:chain reader) (:start parent))))
+        (when found
+          (let (at (dec (:end (first found))))
+            (when (partner? reader token at) at)))))))
+
+(defn- gaps (kids from to)
+  "The `[a b]` ranges of `[from, to)` not covered by a named child longer than a delimiter —
+the parent's own tokens lie there. A child of three characters or fewer is walked: it may be
+a wrapper around a delimiter (`block_end`)."
+  (let (spans (seq/filter kids (fn (k) (> (- (:end k) (:start k)) 3)))
+        [ranges at] (fold spans
+                      [[] from]
+                      (fn (acc k)
+                        (let ([ranges at] acc)
+                          (if (or (<= (:end k) from) (>= (:start k) to))
+                            acc
+                            [(if (> (:start k) at) (conj ranges [at (:start k)]) ranges)
+                              (math/max at (:end k))])))))
+    (if (< at to) (conj ranges [at to]) ranges)))
+
+(defn- scan-partner (reader token)
+  "The partner found by walking the parent's own text away from `token`, counting nested
+pairs of the same bracket — nil when there is none, or the walk outruns `*scan-budget*`."
+  (let (parent (:parent token)
+        open? (:open? token)
+        ;; a probe the parent strictly contains, and no container child of it does: just
+        ;; past an opener, or at a closer's start
+        kids (or ((:kids reader) (if open? (:end (:leaf token)) (:start (:leaf token)))) [])
+        spans (if open?
+                (gaps kids (:end (:leaf token)) (:end parent))
+                (reverse (gaps kids (:start parent) (:start (:leaf token)))))
+        same (:char token)
+        other (if open? (get closer-of same) (get opener-of same))
+        ;; one character: `[:halt [offset depth]]` at the partner, else the depth so far
+        step (fn (acc offset)
+               (let ([_ depth] acc
+                     c (reader-text reader offset (inc offset)))
+                 (cond
+                   (and (= c other) (partner? reader token offset))
+                     (if (= depth 0) [:halt [offset depth]] [:cont [nil (dec depth)]])
+                   (and (= c same)
+                     (let (found (token-at reader offset))
+                       (and found (same-node? (:parent found) parent))))
+                     [:cont [nil (inc depth)]]
+                   else [:cont acc]))))
+    (letrec (walk (fn (spans budget depth)
+                    (if (or (empty? spans) (<= budget 0))
+                      nil
+                      (let ([a b] (first spans)
+                            offsets (if open? (range a b) (reverse (range a b)))
+                            [hit reached] (seq/reduce-while offsets [nil depth] step))
+                        (or hit (walk (rest spans) (- budget (- b a)) reached))))))
+      (walk spans *scan-budget* 0))))
+
+(defn- match-with (reader pos)
+  (let (token (or (token-at reader (dec pos)) (token-at reader pos)))
+    (when token
+      (let (partner (or (edge-partner reader token) (scan-partner reader token)))
+        (cond
+          (not (nil? partner)) (if (:open? token) [(:at token) partner] [partner (:at token)])
+          ;; no partner: a broken parse is missing one; an intact one used the character
+          ;; alone, as bash's `case` arm does
+          (:broken (first ((:chain reader) (:at token)))) [(:at token) :unmatched]
+          else nil)))))
+
+(defn match-text (text lang pos)
+  "The bracket pair at `pos` in the string `text` parsed as tree-sitter language `lang` —
+the `:bracket-match` service's body, over the window of text the view hands it: `[opener
+closer]`, `[at :unmatched]`, or nil (also when `lang` has no grammar loaded).
+
+    (tsbrackets/match-text \"f(\\\")\\\")\" :python 1)   ;=> [1 6] — with the :python grammar installed"
+  (or-nil (fn ()
+            (match-with {:chain (fn (offset) (%tree-sitter-chain text lang offset))
+                         :kids (fn (offset) (%tree-sitter-kids text lang offset))
+                         :slice (fn (from to) (string/substring text from to))
+                         :length (string/length text)}
+              pos))))
+
+(defn match-tree (tree rope pos)
+  "`match-text` over a held tree (`syntaxtree`) of exactly `rope`, with `pos` in the whole
+document: no parse, and only the characters it inspects are read from the rope — the
+`:bracket-match-tree` service. Nil for a gone handle."
+  (or-nil (fn ()
+            (match-with {:chain (fn (offset) (or (%tree-sitter-tree-chain tree offset) []))
+                         :kids (fn (offset) (%tree-sitter-tree-kids tree offset))
+                         :slice (fn (from to) (text/slice rope from to))
+                         :length (text/length rope)}
+              pos))))

@@ -1,0 +1,410 @@
+;; The lexed languages with a grammar (src/languages.blsp): shell, JSON, TOML, YAML and
+;; Dockerfile are tree-sitter modes that keep their line lexer as a `:fallback`. Two halves:
+;; the STAND-IN, tested whatever is installed (`model/*grammar-ready?*` answers "missing"),
+;; and the parsed mode, which needs `~/.config/bedit/grammars/libtree-sitter-<lang>.so`
+;; (M-x grammar-install) and SKIPS without it, as every runtime-loaded language's tests do.
+(defmodule lexed-languages-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer))
+
+;; loaded here, at file load, so the `when`s below see what is installed
+(grammars/load-user-grammars)
+
+(defn- file-model (text file) (ed-init (make-buffer text file file)))
+(defn- file-buffer (text file) (ed-current-buf (file-model text file)))
+(defn- press (m keys) (fold keys m (fn (acc k) (input/ed-update acc k 80 24))))
+
+(defn- without-grammars (thunk)
+  ;; `thunk` run as a runtime with no grammar installed would run it
+  (binding (*grammar-ready?* (fn (lang) false)) (thunk)))
+
+(defn- face-at (spans src needle)
+  "The face of the span that starts exactly where `needle` first occurs in `src`, or nil."
+  (let (at (index-of src needle)
+        hit (seq/find spans (fn (span) (= (first span) at))))
+    (when hit (nth hit 2))))
+
+(defn- face-of (name) (editor/face/face name))
+
+(defn- fontified (src file) ((ed-mode-service (file-buffer src file) :fontify) src))
+
+(defn- indents (src file)
+  "`[got want]`: the column the mode's indenter answers for every non-blank line of `src`,
+and the column the line already has."
+  (let (indent (ed-mode-service (file-buffer src file) :indent)
+        lines (string/split src "\n")
+        rows (seq/filter (range (count lines)) (fn (i) (not (= (string/trim (nth lines i "")) ""))))
+        bol-of (fn (i) (fold (range i) 0 (fn (a k) (+ a (string/length (nth lines k "")) 1))))
+        want (into []
+               (map rows
+                 (fn (i)
+                   (let (line (nth lines i ""))
+                     (- (string/length line) (string/length (string/triml line)))))))
+        got (into [] (map rows (fn (i) (indent src (bol-of i))))))
+    [got want]))
+
+;; ---- the stand-in: a parsed mode without its grammar --------------------------------
+(describe "a parsed language without its grammar is coloured by its line lexer"
+  (test "a shell script is typed as the stand-in, under the same mode name"
+    (let (buf (without-grammars (fn () (file-buffer "echo hi\n" "/p/run.sh"))))
+      (assert= (:type buf) :shell-lexer)
+      (assert= (ed-buf-mode-name buf) "shell")
+      (assert= (:grammar-wanted buf) :shell)
+      (is (nil? (ed-mode-service buf :ts-lang)))
+      (assert= (ed-mode-service buf :wants-grammar) :bash)
+      (assert= (map ((ed-mode-service buf :fontify) "echo $HOME # hi") (fn ([s e _]) [s e]))
+        (list [0 4] [5 10] [11 15]))
+      (is (fn? (ed-mode-service buf :line-lexer)))
+      (assert= (ed-mode-service buf :comment-syntax) "# ")))
+  (test "a script typed by its #! line stands in too"
+    (let (buf (without-grammars (fn () (file-buffer "#!/usr/bin/env bash\necho hi\n" "/p/deploy"))))
+      (assert= (:type buf) :shell-lexer)))
+  (test "with its grammar ready the same file is the parsed mode"
+    (let (buf (binding (*grammar-ready?* (fn (lang) true)) (file-buffer "echo hi\n" "/p/run.sh")))
+      (assert= (:type buf) :shell)
+      (assert= (ed-mode-service buf :ts-lang) :bash)
+      (is (nil? (:grammar-wanted buf)))))
+  (test "opening one says the grammar is missing, and that it is coloured meanwhile"
+    (let (buf (without-grammars (fn () (file-buffer "echo hi\n" "/p/run.sh"))))
+      (is (includes? (without-grammars (fn () (grammars/missing-note buf))) "coloured line by line"))
+      (is (includes? (without-grammars (fn () (grammars/missing-note buf))) "M-x grammar-install"))))
+  ;; what M-x grammar-install / grammar-reload do once the library has landed
+  (test "an open stand-in becomes the parsed mode when its grammar arrives"
+    (let (m (without-grammars (fn () (file-model "echo hi\n" "/p/run.sh")))
+          still (without-grammars (fn () (ed-grammars-arrived m)))
+          arrived (binding (*grammar-ready?* (fn (lang) true)) (ed-grammars-arrived m)))
+      (assert= (:type (ed-current-buf still)) :shell-lexer)
+      (assert= (:type (ed-current-buf arrived)) :shell)
+      (assert= (ed-mode-service (ed-current-buf arrived) :ts-lang) :bash)
+      (assert= (buffer-text (ed-current-buf arrived)) "echo hi\n")))
+  (test "M-x grammar-install offers the stand-in's grammar first"
+    (let (m (without-grammars (fn () (file-model "echo hi\n" "/p/run.sh"))))
+      (assert= (grammars/buffer-grammar (ed-current-buf m)) :bash))))
+
+;; ---- shell, parsed by tree-sitter-bash ----------------------------------------------
+(describe "shell-mode declares its grammar, formatter and interpreters"
+  (test "where tree-sitter-bash lives, and shfmt"
+    (assert= (grammars/grammar-source :bash) "https://github.com/tree-sitter/tree-sitter-bash")
+    (assert= (first (ed-mode-service (file-buffer "" "/p/run.sh") :format-command)) "shfmt"))
+  (test "the restart is a column-0 statement, not prose inside a string or a heredoc"
+    (let (src "usage=\"one\ntwo three\nfour\"\n\nbuild() {\n  make\n}\n")
+      (assert= (languages/shell-restart src (index-of src "four")) 0)
+      (assert= (languages/shell-restart src (index-of src "  make")) (index-of src "build()")))
+    (let (src "cat <<EOF\nNAME=x\nEOF\nif true; then\n  echo\nfi\n")
+      (assert= (languages/shell-restart src (index-of src "  echo")) 0))))
+
+;; shfmt-clean (`shfmt -i 2 -d`)
+(def sh-src
+  (string/join ["#!/usr/bin/env bash"
+                 "# deploy: build and ship" "readonly ROOT=\"$(cd \"$(dirname \"$0\")\" && pwd)\""
+                 "" "usage() {" "  cat <<'USAGE'" "usage: deploy [-n] TARGET" "  -n   dry run"
+                 "USAGE" "}" "" "function build {" "  local target=$1" "  if [[ -z $target ]]"
+                 "  then" "    usage" "    return 1" "  elif (( ${#target} > 9 )); then"
+                 "    echo long" "  else" "    echo \"building $target\"" "  fi" "  docker build \\"
+                 "    --tag \"app:$target\" \\" "    --file Dockerfile ." "  find . -name '*.tmp' |"
+                 "    xargs rm -f" "  while read -r line; do" "    echo \"$line\""
+                 "  done <\"$ROOT/list\"" "  for f in *.sh" "  do" "    (" "      cd \"$f\" || exit"
+                 "      make" "    )" "  done" "  case \"$target\" in" "    prod | staging)"
+                 "      echo \"remote\"" "      ;;" "    *)" "      echo \"local\"" "      ;;"
+                 "  esac" "  files=(" "    a.txt" "    b.txt" "  )" "  msg=\"line one" "line two\""
+                 "  echo \"$msg\" $((1 + 2))" "}" "" "build \"$@\"" ""]
+    "\n"))
+
+(when (grammars/grammar-loaded? :bash)
+  (describe "shell, parsed"
+    (def sh-spans (fontified sh-src "deploy.sh"))
+
+    (test "a shell file with the grammar is the parsed mode"
+      (let (buf (file-buffer sh-src "deploy.sh"))
+        (assert= (:type buf) :shell)
+        (assert= (ed-buf-mode-name buf) "shell")))
+    (test "comments, the shebang included"
+      (assert= (face-at sh-spans sh-src "#!/usr") (face-of :syntax/comment))
+      (assert= (face-at sh-spans sh-src "# deploy") (face-of :syntax/comment)))
+    (test "a string's text and quotes are strings; what is inside `$…` is code"
+      (assert= (face-at sh-spans sh-src "building ") (face-of :syntax/string))
+      (assert= (face-at sh-spans sh-src "$target\"\n  fi") (face-of :syntax/special))
+      (assert= (face-at sh-spans sh-src "$(cd") (face-of :syntax/special))
+      (assert= (face-at sh-spans sh-src "cd \"$(") (face-of :syntax/function))
+      (assert= (face-at sh-spans sh-src "'*.tmp'") (face-of :syntax/string)))
+    ;; the lexer coloured a multi-line string's first line only, and a heredoc not at all
+    (test "a heredoc and a multi-line string are strings to their last line"
+      (assert= (face-at sh-spans sh-src "usage: deploy") (face-of :syntax/string))
+      (assert= (face-at sh-spans sh-src "USAGE\n}") (face-of :syntax/string))
+      (assert= (face-at sh-spans sh-src "line one") (face-of :syntax/string))
+      (is (not (nil? (seq/find sh-spans
+                       (fn (span)
+                         (and (<= (first span) (index-of sh-src "line two"))
+                           (> (second span) (index-of sh-src "line two"))
+                           (= (nth span 2) (face-of :syntax/string)))))))))
+    (test "every command's name is a call, a definition's name a function"
+      (assert= (face-at sh-spans sh-src "docker") (face-of :syntax/function))
+      (assert= (face-at sh-spans sh-src "xargs") (face-of :syntax/function))
+      (assert= (face-at sh-spans sh-src "usage() {") (face-of :syntax/function))
+      (assert= (face-at sh-spans sh-src "build {") (face-of :syntax/function)))
+    (test "keywords, numbers and assignments"
+      (assert= (face-at sh-spans sh-src "if [[") (face-of :syntax/keyword))
+      (assert= (face-at sh-spans sh-src "esac") (face-of :syntax/keyword))
+      (assert= (face-at sh-spans sh-src "local target") (face-of :syntax/keyword))
+      (assert= (face-at sh-spans sh-src "9 ))") (face-of :syntax/number))
+      (assert= (face-at sh-spans sh-src "files=(") (face-of :syntax/special)))
+
+    (test "it indents every line where shfmt put it — heredoc, continuations, case arms"
+      (let ([got want] (indents sh-src "deploy.sh"))
+        (is (> (count want) 45))
+        (assert= got want)))
+    (test "TAB inside a heredoc leaves the line as it was written"
+      (let (text "f() {\n  cat <<EOF\n      kept\nEOF\n}\n"
+            m (file-model text "a.sh")
+            on (ed-set-buf m (goto-char (ed-current-buf m) (index-of text "kept"))))
+        (assert= (buffer-text (ed-current-buf (press on [:tab]))) text)))
+    (test "RET after `then` indents the new line, though nothing parses yet"
+      (let (text "if true; then"
+            m (file-model text "a.sh")
+            entered (press (ed-set-buf m (goto-char (ed-current-buf m) (string/length text)))
+                      [:enter]))
+        (assert= (buffer-text (ed-current-buf entered)) (str text "\n  "))))
+    (test "C-M-a lands on the enclosing function"
+      (assert= (editor/treesit/point-defun-start sh-src :bash (index-of sh-src "xargs"))
+        (index-of sh-src "function build"))
+      (assert= (editor/treesit/point-defun-start sh-src :bash (index-of sh-src "dry run"))
+        (index-of sh-src "usage() {")))))
+
+;; ---- JSON, parsed by tree-sitter-json -----------------------------------------------
+(describe "json-mode: its grammar, its lexer past a size, and JSON5 left lexed"
+  (test "where tree-sitter-json lives"
+    (assert= (grammars/grammar-source :json) "https://github.com/tree-sitter/tree-sitter-json"))
+  (test "a JSON file past `json-lexer-above` is the lexer's, grammar or not"
+    (let (big (str "[" (string/repeat "1," (math/quot languages/json-lexer-above 2)) "1]")
+          buf (binding (*grammar-ready?* (fn (lang) true)) (file-buffer big "dump.json")))
+      (assert= (:type buf) :json-lexer)
+      (assert= (ed-buf-mode-name buf) "json")
+      (assert= (ed-mode-service buf :fontify) lex-configs/json-spans)))
+  (test "a small one is parsed when the grammar is ready"
+    (assert= (:type (binding (*grammar-ready?* (fn (lang) true)) (file-buffer "{}" "a.json")))
+      :json))
+  (test "a JSON5 file stays lexed: tree-sitter-json reads its unquoted keys as errors"
+    (let (buf (file-buffer "{a: 1,}" "x.json5"))
+      (assert= (ed-buf-mode-name buf) "json5")
+      (is (nil? (ed-mode-service buf :ts-lang))))))
+
+;; prettier-clean
+(def json-src
+  (string/join ["{"
+                 "  \"name\": \"bedit\"," "  // JSONC: a comment" "  \"version\": 1.5,"
+                 "  \"private\": true," "  \"files\": [\"src\", \"tests\"]," "  \"scripts\": {"
+                 "    \"test\": \"nest test\"," "    \"nested\": {"
+                 "      \"deep\": [1, -2.5e3, null, false]" "    }" "  }," "  \"matrix\": [" "    {"
+                 "      \"os\": \"linux\"" "    }," "    [" "      \"x\\n\"" "    ]" "  ]" "}" ""]
+    "\n"))
+
+(when (grammars/grammar-loaded? :json)
+  (describe "json, parsed"
+    (def json-spans (fontified json-src "package.json"))
+
+    (test "a key is a keyword, a value string a string"
+      (assert= (face-at json-spans json-src "\"name\"") (face-of :syntax/keyword))
+      (assert= (face-at json-spans json-src "\"deep\"") (face-of :syntax/keyword))
+      (assert= (face-at json-spans json-src "\"bedit\"") (face-of :syntax/string))
+      (assert= (face-at json-spans json-src "\"src\"") (face-of :syntax/string))
+      (assert= (face-at json-spans json-src "\"linux\"") (face-of :syntax/string)))
+    (test "numbers, the three literals and a comment"
+      (assert= (face-at json-spans json-src "1.5") (face-of :syntax/number))
+      (assert= (face-at json-spans json-src "-2.5e3") (face-of :syntax/number))
+      (assert= (face-at json-spans json-src "true") (face-of :syntax/special))
+      (assert= (face-at json-spans json-src "null") (face-of :syntax/special))
+      (assert= (face-at json-spans json-src "// JSONC") (face-of :syntax/comment)))
+    (test "it indents every line where prettier put it"
+      (let ([got want] (indents json-src "package.json"))
+        (is (> (count want) 18))
+        (assert= got want)))
+    (test "RET after `{` indents the new line, though nothing parses yet"
+      (let (text "{\n  \"a\": {"
+            m (file-model text "a.json")
+            entered (press (ed-set-buf m (goto-char (ed-current-buf m) (string/length text)))
+                      [:enter]))
+        (assert= (buffer-text (ed-current-buf entered)) (str text "\n    "))))
+    (test "C-M-a lands on the key/value pair point is in"
+      (assert= (editor/treesit/point-defun-start json-src :json (index-of json-src "null"))
+        (index-of json-src "\"deep\"")))))
+
+;; ---- TOML, parsed by tree-sitter-toml -----------------------------------------------
+(describe "toml-mode declares its grammar and formatter"
+  (test "where tree-sitter-toml lives, and taplo"
+    (assert= (grammars/grammar-source :toml)
+      "https://github.com/tree-sitter-grammars/tree-sitter-toml")
+    (assert= (first (ed-mode-service (file-buffer "" "Cargo.toml") :format-command)) "taplo"))
+  (test "a lock file is TOML too"
+    (assert= (ed-buf-mode-name (file-buffer "" "Cargo.lock")) "toml"))
+  (test "the restart is a column-0 line outside a multi-line string"
+    (let (src "a = \"\"\"\n[not.a.table]\n\"\"\"\n[t]\nb = [\n  1,\n]\n")
+      (assert= (languages/toml-restart src (index-of src "  1,")) (index-of src "b = ["))
+      (assert= (languages/toml-restart src (index-of src "\"\"\"\n[t]")) 0))))
+
+;; taplo-clean
+(def toml-src
+  (string/join ["# Cargo manifest"
+                 "[package]" "name = \"bedit\"" "edition = 2024" "keywords = [" "  \"editor\","
+                 "  'lisp'," "  [1, 2]," "]" "inline = { a = 1, b.c = true }"
+                 "released = 1979-05-27T07:32:00Z" "ratio = 3.14" "about = \"\"\""
+                 "  kept as written" "[not.a.table]\"\"\"" "" "[[bin]]" "name = \"x\"" ""
+                 "[dependencies.serde]" "version = \"1\"" "\"quoted key\" = false" ""]
+    "\n"))
+
+(when (grammars/grammar-loaded? :toml)
+  (describe "toml, parsed"
+    (def toml-spans (fontified toml-src "Cargo.toml"))
+
+    (test "a table's header is a function — its brackets and its name, dotted or not"
+      (assert= (face-at toml-spans toml-src "[package]") (face-of :syntax/function))
+      (assert= (face-at toml-spans toml-src "package]") (face-of :syntax/function))
+      (assert= (face-at toml-spans toml-src "[[bin]]") (face-of :syntax/function))
+      (assert= (face-at toml-spans toml-src "dependencies.serde") (face-of :syntax/function)))
+    (test "a key is a keyword, an inline table's and a dotted one's too"
+      (assert= (face-at toml-spans toml-src "edition") (face-of :syntax/keyword))
+      (assert= (face-at toml-spans toml-src "b.c") (face-of :syntax/keyword))
+      (assert= (face-at toml-spans toml-src "\"quoted key\"") (face-of :syntax/keyword)))
+    (test "values: strings, numbers, dates and booleans"
+      (assert= (face-at toml-spans toml-src "'lisp'") (face-of :syntax/string))
+      (assert= (face-at toml-spans toml-src "2024") (face-of :syntax/number))
+      (assert= (face-at toml-spans toml-src "1979-") (face-of :syntax/number))
+      (assert= (face-at toml-spans toml-src "true") (face-of :syntax/special)))
+    ;; the lexer read the `[not.a.table]` line inside the string as a header
+    (test "a multi-line string is a string to its last line"
+      (assert= (face-at toml-spans toml-src "\"\"\"\n  kept") (face-of :syntax/string))
+      (is (nil? (face-at toml-spans toml-src "not.a.table"))))
+    (test "it indents every line where taplo put it, a multi-line string as written"
+      (let ([got want] (indents toml-src "Cargo.toml"))
+        (is (> (count want) 18))
+        (assert= got want)))
+    (test "C-M-a goes to the header of the table point is in"
+      (assert= (editor/treesit/point-defun-start toml-src :toml (index-of toml-src "ratio"))
+        (index-of toml-src "[package]"))
+      (assert= (editor/treesit/point-defun-start toml-src
+                 :toml (index-of toml-src "\"quoted key\""))
+        (index-of toml-src "[dependencies.serde]")))))
+
+;; ---- YAML, parsed by tree-sitter-yaml -----------------------------------------------
+(describe "yaml-mode declares its grammar, and a stand-in's fallback layer"
+  (test "where tree-sitter-yaml lives, and prettier"
+    (assert= (grammars/grammar-source :yaml)
+      "https://github.com/tree-sitter-grammars/tree-sitter-yaml")
+    (assert= (first (ed-mode-service (file-buffer "" "ci.yml") :format-command)) "prettier"))
+  (test "the stand-in's layer is the lexer's, by the deflexer stem"
+    (let (layer languages/yaml-fallback-layer)
+      (assert= (:fontify layer) 'lex-configs/yaml-spans)
+      (assert= (:line-lexer layer) 'lex-configs/yaml-line-lexer)
+      (assert= (:fontify-restart layer) 'editor/highlight/line-restart)
+      (assert= (:wants-grammar layer) :yaml))))
+
+(def yaml-src
+  (string/join ["# CI"
+                 "name: ci" "on:" "  push:" "    branches: [main, \"release/*\"]" "jobs:" "  test:"
+                 "    runs-on: ubuntu-latest" "    steps:" "      - uses: actions/checkout@v4"
+                 "      - name: run" "        run: |" "          nest test"
+                 "              # kept as written" "        env:" "          N: 3"
+                 "          ON: true" "          NIL: null" "    defaults: &base" "      a: 1.5"
+                 "    copy: *base" "    flow: {a: 1, 'b': 'x'}" "---" "- plain" "- key: value" ""]
+    "\n"))
+
+(when (grammars/grammar-loaded? :yaml)
+  (describe "yaml, parsed"
+    (def yaml-spans (fontified yaml-src "ci.yml"))
+
+    (test "a key is a keyword — nested, in a list item, in a flow mapping, quoted"
+      (assert= (face-at yaml-spans yaml-src "runs-on") (face-of :syntax/keyword))
+      (assert= (face-at yaml-spans yaml-src "uses") (face-of :syntax/keyword))
+      (assert= (face-at yaml-spans yaml-src "a: 1,") (face-of :syntax/keyword))
+      (assert= (face-at yaml-spans yaml-src "'b'") (face-of :syntax/keyword)))
+    (test "a plain value is data and stays uncoloured; a quoted one is a string"
+      (is (nil? (face-at yaml-spans yaml-src "ubuntu-latest")))
+      (assert= (face-at yaml-spans yaml-src "\"release/*\"") (face-of :syntax/string))
+      (assert= (face-at yaml-spans yaml-src "'x'") (face-of :syntax/string)))
+    ;; the lexer coloured a block scalar's lines as keys and comments
+    (test "a block scalar is a string to its last line"
+      (assert= (face-at yaml-spans yaml-src "|\n") (face-of :syntax/string))
+      (is (nil? (face-at yaml-spans yaml-src "# kept"))))
+    (test "numbers, booleans, null, anchors, aliases and the document marker"
+      (assert= (face-at yaml-spans yaml-src "1.5") (face-of :syntax/number))
+      (assert= (face-at yaml-spans yaml-src "true") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "null") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "&base") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "*base") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "---") (face-of :syntax/special))
+      (assert= (face-at yaml-spans yaml-src "# CI") (face-of :syntax/comment)))
+    ;; The columns are the structure: the indenter leaves every line where it is
+    (test "TAB leaves every line where it is written"
+      (let ([got want] (indents yaml-src "ci.yml"))
+        (is (> (count want) 20))
+        (assert= got want)))
+    (test "a line TAB cannot place is left alone rather than moved under the line above"
+      (let (text "a:\n  b:\n    c: 1\nd: 2\n"
+            m (file-model text "x.yml")
+            on (ed-set-buf m (goto-char (ed-current-buf m) (index-of text "d: 2"))))
+        (assert= (buffer-text (ed-current-buf (press on [:tab]))) text)))
+    (test "RET carries the previous line's indentation, at the end of the file too"
+      (let (text "a:\n  b: 1"
+            m (file-model text "x.yml")
+            entered (press (ed-set-buf m (goto-char (ed-current-buf m) (string/length text)))
+                      [:enter]))
+        (assert= (buffer-text (ed-current-buf entered)) (str text "\n  "))))
+    (test "C-M-a goes to the key point is under"
+      (assert= (editor/treesit/point-defun-start yaml-src :yaml (index-of yaml-src "nest test"))
+        (index-of yaml-src "run: |")))))
+
+;; ---- Dockerfile, parsed by tree-sitter-dockerfile ------------------------------------
+(describe "docker-mode declares its grammar, and no formatter"
+  (test "where tree-sitter-dockerfile lives"
+    (assert= (grammars/grammar-source :dockerfile)
+      "https://github.com/camdencheek/tree-sitter-dockerfile"))
+  (test "Docker ships no formatter, so the mode names none"
+    (is (nil? (ed-mode-service (file-buffer "" "Dockerfile") :format-command))))
+  (test "without the grammar a Dockerfile is the lexer's docker-mode"
+    (let (buf (without-grammars (fn () (file-buffer "FROM alpine\n" "Containerfile"))))
+      (assert= (:type buf) :docker-lexer)
+      (assert= (ed-buf-mode-name buf) "docker"))))
+
+(def docker-src
+  (string/join ["# syntax=docker/dockerfile:1"
+                 "ARG VERSION=1.2" "FROM rust:${VERSION} AS build" "WORKDIR /src"
+                 "ENV PATH=\"/x:$PATH\" \\" "    MODE=release" "COPY --from=deps /a /b"
+                 "RUN apt-get update \\" "    && apt-get install -y curl \\"
+                 "    && rm -rf /var/lib/apt/lists/*" "RUN <<EOT" "  echo kept as written" "EOT"
+                 "EXPOSE 8080/tcp" "CMD [\"app\", \"--port\", \"8080\"]" ""]
+    "\n"))
+
+(when (grammars/grammar-loaded? :dockerfile)
+  (describe "dockerfile, parsed"
+    (def docker-spans (fontified docker-src "Dockerfile"))
+
+    (test "the instructions are keywords, AS too"
+      (assert= (face-at docker-spans docker-src "FROM") (face-of :syntax/keyword))
+      (assert= (face-at docker-spans docker-src "RUN apt") (face-of :syntax/keyword))
+      (assert= (face-at docker-spans docker-src "AS build") (face-of :syntax/keyword)))
+    (test "an image's name is a function, its tag and alias by place"
+      (assert= (face-at docker-spans docker-src "rust:") (face-of :syntax/function))
+      (assert= (face-at docker-spans docker-src ":${VERSION}") (face-of :syntax/special))
+      (assert= (face-at docker-spans docker-src "build\n") (face-of :syntax/function)))
+    (test "strings, a heredoc, a port, a flag, a variable's name and a comment"
+      (assert= (face-at docker-spans docker-src "\"/x:$PATH\"") (face-of :syntax/string))
+      (assert= (face-at docker-spans docker-src "\"--port\"") (face-of :syntax/string))
+      (assert= (face-at docker-spans docker-src "<<EOT") (face-of :syntax/string))
+      (assert= (face-at docker-spans docker-src "8080/tcp") (face-of :syntax/number))
+      (assert= (face-at docker-spans docker-src "--from=deps") (face-of :syntax/special))
+      (assert= (face-at docker-spans docker-src "MODE") (face-of :syntax/special))
+      (assert= (face-at docker-spans docker-src "# syntax") (face-of :syntax/comment)))
+    (test "it indents a continued instruction four in, a heredoc as written"
+      (let ([got want] (indents docker-src "Dockerfile"))
+        (is (> (count want) 14))
+        (assert= got want)))
+    (test "RET after a `\\` continues the instruction four in"
+      (let (text "RUN make \\"
+            m (file-model text "Dockerfile")
+            entered (press (ed-set-buf m (goto-char (ed-current-buf m) (string/length text)))
+                      [:enter]))
+        (assert= (buffer-text (ed-current-buf entered)) (str text "\n    "))))
+    (test "C-M-a goes to the first line of the instruction point is in"
+      (assert= (editor/treesit/point-defun-start docker-src
+                 :dockerfile (index-of docker-src "rm -rf"))
+        (index-of docker-src "RUN apt")))))
