@@ -1,0 +1,147 @@
+(defmodule murhistory
+  "mur's side of the time machine (C-x v t, src/timemachine.blsp): the `vcscore` row's
+`:file-history`, `:file-at` and `:show-revision` for a mur working copy.
+
+A file's history in mur has two parts, and the time machine's two scopes are them:
+
+- **this change's versions** (`mur versions --json PATH`) — each `mur save` that changed
+  the file, newest first. They are the change's work, not on trunk yet: the time machine's
+  BRANCH scope (`B`), what git calls what this branch changed, measured against `trunk`.
+  Entered in a change that saved the file, the time machine opens there;
+- **trunk's history** (`mur log --json PATH`) — the landed snapshots that changed it.
+
+The whole history is both, the change's versions first: they are the newest work here
+whatever trunk did meanwhile. A version reads as `v2 of this change` in the info pane, a
+trunk snapshot as the change it landed. A revision's text is `mur cat PATH --at SNAPSHOT`
+(one file, fetched alone) and its diff `mur show SNAPSHOT PATH` — mur prints a unified diff,
+so it is painted as every diff is. `D` shows the whole snapshot (`mur show`) in *mur-show*.
+mur has no blame, so `b` says so.
+
+The hooks run in the time machine's task, off the loop; everything they read is parsed by
+pure functions here, which the tests feed what mur prints."
+  (:use murcore) ; mur-mur / mur-short
+  (:use murstatus :only [mur-show-text])) ; *mur-show* — D
+
+(def *mur-history-count* 1000) ; trunk's snapshots of a file the time machine lists
+(def *mur-history-timeout-ms* 30000) ; trunk's history asks the forge
+
+;; ---- pure: what mur printed, as the time machine's revisions --------------------------
+
+(defn mur-date (ms)
+  "A snapshot's time (milliseconds) as the time machine's date: `YYYY-MM-DD HH:MM`, UTC.
+
+    (murhistory/mur-date 0)   ;=> \"1970-01-01 00:00\""
+  (if (int? ms) (datetime/format (datetime/epoch-ms-> ms) "%Y-%m-%d %H:%M") ""))
+
+(defn mur-age (ms now)
+  "How long before `now` a snapshot made at `ms` was, as git's `%ar` says it.
+
+    (murhistory/mur-age 0 7200000)        ;=> \"2 hours ago\"
+    (murhistory/mur-age 0 86400000)       ;=> \"1 day ago\""
+  (if (not (int? ms))
+    ""
+    (let (seconds (math/quot (math/max 0 (- now ms)) 1000)
+          [amount unit] (cond
+                          (< seconds 60) [seconds "second"]
+                          (< seconds 3600) [(math/quot seconds 60) "minute"]
+                          (< seconds 86400) [(math/quot seconds 3600) "hour"]
+                          (< seconds 2592000) [(math/quot seconds 86400) "day"]
+                          (< seconds 31536000) [(math/quot seconds 2592000) "month"]
+                          :else [(math/quot seconds 31536000) "year"]))
+      (str amount " " unit (if (= amount 1) "" "s") " ago"))))
+
+(defn- mur-body (message)
+  "A message without its first line (the subject), trimmed."
+  (let (lines (string/split (or message "") "\n"))
+    (string/trim (string/join (rest lines) "\n"))))
+
+(defn mur-history-revision (entry path now)
+  "One entry of `mur versions --json` (it has `:version`) or `mur log --json` as a time
+machine revision: `{:hash :short :author :date :age :subject :body :path :note}`, `:note` the
+info pane's line saying which part of the history it is."
+  (let (version (:version entry))
+    {:hash (:snapshot entry)
+     :short (mur-short (:snapshot entry))
+     :author (:author entry "")
+     :email nil
+     :date (mur-date (:time entry))
+     :age (mur-age (:time entry) now)
+     :subject (:title entry "")
+     :body (mur-body (:message entry))
+     :path path
+     :version version
+     :note (if (nil? version)
+             (str "Trunk:  landed as change " (mur-short (:change entry)))
+             (str "Change: v"
+               version
+               " of this change, not landed"
+               (if (= (:sent entry) false) " — not on the forge yet" "")))}))
+
+(defn mur-history-of (versions log path start now)
+  "The time machine's `:file-history` answer from `mur versions --json PATH` and `mur log
+--json PATH` (decoded): `{:revisions :branch :start}` — this change's versions, then trunk's
+snapshots, newest first; the branch scope is the versions, measured against `trunk`; `:start`
+the revision whose ID starts with `start` (a version entered from), else nil.
+
+    (:revisions (murhistory/mur-history-of [] [] \"f\" nil 0))   ;=> []"
+  (let (mine (map (or versions []) (fn (entry) (mur-history-revision entry path now)))
+        trunk (map (or log []) (fn (entry) (mur-history-revision entry path now)))
+        revisions (into [] (append mine trunk))
+        started (if (or (nil? start) (= start ""))
+                  nil
+                  (seq/find revisions (fn (revision) (string/starts-with? (:hash revision) start)))))
+    {:revisions revisions
+     :branch {:base "trunk" :hashes (into #{} (map mine :hash))}
+     :start (and started (:hash started))}))
+
+(defn mur-show-diff (text)
+  "What `mur show SNAPSHOT PATH` printed, without the snapshot's header and message: the
+unified diff from its first `--- ` line on. A message line is indented, so it never starts
+one; nothing changed is \"\".
+
+    (murhistory/mur-show-diff \"snapshot x\\n\\n    msg\\n\\n--- f\\n+++ f\\n\")   ;=> \"--- f\\n+++ f\\n\""
+  (let (lines (string/split (or text "") "\n")
+        at (seq/index-where lines (fn (line) (string/starts-with? line "--- "))))
+    (if (< at 0) "" (string/join (drop lines at) "\n"))))
+
+;; ---- the hooks, off the loop -------------------------------------------------------------
+
+(defn mur-file-history (root path start)
+  "The time machine's `:file-history` for mur: [[mur-history-of]] over what this working
+copy's mur answers for `path` (relative to `root`) — or `{:failed result}` when either
+command fails (trunk's history asks the forge). Subprocesses: run off the loop."
+  (let (versions (mur-mur root ["versions" "--json" path])
+        log (if (= (:exit versions) 0)
+              (mur-mur root
+                ["log" "-n" (str *mur-history-count*) "--json" path]
+                {:timeout-ms *mur-history-timeout-ms*})
+              versions)
+        decode (fn (r) (check-allow :discarded-catch (try (json/decode (:stdout r)) (catch _ nil)))))
+    (cond
+      (not (= (:exit versions) 0)) {:failed versions}
+      (not (= (:exit log) 0)) {:failed log}
+      :else
+        (let (listed-versions (decode versions)
+              listed-log (decode log))
+          (if (or (not (vector? listed-versions)) (not (vector? listed-log)))
+            {:failed {:exit 1
+                      :stdout ""
+                      :stderr "this mur client cannot list a file's versions: update it (mur.fly.dev/install.sh)"}}
+            (mur-history-of listed-versions listed-log path start (os/now)))))))
+
+(defn mur-file-revision (root revision)
+  "The time machine's `:file-at` for mur: `{:text :diff}` — the file as `revision`'s snapshot
+has it (`mur cat PATH --at SNAPSHOT`) and that snapshot's diff of it against its first parent
+(`mur show SNAPSHOT PATH`) — or `{:failed result}`. Subprocesses: run off the loop."
+  (let (hash (:hash revision)
+        path (:path revision)
+        shown (mur-mur root ["cat" path "--at" hash]))
+    (if (not (= (:exit shown) 0))
+      {:failed shown}
+      (let (diff (mur-mur root ["show" hash path]))
+        {:text (:stdout shown "") :diff (if (= (:exit diff) 0) (mur-show-diff (:stdout diff)) "")}))))
+
+(defn mur-show-revision (m root hash)
+  "The time machine's `:show-revision` for mur (D): the whole snapshot — its message and
+every file it changed — in *mur-show*."
+  (mur-show-text m root "show" ["show" hash] "*mur-show*"))

@@ -7,7 +7,8 @@
   (:use pool)
   (:use editor/buffer)
   (:use gitbar) ; git's row, with the time machine's hooks
-  (:use murbar) ; mur's, without them
+  (:use murbar) ; mur's row, its hooks in murhistory
+  (:use murcore) ; a stand-in mur
   (:use-internals timemachine))
 
 (defn- tm-git (dir args) (os/cmd "git" args {:cwd dir}))
@@ -166,13 +167,107 @@
         (is (contains? (:cache (tm-state-of past)) middle))
         (is (not (= newest middle)))))))
 
-(describe "time machine: a VCS without the hooks"
-  (test "mur says it is not supported yet"
-    (let (dir (temp-dir "bedit-timemachine-mur-"))
+;; mur: no forge here, so `mur` is a stand-in script answering what the time machine asks —
+;; in the shapes mur's own tests pin (`mur versions --json`, `mur log --json`, `mur cat
+;; --at`, `mur show SNAPSHOT PATH`).
+
+(def- tm-trunk-id (string/repeat "a" 64))
+(def- tm-version-id (string/repeat "b" 64))
+
+(defn- tm-mur-copy (name)
+  "A mur working copy whose f.txt landed once on trunk and has one saved version in the
+change, and a stand-in `mur` that answers for it: `[dir program]`."
+  (let (dir (temp-dir (str "bedit-timemachine-mur-" name "-"))
+        bin (path/join dir ".mur" "bin")
+        program (path/join bin "mur"))
+    (do
       (file/mkdir dir)
       (file/mkdir (path/join dir ".mur"))
+      (file/mkdir bin)
+      (file/spit (path/join dir "f.txt") "one\ntwo\nbeing typed\n")
+      (file/spit (path/join bin "versions.json")
+        (json/encode [{:version 2
+                       :snapshot tm-version-id
+                       :time 1700000000000
+                       :author "Ann"
+                       :title "Two"
+                       :message "Two\n\nWhy it is two."
+                       :change "0ec8927f51595d56ebc1dceee9ba7d85"
+                       :sent false}]))
+      (file/spit (path/join bin "log.json")
+        (json/encode [{:snapshot tm-trunk-id
+                       :time 1690000000000
+                       :author "Bob"
+                       :title "Add f"
+                       :message "Add f"
+                       :change "1111222233334444aaaabbbbccccdddd"
+                       :base true}]))
+      (file/spit (path/join bin (str "text-" tm-version-id)) "one\ntwo\n")
+      (file/spit (path/join bin (str "text-" tm-trunk-id)) "one\n")
+      (file/spit (path/join bin (str "show-" tm-version-id))
+        (str "snapshot blake3:"
+          tm-version-id "  (a snapshot)\nauthor   Ann\n\n    Two\n\n"
+          "--- f.txt\n+++ f.txt\n@@ -1 +1,2 @@\n one\n+two\n"))
+      (file/spit (path/join bin (str "show-" tm-trunk-id))
+        (str "snapshot blake3:"
+          tm-trunk-id "\n\n    Add f\n\n--- f.txt\n+++ f.txt\n@@ -0,0 +1 @@\n+one\n"))
+      (file/spit program
+        (str "#!/bin/sh\nbin=$(dirname \"$0\")\necho \"$*\" >> \"$bin/asked\"\n"
+          "case \"$1\" in\n" "  versions) cat \"$bin/versions.json\" ;;\n"
+          "  log) cat \"$bin/log.json\" ;;\n"
+          "  cat) [ \"$2\" = f.txt ] && [ \"$3\" = --at ] && cat \"$bin/text-$4\" ;;\n"
+          "  show) cat \"$bin/show-$2\" ;;\n" "  *) exit 2 ;;\n" "esac\n"))
+      (os/cmd "chmod" ["+x" program] {:cwd "/"})
+      [dir program])))
+
+(describe "time machine: in a mur working copy"
+  (test "it opens on this change's versions of the file; B widens to trunk's history"
+    (let ([dir program] (tm-mur-copy "versions"))
+      (binding (*mur-program* program)
+        (let (m (cmd-vc-timemachine (tm-open dir) nil)
+              state (tm-state-of m))
+          (assert= (into [] (map (:history state) :hash)) [tm-version-id tm-trunk-id])
+          (assert= (:scope state) :branch)
+          (assert= (:branch-base state) "trunk")
+          (assert= (tm-text m) "one\ntwo\n")
+          (is (includes? (tm-info-text m)
+                "Change: v2 of this change, not landed — not on the forge yet"))
+          (is (includes? (tm-info-text m) "Why it is two."))
+          (is (includes? (tm-info-text m) "+two"))
+          (is (includes? (:echo (cmd-vc-timemachine-older m nil)) "oldest"))
+          (let (all (cmd-vc-timemachine-toggle-scope m nil)
+                older (cmd-vc-timemachine-older all nil))
+            (assert= (count (tm-revisions (tm-state-of all))) 2)
+            (assert= (tm-text older) "one\n")
+            (is (includes? (tm-info-text older) "Trunk:  landed as change 111122223333"))
+            (is (includes? (tm-info-text older) "+one")))
+          (is (includes? (file/slurp (path/join dir ".mur" "bin" "asked"))
+                (str "cat f.txt --at " tm-version-id)))))))
+  (test "mur's failure is said"
+    (let ([dir program] (tm-mur-copy "fails"))
+      (file/spit program "#!/bin/sh\necho 'mur: the forge did not answer' >&2\nexit 1\n")
+      (binding (*mur-program* program)
+        (let (m (cmd-vc-timemachine (tm-open dir) nil))
+          (is (includes? (:echo m) "the forge did not answer"))))))
+  (test "D shows the whole snapshot through mur show"
+    (let ([dir program] (tm-mur-copy "show"))
+      (binding (*mur-program* program)
+        (let (m (cmd-vc-timemachine-show-commit (cmd-vc-timemachine (tm-open dir) nil) nil))
+          (is (includes? (file/slurp (path/join dir ".mur" "bin" "asked"))
+                (str "show " tm-version-id "\n")))
+          (is (not (nil? (ed-buffer-index-by-name m "*mur-show*")))))))))
+
+(describe "time machine: a VCS without the hooks"
+  (test "says it is not supported"
+    ;; a kind of checkout of this test's own, so no real row is touched
+    (let (dir (temp-dir "bedit-timemachine-none-"))
+      (file/mkdir dir)
+      (file/mkdir (path/join dir ".tmtestvcs"))
+      (registry/put! :vcs/backends :tmtestvcs {:rank 5 :marker ".tmtestvcs"})
+      (vcscore/register-vcs-backend :tmtestvcs {:status 'murstatus/cmd-mur-status})
       (let (m (ed-init (make-buffer "x" "a.txt" (path/join dir "a.txt"))))
-        (assert= (:echo (cmd-vc-timemachine m nil)) "the time machine is not supported for mur yet")))))
+        (assert= (:echo (cmd-vc-timemachine m nil))
+          "the time machine is not supported for tmtestvcs yet")))))
 
 (describe "time machine: the changed lines tinted"
   (test "added and modified lines are tinted; a deletion, with no line of its own, is not"

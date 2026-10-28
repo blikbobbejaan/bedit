@@ -539,6 +539,11 @@ src/murstatus.blsp          C-x g in a mur working copy: *mur-status*, a section
 src/murforge.blsp           the forge's side (mur-forge, mur.fly.dev) through the client: o the
                             change's page in the browser, O *mur-changes* (the forge's open
                             changes; RET brings one here), C checks, D discussion, R reviews
+src/murhistory.blsp         mur's side of the time machine (C-x v t): a file's history is this
+                            change's saved versions (`mur versions --json PATH` — the BRANCH
+                            scope, against trunk) then trunk's (`mur log --json PATH`); a
+                            version's text `mur cat PATH --at SNAPSHOT`, its diff `mur show
+                            SNAPSHOT PATH`; D shows the snapshot. No blame: mur has none
 src/git.blsp                the TOP of the git porcelain (Magit's): `:use`s every git* module
                             below, so loading git loads all of it and every command a menu
                             or keymap names by symbol is there. Holds what has no better
