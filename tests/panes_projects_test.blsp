@@ -1329,7 +1329,8 @@ order they're emitted) to recover the whole line."
                   :minibuffer
                     (assoc (:minibuffer waiting)
                       :edit (ed-mb-set-text (:edit (:minibuffer waiting)) "vie")))
-          filled (commands/ed-apply-project-scan typed (list "src/view.blsp" "README.md")))
+          filled (commands/ed-apply-project-scan typed
+                   {:root (file/cwd) :files (list "src/view.blsp" "README.md") :stamp nil}))
       ;; the list is there…
       (assert= (list "src/view.blsp" "README.md") (:rank-source (:minibuffer filled)))
       ;; …the typing survived, and the slot is free
@@ -1338,8 +1339,11 @@ order they're emitted) to recover the whole line."
 
   (test "a scan that lands after the prompt closed is dropped"
     (let (closed (assoc (ed-init (make-buffer "")) :project-scan :job-1)
-          folded (commands/ed-apply-project-scan closed (list "src/view.blsp")))
+          folded (commands/ed-apply-project-scan closed
+                   {:root "/p" :files (list "src/view.blsp") :stamp 7}))
       (is (nil? (:minibuffer folded)))
+      ;; … but the list it found is kept, so the next `C-x p f` opens on it at once
+      (assert= (list "src/view.blsp") (get-in folded [:project-files "/p" :files]))
       (is (nil? (:project-scan folded)))))
 
   (test "a scan that lands over a DIFFERENT prompt is dropped"
@@ -1347,9 +1351,65 @@ order they're emitted) to recover the whole line."
     (let (other (assoc (ed-init (make-buffer ""))
                   :minibuffer (ed-mb-edit "Find file: " "")
                   :project-scan :job-1)
-          folded (commands/ed-apply-project-scan other (list "src/view.blsp")))
+          folded (commands/ed-apply-project-scan other
+                   {:root "/p" :files (list "src/view.blsp") :stamp 7}))
       (is (nil? (:rank-source (:minibuffer folded))))
       (is (nil? (:project-scan folded))))))
+
+;; ---- the project file list is cached per root, and refreshed behind the prompt ----
+;; `C-x p f` opens on the list it last found for the root and walks again behind the prompt
+;; only when that may be stale; a walk that finds a different list swaps it into the open
+;; prompt in place — typing kept, its ranking session handed the new set rather than restarted.
+
+(defn- waiting-project-prompt (root files typed)
+  "A live-editor shape: the project prompt open on `files`, `typed` typed, waiting on a walk."
+  (let (prompt (commands/ed-project-prompt root files))
+    (assoc (ed-init (make-buffer ""))
+      :minibuffer (assoc prompt :scanning root :edit (ed-mb-set-text (:edit prompt) typed))
+      :project-scan :job-1)))
+
+(describe "find-file-in-project — the cached list and its refresh"
+  (test "a cached list is trusted while git's index and its age say so"
+    (let (entry {:files ["a"] :stamp 5 :at 1000})
+      (is (commands/project-files-fresh? entry 5 2000))
+      (is (not (commands/project-files-fresh? entry 6 2000))) ; the index moved
+      (is (not (commands/project-files-fresh? entry 5 (+ 1000 commands/*project-files-fresh-ms*))))
+      (is (not (commands/project-files-fresh? (assoc entry :stale true) 5 2000)))
+      (is (not (commands/project-files-fresh? nil 5 2000)))))
+  (test "saving a NEW file marks the lists it lies under stale, and no other"
+    (let (m (assoc (ed-init (make-buffer ""))
+              :project-files {"/p" {:files [] :stamp 1 :at 1} "/q" {:files [] :stamp 1 :at 1}})
+          forgotten (ed-project-files-forget m "/p/src/new.blsp"))
+      (is (get-in forgotten [:project-files "/p" :stale]))
+      (is (nil? (get-in forgotten [:project-files "/q" :stale])))))
+  (test "a walk that finds the same list leaves the prompt alone"
+    (let (m (waiting-project-prompt "/p" ["src/view.blsp"] "vi")
+          folded (commands/ed-apply-project-scan m {:root "/p" :files ["src/view.blsp"] :stamp 3}))
+      (is (nil? (get-in folded [:minibuffer :scanning])))
+      (assert= "vi" (mb-text (:minibuffer folded)))
+      (assert= 3 (get-in folded [:project-files "/p" :stamp]))))
+  (test "a walk that finds a new file swaps it into the open prompt, typing kept"
+    (let (m (waiting-project-prompt "/p" ["src/view.blsp"] "view")
+          folded (commands/ed-apply-project-scan m
+                   {:root "/p" :files ["src/view.blsp" "src/viewer.blsp"] :stamp 3}))
+      (assert= "view" (mb-text (:minibuffer folded)))
+      (assert= (list "src/view.blsp" "src/viewer.blsp") (mb-candidates (:minibuffer folded)))
+      (is (nil? (get-in folded [:minibuffer :scanning])))))
+  (test "the ranking session survives the swap and answers over the new list"
+    (let (session (fuzzy/ranker ["src/view.blsp"] {:category :file})
+          m0 (waiting-project-prompt "/p" ["src/view.blsp"] "view")
+          m (assoc-in m0 [:minibuffer :ranker] session)
+          folded (commands/ed-apply-project-scan m
+                   {:root "/p" :files ["src/view.blsp" "src/viewer.blsp"] :stamp 3}))
+      (do
+        ;; the same session, now holding the new list, and the shown answer marked stale
+        (assert= session (get-in folded [:minibuffer :ranker]))
+        (is (mb-cands-stale? folded))
+        ;; so the next event asks again — and the answer covers the new file
+        (ed-cache-mb-candidates folded)
+        (assert= ["view" (list "src/view.blsp" "src/viewer.blsp")]
+          (receive ([:fuzzy-ranked ^session query hits] [query hits]) (after 5000 :timeout)))
+        (fuzzy/ranker-stop session)))))
 
 ;; ---- C-x p k: closing the project -------------------------------------------
 ;; Emacs `project-kill-buffers`. The care is all in "belongs to": a prefix test without a

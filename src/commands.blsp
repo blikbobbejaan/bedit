@@ -2287,11 +2287,12 @@ Emacs — no `../` needed. Last-used files (recentf) sort to the top, then by na
       (ed-find-file-prompt (str (ed-default-dir m) "/")
         ; the current buffer's dir, not the launch cwd
         (if (:recent-files m) (recent-files) [])))) ; recency only in the live editor
-(defn- ed-project-prompt (root files)
+(defn- ed-project-prompt (root files &optional (boost nil))
   "The find-file-in-project minibuffer spec over `files` (root-relative paths). Separate from
-the command because the file list arrives LATE: the prompt opens over `()` and this same
-shape is rebuilt around the real list when the walk lands (`ed-apply-project-scan`), so the
-two can never describe different things."
+the command because the file list can arrive LATE: the prompt opens over the cached list (or
+`()`) and this same shape is rebuilt around the real list when the walk lands
+(`ed-apply-project-scan`), so the two can never describe different things. `boost` is the
+project's frecency (`projects/project-file-boost`), ranked in as the fuzzy `:boost`."
   {:edit (assoc (ed-mb-edit "Find file in project: " "") :word-mode :path) ; M-b/M-f by folder
    :on-complete (fn (mm t)
                   ;; a Vertico selection is a real project file → open it; a
@@ -2309,15 +2310,50 @@ two can never describe different things."
    ;; default order: most-recently-visited (per project) first, then by last-written
    :rank-source (sort-project-files root files) ; narrowed incrementally as you type
    :rank-cap 20
-   :category :file ; marginalia per row …
+   ;; once something is typed: the fuzzy score plus what you open often and lately
+   :rank-boost boost
+   :project-files files ; what the prompt was built from — a refresh compares against it
+   :category :file ; marginalia per row, and paths ranked by their file name …
    :anno-base root ; … the candidate is project-root-relative, so resolve from here
    :accept-selection true})
+
+;; ---- the project file list, cached per root -----------------------------------
+;; `C-x p f` used to wait for `git ls-files` every time — 35 ms on a 27k-file project before
+;; the prompt could list anything. The list is now kept on the model per root
+;; (`:project-files`, `{root {:files :stamp :at}}`): the prompt opens on it at once and the
+;; walk runs behind it only when the list may have moved — git's index changed (`:stamp`,
+;; its mtime), a file was created by saving it (`ed-project-files-forget`), or it is older
+;; than `*project-files-fresh-ms*` (files made outside the editor touch neither). When the
+;; walk lands with a different list, the open prompt is rebuilt around it in place, keeping
+;; what was typed and handing the new list to its ranking session rather than starting one.
+
+(def *project-files-fresh-ms* 30000)
+
+(defn project-index-stamp (root)
+  "The mtime of `root`'s git index, or nil when it has none — what changes when files are
+added, removed or staged, so a cached list stamped with another value may be stale."
+  (let (index (path/join (path/join root ".git") "index"))
+    (if (file/exists? index) (:mtime (file/stat index)) nil)))
+
+(defn project-files-fresh? (entry stamp now)
+  "Whether cached list `entry` can be trusted without a walk: the index `stamp` it was made
+under still holds, and it is younger than `*project-files-fresh-ms*`."
+  (and (not (nil? entry))
+    (not (:stale entry))
+    (= (:stamp entry) stamp)
+    (< (- now (:at entry)) *project-files-fresh-ms*)))
+
+(defn- project-scan-job (root)
+  "The off-loop walk of `root`: its files and the index stamp they were listed under."
+  (task (fn () {:root root :files (project-files root) :stamp (project-index-stamp root)})))
 
 (defn ed-find-file-in-project (m root)
   "Open the find-file-in-project minibuffer over the files under `root` (recursive,
 root-relative; Tab narrows, Enter opens the first match). The shared core of `C-x p f`
 (root = the *current* project) and `C-x p p` (root = the *chosen* project) — so a switch
-lists the files of the project it switched to, not wherever the current buffer sits."
+lists the files of the project it switched to, not wherever the current buffer sits.
+Opens on the cached list when there is one, walking again behind it only when that may be
+stale (`project-files-fresh?`)."
   (if (nil? root)
     (message m "not in a project (no project.blsp found)")
     ;; Recording the project writes the on-disk cache, so it is gated on `:recent-files` —
@@ -2325,30 +2361,58 @@ lists the files of the project it switched to, not wherever the current buffer s
     ;; progress are. Ungated, ANY model reached this: a pure model test would rewrite the
     ;; developer's real `~/.config/bedit/state/projects.blsp` with its /tmp fixtures,
     ;; which is why `panes_projects_test` used to save and restore that file by hand.
-    (let (_ (when (:recent-files m) (remember-project! root)))
+    (let (_ (when (:recent-files m) (remember-project! root))
+          boost (if (:recent-files m) (project-file-boost root) nil))
       (if (ed-headless?)
-        (assoc m :minibuffer (ed-project-prompt root (project-files root)))
-        ;; The prompt opens NOW and the list arrives when the walk does. `project-files` is
-        ;; `git ls-files` in a subprocess — 35 ms on a 27,310-file project — and every
-        ;; millisecond of it was spent between pressing `C-x p f` and the prompt appearing.
-        (let (job (task (fn () (project-files root))))
-          (assoc m
-            :minibuffer (assoc (ed-project-prompt root '()) :scanning root)
-            :project-scan job))))))
+        (assoc m :minibuffer (ed-project-prompt root (project-files root) boost))
+        (let (entry (get-in m [:project-files root])
+              prompt (ed-project-prompt root (if (nil? entry) '() (:files entry)) boost))
+          (if (project-files-fresh? entry (project-index-stamp root) (os/now))
+            (assoc m :minibuffer prompt)
+            ;; The prompt opens NOW, on whatever list is cached, and the walk lands behind it.
+            (assoc m
+              :minibuffer (assoc prompt :scanning root)
+              :project-scan (project-scan-job root))))))))
 
 ;; the project file walk, off the loop (`model/register-task-reply`)
-(register-task-reply :project-scan 'commands/ed-apply-project-scan '() "scanning")
-(defn ed-apply-project-scan (m files)
-  "Fill the open find-file-in-project prompt with the files the walk found, keeping whatever
-the reader has typed in the meantime. Dropped unless a prompt is still open and still waiting
-(`:scanning`) — closing it, or opening another, must not be overwritten by a walk that was
-already running."
+(register-task-reply :project-scan 'commands/ed-apply-project-scan nil "scanning")
+(defn ed-apply-project-scan (m scan)
+  "Fold a finished walk (`{:root :files :stamp}`, nil when it failed) in: cache the list for
+its root, and — when a prompt is still open on that root and waiting (`:scanning`) — rebuild
+it around the new list if the list changed, keeping what the reader typed. A prompt with a
+ranking session keeps it: the session is handed the new candidates (`fuzzy/ranker-candidates`)
+and its answer marked stale, so the next event asks again over the new set while the old
+answer stays on screen. Closing the prompt, or opening another, is never overwritten by a
+walk that was already running."
   (let (mb (:minibuffer m)
-        m1 (dissoc m :project-scan))
-    (if (or (nil? mb) (nil? (:scanning mb)))
-      m1
-      (assoc m1
-        :minibuffer (assoc (ed-project-prompt (:scanning mb) files) :edit (:edit mb) :sel 0)))))
+        m1 (dissoc m :project-scan)
+        root (:root scan)
+        files (:files scan)
+        cached (if (nil? scan)
+                 m1
+                 (assoc-in m1
+                   [:project-files root]
+                   {:files files :stamp (:stamp scan) :at (os/now)})))
+    (cond
+      (or (nil? mb) (nil? (:scanning mb))) cached
+      (or (nil? scan) (not (= (:scanning mb) root)))
+        (assoc cached :minibuffer (dissoc mb :scanning))
+      (= files (:project-files mb)) (assoc cached :minibuffer (dissoc mb :scanning))
+      :else
+        (let (rebuilt (assoc (ed-project-prompt root files (:rank-boost mb))
+                        :edit (:edit mb)
+                        :sel 0
+                        :ranker (:ranker mb))
+              session (:ranker mb))
+          (assoc cached
+            :minibuffer
+              (if (nil? session)
+                rebuilt
+                (do
+                  (fuzzy/ranker-candidates session (:rank-source rebuilt))
+                  ;; still shown (a session prompt shows its last answer), but no longer
+                  ;; for the typed text — so the next event, or the idle beat, re-asks
+                  (assoc rebuilt :cand-cache (assoc (or (:cand-cache mb) {:cands (list)}) :for nil)))))))))
 
 (defcommand cmd-project-find-file
   (m key)
