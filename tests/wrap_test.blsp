@@ -409,3 +409,136 @@ line kinds a section buffer marks — the shape of *git-status*'s Recent commits
           ellipsis-click (ed-update m [:mouse :press :left 0 28 [] 1] 30 6))
       (assert= (buffer-point (cur text-click)) 4)
       (assert= (buffer-point (cur ellipsis-click)) (string/length commit-row)))))
+
+;; ---- a wrapped pane scrolls by screen ROWS ------------------------------------------
+;; A pane's scroll position used to be a LINE, so in a wrapped buffer the view could only
+;; move a whole paragraph at once: typing at the bottom of the window held point's row
+;; while a one-row line scrolled off the top, then lurched every row on screen up by the
+;; height of the next paragraph. Emacs's window-start is a screen line, so it scrolls by
+;; rows; the pane now starts on a row of its top line (`:top-row`).
+(describe "a wrapped pane scrolls by screen rows"
+  (def paragraph (string/join (map (range 0 60) (fn (i) (str "word" i))) " "))
+  (def sections
+    (string/join (map (range 0 12) (fn (i) (str "## Heading " i "\n\n" paragraph "\n"))) "\n"))
+  (defn point-row (m cols rows)
+    "Point's text row in the selected pane, as the view lays it out."
+    (let (pane (ed-selected-pane (:panes (ed-body-layout m cols rows)))
+          buf (ed-buf-at m (get (:payload pane) :buffer)))
+      (first (ed-pane-point-row pane buf (ed-pane-vrows pane buf)))))
+  (defn typing-rows (m keys cols rows)
+    "Point's text row after each key."
+    (second (fold keys
+              [m []]
+              (fn ([acc trail] k)
+                (let (next (ed-update acc k cols rows))
+                  [next (conj trail (point-row next cols rows))])))))
+  (sig end-of-paragraph (map int -> map))
+  (defn end-of-paragraph (m n)
+    "The model with point at the end of the `n`th paragraph (from 0) of `sections`."
+    (ed-set-buf m
+      (goto-char (cur m) (+ (* n (+ 14 (string/length paragraph))) 13 (string/length paragraph)))))
+  (test "typing at the bottom margin moves point's row by at most one per key"
+    (let (m (ed-update (end-of-paragraph (wrapped sections) 4) :tick 80 24)
+          keys (map (string/->list (string/join (map (range 0 40) (fn (i) (str " typed" i))) ""))
+                 str)
+          trail (typing-rows m keys 80 24)
+          jumps (map (range 1 (count trail))
+                  (fn (i) (math/abs (- (nth trail i) (nth trail (dec i)))))))
+      (is (every? trail int?))
+      ;; before rows: 5 — the height of the paragraph that scrolled off, less the row it grew
+      (is (<= (reduce jumps 0 math/max) 1)))))
+
+(describe "a pane started part-way down a wrapped line"
+  (defn mid-paragraph ()
+    "Typing at the bottom margin until the pane starts part-way down a paragraph: the model,
+on an 80x24 frame."
+    (letrec (go (fn (m i)
+                  (if (or (> (ed-current-top-row m) 0) (> i 400))
+                    m
+                    (go (ed-update m " " 80 24) (inc i)))))
+      (go (ed-update (end-of-paragraph (wrapped sections) 4) :tick 80 24) 0)))
+  (defn selected (m) (ed-selected-pane (:panes (ed-body-layout m 80 24))))
+  (test "typing gets the pane there, and its first row continues the top line"
+    (let (m (mid-paragraph)
+          pane (selected m)
+          rows (ed-pane-rows pane (cur m)))
+      (is (> (ed-current-top-row m) 0))
+      (assert= (first (first rows)) (ed-current-top m))
+      ;; the first row is a later segment of the line, not its start
+      (is (> (second (first rows)) 0))
+      (is (ed-pane-top-continued? pane (cur m)))))
+  (test "an unchanged position leaves the model alone"
+    (let (m (mid-paragraph))
+      (is (= (ed-scroll m 22) m))))
+  (test "the first row shows no line number: it continues the line"
+    (let (m (mid-paragraph)
+          ops (ed-view m 80 24)
+          number (str (inc (ed-current-top m))))
+      ;; the top line's number is nowhere in the gutter: its first row is off the top
+      (is (not (any? (line-texts ops) (fn (t) (= (string/trim t) number)))))))
+  (test "a click on the first row lands in that row's slice of the top line"
+    (let (m (mid-paragraph)
+          pane (selected m)
+          buf (cur m)
+          from (second (first (ed-pane-rows pane buf)))
+          [px py _ _] (:rect pane)
+          gutter (panes/ed-pane-gutter-width buf pane)
+          clicked (ed-update m [:mouse :press :left py (+ px gutter) [] 1] 80 24)
+          bol (text/line->char (buffer-rope buf) (ed-current-top m)))
+      (assert= (buffer-point (cur clicked)) (+ bol from))))
+  (test "C-v and M-v move by rows and keep point's screen row"
+    (let (m (mid-paragraph)
+          before (point-row m 80 24)
+          down (ed-update m :ctrl-v 80 24)
+          back (ed-update down :alt-v 80 24))
+      (assert= (point-row down 80 24) before)
+      (assert= (point-row back 80 24) before)
+      (assert= [(ed-current-top back) (ed-current-top-row back)]
+        [(ed-current-top m) (ed-current-top-row m)])))
+  (test "C-l puts point's row in the middle, then at the top margin, then the bottom"
+    (let (m (mid-paragraph)
+          middle (ed-update m :ctrl-l 80 24)
+          top (ed-update middle :ctrl-l 80 24)
+          bottom (ed-update top :ctrl-l 80 24))
+      (assert= (point-row middle 80 24) 11)
+      (assert= (point-row top 80 24) (ed-margin 22))
+      (assert= (point-row bottom 80 24) (- 22 1 (ed-margin 22)))))
+  (test "two panes on one buffer keep their own row"
+    (let (m (mid-paragraph)
+          other (press m [:ctrl-x "2"])
+          paths (editor/pane/pane-leaf-paths (:layout other))
+          rows (map paths
+                 (fn (path) (get (editor/pane/pane-payload-at (:layout other) path) :top-row))))
+      ;; the split copies the selected pane's start; moving one does not move the other
+      (let (moved (ed-update other :ctrl-v 80 24)
+            after (map paths
+                    (fn (path) (get (editor/pane/pane-payload-at (:layout moved) path) :top-row))))
+        (assert= (count paths) 2)
+        (is (not (= (first after) (second after))))
+        ;; the pane C-v did not reach starts where it did
+        (is (any? (range 2) (fn (i) (= (nth after i) (nth rows i))))))))
+  (test "an edit that shortens the top line clamps the row to what it has"
+    (let (m (mid-paragraph)
+          top (ed-current-top m)
+          rope (buffer-rope (cur m))
+          bol (text/line->char rope top)
+          ;; the top line cut to a few words: one row left
+          shortened (ed-set-buf m
+                      (replace-region (cur m)
+                        (+ bol 10)
+                        (+ bol (string/length (wrap/line-text (cur m) top)))
+                        ""))
+          pane (selected shortened)
+          w (panes/ed-pane-text-cols pane (cur shortened)))
+      (assert= (ed-pane-top-row pane (cur shortened) w (ed-row-extras (cur shortened))) 0)
+      (assert= (first (first (ed-pane-rows pane (cur shortened)))) top)))
+  (test "a narrowed pane scrolls by rows within its restriction"
+    (let (m (ed-map-panes (ed-update (end-of-paragraph (wrapped sections) 4) :tick 80 24)
+              (fn (w) (assoc w :restrict [0 (- (buffer-length (cur (wrapped sections))) 1)])))
+          keys (map (string/->list (string/join (map (range 0 40) (fn (i) (str " typed" i))) ""))
+                 str)
+          trail (typing-rows m keys 80 24)
+          jumps (map (range 1 (count trail))
+                  (fn (i) (math/abs (- (nth trail i) (nth trail (dec i)))))))
+      (is (every? trail int?))
+      (is (<= (reduce jumps 0 math/max) 1)))))

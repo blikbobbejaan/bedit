@@ -6,9 +6,9 @@ its long lines — wrapped, truncated with an ellipsis or scrolled, per buffer a
 (`ed-long-lines`) — and whether it lays out row-wise, and the snap that ends a fractional
 glide on a whole line (`ed-settle-scroll`).
 
-All `model -> model` over the selected pane's `:top` / `:hscroll`: the model owns the panes
-and the setters (`ed-set-top`), this owns the POLICY of where they should sit, which is
-what the dispatcher, the panes and the view each ask."
+All `model -> model` over the selected pane's `:top` / `:top-row` / `:hscroll`: the model owns
+the panes and the setters (`ed-set-top`, `ed-set-start`), this owns the POLICY of where they
+should sit, which is what the dispatcher, the panes and the view each ask."
   (:use editor/buffer) ; buffer-line-count / buffer-current-line / buffer-column / buffer-line-at
   (:use editor/pane) ; pane-update-selected — write the selected pane's `:hscroll`
   (:use model) ; ed-current-buf / ed-current-top / ed-set-top / ed-map-panes / ed-mode-service / restriction
@@ -241,18 +241,186 @@ walk that counted only the segments would stop one line too high for every inlay
                      (step (dec t) (+ used above)))))))
     (step line (inc seg-row))))
 
-(sig ed-wrap-top-above (buffer int int int int int &optional map -> int))
-(defn- ed-wrap-top-above (buf line seg-row w margin floor &optional (inlays {}))
-  "The lowest scroll top that leaves `margin` ROWS above point's row: from `line` (point on
-its `seg-row`, below the line's own inlay rows) walk up a line at a time until that many
-rows are above it — never above `floor`. The top-side twin of `ed-wrap-top-for`."
-  (let (inlay-rows (fn (k) (count (get (or inlays {}) k [])))
-        step (fn (t used)
-               (if (or (>= used margin) (<= t floor))
-                 t
-                 (step (dec t)
-                   (+ used (wrap/line-rows buf (dec t) w (or inlays {})))))))
-    (step line (+ seg-row (inlay-rows line)))))
+;; ---- a wrapped pane's start: a ROW of its top line -------------------------------------
+;; In a row-wise buffer a pane starts on a screen ROW, `[line row]` — `row` counting the
+;; line's inlay rows, then its wrapped segments (`wrap/line-rows`). A position is moved a
+;; whole number of rows at a time, so the view never moves further than it has to: a long
+;; paragraph scrolls off the top a row at a time, as Emacs's window-start (a screen line)
+;; does in visual-line-mode. A line a fold hides has no rows and is stepped over.
+
+(sig ed-point-row-in-line (buffer int int int map -> int))
+(defn ed-point-row-in-line (buf line column w extras)
+  "Which of `line`'s rows char `column` sits on: its inlay rows come first, then the wrapped
+segment holding the column (`wrap/row-of`)."
+  (+ (count (get extras line []))
+    (wrap/row-of (wrap/line-segments buf line w extras) column)))
+
+(sig ed-rows-up (buffer (tuple int int) int int map int -> (tuple int int)))
+(defn ed-rows-up (buf position k w extras floor)
+  "The position `k` rows above `position` (`[line row]`), never above `floor`'s first row.
+Tail-recursive over the lines above."
+  (let ([line row] position)
+    (cond
+      (<= k row) [line (- row k)]
+      (<= line floor) [line 0]
+      else
+        (let (above (wrap/line-rows buf (dec line) w extras))
+          (if (= above 0)
+            ;; a hidden line: no rows to land on, step past it
+            (ed-rows-up buf [(dec line) 0] (- k row) w extras floor)
+            (ed-rows-up buf [(dec line) (dec above)] (- k row 1) w extras floor))))))
+
+(sig ed-rows-before? ((tuple int int) (tuple int int) -> bool))
+(defn ed-rows-before? (a b)
+  "Whether position `a` comes before position `b`."
+  (or (< (first a) (first b)) (and (= (first a) (first b)) (< (second a) (second b)))))
+
+(sig ed-rows-between (buffer (tuple int int) (tuple int int) int map int -> int))
+(defn ed-rows-between (buf from to w extras limit)
+  "How many rows `to` is below `from` (both `[line row]`, `from` not after `to`), counting
+no further than just past `limit` — the clamp only asks whether it is on screen."
+  (+ (- (wrap/row-count buf (first from) (first to) w extras limit) (second from)) (second to)))
+
+(sig ed-current-start (model int map -> (tuple int int)))
+(defn ed-current-start (m w extras)
+  "The selected pane's start, `[top row]`, its row clamped to the rows the top line has now
+(an edit may have shortened it): what `ed-scroll` moves from."
+  (let (buf (ed-current-buf m)
+        top (math/min (ed-current-top m) (math/max 0 (dec (buffer-line-count buf))))
+        rows (wrap/line-rows buf top w extras))
+    [top (math/max 0 (math/min (ed-current-top-row m) (dec rows)))]))
+
+(sig ed-rows-down (buffer (tuple int int) int int map int -> (tuple int int)))
+(defn ed-rows-down (buf position k w extras last-line)
+  "The position `k` rows below `position` (`[line row]`), never past `last-line`'s last
+row. Tail-recursive over the lines below."
+  (let ([line row] position
+        rows (wrap/line-rows buf line w extras))
+    (cond
+      (< (+ row k) rows) [line (+ row k)]
+      (>= line last-line) [line (math/max 0 (dec rows))]
+      ;; past this line's last row: on to the next line's first, with what is left
+      else (ed-rows-down buf [(inc line) 0] (- k (- rows row)) w extras last-line))))
+
+(sig ed-start-bounds (buffer int int int int map -> (tuple (tuple int int) (tuple int int))))
+(defn ed-start-bounds (buf textrows first-line last-line w extras)
+  "`[lowest highest]` — the first start a `textrows`-tall pane over lines
+`[first-line, last-line]` may have, and the last: the one that shows `last-line`'s last row
+on the bottom row (no blank rows past the end), or the first when everything fits."
+  (let (lowest [first-line 0]
+        last-rows (wrap/line-rows buf last-line w extras)
+        highest (ed-rows-up buf
+                  [last-line (math/max 0 (dec last-rows))]
+                  (dec textrows)
+                  w
+                  extras
+                  first-line))
+    [lowest (if (ed-rows-before? highest lowest) lowest highest)]))
+
+(sig ed-clamp-start ((tuple int int) (tuple (tuple int int) (tuple int int)) -> (tuple int int)))
+(defn ed-clamp-start (want bounds)
+  "`want` held within `bounds` (`ed-start-bounds`)."
+  (let ([lowest highest] bounds)
+    (cond
+      (ed-rows-before? want lowest) lowest
+      (ed-rows-before? highest want) highest
+      else want)))
+
+(sig ed-scroll-lines (model -> (tuple int int)))
+(defn ed-scroll-lines (m)
+  "`[first last]` — the lines the selected pane scrolls within: its narrowing's, else the
+buffer's."
+  (let (buf (ed-current-buf m)
+        restrict (ed-selected-restrict m))
+    (if restrict (ed-restrict-lines buf restrict) [0 (dec (buffer-line-count buf))])))
+
+(sig ed-row-scroll-width (model -> (or nil int)))
+(defn ed-row-scroll-width (m)
+  "The text width the selected pane scrolls BY ROWS at — its buffer row-wise
+(`ed-row-wise?`) and the loop having stored a width (`:view-cols`) — else nil, when it
+scrolls by lines."
+  (let (w (or (:view-cols m) 0)
+        buf (ed-current-buf m))
+    (if (and (> w 0) (ed-row-wise? buf (ed-row-extras buf))) w nil)))
+
+(sig ed-scroll-rows (model int int int int int map -> model))
+(defn- ed-scroll-rows (m textrows margin first-line last-line w extras)
+  "`ed-scroll` for a row-wise buffer: the selected pane's start moved by exactly as many
+ROWS as keep point `margin` rows clear of the top and bottom (fewer near the ends), never
+above `first-line` nor so far down that rows past `last-line`'s last would show."
+  (let (buf (ed-current-buf m)
+        line (buffer-current-line buf)
+        point [line (ed-point-row-in-line buf line (buffer-column buf) w extras)]
+        start (ed-current-start m w extras)
+        bounds (ed-start-bounds buf textrows first-line last-line w extras)
+        want (if (ed-rows-before? point start)
+               (ed-rows-up buf point margin w extras first-line)
+               (let (r (ed-rows-between buf start point w extras textrows))
+                 (cond
+                   (and (< r margin) (ed-rows-before? (first bounds) start))
+                     (let (above (ed-rows-up buf point margin w extras first-line))
+                       (if (ed-rows-before? above start) above start))
+                   (> r (- textrows 1 margin))
+                     (let (below (ed-rows-up buf point (- textrows 1 margin) w extras first-line))
+                       (if (ed-rows-before? start below) below start))
+                   else start)))
+        clamped (ed-clamp-start want bounds))
+    (ed-set-start m (first clamped) (second clamped))))
+
+(sig ed-scroll-by-rows (model int int -> model))
+(defn ed-scroll-by-rows (m k w)
+  "The selected pane's start moved `k` rows (negative: up), point moving with it so it keeps
+its screen row (Emacs's `scroll-preserve-screen-position`) — C-v / M-v in a buffer that
+scrolls by rows, at text width `w` (`ed-row-scroll-width`). Point lands on the row at its
+old screen row, at the same column into that row as far as the row reaches."
+  (let (buf (ed-current-buf m)
+        extras (ed-row-extras buf)
+        textrows (math/max 1 (or (:view-rows m) 1))
+        [first-line last-line] (ed-scroll-lines m)
+        line (buffer-current-line buf)
+        segments (wrap/line-segments buf line w extras)
+        segment-row (wrap/row-of segments (buffer-column buf))
+        into-row (- (buffer-column buf) (first (nth segments segment-row [0 0])))
+        point [line (+ (count (get extras line [])) segment-row)]
+        start (ed-current-start m w extras)
+        screen-row (if (ed-rows-before? point start)
+                     0
+                     (math/min (dec textrows) (ed-rows-between buf start point w extras textrows)))
+        moved (ed-clamp-start (if (< k 0)
+                                (ed-rows-up buf start (- k) w extras first-line)
+                                (ed-rows-down buf start k w extras last-line))
+                (ed-start-bounds buf textrows first-line last-line w extras))
+        [new-line new-row] (ed-rows-down buf moved screen-row w extras last-line)
+        ;; an inlay row has no text: point goes to the line's first text row
+        new-segments (wrap/line-segments buf new-line w extras)
+        segment (nth new-segments
+                  (math/max 0
+                    (math/min (- new-row (count (get extras new-line [])))
+                      (dec (count new-segments))))
+                  [0 0])
+        ;; a segment is untyped data (`wrap/segments`): the guard makes the column an int
+        from (first segment)
+        to (second segment)
+        column (if (and (int? from) (int? to) (int? into-row)) (math/min (+ from into-row) to) 0)
+        moved-buf (goto-char buf (+ (text/line->char (buffer-rope buf) new-line) column)))
+    (ed-set-start (ed-set-buf m moved-buf) (first moved) (second moved))))
+
+(sig ed-recenter-rows (model int int -> model))
+(defn ed-recenter-rows (m row w)
+  "The selected pane started so point's row sits on screen row `row` — C-l in a buffer that
+scrolls by rows, at text width `w`. Near the buffer's start it stops at the first row; the
+post-command clamp (`ed-scroll`) settles the end."
+  (let (buf (ed-current-buf m)
+        extras (ed-row-extras buf)
+        [first-line _] (ed-scroll-lines m)
+        line (buffer-current-line buf)
+        start (ed-rows-up buf
+                [line (ed-point-row-in-line buf line (buffer-column buf) w extras)]
+                row
+                w
+                extras
+                first-line))
+    (ed-set-start m (first start) (second start))))
 
 (sig ed-scroll (model int -> model))
 (defn ed-scroll (m textrows)
@@ -260,9 +428,10 @@ rows are above it — never above `floor`. The top-side twin of `ed-wrap-top-for
 above and below it within a `textrows`-tall viewport — scrolling only as far as needed
 (Emacs `scroll-margin` + `scroll-conservatively`: never recenter, just enough). Clamped
 so it never scrolls past end-of-buffer (no blank void below the last line); near the
-edges the margin is whatever the buffer allows. A wrapped buffer (`ed-wrap?`) counts
-ROWS below the top, not lines — a long line above point takes several — against the
-text width the loop last stored (`:view-cols`), and both margins are counted in rows. Pure."
+edges the margin is whatever the buffer allows. A row-wise buffer (`ed-row-wise?`:
+wrapped lines, inlay rows, folds) is scrolled by ROWS instead (`ed-scroll-rows`): both
+margins are rows, against the text width the loop last stored (`:view-cols`), and the pane
+may start part-way down a long line, so it never moves further than it has to. Pure."
   (let (buf (ed-current-buf m)
         line (buffer-current-line buf)
         top (ed-current-top m)
@@ -275,44 +444,18 @@ text width the loop last stored (`:view-cols`), and both margins are counted in 
         [rtop rbot] (if restrict (ed-restrict-lines buf restrict) [0 (dec (buffer-line-count buf))])
         mintop rtop
         w (or (:view-cols m) 0)
-        inlays (ed-row-extras buf)
-        wrap? (and (> w 0) (ed-row-wise? buf inlays))
-        ;; row-wise: the top that puts the last (restricted) line's last row on the bottom row
-        maxtop (math/max rtop
-                 (if wrap?
-                   (ed-wrap-top-for buf
-                     rbot
-                     (dec (count (wrap/line-segments buf rbot w inlays)))
-                     w
-                     textrows
-                     rtop
-                     inlays)
-                   (math/min (ed-max-top buf textrows) (math/max 0 (- (inc rbot) textrows)))))
-        lo (+ top mgn) ; first comfortable line (margin below top)
-        hi (- (+ top textrows) 1 mgn) ; last comfortable line (margin above bottom)
-        want (if (not wrap?)
-               (cond
-                 (< line lo) (- line mgn)
-                 (> line hi) (+ (- line textrows) 1 mgn)
-                 else top)
-               ;; row-wise, both margins are ROWS, as Emacs counts screen lines: a long
-               ;; line above point is several rows of context, not one
-               (let (seg-row (wrap/row-of (wrap/line-segments buf line w inlays)
-                               (buffer-column buf)))
-                 (if (< line top)
-                   (ed-wrap-top-above buf line seg-row w mgn mintop inlays)
-                   ;; point's row below the top: the rows of the lines above it plus its
-                   ;; own segment — past the comfortable last row is all that is asked,
-                   ;; so the count may stop there
-                   (let (r (+ (wrap/row-count buf top line w inlays textrows) seg-row))
-                     (cond
-                       (and (< r mgn) (> top mintop))
-                         (math/min top (ed-wrap-top-above buf line seg-row w mgn mintop inlays))
-                       (> r (- textrows 1 mgn))
-                         (math/max top
-                           (ed-wrap-top-for buf line seg-row w (- textrows mgn) mintop inlays))
-                       else top))))))
-    (ed-set-top m (math/max mintop (math/min maxtop want)))))
+        inlays (ed-row-extras buf))
+    (if (and (> w 0) (ed-row-wise? buf inlays))
+      (ed-scroll-rows m textrows mgn rtop rbot w inlays)
+      (let (maxtop (math/max rtop
+                     (math/min (ed-max-top buf textrows) (math/max 0 (- (inc rbot) textrows))))
+            lo (+ top mgn) ; first comfortable line (margin below top)
+            hi (- (+ top textrows) 1 mgn) ; last comfortable line (margin above bottom)
+            want (cond
+                   (< line lo) (- line mgn)
+                   (> line hi) (+ (- line textrows) 1 mgn)
+                   else top))
+        (ed-set-top m (math/max mintop (math/min maxtop want)))))))
 
 ;; ---- horizontal scroll (long lines, no wrap): keep point's column in view ----
 (def *hscroll-margin* 8) ; columns of context kept left/right of point

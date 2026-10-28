@@ -98,7 +98,10 @@ src/model.blsp              the ui-run model: buffer pool, panes, kill ring, min
 src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
                             over the live keymap, `\[command]` substitution, docstrings
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
-                            `ed-max-top`, and the snap that ends a glide on a line — and the
+                            `ed-max-top`, and the snap that ends a glide on a line; in a
+                            row-wise (wrapped) buffer the pane starts on a screen ROW of its top
+                            line (`:top-row`, `[line row]`) and the clamp, C-v / M-v and C-l move
+                            it by rows, as Emacs's window-start is a screen line — and the
                             LONG-LINES policy (`ed-long-lines`): :wrap / :truncate / :scroll per
                             buffer and per line — the buffer's toggle (M-x toggle-truncate-lines,
                             visual-line-mode), the `:long-lines` setting for its mode, the line's
@@ -145,7 +148,9 @@ src/themes.blsp             the theme registry (M-x theme-select): a live picker
 src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
                             hive packages that `:enhances bedit` at RUNTIME, into
                             ~/.config/bedit/packages (the elpa model) — never the build's _deps
-src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model)
+src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model); the
+                            row table every row↔line question reads (`ed-pane-rows`), from the
+                            pane's start row
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
                             feature: a pane body's layers share ONE geometry map, and the
                             mode line's feature chips come from the statusbar registry
