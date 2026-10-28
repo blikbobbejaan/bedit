@@ -619,7 +619,8 @@ src/timemachine.blsp        the TIME MACHINE (C-x v t, C-c g t / p / n; Emacs's 
                             commit, b blame, w / W the hash. VCS-neutral: the history and a
                             revision come from the row's `:file-history` / `:file-at` in a
                             task — the history once, a revision when first stepped to, cached;
-                            a step supersedes the fetch in flight. mur has no `:file-at` yet
+                            a step supersedes the fetch in flight. git and mur both provide
+                            the rows (gitview, murhistory); mur has no blame
 src/smerge.blsp             conflicts resolved IN the file, Emacs's smerge: C-c ^ n/p between
                             conflicts, u/l/a/b keep upper / lower / both / base
 src/diffhl.blsp             diff-hl change gutter: per-line added/modified/deleted against the

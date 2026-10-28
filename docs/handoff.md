@@ -2,35 +2,45 @@
 
 **Replaced each session; this is the *current* picture, not history.** The narrative lives
 in brood's `docs/devlog.md`; decisions in brood's `docs/decisions/`; the open backlog is
-[`../issues.md`](../issues.md). Read this to pick the work back up cold.
+`todo.md` and the Next list below. Read this to pick the work back up cold.
 
-## State when written — 2026-10-26, morning
+## State when written — 2026-10-28, evening
 
-Released and published; everything committed and pushed.
+Released and published; everything of bedit's committed and pushed.
 
-- **brood v0.44.0** (tag on `bd75fb95`, merged into main as `0884b0b0`): WASI by grant
-  (ADR-453), `include-bytes` (ADR-454), typed parameters, sorted collections, process
-  registry and groups, `defapp`/`defstatem`, crypto, UDP, TLS ALPN, `nest dap`, std `vcs`,
-  `os/shell-split`, `path/substitute`. The CHANGELOG had recorded about a quarter of the 229
-  commits since 0.43.0; the release commit filled it in, including two **breaking** changes
-  (`gen/start-link`/`gen/start-named` gone, ADR-433; tempo/resolver answer failures).
-- **bedit v0.7.0** (`f85847ca`): the floor is brood 0.44.0 — the first release since v0.6.1
-  that a released toolchain can run. All 59 issues from the 2026-09-23 review are fixed.
-- **hive**: `observe-otlp 0.1.0` and `sqlite 0.1.0` published; repos
-  `broodlang/observe-otlp` and `broodlang/sqlite` created (public).
-- **path/substitute moved to brood std** (`efd919d1`): `path/expand-env`, `path/escape-env`,
-  `path/substitute`, `path/substitute-start` (Emacs's `substitute-in-file-name`; a `keep?`
-  predicate keeps path pure, ADR-234). bedit's `filename.blsp` is now the prompt's layer only.
+- **brood v0.45.0** (tag on `ad737a7d`, cut by another session): C-g through a busy update
+  (ADR-491/493/494/502), every error a map and `catch` by pattern (ADR-501), hygiene at every
+  binding site (ADR-500), nested quasiquote (ADR-503), tree handles owned per process
+  (ADR-495), injection `:exclude` (ADR-496), fuzzy ranking (ADR-497), `diff/map-line` and
+  friends (ADR-499), vt rows of several colours painted in order (PR #6).
+- **bedit v0.8.0** (`efae0fa8`): the floor is brood 0.45.0. Since 0.7.0: the time machine
+  (C-x v t, git and mur), fuzzy file finding with Emacs-style ranking and frequency, the
+  long-lines policy (`:long-lines`, `M-x toggle-truncate-lines`), completion that merges
+  mid-word, the terminal's completion preview no longer taking a program's keys (PR #1).
+  Binaries for Linux x86_64 / arm64 and macOS arm64 on the GitHub release; on hive.
+- Installed: nest 0.45.0 (`ad737a7d`, GUI build) and bedit 0.8.0.
 
 ## Next
 
-1. The installed nest is 0.44.0 (`bd75fb95`, GUI build); its worktree has been removed.
-2. `todo.md` is stale except one bug: a slight jitter when editing a markdown file. No commit
-   addresses it; reproduce before assuming it is gone.
-3. Brood gaps still open (`../brood/docs/general-purpose-gaps.md`): runtime memory items
-   (benchmark-gated — the test machine), re-timing the load-path work, a C embedding API,
-   `:wasm-build` build-on-fetch, HTTP/2 / gRPC / Redis / MySQL packages, W3C `traceparent`.
-4. `toolchain.blsp` (marker file → compile/test/run commands) was weighed for std and left
+1. **In flight — brood branch `native-redirect`** (worktree `~/.cache/brood-wt-redirect`, not
+   merged): a builtin that calls Brood back from Rust (`num/add` and `compare-to` on records,
+   `->seq` / `->count`, `apply` as a value) hands the call to the engine instead, so a
+   `receive` under it parks; `isolate` as a frame; an alias of `proc/interruptible`. Review,
+   merge onto main, delete the worktree.
+2. **Benchmark ADR-502 on the benchmark machine**: `make ab BASE=11601fe6 ROWS="nqueens
+   pipeline json reduce"`. A closure reducer's fold over a vector or range now walks in Brood;
+   never measured. If it is slow: keep the Rust loop outside interrupt windows.
+3. `todo.md`: every feature listed there is built (region wrap and the electric-pair toggle,
+   the markdown preview, `aside` panes, window swapping). One bug is unconfirmed: a slight
+   jitter when editing a markdown file. Reproduce before assuming it is gone.
+4. Open Brood lead: `docs/fuzz-diag-overrides-anomaly.md`, two compilations of one pure
+   expression disagreeing (JIT, map-shape caches / closure capture). Open since 2026-07-10.
+5. Multiplayer (`docs/remote-multiplayer-plan.md`, Open): a CRDT for offline divergence,
+   per-participant undo, one real cross-machine run of `--listen`.
+6. Brood gaps still open (`../brood/docs/general-purpose-gaps.md`): runtime memory items
+   (benchmark-gated), a C embedding API, `:wasm-build` build-on-fetch, HTTP/2 / gRPC / Redis /
+   MySQL packages, W3C `traceparent`.
+7. `toolchain.blsp` (marker file → compile/test/run commands) was weighed for std and left
    in bedit: mostly data, no second user yet. Revisit if one appears.
 
 ## Decisions
@@ -50,7 +60,7 @@ Released and published; everything committed and pushed.
 - `nest publish` can hit the http client's fixed 30 s timeout on a transient registry stall;
   `nest search NAME` says whether it landed (releases are immutable) — then just retry.
 - Brood ADR numbers collide across sessions: `git grep '^## ADR-NNN' origin/main` first.
-  Next free: 455.
+  Next free: 505 (check first — sessions run in parallel).
 - A release's CHANGELOG is checked only for its heading — read `git log vPREV..` and fill
   in what is missing before tagging.
 - `nest format` takes no file arguments: `nest format --changed [--check]`.
