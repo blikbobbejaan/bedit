@@ -1,6 +1,17 @@
 # The web-fuzz render-error anomaly (compiled code ≠ source semantics)
 
-**Status:** open Brood lead, editor unaffected in normal states. Found 2026-07-10 while the
+**Status:** dormant — not reproducible since 2026-10-18. `ed-diagnostic-overrides` was
+rewritten in `280ce399`: it reads the model's per-line diagnostic index, bounded by the
+buffer's line count, and has no filter inside a `mapcat`, so the expression that diverged no
+longer exists. On 2026-10-28, `tests/web_fuzz_session_test.blsp` passed in the trigger shape
+(a worktree with four modified files) on brood 0.45.0. Whether the JIT fault was fixed or is
+only no longer reached is unknown: it never reproduced outside the full session history, and
+brood's JIT has been reworked many times since. If compiled code and source disagree again,
+the method below applies; brood CI's differential (tree-walker) job is the standing check.
+
+The record from July follows.
+
+**Status then:** open Brood lead, editor unaffected in normal states. Found 2026-07-10 while the
 working tree happened to have exactly 4 modified files; **reproduced at HEAD** (a clean
 worktree given the same dirty-file shape), so it predates the collab work that surfaced it.
 

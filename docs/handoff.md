@@ -33,8 +33,8 @@ Released and published; everything of bedit's committed and pushed.
 3. `todo.md`: every feature listed there is built (region wrap and the electric-pair toggle,
    the markdown preview, `aside` panes, window swapping). One bug is unconfirmed: a slight
    jitter when editing a markdown file. Reproduce before assuming it is gone.
-4. Open Brood lead: `docs/fuzz-diag-overrides-anomaly.md`, two compilations of one pure
-   expression disagreeing (JIT, map-shape caches / closure capture). Open since 2026-07-10.
+4. Dormant Brood lead: `docs/fuzz-diag-overrides-anomaly.md` (compiled code and source
+   disagreeing, July). The code it hit was rewritten on 2026-10-18 and it no longer reproduces.
 5. Multiplayer (`docs/remote-multiplayer-plan.md`, Open): a CRDT for offline divergence,
    per-participant undo, one real cross-machine run of `--listen`.
 6. Brood gaps still open (`../brood/docs/general-purpose-gaps.md`): runtime memory items
