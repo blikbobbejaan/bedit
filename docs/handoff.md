@@ -22,14 +22,19 @@ Released and published; everything of bedit's committed and pushed.
 
 ## Next
 
-1. **In flight — brood branch `native-redirect`** (worktree `~/.cache/brood-wt-redirect`, not
-   merged): a builtin that calls Brood back from Rust (`num/add` and `compare-to` on records,
-   `->seq` / `->count`, `apply` as a value) hands the call to the engine instead, so a
-   `receive` under it parks; `isolate` as a frame; an alias of `proc/interruptible`. Review,
-   merge onto main, delete the worktree.
-2. **Benchmark ADR-502 on the benchmark machine**: `make ab BASE=11601fe6 ROWS="nqueens
-   pipeline json reduce"`. A closure reducer's fold over a vector or range now walks in Brood;
-   never measured. If it is slow: keep the Rust loop outside interrupt windows.
+1. **Merged after the release — brood ADR-505** (`8260983f`, on main, not in 0.45.0): a
+   builtin that would call Brood from Rust (a record's `num/add` & co. under `+ - * /`, its
+   `compare-to` under `<`, `->seq` / `->count` under `first` / `rest` / `count` / `empty?`)
+   hands the call back to the engine, so a `receive` in the method parks; an alias of
+   `proc/interruptible` is a region too. Still nested: `isolate`'s thunk (a frame for it is
+   the global snapshot, stamp and reap on every exit), contracts, macro expansion, the loader,
+   the `*err*` port, and a callback reached from JIT-compiled code (first park blocks, then
+   the latch). bedit's full suite passed on it.
+2. **Benchmark on the benchmark machine** (never measured — this desktop runs none):
+   ADR-502, `make ab BASE=11601fe6 ROWS="nqueens pipeline json reduce"` (a closure reducer's
+   fold over a vector or range walks in Brood; if slow, keep the Rust loop outside interrupt
+   windows); and ADR-505's offer, a store before and after each native call through
+   `dispatch` and the tier-0 machine (`make ab BASE=d3b0e654` with a native-call-heavy row).
 3. `todo.md`: every feature listed there is built (region wrap and the electric-pair toggle,
    the markdown preview, `aside` panes, window swapping). One bug is unconfirmed: a slight
    jitter when editing a markdown file. Reproduce before assuming it is gone.
