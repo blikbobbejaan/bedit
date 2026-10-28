@@ -18,11 +18,12 @@ Released and published; everything of bedit's committed and pushed.
   long-lines policy (`:long-lines`, `M-x toggle-truncate-lines`), completion that merges
   mid-word, the terminal's completion preview no longer taking a program's keys (PR #1).
   Binaries for Linux x86_64 / arm64 and macOS arm64 on the GitHub release; on hive.
-- Installed: nest 0.45.0 (`ad737a7d`, GUI build) and bedit 0.8.0.
+- Installed: nest 0.46.0 (`7d7e8d99`, GUI build: ADR-505, wasmtime 50, minimum Rust 1.97; tagged
+  by another session before CI finished — bedit passed its full suite on it) and bedit main.
 
 ## Next
 
-1. **Merged after the release — brood ADR-505** (`8260983f`, on main, not in 0.45.0): a
+1. **Brood ADR-505, released in 0.46.0** (`8260983f`): a
    builtin that would call Brood from Rust (a record's `num/add` & co. under `+ - * /`, its
    `compare-to` under `<`, `->seq` / `->count` under `first` / `rest` / `count` / `empty?`)
    hands the call back to the engine, so a `receive` in the method parks; an alias of
@@ -36,8 +37,10 @@ Released and published; everything of bedit's committed and pushed.
    windows); and ADR-505's offer, a store before and after each native call through
    `dispatch` and the tier-0 machine (`make ab BASE=d3b0e654` with a native-call-heavy row).
 3. `todo.md`: every feature listed there is built (region wrap and the electric-pair toggle,
-   the markdown preview, `aside` panes, window swapping). One bug is unconfirmed: a slight
-   jitter when editing a markdown file. Reproduce before assuming it is gone.
+   the markdown preview, `aside` panes, window swapping), and the markdown jitter is fixed
+   (`1615ae23`): a wrapped pane scrolls by screen rows (`:top-row`), so typing at the bottom
+   of a paragraph no longer lurches it up. Still by lines in wrapped text: the wheel and
+   trackpad (a step over a paragraph jumps), the scrollbar and `ed-max-top`.
 4. Dormant Brood lead: `docs/fuzz-diag-overrides-anomaly.md` (compiled code and source
    disagreeing, July). The code it hit was rewritten on 2026-10-18 and it no longer reproduces.
 5. Multiplayer (`docs/remote-multiplayer-plan.md`, Open): a CRDT for offline divergence,
