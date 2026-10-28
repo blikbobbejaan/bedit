@@ -20,6 +20,7 @@ program left it, and `C-x k` taking the worker down with the buffer.
 (def *cols* 100)
 (def *rows* 30)
 (def *deadline-ms* 15000)
+(def *pause-ms* 300)
 
 (def *failures* (%table))
 
@@ -41,10 +42,24 @@ program left it, and `C-x k` taking the worker down with the buffer.
     ([:open] (sched-loop pending true))
     ([:stop] nil)))
 
-(defn poll-fn (sch me)
+(defn poll-fn (sch me t0)
   (fn (ms)
-    (let (scripted (do (send sch [:next me]) (receive ([:scripted e] e) (after 5000 nil))))
-      (if (nil? scripted) (receive (msg msg) (after (math/max 1 ms) nil)) scripted))))
+    (let (scripted (if (> (- (os/now) t0) *deadline-ms*)
+                     ;; past the deadline the poll says so itself: a run whose keys went
+                     ;; astray has nothing left to wake the loop, so a deadline checked
+                     ;; only in `update` would wait for ever instead of failing
+                     :deadline
+                     (do (send sch [:next me]) (receive ([:scripted e] e) (after 5000 nil)))))
+      ;; `:idle` in a script is a pause: a poll with nothing typed that waits
+      ;; `*pause-ms*`, past the idle beat's debounce, so the loop's timers come due as they
+      ;; do when your hands leave the keys (the loop's own `ms` may be shorter, or far
+      ;; longer when nothing is armed).
+      ;; A message still ends it early: the program's echo lands before the pause does
+      (cond
+        ;; capped, so the deadline above is looked at even when nothing is armed
+        (nil? scripted) (receive (msg msg) (after (math/max 1 (math/min ms 1000)) nil))
+        (= scripted :idle) (receive (msg msg) (after *pause-ms* nil))
+        :else scripted))))
 
 ;; The last frame painted, kept in a table so the assertions can read what the SCREEN
 ;; showed, not only what the model holds.
@@ -54,6 +69,14 @@ program left it, and `C-x k` taking the worker down with the buffer.
   "Every `[:text row col s …]` op's string, joined — enough to look for a needle."
   (string/join (map (seq/filter frame (fn (op) (and (vector? op) (= (first op) :text)))) (fn (op) (nth op 3))) "\n"))
 
+(defn frame-rows (frame)
+  "Each screen row as it reads: its `[:text row col s …]` ops in column order, joined. A
+row of several colours is several ops, so [[frame-text]] would cut it at each colour."
+  (let (ops (seq/filter frame (fn (op) (and (vector? op) (= (first op) :text))))
+        by-row (seq/group-by ops (fn (op) (nth op 1))))
+    (map (sort (keys by-row))
+      (fn (row) (string/join (map (sort-by (get by-row row) (fn (op) (nth op 2))) (fn (op) (nth op 3))) "")))))
+
 (defn drive (m0 script ready? arrived? on-arrival what)
   (let (t0 (os/now)
         sch (spawn (fn () (sched-loop script false)))
@@ -62,13 +85,13 @@ program left it, and `C-x k` taking the worker down with the buffer.
                  :leave (fn () nil)
                  :size (fn () [*cols* *rows*])
                  :draw (fn (frame) (%table-put *last-frame* :frame frame))
-                 :poll (poll-fn sch me)}
+                 :poll (poll-fn sch me t0)}
         update (fn (m input cols rows)
-                 (let (next (input/ed-update m input cols rows)
+                 (let (next (if (= input :deadline) m (input/ed-update m input cols rows))
                        _ (when (ready? next) (send sch [:open])))
                    (cond
                      (arrived? next) (do (on-arrival next) (assoc next :done true))
-                     (> (- (os/now) t0) *deadline-ms*)
+                     (or (= input :deadline) (> (- (os/now) t0) *deadline-ms*))
                        (do (check (str what " arrived before the deadline") false)
                          (assoc next :done true))
                      :else next))))
@@ -115,6 +138,39 @@ program left it, and `C-x k` taking the worker down with the buffer.
               (commands/cmd-kill-buffer m nil))))
         "the program's answer"))))
 
+(defn drive-colour-pause (m0)
+  ;; A prompt of several colours on one row (a zsh prompt's shape), and a pause mid-word.
+  ;; vt once handed a row's spans back last-first and the frame drew the prompt twice
+  ;; (`dir main > main > …`); and the pause let the idle beat set an inline completion
+  ;; preview at the program's cursor, which then took every key the program should have
+  ;; had, so the program never answered. `window` is on the screen before the prompt, so
+  ;; `win` (a preview wants three characters) has a candidate; the outer `sh` prints it
+  ;; rather than the script typing it, since keys typed ahead of a prompt echo out of order
+  (let (prompt "$(printf '\\033[34mdir\\033[0m \\033[35mmain\\033[0m \\033[32m>\\033[0m ')"
+        opened (terminal/term-open m0 "term" (str "echo window; PS1=\"" prompt "\" sh -i")))
+    (drive opened
+      ;; two pauses: the word index a preview completes from is built OFF the loop by a
+      ;; pause, so the preview a pause shows comes from the index the pause before it
+      ;; built — as it does when you have been looking at the screen a while
+      (append (list "e" "c" "h" "o" " " "w" "i")
+        (repeat 6 :idle)
+        (list "n")
+        (repeat 6 :idle)
+        (list "d" "o" :enter))
+      (fn (m) (let (tb (term-buf m)) (and tb (includes? (editor/buffer/buffer-text tb) "> "))))
+      (fn (m) (let (tb (term-buf m)) (and tb (includes? (editor/buffer/buffer-text tb) "\nwindo\n"))))
+      (fn (m)
+        (let (tb (term-buf m)
+              text (editor/buffer/buffer-text tb)
+              rows (frame-rows (view/ed-view m *cols* *rows*)))
+          (do
+            (check "the keys typed after the pause reached the program" (includes? text "> echo windo\nwindo\n"))
+            (check "nothing was typed into the read-only buffer" (not (includes? (str (:message m)) "read-only")))
+            (check "the coloured prompt paints once" (any? rows (fn (row) (includes? row "dir main > echo windo"))))
+            (check "…and never twice over" (not (any? rows (fn (row) (includes? row "main > main")))))
+            (commands/cmd-kill-buffer m nil))))
+      "the answer to the keys typed after a pause")))
+
 (defn drive-kill (m0)
   (let (opened (terminal/term-open m0 "term" "PS1='> ' sh -i")
         pid (:term-proc (term-buf opened)))
@@ -134,6 +190,8 @@ program left it, and `C-x k` taking the worker down with the buffer.
   (do
     (io/puts "== a program under a pty answers through the buffer")
     (drive-term m0)
+    (io/puts "== a coloured prompt, and a pause mid-word")
+    (drive-colour-pause m0)
     (io/puts "== killing the buffer stops the program")
     (drive-kill m0)
     (io/puts "")
