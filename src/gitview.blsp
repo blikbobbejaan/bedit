@@ -294,7 +294,7 @@ coloured like the file."
 
 (defn- gv-land-blob (m pending blob text)
   "Show `text`, `blob`'s file (`{:root :path :rev}`) as it was at its revision: read-only, and
-remembering where it came from so `C-c g p` / `C-c g n` step on from it."
+remembering where it came from so the time machine (`C-x v t`) entered from it steps through its file."
   (let (name (gv-blob-name (:path blob) (:rev blob))
         m1 (ed-display-buffer m
              name
@@ -1038,28 +1038,20 @@ deletes it."
       {:failed r :verb (str "git show " rev ":" path)}
       {:text (:stdout r "") :blob {:root root :path path :rev rev}})))
 
-(defn- gv-launch-blob (m o verb name build)
-  "Run `build` (a `gv-launch` answer for a version of origin `o`'s file) off the loop. `name`
-is the buffer it fills when the revision is already known (a placeholder shows at once), nil
-when git has first to say which version it is."
-  (gv-launch m
-    (merge {:slot :git-blob-proc :opts {:action :here} :root (:root o) :verb verb :build build}
-      (if (nil? name)
-        {}
-        {:name name
-         :type (gv-blob-type (:root o) (:path o))
-         ;; a C-c g p on the placeholder steps from the version it is loading
-         :props {:blob o}}))))
-
 (defn git-show-blob (m root path rev)
   "Open `path` (relative to `root`) as it was at `rev`: read-only, in the file's own mode so
-it is coloured like the file, remembering where it came from so `C-c g p` / `C-c g n` can
-step to the version before or after."
-  (gv-launch-blob m
-    {:root root :path path :rev rev}
-    (str "git show " rev ":" path)
-    (gv-blob-name path rev)
-    (fn () (gv-blob-answer root path rev))))
+it is coloured like the file, remembering where it came from so the time machine (`C-x v t`,
+`C-c g p`) entered from it steps through that file's history."
+  (gv-launch m
+    {:slot :git-blob-proc
+     :name (gv-blob-name path rev)
+     :type (gv-blob-type root path)
+     :opts {:action :here}
+     ;; the placeholder already knows which file it is a version of
+     :props {:blob {:root root :path path :rev rev}}
+     :root root
+     :verb (str "git show " rev ":" path)
+     :build (fn () (gv-blob-answer root path rev))}))
 
 (defn- gv-blob-origin (m)
   "`{:root :path :rev}` for the current buffer: a blob buffer's own, or the work-tree file
@@ -1079,51 +1071,121 @@ step to the version before or after."
         "Find file at revision: "
         :branches (fn (mm rev) (git-show-blob mm (:root o) (:path o) rev))))))
 
-(defcommand cmd-git-blob-previous
-  (m key)
-  "The version of this file before the one shown (C-c g p) — from the work tree, the last
-committed one. Which version that is is git's to say, so the search and the show both run
-off the loop, and the buffer opens when they land."
-  (let (o (gv-blob-origin m))
-    (if (nil? o)
-      (message m "this buffer is not a file in a git repository")
-      (gv-launch-blob m
-        o
-        "git log"
-        nil
-        (fn ()
-          (let (hashes (git-lines (:root o)
-                         (append ["log" "--format=%h" "-n" "2"]
-                           (if (:rev o) [(:rev o)] [])
-                           ["--" (:path o)]))
-                target (if (:rev o) (second hashes) (first hashes)))
-            (if (nil? target)
-              {:note "no earlier version"}
-              (gv-blob-answer (:root o) (:path o) target))))))))
+;; ---- the time machine's git side (vcscore's `:file-history` / `:file-at`) --------------
+;; The time machine itself (src/timemachine.blsp) names no VCS: it asks the checkout's row
+;; for a file's history and for one revision of it, both in its task. These are git's
+;; answers — plain data in and out, so they run off the loop as they are.
 
-(defcommand cmd-git-blob-next
-  (m key)
-  "The version of this file after the one shown (C-c g n) — the newest is the work tree's."
-  (let (o (gv-blob-origin m))
+(def- gv-history-separator (string/int->char 30)) ; between commits (ASCII record separator)
+(def- gv-field-separator (string/int->char 31)) ; between a commit's fields (unit separator)
+
+(def- gv-history-format
+  ;; full and short hash, author and address, date, age, subject, body — then `--name-only`
+  ;; prints the path the file had in that commit, which is how a rename is followed back
+  (str "--format="
+    "%x1e%H%x1f%h%x1f%an%x1f%ae%x1f%ad%x1f%ar%x1f%s%x1f%b%x1f"))
+
+(defn- gv-history-revision (record)
+  "One `gv-history-format` record as a revision, its `:path` nil when git printed none (a
+merge `--name-only` lists nothing for)."
+  (let (fields (string/split record gv-field-separator))
+    (if (< (count fields) 9)
+      nil
+      {:hash (nth fields 0)
+       :short (nth fields 1)
+       :author (nth fields 2)
+       :email (nth fields 3)
+       :date (nth fields 4)
+       :age (nth fields 5)
+       :subject (nth fields 6)
+       :body (string/trim (nth fields 7))
+       :path (first (seq/reject (map (string/split (nth fields 8) "\n") string/trim) empty?))})))
+
+(defn gv-parse-file-history (stdout path)
+  "`git log --follow --name-only` in `gv-history-format` as revisions, newest first. A
+revision git named no path for (a merge) has the path of the one after it — the file's
+name does not change in a commit that does not touch it — and the newest falls back to
+`path`.
+
+    (count (gitview/gv-parse-file-history \"\" \"f\"))   ;=> 0"
+  (let (parsed (seq/keep (seq/reject (string/split (or stdout "") gv-history-separator)
+                           string/blank?)
+                 gv-history-revision))
+    (nth (fold parsed
+           [[] path]
+           (fn (acc revision)
+             (let ([kept newer-path] acc
+                   named (or (:path revision) newer-path))
+               [(conj kept (assoc revision :path named)) named])))
+      0)))
+
+(defn- gv-branch-of (ref)
+  "The branch a ref names, its remote taken off: `origin/main` is `main`."
+  (let (slash (index-of ref "/"))
+    (if (and (>= slash 0) (string/starts-with? ref "origin/"))
+      (string/substring ref (inc slash) (string/length ref))
+      ref)))
+
+(defn- gv-default-branch (root)
+  "The repository's default branch: what `origin/HEAD` points at, else a local `main` or
+`master` — nil when there is none of them."
+  (let (remote-head (git-output root ["symbolic-ref" "-q" "--short" "refs/remotes/origin/HEAD"]))
+    (if (not (= remote-head ""))
+      remote-head
+      (seq/find ["main" "master"]
+        (fn (name)
+          (= 0 (:exit (gv-git root ["rev-parse" "-q" "--verify" (str "refs/heads/" name)]))))))))
+
+(defn- gv-branch-base (root)
+  "The ref \"what this branch changed\" is measured from: the upstream when it tracks ANOTHER
+branch (`git branch -u origin/main`), else the default branch, else — on the default branch
+itself — its upstream, so what is not pushed yet. nil when there is nothing to measure from."
+  (let (current (git-current-branch root)
+        upstream (git-upstream root)
+        default (gv-default-branch root)
+        other? (fn (ref) (and ref (not (= (gv-branch-of ref) current)))))
     (cond
-      (nil? o) (message m "this buffer is not a file in a git repository")
-      (nil? (:rev o)) (message m "this is the work tree — there is nothing newer")
-      :else
-        (gv-launch-blob m
-          o
-          "git log"
-          nil
-          (fn ()
-            (let (target (first (git-lines (:root o)
-                                  ["log"
-                                    "--reverse"
-                                    "--format=%h"
-                                    (str (:rev o) "..HEAD")
-                                    "--"
-                                    (:path o)])))
-              (if (nil? target)
-                {:visit (path/join (:root o) (:path o))}
-                (gv-blob-answer (:root o) (:path o) target))))))))
+      (nil? current) nil
+      (other? upstream) upstream
+      (other? default) default
+      :else upstream)))
+
+(defn gv-branch-scope (root)
+  "`{:base ref :hashes #{full-hash}}`: the commits on HEAD that are not on the branch base
+(`gv-branch-base`), since their merge base — what this branch changed. nil without a base."
+  (let (base (gv-branch-base root)
+        fork (if (nil? base) "" (git-output root ["merge-base" "HEAD" base])))
+    (if (= fork "")
+      nil
+      {:base base :hashes (into #{} (git-lines root ["rev-list" (str fork "..HEAD")]))})))
+
+(defn git-file-history (root path)
+  "The time machine's `:file-history` for git: `{:revisions [...] :branch {:base :hashes}}`,
+the revisions of `path` (relative to `root`) newest first, following renames — each
+`{:hash :short :author :email :date :age :subject :body :path}`, `:path` the file's name in
+that commit — or `{:failed result}`. Subprocesses: run off the loop."
+  (let (r (gv-git root
+            ["log"
+              "--follow" "--name-only" "--no-color" "--date=format:%Y-%m-%d %H:%M" gv-history-format
+              "--" path]))
+    (if (not (= (:exit r) 0))
+      {:failed r}
+      {:revisions (gv-parse-file-history (:stdout r "") path) :branch (gv-branch-scope root)})))
+
+(defn git-file-revision (root revision)
+  "The time machine's `:file-at` for git: `{:text :diff}` — the file as `revision` (a
+`git-file-history` one) has it, and that commit's unified diff of it against its first
+parent (a rename shown as one) — or `{:failed result}`. Subprocesses: run off the loop."
+  (let (hash (:hash revision)
+        path (:path revision)
+        shown (gv-git root ["show" (str hash ":" path)]))
+    (if (not (= (:exit shown) 0))
+      {:failed shown}
+      (let (diff (gv-git root
+                   ["log"
+                     "-1" "-p" "-M" "--follow" "--format=" "--no-color" "--no-ext-diff"
+                     "--diff-merges=first-parent" hash "--" path]))
+        {:text (:stdout shown "") :diff (if (= (:exit diff) 0) (:stdout diff "") "")}))))
 
 ;; The git VIEWS (src/gitview.blsp): a commit, a diff, a log, blame, the refs — section
 ;; buffers with the common keys, plus each one's own.

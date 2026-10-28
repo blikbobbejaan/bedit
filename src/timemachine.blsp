@@ -1,0 +1,860 @@
+(defmodule timemachine
+  "The **time machine** (`C-x v t`, M-x vc-timemachine) — Emacs's git-timemachine, told
+what the version control knows: ONE buffer per file that steps through the file's
+revisions IN PLACE, and beside it the commit each revision came from.
+
+- `p` / `n` the revision before / after, `<` / `>` the oldest / newest, `g` one picked from
+  the file's history (hash, date, author, subject), `q` back to the file;
+- `B` switches between the file's whole history and **what this branch changed**: the
+  commits touching it since the branch left its base (its upstream when that is another
+  branch, else the repository's default branch). Entered on a branch that changed the file,
+  that is where it starts, and the mode line says so;
+- the **info pane** (an `aside`, `d` toggles it) follows the revision shown: its whole
+  message, author and date, and its diff of THIS file painted as every diff is
+  (`vcsproc`'s hunk sections). RET on a diff line goes to that line here; `D` opens the
+  whole commit, `b` blames this revision, `w` / `W` copy the short / full hash;
+- `h` tints the lines this revision changed, in the change gutter's colours.
+
+Point stays on the same LOGICAL line across a step: the line is mapped through the line
+diff of the two revisions (`diff/line-hunks`), so a line pushed down by an insertion above
+it is followed.
+
+**Nothing here names a VCS.** The history and a revision's text come from the checkout's
+row in `vcscore` (`:file-history`, `:file-at`; `:show-revision` and `:blame-revision` for
+`D` and `b`), called in a task: the history once on entry, a revision when it is first
+stepped to — cached on the buffer after that. Stepping faster than the VCS answers
+COALESCES: a step supersedes the fetch in flight, and an answer for a revision the reader
+has stepped past is kept in the cache but never shown. A backend without the hooks (mur's
+client cannot print a file as an old version had it) is told so."
+  (:use model) ; ed-current-buf / ed-buf-at / ed-set-buf-at / ed-buffer-index-by-name / message
+  (:use pool) ; ed-display-buffer / ed-goto-line / ed-name-prompt / ed-pop-to-buffer-named
+  (:use editor/buffer) ; make-buffer / buffer-rope / buffer-current-line / set-read-only
+  (:use editor/keymap :only [keymap-bind]) ; the two keymaps below
+  (:use editor/layers :only [activate-layer buffer-type-for register-type-layers])
+  (:use interactive) ; defcommand
+  (:use vcscore) ; vcs-checkout / vcs-backend / vcs-kind-name / vcs-load-hook — the row
+  (:use section)) ; section — the info pane's tree
+;; `theme` (a project source module, loaded with the image) provides the *yellow* / *base*
+;; colour globals the face below reads bare.
+
+;; ---- faces ---------------------------------------------------------------------------
+
+;; a line this revision modified (an added one takes the diff's own green band)
+(theme/defchrome tm-face-modified-band {:bg (theme/mix *yellow* *base* 0.12)})
+(theme/defchrome tm-face-chip {:fg *peach* :bold true}) ; the mode line's `⟲ hash`
+(theme/defchrome tm-face-branch {:fg *green*}) ; a revision only this branch has
+
+(def- tm-face-summary {:bold true}) ; the info pane's subject line
+
+;; ---- tunables ------------------------------------------------------------------------
+
+(def *timemachine-cache-max* 48) ; revisions kept on a buffer; past it only the shown one stays
+(def *timemachine-map-max-chars* 400000) ; past this, a step keeps the line NUMBER (no line diff)
+(def *timemachine-timeout-ms* 60000)
+
+(def *info-spec*
+  ;; the info pane, an `aside`: its state under the model's `:timemachine-info`
+  {:key :timemachine-info :buffer "*timemachine-info*" :type :timemachine-info})
+
+;; ---- pure: lines, revisions, the scope ---------------------------------------------
+
+(defn tm-map-line (hunks line)
+  "The 0-based line `line` of an old text, followed into the new one through `hunks`
+(`diff/line-hunks`, `[old-start old-count new-start new-count]` each): a line before a hunk
+moves by what the hunks above it added or removed; a line inside one lands on the line
+that replaced it (the last one, when fewer replaced it), or where it was removed.
+
+    (timemachine/tm-map-line [[0 0 0 2]] 3)   ;=> 5
+    (timemachine/tm-map-line [[1 1 1 1]] 1)   ;=> 1"
+  (letrec (walk (fn (remaining delta)
+                  (if (empty? remaining)
+                    (+ line delta)
+                    (let ([old-start old-count new-start new-count] (first remaining))
+                      (cond
+                        (< line old-start) (+ line delta)
+                        (< line (+ old-start old-count))
+                          (+ new-start (math/min (- line old-start) (math/max 0 (dec new-count))))
+                        :else (walk (rest remaining) (+ delta (- new-count old-count))))))))
+    (walk hunks 0)))
+
+(defn tm-changed-lines (hunks)
+  "The lines of the NEW side a diff's `hunks` (`diff/parse-unified`'s) added or modified,
+`{0-based-line :added | :modified}` — as the change gutter reads a hunk: the `+` lines that
+replace `-` lines are modified, the rest added.
+
+    (timemachine/tm-changed-lines [{:new-start 2 :lines [\" a\" \"-b\" \"+c\" \"+d\"]}])   ;=> {2 :modified 3 :added}"
+  (fold hunks
+    {}
+    (fn (changed hunk)
+      (first (fold (:lines hunk)
+               [changed (math/max 0 (dec (:new-start hunk 1))) 0]
+               (fn (state line)
+                 (let ([acc line0 removed] state)
+                   (cond
+                     (string/starts-with? line "+")
+                       [(assoc acc line0 (if (> removed 0) :modified :added))
+                         (inc line0)
+                         (math/max 0 (dec removed))]
+                     (string/starts-with? line "-") [acc line0 (inc removed)]
+                     (string/starts-with? line "\\") state
+                     :else [acc (inc line0) 0]))))))))
+
+(defn tm-revisions (state)
+  "The revisions the time machine steps through, newest first: the file's whole history,
+or under the branch scope only the commits this branch made to it."
+  (let (history (:history state []))
+    (if (= (:scope state) :branch)
+      (into []
+        (seq/filter history (fn (revision) (contains? (:branch-hashes state) (:hash revision)))))
+      history)))
+
+(defn- tm-index-of (revisions hash)
+  "The position of `hash` in `revisions`, or nil."
+  (let (i (seq/index-where revisions (fn (revision) (= (:hash revision) hash))))
+    (if (< i 0) nil i)))
+
+(defn- tm-revision (state hash)
+  "The revision `hash` of the file's history, or nil."
+  (seq/find (:history state []) (fn (revision) (= (:hash revision) hash))))
+
+(defn- tm-branch-only? (state hash)
+  "Whether revision `hash` is one this branch made and its base does not have."
+  (contains? (or (:branch-hashes state) #{}) hash))
+
+(defn- tm-name (path)
+  "The time machine buffer's name for `path`."
+  (str "timemachine:" path))
+
+(defn- tm-relative (root file)
+  "`file` relative to `root`."
+  (let (prefix (str root "/"))
+    (if (string/starts-with? file prefix)
+      (string/substring file (string/length prefix) (string/length file))
+      file)))
+
+(defn- tm-bands (state changed)
+  "The buffer's `:line-bands` for the `changed` lines, or nil while the highlight is off."
+  (if (not (:highlight? state))
+    nil
+    (into {}
+      (map changed
+        (fn ([line status])
+          [line (if (= status :added) vcsproc/vcs-face-add-band tm-face-modified-band)])))))
+
+;; ---- the info pane's tree --------------------------------------------------------------
+
+(defn- tm-file-label (file)
+  "What happened to the file in this revision, from its diff's header lines."
+  (let (headers (:headers file [])
+        says? (fn (prefix) (any? headers (fn (line) (string/starts-with? line prefix)))))
+    (cond
+      (says? "new file mode") "new file"
+      (says? "deleted file mode") "deleted"
+      (says? "rename from") "renamed"
+      :else "modified")))
+
+(defn tm-info-tree (state revision diff)
+  "The info pane's section tree for `revision` of the file: the header (hash, author, date,
+whether only this branch has it), the message with its subject as the heading, then the
+revision's diff of the file as hunk sections — the painting every diff gets."
+  (let (body (:body revision "")
+        meta (seq/reject [(str "commit " (:hash revision))
+                           (str "Author: " (:author revision) " <" (:email revision) ">")
+                           (str "Date:   " (:date revision) "  (" (:age revision) ")")
+                           (if (tm-branch-only? state (:hash revision))
+                             (str "Branch: only on this branch — not on " (:branch-base state))
+                             nil)]
+               nil?)
+        files (diff/parse-unified diff))
+    (section :tm-revision
+      (:hash revision)
+      nil
+      (into [(section :meta nil nil (into [] meta) {:separator true})
+              (section :message
+                (:hash revision)
+                (:subject revision)
+                (if (= body "") [] (into [] (string/split body "\n")))
+                {:separator true})]
+        (if (empty? files)
+          [(section :note nil "(no change to this file)")]
+          (map files
+            (fn (file)
+              (let (path (or (:new-path file) (:old-path file) "?"))
+                (section :file
+                  {:path path}
+                  (str (tm-file-label file) "  " path)
+                  (vcsproc/vcs-hunk-sections file {:path path} true)
+                  {:key path})))))))))
+
+(defn tm-info-faces (row line)
+  "The info pane's `:section-faces`: a hunk as every diff paints one, the header quiet, the
+subject bold, a file heading as a diff's."
+  (let (type (:type row))
+    (cond
+      (= type :hunk) (vcsproc/vcs-hunk-spans row line)
+      (= type :meta) (vcsproc/vcs-whole-line 0 line vcsproc/vcs-face-meta)
+      (and (= type :message) (:heading? row)) (vcsproc/vcs-whole-line 0 line tm-face-summary)
+      (and (= type :file) (:heading? row)) (vcsproc/vcs-whole-line 0 line vcsproc/vcs-face-file)
+      :else '())))
+
+(defn tm-info-bands (row line)
+  "The info pane's `:section-bands`: a hunk's heading bar and its tinted lines."
+  (when (= (:type row) :hunk) (vcsproc/vcs-hunk-band row line)))
+
+(defn- tm-show-info (m buffer-name state hash force)
+  "Show revision `hash`'s info in the aside — opening it when `force`, else only refreshing
+one already open. A revision not fetched yet shows nothing new."
+  (let (revision (tm-revision state hash)
+        entry (get (:cache state) hash))
+    (if (or (nil? revision) (nil? entry))
+      m
+      (aside/refresh-with *info-spec*
+        m
+        force
+        (fn (shown action)
+          (sectionbuf/sb-show shown
+            (:buffer *info-spec*)
+            (tm-info-tree state revision (:diff entry ""))
+            (:type *info-spec*)
+            {:action action :ctx {:timemachine buffer-name :hash hash} :vis {} :line 1}))))))
+
+;; ---- off the loop: the history once, a revision when it is stepped to ------------------
+;; Two slots, one per kind of question: entering a second file's time machine must not
+;; cancel the step in flight in the first. Within a slot the newest request wins — the one
+;; in flight is cancelled, and its buffer told (a history) or put back on the revision it
+;; shows (a step), so nothing is left waiting for an answer that will not come.
+
+(def- tm-slots [:timemachine-history-proc :timemachine-revision-proc])
+
+(defn- tm-call (hook fallback & args)
+  "Call the backend `hook` (a symbol) with `args`, in the task — `fallback` when it is unbound."
+  (apply reflect/call-if-bound hook fallback args))
+
+(def- tm-unloaded {:failed {:exit 1 :stdout "" :stderr "the VCS backend did not load"}})
+
+(defn- tm-buffer-at (m pending)
+  "The pool index of `pending`'s time machine buffer, or nil when it was killed."
+  (let (i (ed-buffer-index-by-name m (:buffer pending)))
+    (if (and i (:timemachine (ed-buf-at m i))) i nil)))
+
+(defn- tm-update-state (m i f)
+  "`m` with time machine buffer `i`'s state passed through `f`."
+  (let (b (ed-buf-at m i)) (ed-set-buf-at m i (assoc b :timemachine (f (:timemachine b))))))
+
+(defn- tm-forget (m slot)
+  "`m` with `slot` free: no handle, no pending request."
+  (assoc (dissoc m slot) :timemachine-pending (dissoc (:timemachine-pending m {}) slot)))
+
+(defn- tm-abandon (m slot)
+  "Free `slot`, and leave the buffer its request was for as it was before asking: a history
+never fetched says so, a step goes back to the revision shown."
+  (let (pending (get (:timemachine-pending m {}) slot)
+        freed (tm-forget m slot)
+        i (if (nil? pending) nil (tm-buffer-at freed pending)))
+    (cond
+      (nil? i) freed
+      (= slot :timemachine-history-proc)
+        (tm-update-state (tm-note freed i "The history was not fetched — C-x v t to ask again.")
+          i
+          (fn (state) (assoc state :loading? false :history [])))
+      :else (tm-update-state freed i (fn (state) (assoc state :wanted (:shown state)))))))
+
+(defn- tm-launch (m slot pending build)
+  "Run `build` off the loop for `pending` (`{:buffer :hash}`) on `slot`, superseding the
+request in flight there — forgotten when it was for the same buffer (the new request takes
+it over), abandoned when it was another's. Headless, it runs inline and folds at once."
+  (let (in-flight (get m slot)
+        previous (get (:timemachine-pending m {}) slot)
+        cleared (cond
+                  (nil? in-flight) m
+                  :else
+                    (do
+                      (when (not (= in-flight :inline)) (task/cancel in-flight))
+                      (if (= (:buffer previous) (:buffer pending))
+                        (tm-forget m slot)
+                        (tm-abandon m slot))))
+        headless? (ed-headless?)
+        handle (if headless? :inline (task/task build {:timeout *timemachine-timeout-ms*}))
+        launched (assoc cleared
+                   slot handle
+                   :timemachine-pending (assoc (:timemachine-pending cleared {}) slot pending)))
+    (if headless? (tm-apply launched [:task-done handle (build)]) launched)))
+
+(doseq (slot tm-slots)
+  (register-task-reply slot
+    'timemachine/tm-apply
+    nil
+    "time machine"
+    {:folds-event? true :cancel-on-quit? true :on-quit 'timemachine/tm-quit-jobs}))
+
+(defn tm-quit-jobs (m)
+  "C-g's clean-up (`:on-quit`): every request it just cancelled is abandoned, its buffer
+left as it was before asking."
+  (fold (:timemachine-pending m {})
+    m
+    (fn (acc entry)
+      (let ([slot _] entry)
+        (if (nil? (get acc slot)) (tm-abandon acc slot) acc)))))
+
+(defn tm-apply (m event)
+  "Fold an answer — the whole `[:task-done handle answer]` / `[:task-error …]` /
+`[:task-timeout …]` event — into the time machine buffer it was asked for. One whose handle
+is no longer in its slot (superseded) or whose buffer was killed is dropped."
+  (let (handle (nth event 1)
+        slot (seq/find tm-slots (fn (s) (and (not (nil? (get m s))) (= (get m s) handle))))
+        pending (if (nil? slot) nil (get (:timemachine-pending m {}) slot))
+        i (if (nil? pending) nil (tm-buffer-at m pending))
+        answer (nth event 2 nil))
+    (cond
+      (nil? pending) m
+      (nil? i) (tm-forget m slot)
+      (not (= (first event) :task-done))
+        (message (tm-abandon m slot) "time machine: the version control did not answer")
+      (:failed answer)
+        (message (tm-abandon m slot)
+          (str "time machine: " (first (vcsproc/vcs-summary (:failed answer)))))
+      :else
+        (let (freed (tm-forget m slot))
+          (if (= slot :timemachine-history-proc)
+            (tm-land-history freed i answer)
+            (tm-land-revision freed i (:hash pending) answer))))))
+
+;; ---- showing a revision in place --------------------------------------------------------
+
+(defn- tm-note (m i text)
+  "Put `text` in time machine buffer `i` in place of a revision — a load, a failure."
+  (let (b (ed-buf-at m i))
+    (ed-set-buf-at m
+      i
+      (set-read-only (assoc (make-buffer (str text "\n") (buffer-name b))
+                       :type (:type b)
+                       :layers (:layers b)
+                       :dir (:dir b)
+                       :timemachine (:timemachine b))
+        true))))
+
+;; check-allow: `diff/line-hunks` answers its line numbers as `any`; they are ints, and so is
+;; every line mapped through them
+(check-allow :trusted
+  (sig tm-target-line (any any string -> int))
+  (defn- tm-target-line (b state text)
+    "The 0-based line of `text` that point on buffer `b` corresponds to: the line it is on,
+followed through the line diff of what `b` shows and `text` — or, on entry, of the file
+the reader came from. A text past `*timemachine-map-max-chars*` keeps the line number."
+    (let ([old line] (if (nil? (:shown state))
+                       [(:from-rope state) (:from-line state 0)]
+                       [(buffer-rope b) (buffer-current-line b)])
+          small? (and old
+                   (< (text/length old) *timemachine-map-max-chars*)
+                   (< (string/length text) *timemachine-map-max-chars*))
+          mapped (if small? (tm-map-line (diff/line-hunks old text) line) line)
+          last-line (math/max 0 (dec (count (string/split text "\n")))))
+      (math/max 0 (math/min mapped last-line)))))
+
+(defn- tm-trim-cache (cache keep)
+  "`cache` bounded by `*timemachine-cache-max*`: past it, only the revisions in `keep`."
+  (if (<= (count cache) *timemachine-cache-max*) cache (map/select-keys cache (into [] keep))))
+
+(defn- tm-show (m i hash)
+  "Show cached revision `hash` in time machine buffer `i`, in place: its text (point on the
+same logical line), its changed lines tinted, the info pane following."
+  (let (b (ed-buf-at m i)
+        state (:timemachine b)
+        entry (get (:cache state) hash)
+        text (:text entry "")
+        line0 (tm-target-line b state text)
+        files (diff/parse-unified (:diff entry ""))
+        changed (tm-changed-lines (if (empty? files) [] (:hunks (first files))))
+        shown-state (assoc (dissoc state :from-rope :from-line)
+                      :shown hash
+                      :wanted hash
+                      :changed changed)
+        fresh (ed-goto-line (set-read-only (assoc (make-buffer text (buffer-name b))
+                                             :type (:type b)
+                                             :layers (:layers b)
+                                             :dir (:dir b)
+                                             :timemachine shown-state
+                                             :line-bands (tm-bands shown-state changed))
+                              true)
+                (inc line0))
+        placed (ed-map-panes (ed-set-buf-at m i fresh)
+                 (fn (w) (if (= (:buffer w) i) (assoc w :point nil :mark nil) w))))
+    (tm-show-info placed (buffer-name b) shown-state hash false)))
+
+(defn- tm-land-revision (m i hash answer)
+  "Cache a fetched revision on buffer `i`, and show it when it is still the one wanted — a
+step taken since makes it a cache entry only."
+  (let (b (ed-buf-at m i)
+        state (:timemachine b)
+        cached (tm-update-state m
+                 i
+                 (fn (current)
+                   (assoc current
+                     :cache
+                       (tm-trim-cache (assoc (:cache current {}) hash answer)
+                         [hash (:shown current) (:wanted current)])))))
+    (if (= hash (:wanted state)) (tm-show cached i hash) cached)))
+
+(defn- tm-land-history (m i answer)
+  "The history arrived: keep it on buffer `i`, choose the scope (this branch's commits when
+it made any to the file), and show the scope's newest revision with the info pane open."
+  (let (b (ed-buf-at m i)
+        history (into [] (or (:history answer) []))
+        branch (:branch answer)
+        branch-hashes (into #{}
+                        (map (seq/filter history
+                               (fn (revision) (contains? (:hashes branch #{}) (:hash revision))))
+                          :hash))
+        state (assoc (:timemachine b)
+                :history history
+                :branch-base (:base branch)
+                :branch-hashes branch-hashes
+                :branch-commits (count (:hashes branch #{}))
+                :scope (if (empty? branch-hashes) :all :branch)
+                :loading? false)
+        first-hash (:first answer)
+        entry (:entry answer)
+        stored (ed-set-buf-at m i (assoc b :timemachine state)))
+    (cond
+      (empty? history) (tm-note stored i "This file has no committed history.")
+      (or (nil? entry) (:failed entry))
+        (message (tm-note stored i "The first revision could not be read.")
+          (str "time machine: "
+            (if (:failed entry) (first (vcsproc/vcs-summary (:failed entry))) "no revision")))
+      :else
+        (let (ready (ed-set-buf-at stored
+                      i
+                      (assoc (ed-buf-at stored i)
+                        :timemachine
+                          (assoc state
+                            :wanted first-hash
+                            :cache {first-hash entry})))
+              shown (tm-show ready i first-hash))
+          (tm-show-info shown
+            (buffer-name b)
+            (:timemachine (ed-buf-at shown i))
+            first-hash
+            true)))))
+
+(defn- tm-history-job (state)
+  "The entry's task: the file's history, and the revision it opens on (the scope's newest)
+already read, so entering is one round trip."
+  (let (root (:root state)
+        history (tm-call (:file-history state) tm-unloaded root (:path state)))
+    (if (:failed history)
+      history
+      (let (revisions (into [] (:revisions history))
+            hashes (:hashes (:branch history) #{})
+            mine (seq/filter revisions (fn (revision) (contains? hashes (:hash revision))))
+            opening (first (if (empty? mine) revisions mine)))
+        {:history revisions
+         :branch (:branch history)
+         :first (and opening (:hash opening))
+         :entry (and opening (tm-call (:file-at state) tm-unloaded root opening))}))))
+
+(defn- tm-request (m i hash)
+  "Step time machine buffer `i` to revision `hash`: shown at once when cached, else fetched
+off the loop — superseding a fetch in flight, so a burst of steps reads only the last."
+  (let (b (ed-buf-at m i)
+        state (:timemachine b)
+        wanted (ed-set-buf-at m i (assoc-in b [:timemachine :wanted] hash)))
+    (if (contains? (:cache state {}) hash)
+      (tm-show wanted i hash)
+      (let (revision (tm-revision state hash)
+            hook (:file-at state)
+            root (:root state))
+        (tm-launch wanted
+          :timemachine-revision-proc {:buffer (buffer-name b) :hash hash}
+          (fn () (tm-call hook tm-unloaded root revision)))))))
+
+;; ---- entering --------------------------------------------------------------------------
+
+(defn- tm-origin (m)
+  "`{:root :path :file :kind :row}` for the current buffer — a file in a checkout, or an old
+version of one (`:blob`) — else a string saying why not."
+  (let (b (ed-current-buf m)
+        blob (:blob b)
+        file (buffer-file b)
+        where (vcs-checkout m)
+        row (and where (vcs-backend (:kind where))))
+    (cond
+      (nil? where) "not in a version-controlled directory"
+      (nil? row) (str "no porcelain for " (vcs-kind-name (:kind where)) " checkouts has loaded")
+      (or (nil? (:file-history row)) (nil? (:file-at row)))
+        (str "the time machine is not supported for " (vcs-kind-name (:kind where)) " yet")
+      (not (nil? blob))
+        {:root (:root blob) :path (:path blob) :file (path/join (:root blob) (:path blob)) :row row}
+      (nil? file) "this buffer is not a file"
+      :else
+        {:root (:root where)
+         :path (tm-relative (:root where) file)
+         :file file
+         :row row})))
+
+(defn- tm-enter (m origin)
+  "Open the time machine on `origin`'s file: its buffer at once (`Loading…`, in the file's
+own mode, read-only, the time machine's keys on top), the history fetched off the loop."
+  (let (b (ed-current-buf m)
+        row (:row origin)
+        name (tm-name (:path origin))
+        type (buffer-type-for (assoc (make-buffer "" (:path origin)) :file (:file origin)))
+        state {:root (:root origin)
+               :path (:path origin)
+               :file (:file origin)
+               :origin (buffer-name b)
+               :file-history (:file-history row)
+               :file-at (:file-at row)
+               :show-revision (:show-revision row)
+               :blame-revision (:blame-revision row)
+               :from-rope (buffer-rope b)
+               :from-line (buffer-current-line b)
+               :highlight? true
+               :loading? true
+               :cache {}}
+        _ (doseq (hook [(:file-history row) (:file-at row)]) (vcs-load-hook hook))
+        shown (ed-display-buffer m name "Loading history…\n" type {:action :here})
+        i (ed-buffer-index-by-name! shown name)
+        placed (assoc (set-read-only (activate-layer (ed-buf-at shown i)
+                                       'timemachine/timemachine-layer)
+                        true)
+                 :timemachine state)
+        ready (aside/forget *info-spec* (ed-set-buf-at shown i placed)))
+    (tm-launch ready :timemachine-history-proc {:buffer name} (fn () (tm-history-job state)))))
+
+(defcommand cmd-vc-timemachine
+  (m key)
+  "Step through this file's history in place (C-x v t): `p` / `n` older and newer, `<` / `>`
+the ends, `g` a revision you pick, `B` this branch's changes or the whole history, `d` the
+commit beside it, `D` the whole commit, `b` blame, `w` / `W` copy the hash, `h` the changed
+lines, `q` back to the file."
+  (if (:timemachine (ed-current-buf m))
+    (message m "already in the time machine — q goes back to the file")
+    (let (origin (tm-origin m)) (if (string? origin) (message m origin) (tm-enter m origin)))))
+
+;; ---- stepping -------------------------------------------------------------------------
+
+(defn- tm-with (m f)
+  "Run `(f m i state)` on the current time machine buffer once its history is in, else
+say why not."
+  (let (i (ed-current-index m)
+        state (:timemachine (ed-buf-at m i)))
+    (cond
+      (nil? state) (message m "not in a time machine — C-x v t opens one on a file")
+      (:loading? state) (message m "the history is still loading")
+      (empty? (:history state [])) (message m "this file has no committed history")
+      :else (f m i state))))
+
+(defn- tm-goto-index (m i state index)
+  "Step buffer `i` to position `index` of its scope's revisions (0 the newest)."
+  (let (revisions (tm-revisions state))
+    (cond
+      (>= index (count revisions)) (message m "this is the oldest revision")
+      (< index 0) (message m "this is the newest revision")
+      :else (tm-request m i (:hash (nth revisions index))))))
+
+(defn- tm-step (m delta)
+  "Move `delta` revisions older (positive) or newer, from the one last asked for — so two
+quick steps go two revisions even while the first is still being fetched."
+  (tm-with m
+    (fn (m i state)
+      (let (here (or (tm-index-of (tm-revisions state) (:wanted state)) 0))
+        (tm-goto-index m i state (+ here delta))))))
+
+(defcommand cmd-vc-timemachine-older
+  (m key)
+  "The revision before the one shown (p; C-c g p). Outside the time machine, enter it — on
+the last committed version of the file."
+  (if (:timemachine (ed-current-buf m)) (tm-step m 1) (cmd-vc-timemachine m key)))
+
+(defcommand cmd-vc-timemachine-newer
+  (m key)
+  "The revision after the one shown (n; C-c g n)."
+  (if (:timemachine (ed-current-buf m))
+    (tm-step m -1)
+    (message m "this is the work tree — nothing is newer (C-c g p goes back)")))
+
+(defcommand cmd-vc-timemachine-oldest
+  (m key)
+  "The oldest revision in scope (<)."
+  (tm-with m (fn (m i state) (tm-goto-index m i state (dec (count (tm-revisions state)))))))
+
+(defcommand cmd-vc-timemachine-newest
+  (m key)
+  "The newest revision in scope (>)."
+  (tm-with m (fn (m i state) (tm-goto-index m i state 0))))
+
+(defn- tm-choice (revision)
+  "A revision as the `g` prompt lists it: hash, date, author, subject."
+  (str (:short revision) "  " (:date revision) "  " (:author revision) "  " (:subject revision)))
+
+(defcommand cmd-vc-timemachine-goto
+  (m key)
+  "Jump to a revision picked from the file's history (g) — hash, date, author and subject,
+the ones in scope first. One outside the branch scope widens it to the whole history."
+  (tm-with m
+    (fn (m i state)
+      (let (in-scope (tm-revisions state)
+            rest-of-history (seq/reject (:history state)
+                              (fn (revision) (tm-index-of in-scope (:hash revision))))
+            choices (map (append in-scope rest-of-history) tm-choice))
+        (assoc m
+          :minibuffer
+            (ed-name-prompt "Time machine: revision "
+              choices
+              (fn (mm text)
+                (let (short (first (string/split (string/trim text) " "))
+                      revision (seq/find (:history state)
+                                 (fn (r) (or (= (:short r) short) (= (:hash r) short))))
+                      j (ed-buffer-index-by-name mm (buffer-name (ed-buf-at m i))))
+                  (cond
+                    (nil? revision)
+                      (message mm (str "no revision " short " in this file's history"))
+                    (nil? j) mm
+                    (tm-index-of (tm-revisions state) (:hash revision))
+                      (tm-request mm j (:hash revision))
+                    :else
+                      (tm-request (tm-update-state mm j (fn (s) (assoc s :scope :all)))
+                        j
+                        (:hash revision)))))))))))
+
+(defcommand cmd-vc-timemachine-toggle-scope
+  (m key)
+  "Between the file's whole history and what this branch changed in it (B)."
+  (tm-with m
+    (fn (m i state)
+      (cond
+        (nil? (:branch-base state)) (message m "no base branch to measure this branch against")
+        (empty? (:branch-hashes state))
+          (message m (str "this branch changed nothing in this file since " (:branch-base state)))
+        :else
+          (let (scope (if (= (:scope state) :branch) :all :branch)
+                scoped (assoc state :scope scope)
+                m1 (tm-update-state m i (fn (s) (assoc s :scope scope)))
+                said (message m1
+                       (if (= scope :branch)
+                         (str "what this branch changed since " (:branch-base state))
+                         "the whole history"))
+                revisions (tm-revisions scoped))
+            (if (tm-index-of revisions (:shown state))
+              said
+              (tm-request said i (:hash (first revisions)))))))))
+
+(defcommand cmd-vc-timemachine-quit
+  (m key)
+  "Leave the time machine (q): its buffer and the info pane go, and the file is back."
+  (let (b (ed-current-buf m)
+        state (:timemachine b))
+    (if (nil? state)
+      m
+      (let (closed (if (aside/open? *info-spec* m) (aside/close *info-spec* m) m)
+            killed (ed-kill-buffer-named closed (buffer-name b))
+            origin (ed-buffer-index-by-name killed (:origin state)))
+        (cond
+          (not (nil? origin)) (ed-select killed origin)
+          (file/exists? (:file state)) (ed-find-file killed (:file state))
+          :else killed)))))
+
+;; ---- the commit: the info pane, the whole commit, blame, the hash -------------------
+
+(defcommand cmd-vc-timemachine-info
+  (m key)
+  "Show or hide the commit beside the time machine (d): its message, author, date and its
+diff of this file, following every step."
+  (tm-with m
+    (fn (m i state)
+      (if (aside/open? *info-spec* m)
+        (aside/close *info-spec* m)
+        (let (revision (tm-revision state (:shown state))
+              entry (get (:cache state) (:shown state)))
+          (if (or (nil? revision) (nil? entry))
+            (message m "the revision is still loading")
+            (aside/reopen-with *info-spec*
+              m
+              (fn (shown action)
+                (sectionbuf/sb-show shown
+                  (:buffer *info-spec*)
+                  (tm-info-tree state revision (:diff entry ""))
+                  (:type *info-spec*)
+                  {:action action
+                   :ctx {:timemachine (buffer-name (ed-buf-at m i)) :hash (:shown state)}
+                   :vis {}
+                   :line 1})))))))))
+
+;; check-allow: the hook is a backend's symbol resolved now, so the checker cannot see its
+;; result; every such hook is a `(m …) -> m` command, the contract `vcscore`'s row states.
+(check-allow :trusted
+  (sig tm-hook (model map keyword string &rest any -> model))
+  (defn- tm-hook (m state hook what & args)
+    "Run backend `hook` (a state key) with `m` and `args`, its module loaded first — or say
+the VCS has no `what`."
+    (let (sym (get state hook))
+      (if (nil? sym)
+        (message m (str "this version control has no " what))
+        (do
+          (vcs-load-hook sym)
+          (apply reflect/call-if-bound
+            sym
+            (message m (str "the " what " did not load"))
+            m
+            args))))))
+
+;; check-allow: both end in a backend hook, called late through `tm-hook` (trusted there)
+(check-allow :trusted
+  (defcommand cmd-vc-timemachine-show-commit
+    (m key)
+    "The whole commit of the revision shown (D) — every file it changed."
+    (tm-with m
+      (fn (m i state) (tm-hook m state :show-revision "commit view" (:root state) (:shown state)))))
+
+  (defcommand cmd-vc-timemachine-blame
+    (m key)
+    "Blame the revision shown (b), point on the line you are on."
+    (tm-with m
+      (fn (m i state)
+        (let (revision (tm-revision state (:shown state)))
+          (tm-hook m
+            state
+            :blame-revision "blame"
+            (:root state)
+            (:path revision)
+            (:hash revision)
+            (inc (buffer-current-line (ed-buf-at m i)))))))))
+
+(defn- tm-copy (m key)
+  "Copy the shown revision's hash field `key` (`:short`, `:hash`)."
+  (tm-with m
+    (fn (m i state)
+      (let (text (key (tm-revision state (:shown state))))
+        (message (ed-push-kill m text true) (str "copied " text))))))
+
+(defcommand cmd-vc-timemachine-copy-short-hash
+  (m key)
+  "Copy the shown revision's short hash (w)."
+  (tm-copy m :short))
+
+(defcommand cmd-vc-timemachine-copy-hash
+  (m key)
+  "Copy the shown revision's full hash (W)."
+  (tm-copy m :hash))
+
+(defcommand cmd-vc-timemachine-toggle-highlight
+  (m key)
+  "Tint the lines the shown revision changed, or stop (h)."
+  (tm-with m
+    (fn (m i state)
+      (let (on (not (:highlight? state))
+            toggled (assoc state :highlight? on))
+        (message (ed-set-buf-at m
+                   i
+                   (assoc (ed-buf-at m i)
+                     :timemachine toggled
+                     :line-bands (tm-bands toggled (:changed state {}))))
+          (if on "changed lines tinted" "changed lines plain"))))))
+
+(defcommand cmd-vc-timemachine-visit
+  (m key)
+  "RET in the info pane: go to the line a diff line is in the time machine's revision."
+  (let (hunk-row (sectionbuf/sb-ancestor m :hunk)
+        ctx (sectionbuf/sb-ctx m))
+    (if (or (nil? hunk-row) (nil? (:timemachine ctx)))
+      (message m "not on a diff line")
+      (ed-pop-to-buffer-named m
+        (:timemachine ctx)
+        (vcsproc/vcs-hunk-line (sectionbuf/sb-at m) (:value hunk-row))))))
+
+(defcommand cmd-vc-timemachine-info-close
+  (m key)
+  "Close the info pane (q in it); `d` in the time machine brings it back."
+  (aside/close *info-spec* m))
+
+;; ---- the mode line ------------------------------------------------------------------
+
+(defn- tm-cut (text width)
+  "`text`, cut to `width` characters with an ellipsis."
+  (if (> (string/length text) width) (str (string/substring text 0 (dec width)) "…") text))
+
+(defn tm-modeline (m buf)
+  "The time machine's mode line chip: the revision (hash, subject, author, age), where it
+is in the scope (`N/M`, the oldest 1), the scope, and whether only this branch has it."
+  (let (state (:timemachine buf))
+    (cond
+      (nil? state) nil
+      (:loading? state) (statusbar/seg :timemachine "⟲ loading history…" {:face tm-face-chip})
+      (nil? (:shown state)) (statusbar/seg :timemachine "⟲ no revision" {:face tm-face-chip})
+      :else
+        (let (revision (tm-revision state (:shown state))
+              revisions (tm-revisions state)
+              index (or (tm-index-of revisions (:shown state)) 0)
+              scope (cond
+                      (= (:scope state) :branch) (str " · this branch since " (:branch-base state))
+                      (and (:branch-base state) (empty? (:branch-hashes state)))
+                        " · this branch did not change it"
+                      :else "")
+              mine (if (tm-branch-only? state (:shown state)) " · ● only on this branch" "")
+              loading (if (= (:wanted state) (:shown state))
+                        ""
+                        (str " · loading " (:short (tm-revision state (:wanted state)) "…")))
+              text (str "⟲ "
+                     (:short revision)
+                     " "
+                     (tm-cut (:subject revision "") 48)
+                     " · "
+                     (:author revision)
+                     ", "
+                     (:age revision)
+                     " · "
+                     (- (count revisions) index)
+                     "/"
+                     (count revisions)
+                     scope
+                     mine
+                     loading))
+          (statusbar/seg :timemachine
+            text
+            {:face (if (= mine "") tm-face-chip tm-face-branch)
+             :on-click 'timemachine/cmd-vc-timemachine-info
+             :tooltip (into [(str (:hash revision) "  " (:date revision)) (:subject revision)]
+                        (if (= (:body revision "") "") [] (string/split (:body revision) "\n")))})))))
+
+;; ---- the layers ---------------------------------------------------------------------
+
+(def timemachine-keymap
+  (-> {}
+    (keymap-bind ["p"] 'timemachine/cmd-vc-timemachine-older) ; p — the revision before
+    (keymap-bind ["n"] 'timemachine/cmd-vc-timemachine-newer) ; n — the revision after
+    (keymap-bind ["<"] 'timemachine/cmd-vc-timemachine-oldest)
+    (keymap-bind [">"] 'timemachine/cmd-vc-timemachine-newest)
+    (keymap-bind ["g"] 'timemachine/cmd-vc-timemachine-goto) ; g — one picked from the history
+    (keymap-bind ["B"] 'timemachine/cmd-vc-timemachine-toggle-scope) ; B — this branch / all
+    (keymap-bind ["d"] 'timemachine/cmd-vc-timemachine-info) ; d — the commit beside it
+    (keymap-bind ["D"] 'timemachine/cmd-vc-timemachine-show-commit) ; D — the whole commit
+    (keymap-bind ["b"] 'timemachine/cmd-vc-timemachine-blame)
+    (keymap-bind ["w"] 'timemachine/cmd-vc-timemachine-copy-short-hash)
+    (keymap-bind ["W"] 'timemachine/cmd-vc-timemachine-copy-hash)
+    (keymap-bind ["h"] 'timemachine/cmd-vc-timemachine-toggle-highlight)
+    (keymap-bind ["q"] 'timemachine/cmd-vc-timemachine-quit)))
+
+(def timemachine-layer
+  ;; pushed onto the time machine buffer ABOVE the file's own mode, which still colours it
+  {:name 'timemachine
+   :doc "The time machine: p/n step, </> the ends, g pick, B branch scope, d the commit, q quit."
+   :keymap timemachine/timemachine-keymap
+   :modeline 'timemachine/tm-modeline
+   :commands '()})
+
+(def timemachine-info-keymap
+  (-> (sectionbuf/sb-keymap)
+    (keymap-bind [:enter] 'timemachine/cmd-vc-timemachine-visit) ; RET — that line, in the time machine
+    (keymap-bind ["q"] 'timemachine/cmd-vc-timemachine-info-close)))
+
+(def timemachine-info-layer
+  {:name 'timemachine-info
+   :doc "The time machine's commit: RET on a diff line goes to it; q closes."
+   :keymap timemachine/timemachine-info-keymap
+   :commands '()
+   :visual-line true
+   :section-faces 'timemachine/tm-info-faces
+   :section-bands 'timemachine/tm-info-bands})
+
+(register-type-layers :timemachine-info
+  (list 'timemachine/timemachine-info-layer 'modes/special-mode-layer 'modes/text-mode-layer))

@@ -1,0 +1,169 @@
+;; src/timemachine.blsp — the time machine (C-x v t): one buffer per file stepping through
+;; its revisions in place, the commit beside it, and the branch scope. Every test runs REAL
+;; git in a throwaway repo, headless, so each fetch runs inline and folds at once.
+(defmodule timemachine-test
+  (:use test)
+  (:use model)
+  (:use pool)
+  (:use editor/buffer)
+  (:use gitbar) ; git's row, with the time machine's hooks
+  (:use murbar) ; mur's, without them
+  (:use-internals timemachine))
+
+(defn- tm-git (dir args) (os/cmd "git" args {:cwd dir}))
+
+(defn- tm-commit (dir file text subject)
+  "Write `text` to `file` in `dir` and commit it as `subject`."
+  (do
+    (file/spit (path/join dir file) text)
+    (tm-git dir ["add" "-A"])
+    (tm-git dir ["commit" "-qm" subject])))
+
+(defn- tm-repo (name versions)
+  "A repo whose `f.txt` went through `versions` (`[[text subject] …]`, oldest first), on `main`."
+  (let (dir (path/temp (str "bedit-timemachine-test-" name "-")))
+    (do
+      (os/cmd "rm" ["-rf" dir] {:cwd "/"})
+      (file/mkdir dir)
+      (tm-git dir ["init" "-q" "-b" "main"])
+      (tm-git dir ["config" "user.email" "t@example.com"])
+      (tm-git dir ["config" "user.name" "Test"])
+      (tm-git dir ["config" "commit.gpgsign" "false"])
+      (doseq (version versions) (tm-commit dir "f.txt" (first version) (second version)))
+      dir)))
+
+(defn- tm-open (dir)
+  "A model visiting `dir`'s f.txt."
+  (ed-find-file (ed-init (make-buffer "")) (path/join dir "f.txt")))
+
+(defn- tm-text (m) (buffer-text (ed-current-buf m)))
+
+(defn- tm-state-of (m) (:timemachine (ed-current-buf m)))
+
+(defn- tm-info-text (m)
+  (let (i (ed-buffer-index-by-name m "*timemachine-info*"))
+    (if (nil? i) nil (buffer-text (ed-buf-at m i)))))
+
+(def- three [["one\n" "first"] ["one\ntwo\n" "second"] ["one\ntwo\nthree\n" "third"]])
+
+(describe "time machine: the history, stepped in place"
+  (test "entering lists the file's history newest first and shows the newest"
+    (let (m (cmd-vc-timemachine (tm-open (tm-repo "history" three)) nil)
+          state (tm-state-of m))
+      (assert= (buffer-name (ed-current-buf m)) "timemachine:f.txt")
+      (assert= (into [] (map (:history state) :subject)) ["third" "second" "first"])
+      (assert= (tm-text m) "one\ntwo\nthree\n")
+      (assert= (:scope state) :all)
+      (is (read-only? (ed-current-buf m)))))
+  (test "p / n / < / > step in the same buffer"
+    (let (m (cmd-vc-timemachine (tm-open (tm-repo "step" three)) nil)
+          count-before (count (:buffers m))
+          older (cmd-vc-timemachine-older m nil))
+      (assert= (tm-text older) "one\ntwo\n")
+      (assert= (count (:buffers older)) count-before)
+      (assert= (buffer-name (ed-current-buf older)) "timemachine:f.txt")
+      (assert= (tm-text (cmd-vc-timemachine-newer older nil)) "one\ntwo\nthree\n")
+      (let (oldest (cmd-vc-timemachine-oldest m nil))
+        (assert= (tm-text oldest) "one\n")
+        (is (includes? (:echo (cmd-vc-timemachine-older oldest nil)) "oldest"))
+        (assert= (tm-text (cmd-vc-timemachine-newest oldest nil)) "one\ntwo\nthree\n"))))
+  (test "q leaves: the file is back and the time machine is gone"
+    (let (dir (tm-repo "quit" three)
+          m (cmd-vc-timemachine-quit (cmd-vc-timemachine (tm-open dir) nil) nil))
+      (assert= (buffer-file (ed-current-buf m)) (path/join dir "f.txt"))
+      (is (nil? (ed-buffer-index-by-name m "timemachine:f.txt")))
+      (is (nil? (ed-buffer-index-by-name m "*timemachine-info*")))))
+  (test "point stays on its line when a step crosses lines inserted above it"
+    (let (dir (tm-repo "map" [["a\nb\nc\n" "abc"] ["x\ny\na\nb\nc\n" "two above"]])
+          m (cmd-vc-timemachine (tm-open dir) nil)
+          on-c (ed-apply m (fn (b) (ed-goto-line b 5)))
+          older (cmd-vc-timemachine-older on-c nil))
+      (assert= (buffer-current-line (ed-current-buf older)) 2)
+      ;; and back again, onto the same `c`
+      (assert= (buffer-current-line (ed-current-buf (cmd-vc-timemachine-newer older nil))) 4)))
+  (test "the lines a revision changed are tinted, and h turns it off"
+    (let (m (cmd-vc-timemachine (tm-open (tm-repo "bands" three)) nil))
+      (assert= (into [] (keys (:line-bands (ed-current-buf m)))) [2])
+      (is (nil? (:line-bands (ed-current-buf (cmd-vc-timemachine-toggle-highlight m nil))))))))
+
+(describe "time machine: the commit beside it"
+  (test "the info pane follows a step: the subject, and the file's diff"
+    (let (m (cmd-vc-timemachine (tm-open (tm-repo "info" three)) nil)
+          older (cmd-vc-timemachine-older m nil)
+          text (tm-info-text older))
+      (is (includes? (tm-info-text m) "third"))
+      (is (includes? text "second"))
+      (is (not (includes? text "third")))
+      (is (includes? text "@@"))
+      (is (includes? text "+two"))))
+  (test "w copies the short hash of the revision shown"
+    (let (dir (tm-repo "copy" three)
+          m (cmd-vc-timemachine-copy-short-hash (cmd-vc-timemachine (tm-open dir) nil) nil)
+          short (string/trim (:stdout (tm-git dir ["rev-parse" "--short" "HEAD"]))))
+      (assert= (:echo m) (str "copied " short)))))
+
+(describe "time machine: what this branch changed"
+  (test "on a branch that changed the file, it opens on the branch's commits; B widens"
+    (let (dir (tm-repo "branch" [["a\n" "base"] ["a\nb\n" "on main"]])
+          _ (tm-git dir ["checkout" "-qb" "feature"])
+          _ (tm-commit dir "f.txt" "a\nb\nc\n" "feature one")
+          _ (tm-commit dir "f.txt" "a\nb\nc\nd\n" "feature two")
+          m (cmd-vc-timemachine (tm-open dir) nil)
+          state (tm-state-of m))
+      (assert= (:scope state) :branch)
+      (assert= (:branch-base state) "main")
+      (assert= (into [] (map (tm-revisions state) :subject)) ["feature two" "feature one"])
+      (is (includes? (:text (tm-modeline m (ed-current-buf m))) "this branch since main"))
+      (is (includes? (tm-info-text m) "only on this branch"))
+      ;; the oldest in scope is the branch's first commit, not the repository's
+      (assert= (tm-text (cmd-vc-timemachine-oldest m nil)) "a\nb\nc\n")
+      (let (all (cmd-vc-timemachine-toggle-scope m nil))
+        (assert= (count (tm-revisions (tm-state-of all))) 4))))
+  (test "on the default branch with nothing to compare, it is the whole history"
+    (let (m (cmd-vc-timemachine (tm-open (tm-repo "nobase" three)) nil))
+      (assert= (:scope (tm-state-of m)) :all)
+      (is (includes? (:echo (cmd-vc-timemachine-toggle-scope m nil)) "no base branch")))))
+
+(describe "time machine: off the loop"
+  (test "of two quick steps only the last fetch is applied"
+    (let (m (cmd-vc-timemachine (tm-open (tm-repo "coalesce" three)) nil)
+          i (ed-current-index m)
+          [newest middle oldest] (into [] (map (:history (tm-state-of m)) :hash))
+          ;; two steps in flight: the first superseded (`:first`), the second still running
+          asked (assoc (ed-set-buf-at m i (assoc-in (ed-buf-at m i) [:timemachine :wanted] oldest))
+                  :timemachine-revision-proc :second
+                  :timemachine-pending
+                    {:timemachine-revision-proc {:buffer "timemachine:f.txt" :hash oldest}})
+          stale (tm-apply asked [:task-done :first {:text "stale\n" :diff ""}]))
+      ;; an answer for a superseded request is dropped whole
+      (assert= (tm-text stale) "one\ntwo\nthree\n")
+      (assert= (:timemachine-revision-proc stale) :second)
+      (let (landed (tm-apply stale [:task-done :second {:text "oldest\n" :diff ""}]))
+        (assert= (tm-text landed) "oldest\n")
+        (is (nil? (:timemachine-revision-proc landed))))
+      ;; a revision stepped past while it was fetched is cached, not shown
+      (let (past (tm-apply (assoc asked
+                             :timemachine-pending
+                               {:timemachine-revision-proc {:buffer "timemachine:f.txt"
+                                                            :hash middle}})
+                   [:task-done :second {:text "middle\n" :diff ""}]))
+        (assert= (tm-text past) "one\ntwo\nthree\n")
+        (is (contains? (:cache (tm-state-of past)) middle))
+        (is (not (= newest middle)))))))
+
+(describe "time machine: a VCS without the hooks"
+  (test "mur says it is not supported yet"
+    (let (dir (temp-dir "bedit-timemachine-mur-"))
+      (file/mkdir dir)
+      (file/mkdir (path/join dir ".mur"))
+      (let (m (ed-init (make-buffer "x" "a.txt" (path/join dir "a.txt"))))
+        (assert= (:echo (cmd-vc-timemachine m nil)) "the time machine is not supported for mur yet")))))
+
+(describe "time machine: lines through a diff"
+  (test "a line below an insertion moves down; one inside a replacement stays on it"
+    (assert= (tm-map-line (diff/line-hunks "a\nb\nc\n" "x\na\nb\nc\n") 2) 3)
+    (assert= (tm-map-line (diff/line-hunks "a\nb\nc\n" "a\nB\nc\n") 1) 1)
+    (assert= (tm-map-line (diff/line-hunks "a\nb\nc\n" "a\nc\n") 2) 1))
+  (test "a hunk's + lines after - lines are modified, the rest added"
+    (assert= (tm-changed-lines (:hunks (first (diff/parse-unified "--- a/f\n+++ b/f\n@@ -1,2 +1,3 @@\n a\n-b\n+B\n+C\n"))))
+      {1 :modified 2 :added})))

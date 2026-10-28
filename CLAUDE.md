@@ -583,11 +583,25 @@ src/gitview.blsp            the git VIEWS, section buffers acted on in place: *g
                             context), *git-log* (graph, refs, author/age margin; RET shows,
                             SPC peeks, + doubles; A/V/X/r i act on the commit at point), the
                             reflog, *git-blame* (chunks per commit; b blames the version
-                            before), *git-refs* (y), a file at a revision and C-c g p / n to
-                            step through its history. Every view runs git, parses and paints OFF
+                            before), *git-refs* (y), a file at a revision (C-c g f), and git's
+                            side of the time machine (`git-file-history` / `git-file-revision`).
+                            Every view runs git, parses and paints OFF
                             the loop (a slot each): its buffer opens at once — `Loading…`, or what
                             it held on a refresh — and the tree lands when git answers; a reply
                             for a killed or re-asked buffer is dropped, C-g cancels
+src/timemachine.blsp        the TIME MACHINE (C-x v t, C-c g t / p / n; Emacs's git-timemachine):
+                            ONE buffer per file stepping its revisions IN PLACE, in the file's own
+                            mode — p / n, < / >, g pick, q back to the file — point kept on its
+                            logical line through the line diff, the changed lines tinted (h). B:
+                            the whole history or WHAT THIS BRANCH CHANGED since its base (the
+                            upstream when it tracks another branch, else origin/HEAD / main /
+                            master), the default when the branch touched the file. Beside it an
+                            `aside` (d) follows the revision: message, author, date, its diff of
+                            the file painted as every diff (RET goes to the line); D the whole
+                            commit, b blame, w / W the hash. VCS-neutral: the history and a
+                            revision come from the row's `:file-history` / `:file-at` in a
+                            task — the history once, a revision when first stepped to, cached;
+                            a step supersedes the fetch in flight. mur has no `:file-at` yet
 src/smerge.blsp             conflicts resolved IN the file, Emacs's smerge: C-c ^ n/p between
                             conflicts, u/l/a/b keep upper / lower / both / base
 src/diffhl.blsp             diff-hl change gutter: per-line added/modified/deleted against the
