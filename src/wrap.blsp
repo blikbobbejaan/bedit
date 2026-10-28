@@ -10,11 +10,14 @@
 ;;
 ;; A segment is `[from to]` — char offsets into the line, `to` exclusive, the newline
 ;; never included — and a line is a list of them: one when it fits, `'([0 0])` when empty.
+;; A line that is not wrapped (truncated or scrolled — see "long lines" below) is ONE
+;; segment over the whole line with a clip beside it, `[0 len [cut ellipsis]]`.
 (defmodule wrap
-  "Visual-line wrapping: the pure break rule that turns a buffer line into `[from to]`
-row segments at most `w` cells wide, breaking after the last space that fits (else
-mid-word). The one place the breaks are decided, so the view, the cursor, the mouse and
-the scroll agree."
+  "Where a buffer line falls on screen rows: wrapped into `[from to]` segments at most `w`
+cells wide (`visual-line-mode`, breaking after the last space that fits, else mid-word), or
+kept to ONE row cut at the pane's edge — with an ellipsis (`truncate-lines`) or without (a
+line that scrolls sideways). Per line (`line-policy`). The one place the rows are decided,
+so the view, the cursor, the mouse and the scroll agree."
   (:use editor/buffer) ; buffer-rope — a line's text for `line-segments`
   (:use memo)) ; defmemo — the row table is asked for over and over while nothing changes
 (defn- break-at (text from col w)
@@ -72,15 +75,128 @@ few lines of a large document that must not flatten the whole of it."
   "Buffer line `line`'s text without its newline — the text its segments index into."
   (rope-line-text (buffer-rope buf) line))
 
-(sig rope-line-segments (any int int -> (list (vector int))))
-(defn- rope-line-segments (rope line w)
-  "`segments` of line `line` of `rope` (its text without the newline), `w` cells wide."
-  (segments (rope-line-text rope line) w))
+;; ---- long lines: wrap, truncate or scroll, per line ---------------------------------
+;; A line too long for its pane is shown one of three ways (`scroll/ed-long-lines` decides
+;; which, per buffer and per line):
+;;
+;;   :wrap      on as many rows as it needs, broken after words (`segments` above)
+;;   :truncate  on ONE row, cut where the pane ends with an ellipsis in its last cells —
+;;              Emacs's `truncate-lines` with the fringe's `$` made visible text
+;;   :scroll    on ONE row, cut at the pane's edge with no mark — the line scrolls sideways
+;;
+;; A one-row line is a segment that still covers the whole line, `[0 len]`, so everything
+;; that asks which row a column is on (`row-of`, the cursor, C-n) reads it as the line's
+;; only row. What the row SHOWS rides beside it as a CLIP, `[cut ellipsis]`: the chars
+;; `[from, cut)` are painted and `ellipsis` after them in the row's last cells (`""` for a
+;; scrolled line, whose edge simply clips). A row whose text fits carries no clip.
+;;
+;; The row table carries the clip as a row's fifth field (`[line from to nil clip]`), which
+;; only the painter and a click read. Which lines are which comes in with the rest of the
+;; row extras, under `:long-lines` (`scroll/ed-long-lines-spec`):
+;; `{:policy :kinds :kind-policies :ellipsis}` — the policy of a line with no kind, a vector
+;; of each line's KIND (a section heading, a section body — `:line-kinds` on the buffer)
+;; and the policy each kind takes. Data, not a function, so the memoised table below keys
+;; on it like any other input.
 
-(sig line-segments (buffer int int -> (list (vector int))))
-(defn line-segments (buf line w)
-  "`segments` of buffer line `line` (its text without the newline), `w` cells wide."
-  (rope-line-segments (buffer-rope buf) line w))
+(sig line-policy (map int -> keyword))
+(defn line-policy (extras line)
+  "How line `line` shows when it is too long for its row — `:wrap`, `:truncate` or
+`:scroll` — by the `:long-lines` spec in the row `extras`: the policy its kind takes when it
+has one, else the spec's own (scrolling for one that names none). `:wrap` with no spec, the
+rule the row table was first built
+for.
+
+    (wrap/line-policy {:long-lines {:policy :scroll :kinds [:heading] :kind-policies {:heading :truncate}}} 0)   ;=> :truncate
+    (wrap/line-policy {:long-lines {:policy :scroll :kinds [:heading] :kind-policies {:heading :truncate}}} 1)   ;=> :scroll"
+  (let (spec (get extras :long-lines))
+    (if (nil? spec)
+      :wrap (let (kinds (:kinds spec)
+            kind (when (vector? kinds) (nth kinds line nil))
+            by-kind (when kind (get (or (:kind-policies spec) {}) kind)))
+        (let (policy (or by-kind (:policy spec))) (if (keyword? policy) policy :scroll))))))
+
+(sig one-row (string int int string -> vector))
+(defn one-row (text from-cell w ellipsis)
+  "The ONE row `text` shows from display cell `from-cell` on in a `w`-cell row:
+`[from len]` when the rest fits, else `[from len [cut ellipsis]]` — the chars `[from, cut)`
+fit in the cells the `ellipsis` leaves, and it is painted after them. The cut never splits
+a glyph (a wide one that would straddle it is left for the next scroll), and a row too
+narrow to hold the ellipsis and a character keeps the cells for text and shows none.
+
+    (wrap/one-row \"abcdefgh\" 0 5 \"…\")   ;=> [0 8 [4 \"…\"]]
+    (wrap/one-row \"abcdefgh\" 4 5 \"…\")   ;=> [4 8]
+    (wrap/one-row \"ab日本cd\" 0 4 \"…\")   ;=> [0 6 [2 \"…\"]]"
+  (let (len (string/length text)
+        width (string/display-width text)
+        from (if (<= from-cell 0) 0 (string/width->index text from-cell))
+        from-col (if (= from 0) 0 (string/display-width (string/substring text 0 from))))
+    (if (or (<= w 0) (<= (- width from-col) w))
+      [from len]
+      (let (ellipsis-cells (string/display-width ellipsis)
+            room? (> w ellipsis-cells)
+            avail (if room? (- w ellipsis-cells) w)
+            cut (string/width->index text (+ from-col avail)))
+        [from len [(if (< cut from) from cut) (if room? ellipsis "")]]))))
+
+(sig segments-for (string int keyword &optional string -> list))
+(defn segments-for (text w policy &optional (ellipsis "…"))
+  "The row segments of one line `text` in a `w`-cell row under long-line `policy`: its
+wrapped `segments` for `:wrap`, else its ONE row (`one-row`) — ending in `ellipsis` for
+`:truncate`, clipped at the edge for `:scroll`.
+
+    (wrap/segments-for \"the quick brown fox\" 10 :truncate)   ;=> ([0 19 [9 \"…\"]])
+    (wrap/segments-for \"the quick brown fox\" 10 :scroll)   ;=> ([0 19 [10 \"\"]])"
+  (case policy
+    :truncate (list (one-row text 0 w ellipsis))
+    :scroll (list (one-row text 0 w ""))
+    (segments text w)))
+
+(sig follow-point (vector buffer int &optional int -> vector))
+(defn follow-point (rows buf w &optional (margin 8))
+  "`rows` (a pane's row table, `w` cells wide) with point's line scrolled sideways when it
+is a CLIPPED row and point sits at or past the cut — so point is never hidden behind an
+ellipsis. Only that row moves (Emacs's `auto-hscroll-mode` `current-line`): it is shown from
+the cell that leaves point `margin` cells clear of the right edge, and clipped again from
+there. Every other row, and a table without that row, comes back as it was.
+
+The table is memoised without point (`rows-from`), so this is applied after it, and costs a
+scan of the rows for one that is clipped."
+  (let (line (buffer-current-line buf)
+        k (seq/index-where rows
+            (fn (row) (and (= (first row) line) (nil? (nth row 3 nil)) (nth row 4 nil)))))
+    (if (< k 0)
+      rows
+      (let (col (buffer-column buf)
+            clip (nth (nth rows k) 4)
+            [cut ellipsis] clip)
+        (if (< col cut)
+          rows
+          (let (text (line-text buf line)
+                point-cell (string/display-width (string/substring text 0 col))
+                avail (math/max 1 (- w (string/display-width ellipsis)))
+                slack (math/max 0 (math/min margin (math/quot (dec avail) 2)))
+                shown (one-row text (math/max 0 (+ (- point-cell avail) 1 slack)) w ellipsis)
+                shown-clip (nth shown 2 nil))
+            (assoc rows
+              k
+                (if (nil? shown-clip)
+                  [line (first shown) (second shown) nil]
+                  [line (first shown) (second shown) nil shown-clip]))))))))
+
+(sig rope-line-segments (any int int &optional map -> (list vector)))
+(defn- rope-line-segments (rope line w &optional (extras {}))
+  "`segments-for` line `line` of `rope` (its text without the newline), `w` cells wide,
+under the line's policy in the row `extras` (`line-policy`)."
+  (segments-for (rope-line-text rope line)
+    w
+    (line-policy extras line)
+    (or (get (get extras :long-lines) :ellipsis) "…")))
+
+(sig line-segments (buffer int int &optional map -> (list vector)))
+(defn line-segments (buf line w &optional (extras {}))
+  "The row segments of buffer line `line` (its text without the newline), `w` cells wide:
+wrapped, or one row, as its policy in the row `extras` says (`rope-line-segments`)."
+  (rope-line-segments (buffer-rope buf) line w (or extras {})))
 
 ;; ---- inlay rows: a screen row that is not buffer text -------------------------------
 ;; A row need not show text the buffer contains. An INLAY row carries derived text of its
@@ -111,7 +227,7 @@ few lines of a large document that must not flatten the whole of it."
   ;; the rows line `line` takes: its inlays and its segments, none when it is hidden
   (if (hidden? extras line)
     0
-    (+ (count (rope-line-segments rope line w)) (count (get extras line [])))))
+    (+ (count (rope-line-segments rope line w extras)) (count (get extras line [])))))
 
 (sig line-rows (buffer int int map -> int))
 (defn line-rows (buf line w extras)
@@ -138,10 +254,14 @@ segments — none at all when a fold hides it. What a walk up or down the lines 
       inlays
       (if (hidden? inlays line)
         acc
-        (fold (rope-line-segments rope line w)
+        (fold (rope-line-segments rope line w inlays)
           (inlay-rows inlays line limit acc)
           (fn (a seg)
-            (if (>= (count a) limit) a (conj a [line (first seg) (second seg) nil]))))))))
+            (cond
+              (>= (count a) limit) a
+              ;; a clipped row keeps its clip as a fifth field, for the painter and a click
+              (nth seg 2 nil) (conj a [line (first seg) (second seg) nil (nth seg 2)])
+              else (conj a [line (first seg) (second seg) nil]))))))))
 
 ;; The row table is memoised (`defmemo`, std/memo) on `[rope top w limit inlays]`: it is
 ;; asked from the pure `view`, from three hit-test sites in `panes`, and from
@@ -163,14 +283,21 @@ segments — none at all when a fold hides it. What a walk up or down the lines 
   (rows-step rope (text/line-count rope) top w limit inlays []))
 
 (sig rows-from
-  (buffer int int int &optional map -> (vector (tuple int int (or nil int) (or nil string)))))
+  (buffer int
+    int
+    int
+    &optional
+    map
+    ->
+    (vector (or (tuple int int (or nil int) (or nil string)) (tuple int int int nil vector)))))
 ;; check-allow: the cache only ever holds what `rows-step` built, so a hit has the declared
 ;; shape by construction — but it comes back out of the memo's store, which the checker
 ;; reads as unknown.
 (check-allow :trusted
   (defn rows-from (buf top w limit &optional (inlays {}))
     "The first `limit` screen rows from buffer line `top` down, each
-`[line from to inlay]` — a line's inlay rows, then its text segments in order, then the
+`[line from to inlay]` (and a fifth field, the CLIP, on a row cut short — see
+`one-row`) — a line's inlay rows, then its text segments in order, then the
 next line's — stopping at the buffer's end. What a `w`-wide, `limit`-tall pane shows; the
 row↔line owner's table. Memoised on its inputs — see `rope-rows`.
 

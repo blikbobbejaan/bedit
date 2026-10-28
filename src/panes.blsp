@@ -149,12 +149,14 @@ line than this one). Clamped like `ed-pane-top`."
 not its laid-out rect (M-r)."
   (ed-pane-view-top {:payload payload} buf))
 
-;; ---- visual lines (wrapping): the pane's row table ---------------------------------
-;; With `visual-line-mode` on a buffer (`:visual-line`), a line takes as many rows as it
-;; needs (`wrap/segments`), so "row k shows line top + k" stops being true. The pane's ROW
+;; ---- long lines (wrapped, truncated): the pane's row table ------------------------
+;; With a buffer's long lines wrapped (`visual-line-mode`) a line takes as many rows as it
+;; needs (`wrap/segments`), so "row k shows line top + k" stops being true; truncated, a
+;; row shows only part of its line and an ellipsis (`wrap/one-row`). The pane's ROW
 ;; TABLE — `[line from to]` per text row, from `wrap/rows-from` — is what every row↔line
 ;; question reads then; a row's `from` is its horizontal scroll (the chars before it are
-;; on the rows above), so the column geometry (`ed-buf-offset-at`, the caret) is unchanged.
+;; on the rows above, or scrolled off the left of the line at point), so the column
+;; geometry (`ed-buf-offset-at`, the caret) is unchanged.
 
 ;; ---- the pane's cell: every dimension below is in the ZOOMED pane's cells ----------
 ;; A zoomed pane (`appearance/zoom-of`, on its payload) is painted inside a `cell-region`
@@ -218,9 +220,11 @@ at (`ed-selected-text-cols` is this for the selected pane). At least 1."
 than the pane shows so a smooth-scroll step has its extra row — or nil when the rows are
 simply `top + k` (the arithmetic in `ed-pane-line-at`).
 
-A table is built for a buffer that WRAPS, and for one carrying INLAY rows
+A table is built for a buffer whose long lines do not simply scroll (wrapped, truncated —
+`scroll/ed-long-lines`), and for one carrying INLAY rows
 (`results/inlay-lines` — derived text on a row of its own). Both are the same fact: the
-pane's rows are no longer one per line, in order, from the top. Nil is kept for the common
+pane's rows are no longer one per line, in order, from the top (or, truncated, a row no
+longer shows its whole line). Nil is kept for the common
 case rather than always building one, because most buffers need neither.
 
 The table itself is memoised on its inputs in `wrap/rows-from` — at the leaf, so the three
@@ -228,11 +232,15 @@ hit-test sites here and `input/ed-point-into-view` (which asks `rows-from` direc
 the same answer without rebuilding it."
   (let (inlays (ed-row-extras buf))
     (if (ed-row-wise? buf inlays)
-      (wrap/rows-from buf
-        (ed-pane-top pane buf)
-        (ed-pane-text-cols pane buf)
-        (inc (ed-pane-vrows pane buf))
-        inlays)
+      ;; point's line, if it is cut short and point lies past the cut, shown from where point
+      ;; is visible — after the memo, which is keyed without point
+      (let (w (ed-pane-text-cols pane buf))
+        (wrap/follow-point (wrap/rows-from buf
+                             (ed-pane-top pane buf)
+                             w
+                             (inc (ed-pane-vrows pane buf))
+                             inlays)
+          buf w))
       nil)))
 
 (sig ed-pane-row-index (pane buffer number -> int))
@@ -275,6 +283,30 @@ that row's slice of the line."
       (let (k (ed-pane-row-index pane buf row)
             from (when (< k (count rows)) (second (nth rows k))))
         (if (int? from) from 0)))))
+
+(sig ed-pane-row-clip (pane buffer number -> (or nil vector)))
+(defn ed-pane-row-clip (pane buf row)
+  "The CLIP of screen row `row` — `[cut ellipsis]` when the line it shows is cut short
+(`wrap/one-row`: truncated, or clipped at the pane's edge), nil when the row shows all of
+its chars. What a click asks to tell the ellipsis from the text before it."
+  (let (rows (ed-pane-rows pane buf)
+        k (ed-pane-row-index pane buf row)
+        entry (when (and rows (< k (count rows))) (nth rows k))
+        clip (when (vector? entry) (nth entry 4 nil)))
+    (if (vector? clip) clip nil)))
+
+(sig ed-clip-click (buffer int (or nil vector) int -> int))
+(defn ed-clip-click (buf line clip off)
+  "Where a click that `ed-buf-offset-at` put at `off` on `line` lands, given its row's
+`clip`: at the line's END when it fell on the ellipsis or past the cut (the chars there are
+not on screen, so no column of them was clicked) — which then shows that line from where
+point is (`wrap/follow-point`), so a click on `…` reveals the rest. `off` otherwise."
+  (if (nil? clip)
+    off
+    (let (rope (buffer-rope buf)
+          bol (text/line->char rope line)
+          eol (+ bol (string/length (wrap/line-text buf line))))
+      (if (>= off (+ bol (first clip))) eol off))))
 
 (sig ed-rows-line-rows ((or nil vector) int int int -> (list (tuple int int (or nil int)))))
 (defn ed-rows-line-rows (rows top line hscroll)
@@ -1169,13 +1201,11 @@ With no such service the click falls through to the old clamped point move."
           (catch e (message m (str "gutter: " (error-message e)))))
       else
       ;; the row's own hscroll: a wrapped continuation row starts mid-line (`ed-pane-row-hscroll`)
-        (let (off (ed-buf-offset-at buf
-                    (ed-pane-line-at-clamped pane buf row)
-                    (ed-pane-row-hscroll pane buf row)
-                    gw
-                    rw
-                    px
-                    col))
+        (let (line (ed-pane-line-at-clamped pane buf row)
+              off (ed-clip-click buf
+                    line
+                    (ed-pane-row-clip pane buf row)
+                    (ed-buf-offset-at buf line (ed-pane-row-hscroll pane buf row) gw rw px col)))
           (assoc (ed-set-buf m (clear-mark (goto-char buf off)))
             :text-drag
               {:buf (get-in pane [:payload :buffer])
@@ -1364,12 +1394,15 @@ on a comfortable row, else the offset on the nearest one."
         last-ok (if (>= top maxtop) (dec textrows) (- textrows 1 margin))
         comfortable (seq/filter (range (count rows))
                       (fn (i)
-                        (let ([_ _ _ inlay] (nth rows i))
+                        (let (inlay (nth (nth rows i) 3 nil))
                           (and (>= i first-ok) (<= i last-ok) (nil? inlay)))))
         line (buffer-current-line buf)
         col (buffer-column buf)
         on-row? (fn (i)
-                  (let ([row-line from to _] (nth rows i))
+                  (let (row (nth rows i)
+                        row-line (nth row 0)
+                        from (nth row 1)
+                        to (nth row 2))
                     (and (= row-line line)
                       (or (nil? to)
                         (and (>= col from)
@@ -1379,15 +1412,23 @@ on a comfortable row, else the offset on the nearest one."
       (empty? comfortable) nil
       (any? comfortable on-row?) nil
       else
-        (let ([first-line first-from _ _] (nth rows (first comfortable))
+        (let (first-row (nth rows (first comfortable))
+              first-line (nth first-row 0)
+              first-from (nth first-row 1)
               above? (or (< line first-line) (and (= line first-line) (< col first-from)))
-              [target-line from to _] (nth rows (if above? (first comfortable) (last comfortable)))
+              target-row (nth rows (if above? (first comfortable) (last comfortable)))
+              target-line (nth target-row 0)
+              from (nth target-row 1)
+              to (nth target-row 2)
               text (wrap/line-text buf target-line)
               ;; the column within its own row, carried onto the target row
               in-row (if (nil? to)
                        col
-                       (let (segs (wrap/line-segments buf line (ed-pane-text-cols pane buf)))
-                         (let ([row-from _] (nth segs (wrap/row-of segs col))) (- col row-from))))
+                       (let (segs (wrap/line-segments buf
+                                    line
+                                    (ed-pane-text-cols pane buf)
+                                    (ed-row-extras buf)))
+                         (- col (first (nth segs (wrap/row-of segs col))))))
               last (cond
                      (nil? to) (string/length text)
                      (= to (string/length text)) to

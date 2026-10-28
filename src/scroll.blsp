@@ -1,8 +1,9 @@
 (defmodule scroll
   "Keeping point on screen: the vertical clamp (`ed-scroll` — Emacs `scroll-margin` +
 `scroll-conservatively`), its horizontal analogue for long unwrapped lines
-(`ed-scroll-horizontal`), the bottom-of-buffer bound (`ed-max-top`), whether a buffer
-wraps (`ed-wrap?`) or otherwise lays out row-wise, and the snap that ends a fractional
+(`ed-scroll-horizontal`), the bottom-of-buffer bound (`ed-max-top`), how a buffer shows
+its long lines — wrapped, truncated with an ellipsis or scrolled, per buffer and per line
+(`ed-long-lines`) — and whether it lays out row-wise, and the snap that ends a fractional
 glide on a whole line (`ed-settle-scroll`).
 
 All `model -> model` over the selected pane's `:top` / `:hscroll`: the model owns the panes
@@ -80,45 +81,147 @@ below half the viewport (so a tall margin in a short pane can't exceed what fits
   "The largest scroll offset that still fills a `textrows`-tall viewport — the last
 line sits on the bottom row. Beyond this there'd be blank space past end-of-buffer, so
 scrolling clamps here (and the bottom margin relaxes near EOF, as in Emacs). For a
-wrapped buffer (`ed-wrap?`) given its text width `w`, the last line's LAST row sits on
-the bottom row — a wrapped line takes several, so the top can be higher than the line
-count says; without `w` the line arithmetic stands (a caller with no width to measure at)."
-  (if (and w (> w 0) (ed-wrap? buf))
-    (let (last (dec (buffer-line-count buf))
-          segs (wrap/line-segments buf last w))
-      (ed-wrap-top-for buf last (dec (count segs)) w textrows 0))
-    (math/max 0 (- (buffer-line-count buf) textrows))))
+row-wise buffer (`ed-row-wise?` — wrapped lines, inlay rows) given its text width `w`, the
+last line's LAST row sits on the bottom row — a wrapped line takes several, so the top can
+be higher than the line count says; without `w` the line arithmetic stands (a caller with
+no width to measure at)."
+  (let (extras (ed-row-extras buf))
+    (if (and w (> w 0) (ed-row-wise? buf extras))
+      (let (last (dec (buffer-line-count buf))
+            segs (wrap/line-segments buf last w extras))
+        (ed-wrap-top-for buf last (dec (count segs)) w textrows 0 extras))
+      (math/max 0 (- (buffer-line-count buf) textrows)))))
+
+;; ---- long lines: wrap, truncate or scroll ---------------------------------------------
+;; How a line too long for its pane is shown is a POLICY (`wrap` has the three and what each
+;; does to the row table). Which one a line takes, first answer wins:
+;;
+;;   1. the buffer's own toggle — `:long-lines` on the buffer (M-x toggle-truncate-lines,
+;;      M-x visual-line-mode), the whole buffer
+;;   2. the user's setting for the buffer's MODE — `:long-lines {git-status :wrap}` in
+;;      init.blsp, the whole buffer
+;;   3. the line's KIND — `:line-kinds` on the buffer, a vector parallel to its lines (a
+;;      section buffer marks headings `:section-heading` and body lines `:section-body`) —
+;;      and the policy the user's setting gives that kind
+;;   4. the mode's `:long-lines` facet (markdown and org wrap)
+;;   5. the setting's `:default`
+;;
+;; The user's setting is `config`'s `:long-lines`, merged over `*long-lines-defaults*` and
+;; held here as a dynamic var whose root the config re-binds (`ed-set-long-lines`) — a test
+;; `binding`s it instead — as a theme switch re-binds
+;; the palette: it is read from the row table's inputs, which have a buffer and no model.
+
+(def *long-lines-defaults*
+  ;; what `:long-lines` in init.blsp is merged over: lines scroll unless a mode says
+  ;; otherwise, and in a section buffer (*git-status*, a log, *mur-status*) a heading — a
+  ;; commit, a stash, a file — keeps to one row with an ellipsis while a hunk's code wraps
+  {:default :scroll :section-heading :truncate :section-body :wrap})
+
+(defdyn *long-lines* *long-lines-defaults*) ; the user's `:long-lines`, over the defaults
+(defdyn *truncation-ellipsis* "…") ; what ends a truncated line (the user's `:truncation-ellipsis`)
+
+(defn ed-set-long-lines (policies ellipsis)
+  "Make the user's `:long-lines` `policies` (merged over `*long-lines-defaults*`) and
+`:truncation-ellipsis` the ones every buffer is laid out by. `config/apply-long-lines`
+calls it at startup and on M-x reload-config; an empty or missing ellipsis is the default."
+  (def *long-lines* (merge *long-lines-defaults* (if (map? policies) policies {})))
+  (def *truncation-ellipsis*
+    (if (and (string? ellipsis) (not (empty? ellipsis))) ellipsis "…"))
+  nil)
+
+(defn- ed-long-lines-forced (buf)
+  ;; the policy that holds for EVERY line of `buf`, or nil: its own toggle, else the user's
+  ;; setting for its mode (looked up by the mode's name as a symbol)
+  (let (own (:long-lines buf)
+        mode (ed-buf-mode-name buf))
+    (cond
+      (keyword? own) own
+      (empty? mode) nil
+      else (get *long-lines* (symbol mode)))))
+
+(defn- ed-long-lines-base (buf)
+  ;; the policy of a line with no kind: the mode's facet, else the default
+  (or (ed-mode-service buf :long-lines) (:default *long-lines*) :scroll))
+
+(sig ed-long-lines (buffer &optional (or nil int) -> keyword))
+(defn ed-long-lines (buf &optional (line nil))
+  "How `buf` shows a line too long for its pane — `:wrap`, `:truncate` or `:scroll` — and,
+given `line`, how THAT line does (its kind may say otherwise). The order is the one above
+this: the buffer's toggle, the user's setting for its mode, the line's kind, the mode's
+facet, the default."
+  ;; the setting and the facets are data, so the answer is a keyword by this guard: a value
+  ;; that is not one reads as scrolling, which is also what the row table makes of it
+  (let (policy (or (ed-long-lines-forced buf)
+                 (when (int? line)
+                   (let (kinds (:line-kinds buf)
+                         kind (when (vector? kinds) (nth kinds line nil)))
+                     (when kind (get *long-lines* kind))))
+                 (ed-long-lines-base buf)))
+    (if (keyword? policy) policy :scroll)))
+
+(defn ed-long-lines-spec (buf)
+  "What the row table needs to lay `buf`'s lines out by their policies — `{:policy :kinds
+:kind-policies :ellipsis}` (`wrap/line-policy` reads it) — or nil when every line of it
+scrolls, the one case with no row table. Data, so the memoised table keys on it."
+  (let (forced (ed-long-lines-forced buf)
+        kinds (:line-kinds buf))
+    (cond
+      forced (when (not (= forced :scroll)) {:policy forced :ellipsis *truncation-ellipsis*})
+      (vector? kinds)
+        {:policy (ed-long-lines-base buf)
+         :kinds kinds
+         :kind-policies *long-lines*
+         :ellipsis *truncation-ellipsis*}
+      else
+        (let (policy (ed-long-lines-base buf))
+          (when (not (= policy :scroll)) {:policy policy :ellipsis *truncation-ellipsis*})))))
+
+(sig ed-toggle-long-lines (buffer keyword -> buffer))
+(defn ed-toggle-long-lines (buf policy)
+  "`buf` with long-lines `policy` toggled as its own (M-x toggle-truncate-lines with
+`:truncate`, M-x visual-line-mode with `:wrap`): on — every line of it takes `policy` —
+when it does not already, else off, back to what it had without the toggle (its mode's,
+its lines' kinds) or, when that is `policy` too, to scrolling."
+  (cond
+    (not (= policy (ed-long-lines buf))) (assoc buf :long-lines policy)
+    (= policy (ed-long-lines (dissoc buf :long-lines))) (assoc buf :long-lines :scroll)
+    else (dissoc buf :long-lines)))
 
 (sig ed-wrap? (buffer -> bool))
 (defn ed-wrap? (buf)
-  "Whether `buf` wraps long lines visually (`visual-line-mode`, M-x visual-line-mode):
-a long line takes as many screen rows as it needs instead of scrolling sideways. Per
-buffer, as in Emacs: the buffer's own `:visual-line` when it has been toggled, else the
-mode's `:visual-line` facet (markdown wraps by default). The break rule is
-`wrap/segments`."
-  (let (own (:visual-line buf))
-    (if (nil? own) (= true (ed-mode-service buf :visual-line)) (= true own))))
+  "Whether `buf` wraps long lines visually (`visual-line-mode`): its policy is `:wrap`
+(`ed-long-lines`) — a long line takes as many rows as it needs instead of scrolling
+sideways. A line of it whose kind says otherwise keeps its own (`ed-long-lines` with the
+line)."
+  (= :wrap (ed-long-lines buf)))
 
-(defn ed-row-wise? (buf inlays)
+(defn ed-row-wise? (buf extras)
   "Whether `buf`'s rows on screen stop being one per line, in order, from the top — so what
 is visible has to be COUNTED in a row table (`wrap/rows-from`) rather than read off as
-`top + k`. Two things do that: WRAPPING (`ed-wrap?`, a long line takes several rows) and
-INLAY rows (`inlays`, from `results/inlay-lines` — derived text on a row of its own above
-a line). The one rule the scroll clamp (`ed-scroll`), the pane's row table
-(`panes/ed-pane-rows`) and the point-follows-view step (`input/ed-point-into-view`) share:
-when they disagreed, an inlay pushed the last line off the bottom while the cursor step
-still counted it as shown. A FOLD is the third (`:hidden` in the extras): a hidden line
-takes no rows at all."
-  (or (ed-wrap? buf) (not (empty? inlays))))
+`top + k`. `extras` is `ed-row-extras`: what it holds is exactly what makes a buffer row-wise
+— a long-lines policy other than scrolling everywhere (a wrapped line takes several rows, a
+truncated one is cut and marked), INLAY rows (derived text on a row of its own above a
+line), and the lines a FOLD hides (`:hidden`, no rows at all). The one rule the scroll clamp
+(`ed-scroll`), the pane's row table (`panes/ed-pane-rows`) and the point-follows-view step
+(`input/ed-point-into-view`) share: when they disagreed, an inlay pushed the last line off
+the bottom while the cursor step still counted it as shown."
+  (or (not (empty? extras)) (not (nil? (ed-long-lines-spec buf)))))
 
 (defn ed-row-extras (buf)
   "What the row table needs beside the text: each line's INLAY rows (`results/inlay-lines`,
-keyed by line) and, under `:hidden`, the lines a fold hides (`folds/hidden-lines`) — one
-map, so every row↔line question reads the same answer from one call. `{}` for nearly
-every buffer."
+keyed by line), under `:hidden` the lines a fold hides (`folds/hidden-lines`), and under
+`:long-lines` how its long lines show (`ed-long-lines-spec`) — one map, so every row↔line
+question reads the same answer from one call. `{}` for a buffer whose lines simply scroll."
   (let (inlays (results/inlay-lines buf)
-        hidden (folds/hidden-lines buf))
-    (if (empty? hidden) inlays (assoc inlays :hidden hidden))))
+        hidden (folds/hidden-lines buf)
+        spec (ed-long-lines-spec buf)
+        with-hidden (if (empty? hidden) inlays (assoc inlays :hidden hidden)))
+    (cond
+      spec (assoc with-hidden :long-lines spec)
+      (empty? with-hidden) with-hidden
+      ;; row-wise for its inlays or folds alone: its long lines still scroll (one row each,
+      ;; the one at point following it), rather than wrap because a table was built
+      else (assoc with-hidden :long-lines {:policy :scroll :ellipsis *truncation-ellipsis*}))))
 
 (sig ed-wrap-top-for (buffer int int int int int &optional map -> int))
 (defn- ed-wrap-top-for (buf line seg-row w budget floor &optional (inlays {}))
@@ -179,7 +282,7 @@ text width the loop last stored (`:view-cols`), and both margins are counted in 
                  (if wrap?
                    (ed-wrap-top-for buf
                      rbot
-                     (dec (count (wrap/line-segments buf rbot w)))
+                     (dec (count (wrap/line-segments buf rbot w inlays)))
                      w
                      textrows
                      rtop
@@ -194,7 +297,8 @@ text width the loop last stored (`:view-cols`), and both margins are counted in 
                  else top)
                ;; row-wise, both margins are ROWS, as Emacs counts screen lines: a long
                ;; line above point is several rows of context, not one
-               (let (seg-row (wrap/row-of (wrap/line-segments buf line w) (buffer-column buf)))
+               (let (seg-row (wrap/row-of (wrap/line-segments buf line w inlays)
+                               (buffer-column buf)))
                  (if (< line top)
                    (ed-wrap-top-above buf line seg-row w mgn mintop inlays)
                    ;; point's row below the top: the rows of the lines above it plus its
@@ -244,8 +348,9 @@ cells in while its column read twenty: no scroll, and the cursor painted off-scr
         hcell (cell-of hs)
         mgn (math/max 0 (math/min *hscroll-margin* (math/quot (dec cols) 2))))
     (cond
-      ;; a wrapped buffer never scrolls sideways: its long lines take more rows instead
-      (ed-wrap? buf) (if (= hs 0) m (ed-set-hscroll m 0))
+      ;; a row-wise buffer never scrolls the PANE sideways: a wrapped line takes more rows, and
+      ;; a truncated or clipped line at point scrolls by itself (`wrap/follow-point`)
+      (ed-row-wise? buf (ed-row-extras buf)) (if (= hs 0) m (ed-set-hscroll m 0))
       (< (- pcell hcell) mgn)
         (ed-set-hscroll m (string/width->index line (math/max 0 (- pcell mgn))))
       (> (- pcell hcell) (- cols 1 mgn))

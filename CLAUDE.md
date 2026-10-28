@@ -98,7 +98,12 @@ src/model.blsp              the ui-run model: buffer pool, panes, kill ring, min
 src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
                             over the live keymap, `\[command]` substitution, docstrings
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
-                            `ed-max-top`, `ed-wrap?`, and the snap that ends a glide on a line
+                            `ed-max-top`, and the snap that ends a glide on a line — and the
+                            LONG-LINES policy (`ed-long-lines`): :wrap / :truncate / :scroll per
+                            buffer and per line — the buffer's toggle (M-x toggle-truncate-lines,
+                            visual-line-mode), the `:long-lines` setting for its mode, the line's
+                            KIND (`:line-kinds`: a section heading truncates, its body wraps),
+                            the mode's `:long-lines` facet, the setting's `:default`
 src/autosave.blsp           `#file#` auto-save sidecars + auto-revert of files changed on disk
                             (idle-beat jobs)
 src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the idle beat — in
@@ -343,10 +348,14 @@ src/frames.blsp             frames (C-x 5 2 / o / 0): a second OS window is a PR
                             frame is in every frame (docs/frames-plan.md)
 src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
                             apprun's :apprun ride it): line-buffered stdout -> handler fns
-src/wrap.blsp              visual-line-mode: the pure break rule (a line → `[from to]` row
-                            segments, word-wrapped at the pane width) that the row↔line owner
-                            (panes), the view and the scroll clamp all read — markdown wraps
-                            by default (a `:visual-line` mode facet); M-x visual-line-mode toggles
+src/wrap.blsp              where a line falls on screen rows: the pure break rule (a line →
+                            `[from to]` row segments, word-wrapped at the pane width) and the
+                            ONE row of a truncated line (`one-row`: cut before the cells its
+                            ellipsis takes, never halving a wide glyph; a clip `[cut ellipsis]`
+                            rides the row) — per line, by `line-policy`. The row↔line owner
+                            (panes), the view and the scroll clamp all read it; point past a
+                            cut scrolls that one line sideways (`follow-point`, Emacs's
+                            current-line auto-hscroll), a click on `…` goes to the line's end
 src/folds.blsp              outline FOLDING in an editable buffer (org's TAB): a fold is a
                             marker on its heading, the mode's `:fold-extent` says what it
                             covers, and the row table gives the hidden lines no rows — so the
@@ -478,7 +487,9 @@ src/sectionbuf.blsp         the SECTION BUFFER: a read-only buffer whose text is
                             (a diff's tinted lines) from `:section-bands` as `:line-bands`, and TAB · n/p ·
                             ^ · M-n/M-p · 1-4 · M-w are shared by every such buffer. A lazy
                             section (a status file whose diff was never fetched) asks the
-                            mode's `:section-reload`
+                            mode's `:section-reload`. Each line's KIND (`:line-kinds`: a heading,
+                            a body) is how a long one shows — a commit or stash row ends in `…`,
+                            a hunk's code wraps (`scroll/ed-long-lines`)
 src/vcscore.blsp            the VCS layer, whichever system the project uses (Emacs's VC). The
                             checkout a buffer is in comes from std's `vcs` (`.git`, `.mur`);
                             what the editor does with it goes through that system's ROW
