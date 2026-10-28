@@ -47,7 +47,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
   path has no timeout — a loop hangs the session; a `defn` rebinds editor functions for
   every client.
   *Brood:* a per-session reply address in `std/editor/serve` / `evalsession`.
-  FIXED (with L4): a `--serve` client's loop binds `*ui-loop*`, so `ed-headless?` reads it as live and it evaluates in the sandbox child, its answers routed back to it.
+  FIXED (with L4): a `--serve` client's loop binds `editor/ui/*loop*`, so `ed-headless?` reads it as live and it evaluates in the sandbox child, its answers routed back to it.
 
 - [x] **S7 Unquoted paths into `sh -c`.** `toolchain.blsp:119-120,183,200` (`pytest `,
   `go test `, `npm test -- ` + file), `npm run <script>`; `git.blsp:2922`
@@ -131,12 +131,12 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **P3 A warm test session keeps its first project's root.** `testrun.blsp:597-613`.
 - [x] **P4 The shared `:sandbox` re-roots back and forth** (`sandbox.blsp:174` turns nil
   into `/tmp`; diagnostics re-root it) — wipes playground state.
-- [x] **P5 Removing a breakpoint can revert a later redefinition** (`debugger.blsp:548-575`); FIXED the revert, and any LOOP process (every window, every `--serve` client — `*ui-loop*`) now runs through a breakpoint, not only the first window. OPEN:
+- [x] **P5 Removing a breakpoint can revert a later redefinition** (`debugger.blsp:548-575`); FIXED the revert, and any LOOP process (every window, every `--serve` client — `editor/ui/*loop*`) now runs through a breakpoint, not only the first window. OPEN:
   other editor-internal processes (buffer processes, the registry) can still be paused. — FIXED: brood `proc/flag :no-break` (01fc3822) — a breakpoint passes such a process through; std sets it on every buffer process, the buffer registry and the evalsession worker, and bedit on its collab registry.
 - [x] **P6 LSP URIs not percent-encoded** (`lsp.blsp:257-260,534`).
 - [x] **P7 LSP advertises `workspace/configuration` then answers MethodNotFound.**
 - [x] **P8 LSP handshake drops server messages before the initialize reply.**
-- [x] **P9 bshell: no interrupt; non-pty children are not killed as a group.** — FIXED: brood `os/signal` (3c243c45) signals the child's process group (`os/spawn` already made it one, and `os/close` already killed it); `C-c C-c` in a shell buffer interrupts the running command. The worker now answers the loop that opened it (`*ui-loop*`), not `:editor`.
+- [x] **P9 bshell: no interrupt; non-pty children are not killed as a group.** — FIXED: brood `os/signal` (3c243c45) signals the child's process group (`os/spawn` already made it one, and `os/close` already killed it); `C-c C-c` in a shell buffer interrupts the running command. The worker now answers the loop that opened it (`editor/ui/*loop*`), not `:editor`.
 - [x] **P10 Off-loop workers answered `:editor`, the first window.** A compile, a test run, a project run, a terminal or a shell started from a second frame (or a `--serve` client) painted its output into the first. — FIXED: `model/ed-loop-address` is captured on the loop when work is handed off; procstream handlers BUILD events and the worker delivers each run's to the address that run came with. Left on purpose: `frames` asks the primary; the LSP connection and the `*Messages*` log are shared by every frame.
 
 ### Live eval
@@ -145,7 +145,7 @@ Status: `[ ]` open · `[x]` fixed · `[~]` partly / deferred (reason given)
 - [x] **L2 Spy pane cache keyed by form index shows the wrong form after a shift**
   (`playground-core.blsp:583`). — FIXED: `workings/rekey` moves each report through the same form pairing the notes use, before the stale ones are forgotten.
 - [x] **L3 Elixir playground: `x = x + 1` doesn't depend on `x`** (`form-deps`).
-- [x] **L4 Playground/tutor in a second frame hang** — replies go to `:editor`. — FIXED (with S6): brood `evalsession` routes each answer to the loop that asked and the lifecycle to every subscriber (87c2ef44); `ui-run` binds `*ui-loop*` (593e909a), which `ed-headless?`, `session/start` and `session/request` read, so a second frame or a `--serve` client is a loop like the first. Verified by brood's evalsession tests and every driver; no live second-frame driver yet.
+- [x] **L4 Playground/tutor in a second frame hang** — replies go to `:editor`. — FIXED (with S6): brood `evalsession` routes each answer to the loop that asked and the lifecycle to every subscriber (87c2ef44); `ui-run` binds `editor/ui/*loop*` (593e909a), which `ed-headless?`, `session/start` and `session/request` read, so a second frame or a `--serve` client is a loop like the first. Verified by brood's evalsession tests and every driver; no live second-frame driver yet.
 
 ### Hosted / collab
 - [x] **H1 `:shared?` means two things** — registry-owned vs presence-on; `share-session`

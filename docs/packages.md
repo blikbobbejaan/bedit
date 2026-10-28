@@ -25,7 +25,7 @@ Brood/`nest` ships the hard parts (ADR-037, ADR-147 in the brood repo):
 - **Manifests with `:dependencies`** — `:path`, `:git`, `:tarball`, and **`:registry`**
   deps. A registry dep is spelled `[name :version "0.2.1"]`; resolution is an **exact
   version match, no semver solver** (ADR-037's direct-refs-only invariant).
-- **A hosted registry — hive.** `*config-registry*` (default `https://brood.fly.dev`,
+- **A hosted registry — hive.** `project/*config-registry*` (default `https://brood.fly.dev`,
   set per-user in `~/.config/brood/config.blsp`) is an HTTP base URL. `nest search` GETs
   `/api/v1/packages?q=`; resolving a registry dep GETs the release metadata, downloads
   the immutable tarball, **verifies its sha256**, and extracts it into `_deps/<name>/`.
@@ -184,8 +184,8 @@ API to learn*. A whole syntax-highlighter package:
 ### Part 1 — Brood / `std` / hive (the language + registry gaps)
 
 1. **`:enhances` end to end (small, three layers — and generic at every one).**
-   - *Brood* — `project-apply` parses `:enhances` into `*project-enhances*` (a
-     name → constraint map, beside the existing `*project-dependencies*`);
+   - *Brood* — `project-apply` parses `:enhances` into `project/*enhances*` (a
+     name → constraint map, beside the existing `project/*dependencies*`);
      `registry--publish-payload` includes it; `nest search` grows `--enhances <app>`.
      No application name appears anywhere in the implementation.
    - *hive* — store it the way `dependencies` already is (a JSON **text** column on the

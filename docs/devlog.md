@@ -47,7 +47,7 @@ the cell a click landed in and the scroll clamp are all in the pane's cells; the
 the body out at origin 0,0 in those cells and wraps it (`view/ed-pane-ops`). The old integer
 `:scale`, `ed-scale-op` and the `s` parameter threaded through seven view helpers are gone;
 so are the window-zoom throttle, its timer and its three model fields. A zoom outside the
-GUI (`*term-display*`, `--attach`) is refused with a message — a terminal cell has one size.
+GUI (`editor/ui/*term-display*`, `--attach`) is refused with a message — a terminal cell has one size.
 Presets (`M-x preset-select`) still set the window's font, and re-measure every zoom.
 
 **Known gap.** The runtime collects `cursor-zone`s from a frame's TOP-LEVEL ops only, so the
@@ -192,7 +192,7 @@ Emacs's `lisp-mode` indent rule — `lisp-indent-with`, the elisp rule over the 
   cursor), and a trace wrapper emits its `:return` AFTER the call, so each level of a traced
   self-call is a real frame. The number had already been walked back to 250 000 with an
   apologetic comment; the instrumentation was contradicting the lesson it illustrated.
-- **Brood (prime directive), not worked around here — ADR-207:** a `*spy-sink*` may answer
+- **Brood (prime directive), not worked around here — ADR-207:** a `debug/*spy-sink*` may answer
   `:spy-stop` ("I have all I want"), and `debug/trace-fn` then restores the original and
   delegates in TAIL position — so past its budget a traced loop is a plain tail loop.
   `eval-server`'s sink answers it at `*spy-entry-cap*`. Separately, `pr-str-bounded` gained

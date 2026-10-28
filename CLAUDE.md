@@ -322,7 +322,7 @@ src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d sess
                             trace-fn/break-fn by name — the collector process speaks std/debug's
                             wire protocol and forwards UiEvent records to the loop
 src/testrun.blsp            native test runs (C-c t): a dedicated nest subprocess streams per-test
-                            JSON (std's *test-report-sink*) into the *Tests* buffer — never
+                            JSON (std's test/*report-sink*) into the *Tests* buffer — never
                             in-image (%isolate would revert the editor's globals + kill its pids).
                             A project with a WARM test session uses it instead (`*warm-backends*`,
                             one row per language: Elixir's `MIX_ENV=test` node, Brood's
@@ -448,7 +448,7 @@ src/results.blsp            the results-buffer abstraction behind *Tests* / *Run
                             `ed-append-follow` — the streaming append that follows the tail
                             only in a pane already at the bottom
 src/testadapter.blsp        one result vocabulary, two runners: Brood's structured
-                            *test-report-sink* lines and ExUnit's `mix test --trace` text
+                            test/*report-sink* lines and ExUnit's `mix test --trace` text
                             both decode into the same {:group :name :passed :where …}, so
                             C-c t means the same thing in every project
 src/compile.blsp            M-x compile: run a build in the project root, C-x ` next-error,
