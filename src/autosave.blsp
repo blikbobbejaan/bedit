@@ -74,29 +74,70 @@ not sent) and [[ed-auto-save-write]] builds each text there. Returns the model w
           (when (not (empty? due)) (spawn (fn () (ed-auto-save-write due))))
           (assoc m :auto-saved-at now-ms :auto-saved all))))))
 
-(defn ed-revert-at (m i)
-  "Re-read pool buffer `i` from its file, discarding its unsaved changes: the buffer
-keeps its name, mode (`:layers`) and dir, every pane on it keeps its point (clamped to
-the new length), undo history resets. The shared core of `M-x revert-buffer` (the
-current buffer) and the idle beat's auto-revert (any buffer another writer changed).
-Raises if the file cannot be read — the callers report."
-  (let (b (ed-buf-at m i)
-        f (or (buffer-file b) (error "revert: buffer " (buffer-name b) " has no file"))
-        fresh (find-file-buffer f)
-        len (buffer-length fresh)
-        ;; Carry the original buffer's MODE (`:layers`) + dir onto the reverted buffer.
-        ;; The line-number / diff-hl gutter, highlighting and eldoc are all `:layers`
-        ;; mode services — a bare `find-file-buffer` has none (they're seeded lazily on
-        ;; the next dispatch), so without this the gutter vanishes until the next
-        ;; keystroke re-inits them. diff-hl re-arms on its own (fresh has no
-        ;; `:git-status-rope`, so it recomputes against the new content on the idle beat).
-        reverted (goto-char (assoc fresh :name (buffer-name b) :layers (:layers b) :dir (:dir b))
-                   (math/min (buffer-point b) len)))
-    (ed-map-panes (ed-set-buf-at m i reverted)
+(def *follow-points-max-chars* 400000) ; past this, a re-read keeps the character offset
+
+(defn- ed-follow-points (old new points)
+  "The character offsets `points` of rope `old` moved to the same logical line and column
+of rope `new`: one line diff for all of them (`diff/map-lines`), so a point whose line was
+pushed down by lines added above it stays on it, and the column is clamped to its line.
+Past `*follow-points-max-chars*` the diff is skipped and each offset is only clamped to
+the new length."
+  (let (old-length (text/length old)
+        new-length (text/length new)
+        points (map points (fn (point) (math/min point old-length))))
+    (if (or (>= old-length *follow-points-max-chars*) (>= new-length *follow-points-max-chars*))
+      (map points (fn (point) (math/min point new-length)))
+      (map (seq/zip points
+             (diff/map-lines old new (map points (fn (point) (text/char->line old point)))))
+        (fn ([point line])
+          (let (column (- point (text/line->char old (text/char->line old point)))
+                text (text/line new line)
+                ;; the line's own characters: `text/line` keeps its newline
+                width (if (string/ends-with? text "\n")
+                        (dec (string/length text))
+                        (string/length text)))
+            (+ (text/line->char new line) (math/min column width))))))))
+
+(defn ed-follow-reread (m i old)
+  "The model with pool buffer `i`, which now holds a text re-read from its file, given
+back its point and every pane's on it: each moved from where it was in buffer `old` (the
+buffer before the re-read) to the same logical line and column of the new text, through
+one line diff. A pane's mark is dropped — it named an offset of the old text. What a
+revert and a formatter landing share: someone else rewrote the file, and the reader
+should still be looking at the line they were on."
+  (let (new (ed-buf-at m i)
+        points (into [(buffer-point old)]
+                 (seq/keep (pane-leaf-paths (:layout m))
+                   (fn (path)
+                     (let (w (pane-payload-at (:layout m) path))
+                       (when (= (:buffer w) i) (:point w))))))
+        moved (map/zipmap points (ed-follow-points (buffer-rope old) (buffer-rope new) points)))
+    (ed-map-panes (ed-set-buf-at m i (goto-char new (get moved (buffer-point old))))
       (fn (w)
         (if (and (= (:buffer w) i) (not (nil? (:point w))))
-          (assoc w :point (math/min (:point w) len) :mark nil)
+          (assoc w :point (get moved (:point w)) :mark nil)
           w)))))
+
+(defn ed-revert-at (m i)
+  "Re-read pool buffer `i` from its file, discarding its unsaved changes: the buffer
+keeps its name, mode (`:layers`) and dir, every pane on it keeps its point on the same
+logical line and column (`ed-follow-reread`), undo history resets. The shared core of
+`M-x revert-buffer` (the current buffer) and the idle beat's auto-revert (any buffer
+another writer changed). Raises if the file cannot be read — the callers report."
+  (let (b (ed-buf-at m i)
+        f (or (buffer-file b) (error "revert: buffer " (buffer-name b) " has no file"))
+        fresh (find-file-buffer f))
+    ;; Carry the original buffer's MODE (`:layers`) + dir onto the reverted buffer.
+    ;; The line-number / diff-hl gutter, highlighting and eldoc are all `:layers`
+    ;; mode services — a bare `find-file-buffer` has none (they're seeded lazily on
+    ;; the next dispatch), so without this the gutter vanishes until the next
+    ;; keystroke re-inits them. diff-hl re-arms on its own (fresh has no
+    ;; `:git-status-rope`, so it recomputes against the new content on the idle beat).
+    (ed-follow-reread (ed-set-buf-at m
+                        i
+                        (assoc fresh :name (buffer-name b) :layers (:layers b) :dir (:dir b)))
+      i b)))
+
 ;; ---- files that change under the editor ------------------------------------
 ;; Another writer — a formatter, `git checkout`, a build step, a colleague's editor —
 ;; rewrites a file this editor has open. Emacs's answer is two-fold: `auto-revert` reloads
