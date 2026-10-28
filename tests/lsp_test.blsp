@@ -9,6 +9,7 @@
   (:use-internals lsp)
   (:use-internals lsp-commands) ; the lookups and their folds — split out of commands (X1)
   (:use lsp-requests)
+  (:use complete-at-point) ; cmd-complete and the source tables a Tab is bound to
   (:use-internals commands)
   (:use-internals input) ; ed-event-handler — the table the loop routes by
   (:use model) ; ed-init / ed-set-buf / ed-current-buf — the sync hook is a model step
@@ -394,12 +395,14 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
       (assert= [] none))))
 
 (describe "lsp: completion-result shapes"
-  (test "a CompletionItem[] vector yields its labels"
-    (assert= (lsp-completion-labels [{:label "foo"} {:label "bar"}]) (list "foo" "bar")))
+  (test "a CompletionItem[] vector yields its labels, with no edit column"
+    (assert= (lsp-completion-entries [{:label "foo"} {:label "bar"}])
+      (list {:text "foo" :column nil} {:text "bar" :column nil})))
   (test "a {:items …} object yields its items' labels"
-    (assert= (lsp-completion-labels {:isIncomplete false :items [{:label "baz"}]}) (list "baz")))
-  (test "nil yields no labels"
-    (assert= (lsp-completion-labels nil) '())))
+    (assert= (lsp-completion-entries {:isIncomplete false :items [{:label "baz"}]})
+      (list {:text "baz" :column nil})))
+  (test "nil yields no entries"
+    (assert= (lsp-completion-entries nil) '())))
 
 (purge-stale-temp "bedit-applyedit-")
 
@@ -422,7 +425,7 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
                             (lsp-completion)
                             {:uri "file:///a.rb" :lang "ruby" :text "x" :line 1 :char 0}))
         (is (includes? (first frames2) "didChange")))))
-  (test "a matching response routes labels to the waiter and clears pending"
+  (test "a matching response routes entries to the waiter and clears pending"
     (let (state {:proc :fake
                  :buf ""
                  :next-id 8
@@ -434,7 +437,10 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
                                             :result {:items [{:label "foo"} {:label "bar"}]}}))
           [st2 replies] (lsp/lsp-ingest state resp))
       (assert= replies
-        (list [:my-pid [:lsp-completion :corr-1 {:labels (list "foo" "bar") :incomplete false}]]))
+        (list [:my-pid
+                [:lsp-completion
+                  :corr-1 {:entries (list {:text "foo" :column nil} {:text "bar" :column nil})
+                   :incomplete false}]]))
       (is (nil? (get (:pending st2) 7)))))
   ;; The protocol is bidirectional and this half was simply missing. A server may ask the
   ;; CLIENT to do something — `client/registerCapability` is the usual one, sent by every
@@ -1626,7 +1632,8 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
                                                                     (send reply-to
                                                                       [:lsp-completion
                                                                         corr
-                                                                        {:labels (list "defmodule")
+                                                                        {:entries (list {:text "defmodule"
+                                                                                         :column nil})
                                                                          :incomplete false}])
                                                                     (go)))
                                (after 2000 :done))))
@@ -1650,6 +1657,78 @@ directory — saying `caps`. What `M-x lsp-connect` files, without spawning anyt
           m (serving (ed-init buf) conn)
           _ (lsp/lsp-complete-source m))
       (assert= (:text (lspc-request)) "defmo"))))
+
+;; ---- what a server's items INSERT, a segment at a time ------------------------------------
+;; Expert (and ElixirLS) answer for `XB.T` with the module's LAST segment as the label —
+;; `Tool` — and a `textEdit` over the `T`; a function is labelled with its arity, `call/2`,
+;; and may insert a snippet. Read as labels, Tab replaced the whole word `XB.T` with `Tool`.
+;; The responses below are shaped as those servers send them; no server runs.
+(describe "lsp: Expert's completion items, completed a segment at a time"
+  (defn- expert-conn (result)
+    ;; a stand-in connection answering every completion ask with `result`, decoded as a
+    ;; real response is (`lsp-completion-answer`)
+    (spawn (fn ()
+             (letrec (go (fn ()
+                           (receive
+                             ([:ask kind corr reply-to request] (do
+                                                                  (send reply-to
+                                                                    [:lsp-completion
+                                                                      corr
+                                                                      (lsp-completion-answer result)])
+                                                                  (go)))
+                             (after 2000 :done))))
+               (go)))))
+  (defn- expert-tab (text result)
+    ;; the buffer text after Tab at the end of `text`, in an Elixir file whose only
+    ;; completion source is a server answering `result`
+    (let (buf (goto-char (assoc (make-buffer text) :file "/tmp/lsp-expert.ex") (string/length text))
+          m (serving (ed-init buf) (expert-conn result) {:completionProvider {}}))
+      (binding (*completion-sources* (list 'lsp/lsp-complete-source)
+                *completion-prepare* (list))
+        (buffer-text (ed-current-buf (cmd-complete m :tab))))))
+  (defn- edit-from (line from to text)
+    ;; a TextEdit replacing [from, to) of `line`
+    {:range {:start {:line line :character from} :end {:line line :character to}} :newText text})
+
+  (test "a module's last segment, edited over the segment typed, completes the path"
+    (assert= (expert-tab "  XB.T"
+               {:isIncomplete false
+                :items [{:label "Tool" :kind 9 :detail "XB.Tool" :textEdit (edit-from 0 5 6 "Tool")}]})
+      "  XB.Tool"))
+  (test "an InsertReplaceEdit reads its insert range"
+    (assert= (expert-tab "XB.T"
+               {:isIncomplete false
+                :items [{:label "Tool"
+                         :textEdit {:newText "Tool"
+                                    :insert {:start {:line 0 :character 3}
+                                             :end {:line 0 :character 4}}
+                                    :replace {:start {:line 0 :character 3}
+                                              :end {:line 0 :character 4}}}}]})
+      "XB.Tool"))
+  (test "an edit over the whole word, the full path its new text, completes it too"
+    (assert= (expert-tab "XB.T" [{:label "Tool" :textEdit (edit-from 0 0 4 "XB.Tool")}]) "XB.Tool"))
+  (test "a column counts UTF-16 units: an emoji before the word is two"
+    (assert= (expert-tab "\"😀\" <> XB.T" [{:label "Tool" :textEdit (edit-from 0 11 12 "Tool")}])
+      "\"😀\" <> XB.Tool"))
+  (test "a last-segment label with no edit replaces the word's last segment"
+    (assert= (expert-tab "XB.T" [{:label "Tool" :kind 9}]) "XB.Tool"))
+  (test "a function labelled with its arity completes to the name, not the `/2`"
+    (assert= (expert-tab "XB.Tool.c" [{:label "call/2" :kind 3}]) "XB.Tool.call"))
+  (test "a plain insertText is inserted, not the label"
+    (assert= (expert-tab "XB.Tool.c" [{:label "call/2" :kind 3 :insertText "call"}]) "XB.Tool.call"))
+  (test "a snippet inserts up to its first stop, never its placeholder names"
+    (assert= (expert-tab "XB.Tool.c"
+               [{:label "call/2"
+                 :kind 3
+                 :insertTextFormat 2
+                 :insertText "call(${1:args}, ${2:context})"}])
+      "XB.Tool.call("))
+  (test "Tab still steps one segment when the server answers the whole path"
+    (assert= (expert-tab "XB.T" [{:label "XB.Tool.call/2"}]) "XB.Tool"))
+  (test "snippet text: escapes resolved, cut at the first stop"
+    (assert= (lsp-snippet-text "call(${1:a})") "call(")
+    (assert= (lsp-snippet-text "cost\\$5$0") "cost$5")
+    (assert= (lsp-snippet-text "Tool") "Tool")))
 
 ;; ---- the editor side of a server's notices: *lsp-log* always, the echo area rarely ----
 (defn- notice-buffer-text (m name)

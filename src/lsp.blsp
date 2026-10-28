@@ -10,13 +10,13 @@ pollutes the editor's mailbox), runs the `initialize` handshake, and then answer
 completion requests. `lsp-complete-source` plugs into `*completion-sources*`: on Tab
 it does **one bounded synchronous round-trip** to the connection (completion is an
 explicit trigger, never a per-keystroke auto-popup, so a short blocking request is
-fine), and the returned labels are merged + fuzzy-ranked with the mode and
+fine), and the returned candidates are merged + fuzzy-ranked with the mode and
 buffer-word sources by `complete` like any other source. Narrowing the popup filters that
 answer rather than asking again, unless the server said it was incomplete.
 
 The bug-prone logic — frame encode/decode across chunk boundaries, request/response
 correlation, completion-result shapes — is **pure** (`lsp-ingest`,
-`lsp-issue`, `lsp-decode`, `lsp-completion-labels`), so it's unit-tested
+`lsp-issue`, `lsp-decode`, `lsp-completion-entries`, `lsp-completion-candidate`), so it's unit-tested
 without a server (tests/lsp_test.blsp); the connection process is a thin IO shell
 around it.
 
@@ -159,24 +159,122 @@ code units for ASCII. Document sync is INCREMENTAL when the server offers it
 
 ;; ---- pure protocol: completion-result shapes --------------------------------
 
-(defn lsp-completion-labels (result)
-  "The candidate label strings from a `textDocument/completion` `result`, which is
-either a `CompletionItem[]` (a vector) or a `{:items [...] :isIncomplete b}` object
-(or `nil`). Each item's `:label` is its display/insert text."
+;; An item's LABEL is what the popup would show, not what goes in the buffer, and a server
+;; that answers for `XB.T` labels the module `Tool` and the function `call/2`. What it means
+;; to insert is its `textEdit` (new text over a range of the line), else its `insertText`,
+;; else the label — and either may be a SNIPPET. Read as labels, Tab on `XB.T` replaced the
+;; whole word with `Tool`. So an item becomes an ENTRY, `{:text :column}` — the plain text to
+;; insert and the UTF-16 column its edit starts at (nil without an edit) — and the source,
+;; which knows the line, turns each into a candidate for the whole word before point
+;; ([[lsp-completion-candidate]]).
+
+(defn lsp-snippet-text (snippet)
+  "The plain text a snippet `insertText` inserts up to its first tab stop or placeholder,
+its `\\$`, `\\}` and `\\\\` escapes resolved — `call(${1:a}, ${2:b})` is `call(`.
+
+bedit expands no snippets (it advertises `snippetSupport false`, which a server may ignore).
+Stopping at the first stop puts point where the snippet would have: inside the call, ready
+for its arguments. The placeholder's own text (`a`) is a NAME to type over, and inserted as
+code it would be wrong code.
+
+    (lsp/lsp-snippet-text \"call(${1:a}, ${2:b})\")   → \"call(\"
+    (lsp/lsp-snippet-text \"Tool\")   → \"Tool\"
+    (lsp/lsp-snippet-text \"cost\\\\$$0\")   → \"cost$\""
+  (letrec (scan (fn (chars acc)
+                  (cond
+                    (empty? chars) acc
+                    (= (first chars) "$") acc
+                    (and (= (first chars) "\\") (contains? #{"$" "}" "\\"} (second chars)))
+                      (scan (rest (rest chars)) (str acc (second chars)))
+                    :else (scan (rest chars) (str acc (first chars))))))
+    (scan (string/->list snippet) "")))
+
+(defn- lsp-completion-entry (item)
+  ;; `{:text :column}` for one CompletionItem, or nil when it inserts nothing. A `textEdit`
+  ;; is a TextEdit (`:range`) or an InsertReplaceEdit (`:insert` / `:replace`); its range is
+  ;; on the cursor's line, ending at point, so only where it STARTS is needed
+  (let (edit (:textEdit item)
+        raw (cond
+              edit (:newText edit)
+              (string? (:insertText item)) (:insertText item)
+              :else (:label item))
+        text (cond
+               (not (string? raw)) nil
+               (= (:insertTextFormat item) 2) (lsp-snippet-text raw)
+               :else raw)
+        column (when edit (get-in edit [(if (:range edit) :range :insert) :start :character])))
+    (when (and text (not (= text "")))
+      {:text text :column (when (int? column) column)})))
+
+(defn lsp-completion-entries (result)
+  "The entries `{:text :column}` of a `textDocument/completion` `result` — a
+`CompletionItem[]` (a vector), a `{:items [...] :isIncomplete b}` object, or `nil`: each
+item's text to insert (its `textEdit`, else `insertText`, else `label`, a snippet cut at its
+first stop by [[lsp-snippet-text]]) and the UTF-16 column its edit starts at, nil without
+one. What [[lsp-completion-candidate]] turns into a candidate."
   (let (items (cond
                 (nil? result) '()
                 (vector? result) result
                 :else (:items result '())))
-    (seq/keep items :label)))
+    (seq/distinct (seq/keep items lsp-completion-entry))))
 
 (defn lsp-completion-answer (result)
-  "`{:labels :incomplete}` for a `textDocument/completion` `result`: the labels
-([[lsp-completion-labels]]) and whether the server said the list is NOT the whole answer
+  "`{:entries :incomplete}` for a `textDocument/completion` `result`: the entries
+([[lsp-completion-entries]]) and whether the server said the list is NOT the whole answer
 (`isIncomplete`) — in which case typing more must ask it again, where a complete list can
 be narrowed by filtering it (`complete-at-point`'s cache). A bare `CompletionItem[]` is
 complete by the protocol's definition."
-  {:labels (lsp-completion-labels result)
+  {:entries (lsp-completion-entries result)
    :incomplete (and (map? result) (= true (:isIncomplete result)))})
+
+(defn- lsp-utf16->index (s units)
+  ;; the char index in `s` at which `units` UTF-16 code units have passed (LSP's column
+  ;; unit: a character beyond the Basic Multilingual Plane is two), capped at its length
+  (first (fold (string/->codepoints s)
+           [0 0]
+           (fn (acc code)
+             (let ([index seen] acc)
+               (if (>= seen units) acc [(inc index) (+ seen (if (> code 65535) 2 1))]))))))
+
+(defn- lsp-prefix-qualifier (prefix separators)
+  ;; `prefix` up to and including its last separator — `XB.` of `XB.T` — or ""
+  (letrec (back (fn (i)
+                  (cond
+                    (< i 0) ""
+                    (contains? separators (string/char-at prefix i))
+                      (string/substring prefix 0 (inc i))
+                    :else (back (dec i)))))
+    (back (dec (string/length prefix)))))
+
+(defn lsp-completion-candidate (line start entry separators)
+  "The whole word an `entry` ([[lsp-completion-entries]]) completes the word before point
+to, or nil when it cannot say — `line` the cursor's line up to point, `start` where the word
+begins in it, `separators` the buffer's segment separators. Every completion source answers
+whole words from `start`, which is what lets them merge and Tab step a segment at a time.
+
+- An edit starting at or after `start` keeps the line between them: `Tool` over the `T` of
+  `XB.T` is `XB.Tool`. One starting before `start` must begin with the text it rewrites.
+- Without an edit, text extending the word is the word; any other replaces the word's last
+  segment, as a client whose word stops at `.` would read it: `Tool` for `XB.T` is
+  `XB.Tool`, `call/2` for `XB.Tool.c` is `XB.Tool.call/2`, which Tab stops before the
+  `/2` of.
+
+    (lsp/lsp-completion-candidate \"  XB.T\" 2 {:text \"Tool\" :column 5} #{\".\"})   → \"XB.Tool\"
+    (lsp/lsp-completion-candidate \"XB.T\" 0 {:text \"Tool\" :column nil} #{\".\"})   → \"XB.Tool\"
+    (lsp/lsp-completion-candidate \"XB.T\" 0 {:text \"XB.Tool\" :column nil} #{\".\"})   → \"XB.Tool\""
+  (let (text (:text entry)
+        column (:column entry)
+        prefix (string/substring line start (string/length line)))
+    (if (nil? column)
+      (if (string/starts-with? text prefix)
+        text
+        (str (lsp-prefix-qualifier prefix separators) text))
+      (let (from (lsp-utf16->index line column))
+        (if (>= from start)
+          (str (string/substring line start from) text)
+          (let (lead (string/substring line from start))
+            (when (string/starts-with? text lead)
+              (string/substring text (string/length lead) (string/length text)))))))))
 
 ;; ---- pure protocol: documentSymbol shapes (imenu, M-g i) --------------------
 ;; `textDocument/documentSymbol` returns either a flat `SymbolInformation[]` (each with a
@@ -1138,7 +1236,7 @@ its behalf would be worse than letting it say no itself."
 
 (defn- lsp-complete-collect (corrs deadline acc)
   "Receive the completion answers for `corrs` until each has come or `deadline` passes,
-merged into `acc` (`{:labels :incomplete}`); a server that never answered makes the merge
+merged into `acc` (`{:entries :incomplete}`); a server that never answered makes the merge
 incomplete, so nothing caches it."
   (if (empty? corrs)
     acc
@@ -1148,8 +1246,8 @@ incomplete, so nothing caches it."
                                          (lsp-complete-collect (seq/reject corrs
                                                                  (fn (c) (= c corr)))
                                            deadline
-                                           {:labels (seq/distinct (append (:labels acc)
-                                                                    (:labels answer)))
+                                           {:entries (seq/distinct (append (:entries acc)
+                                                                     (:entries answer)))
                                             :incomplete (or (:incomplete acc) (:incomplete answer))})
                                          (lsp-complete-collect corrs deadline acc)))
         (after left (assoc acc :incomplete true))))))
@@ -1157,8 +1255,8 @@ incomplete, so nothing caches it."
 (defn lsp-complete-all (asks timeout)
   "Ask each `[conn request]` in `asks` for completions at its `request` (`{:uri :lang :line
 :char}`, with `:text` when that server's copy has to be brought up to date on the way), all
-at once, blocking up to `timeout` ms in all. Answers the merge `{:labels :incomplete}`
-([[lsp-completion-answer]]): labels in server order, each once. Safe to call only on an
+at once, blocking up to `timeout` ms in all. Answers the merge `{:entries :incomplete}`
+([[lsp-completion-answer]]): entries in server order, each once. Safe to call only on an
 explicit trigger, not per keystroke."
   (let (corrs (into []
                 (map asks
@@ -1166,7 +1264,7 @@ explicit trigger, not per keystroke."
                     (let (corr (ref))
                       (lsp-ask-async conn (lsp-completion) corr (self) request)
                       corr)))))
-    (lsp-complete-collect corrs (+ (os/now) timeout) {:labels '() :incomplete false})))
+    (lsp-complete-collect corrs (+ (os/now) timeout) {:entries '() :incomplete false})))
 
 (defn lsp-close (conn uri)
   "Tell a running server the document `uri` is closed (`textDocument/didClose`)."
@@ -1218,14 +1316,15 @@ and the params, which are now the kind's own `lsp-request-method` / `lsp-request
 ;; ---- the completion source --------------------------------------------------
 
 (defn- lsp-symbol-at-point (buf)
-  "`[start prefix]` — the symbol before point, the completion region, by the same boundary
-rule the other sources use (`symbol-prefix-at`), so the merge keeps this source. Read from
-the current line up to point: a symbol never crosses a line, and flattening the buffer to
-find it was a measurable part of every Tab on a big file."
+  "`[start prefix line]` — the symbol before point, the completion region, by the same
+boundary rule the other sources use (`symbol-prefix-at`), so the merge keeps this source;
+and the current line up to point, which a server's edit columns are read against. Read
+from that line alone: a symbol never crosses a line, and flattening the buffer to find it
+was a measurable part of every Tab on a big file."
   (let (line-start (buffer-point (beginning-of-line buf))
         line (text/slice (buffer-rope buf) line-start (buffer-point buf))
         [start prefix] (symbol-prefix-at line (string/length line)))
-    [(+ line-start start) prefix]))
+    [(+ line-start start) prefix line]))
 
 (defn lsp-path->uri (path)
   "The `file://` URI of `path`, each segment percent-encoded: a server compares URIs as
@@ -1397,12 +1496,12 @@ is not this buffer's (completion's prepare step normally synced it just before).
 
 (defn lsp-complete-source (m)
   "The LSP completion source (a `complete-at-point/*completion-sources*` entry): `[start prefix
-labels opts]` from the buffer's servers that offer completion (the main one when none says),
+candidates opts]` from the buffer's servers that offer completion (the main one when none says),
 asked at once and merged; `nil` when none serves its file, the buffer has no file, or every
 server timed out. `complete` merges these with the mode and buffer-word sources.
 
 `opts` is `{:cache true}` unless a server said its list was incomplete: the popup then
-narrows by filtering these labels as you type, and asks the servers again only when the
+narrows by filtering these candidates as you type, and asks the servers again only when the
 prefix stops extending this one (`complete-at-point/complete-at`). An EMPTY complete answer
 is an answer too — nothing for `foo` means nothing for `foob` — so it is returned, not nil,
 or every narrowing key would ask again.
@@ -1417,13 +1516,17 @@ cannot come."
         asked (cond (not (empty? offering)) offering (empty? live) [] else [(first live)]))
     (if (or (empty? asked) (nil? file))
       nil
-      (let ([start prefix] (lsp-symbol-at-point buf)
+      (let ([start prefix line] (lsp-symbol-at-point buf)
             answer (lsp-complete-all (map asked
                                        (fn (entry)
                                          [(:conn entry) (lsp-complete-request m entry file buf)]))
                      *lsp-timeout-ms*)
-            labels (:labels answer))
+            separators (complete-at-point/completion-separators m)
+            word-start (- (string/length line) (string/length prefix))
+            candidates (seq/distinct (seq/keep (:entries answer)
+                                       (fn (entry)
+                                         (lsp-completion-candidate line word-start entry separators)))))
         (cond
-          (not (:incomplete answer)) [start prefix labels {:cache true}]
-          (empty? labels) nil
-          :else [start prefix labels])))))
+          (not (:incomplete answer)) [start prefix candidates {:cache true}]
+          (empty? candidates) nil
+          :else [start prefix candidates])))))
