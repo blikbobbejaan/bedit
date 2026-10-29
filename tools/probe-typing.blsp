@@ -1,0 +1,207 @@
+;; tools/probe-typing.blsp — what a keystroke costs in the REAL loop, tail included.
+;;
+;; bench/keystrokes.blsp and tools/profile-turn.blsp time `ed-update` and `ed-view` in
+;; isolation and report means. Typing that feels clunky is rarely the mean: it is the key
+;; that lands while the idle beat is running, or behind a reply being folded. So this runs
+;; `editor/ui/ui-run` itself — its timers, the idle beat, the launched tasks' replies, the
+;; memo — over a display whose keys are PRESSED on a schedule (a word at typing speed, then
+;; a pause long enough for the idle beat), and measures each key from the moment it was
+;; pressed to the moment the frame showing it was drawn. A key the loop was too busy to
+;; take at once is charged the wait.
+;;
+;;     nest run tools/probe-typing.blsp -- src/commands.blsp
+;;
+;; A release binary checks no contracts, and `nest run` does: run with BROOD_CONTRACTS=0
+;; to measure what an installed bedit does. Knobs, all environment variables:
+;;   PROBE_ROUNDS=n         rounds of the typed sentence (default 3, ~10 s each)
+;;   PROBE_AT=0.5           where point starts, as a fraction of the file
+;;   PROBE_DISABLE=a,b      idle jobs to drop (`register-idle-job` names) — the bisect lever
+;;   PROBE_PROFILE=1        sample the loop process and print its hottest functions
+;;
+;; Prints p50 / max per ten-second window — a startup that is still warming reads as a slow
+;; first window — beside the most time `ed-update` and `ed-view` took in it: when the key
+;; is slow and those are not, the time went somewhere else in the loop. No window: `:draw`
+;; records the time and drops the frame.
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(def *args* (let (a (system/argv) i (index-of a "--")) (if (>= i 0) (drop a (inc i)) (list))))
+(def *file* (or (first *args*) "src/commands.blsp"))
+(def *cols* 213)
+(def *rows* 49)
+;; a typist at ~90 wpm: a key every 110 ms inside a word
+(def *key-gap-ms* 110)
+;; between words long enough for the idle beat (its debounce) to come due
+(def *word-pause-ms* 700)
+(def *words* ["(defn" " probe" " (x)" " (inc" " x))" " ;;" " a" " comment" " that" " goes" " on" " for" " a" " while"])
+(def *rounds* (let (n (os/env "PROBE_ROUNDS")) (if n (string/->number n) 3)))
+
+(proc/register :editor (self))
+(grammars/load-user-grammars)
+(doseq (name (let (spec (os/env "PROBE_DISABLE")) (if spec (string/split spec ",") [])))
+  (registry/remove! :model/idle-jobs (keyword name)))
+
+;; PROBE_WRAP=ns/fn,ns/fn: redefine each as itself, timed — every call over 5 ms is printed
+;; with when it happened, to set beside the slow turns. A global redefines live (the idle
+;; jobs resolve their hooks late), so this reaches the real call sites.
+(def *probe-t0* (os/now-ns))
+(doseq (name (let (spec (os/env "PROBE_WRAP")) (if spec (string/split spec ",") [])))
+  (let (sym (symbol name)
+        original (reflect/eval sym))
+    (reflect/eval
+      `(def ~sym
+         (fn (& args)
+           (let (started (os/now-ns)
+                 value (apply ~original args)
+                 ms (/ (- (os/now-ns) started) 1000000.0))
+             (do
+               (when (> ms 5)
+                 (io/puts (string/format "  [%7.0f] %s %.1f ms" (/ (- started *probe-t0*) 1000000.0) ~name ms)))
+               value)))))))
+
+;; PROBE_EMPTY_INDEX=1: the word index builds instantly and empty — the preview still runs,
+;; its task does no work
+(when (= (os/env "PROBE_EMPTY_INDEX") "1")
+  (reflect/eval '(def complete-at-point/complete-index-buckets (fn (text) {}))))
+
+(defn schedule ()
+  "`[[due-ms key] …]` relative to the start: every word typed key by key, a pause after it,
+an Enter after each round."
+  (second
+    (fold (range *rounds*)
+      [1500 []]
+      (fn (acc _round)
+        (let ([t keys] (fold *words*
+                         acc
+                         (fn (inner word)
+                           (let ([t0 ks] inner
+                                 chars (string/->list word)
+                                 typed (map (range (count chars)) (fn (i) [(+ t0 (* i *key-gap-ms*)) (nth chars i)])))
+                             [(+ t0 (* (count chars) *key-gap-ms*) *word-pause-ms*) (into ks typed)]))))
+          [(+ t *word-pause-ms*) (conj keys [t :enter])])))))
+
+;; Numbers only: a table is shared storage, and a model (it holds ropes) cannot go in one.
+;; :taken [[due at key]] · :draws [ms] · :inner [[at phase ms]]
+(def *log* (%table))
+
+(defn log-append (k v) (%table-put *log* k (conj (%table-get *log* k []) v)))
+
+(defn now-ms (t0) (/ (- (os/now-ns) t0) 1000000.0))
+
+(defn poll-fn (t0 pending)
+  (fn (ms)
+    (let (queue (%table-get pending :q)
+          now (now-ms t0))
+      (if (empty? queue)
+        (receive (msg msg) (after (math/max 1 (math/min ms 200)) :done))
+        (let ([due key] (first queue))
+          (if (<= due now)
+            (do (%table-put pending :q (rest queue)) (log-append :taken [due now key]) key)
+            ;; a message (a task's reply) may come first; otherwise wake when the key is due
+            (receive (msg msg) (after (math/max 0 (math/min ms (math/ceil (- due now)))) nil))))))))
+
+(defn timed (t0 phase thunk)
+  (let (started (os/now-ns)
+        value (thunk)
+        ms (/ (- (os/now-ns) started) 1000000.0))
+    (do (log-append :inner [(now-ms t0) phase ms]) value)))
+
+(defn percentile (sorted p)
+  (nth sorted (math/min (dec (count sorted)) (math/floor (* p (count sorted))))))
+
+(defn inclusive (hist)
+  "Per-function INCLUSIVE sample counts (tools/profile-turn.blsp's): `{name -> count}`."
+  (fold hist {}
+    (fn (acc e)
+      (fold (seq/distinct (:stack e)) acc (fn (a nm) (assoc a nm (+ (or (get a nm) 0) (:count e))))))))
+
+(defn top-stacks (hist n)
+  ;; a parked process is sampled too, under a stale frame with nothing above it — drop those
+  (let (working (seq/filter hist (fn (e) (> (count (:stack e)) 1)))
+        total (fold working 0 (fn (acc e) (+ acc (:count e))))
+        ranked (seq/sort-by (seq/reject (seq (inclusive working)) (fn ([nm _]) (= nm "<anonymous>"))) (fn ([_ c]) (- c))))
+    (doseq (e (take ranked n))
+      (io/puts (string/format "  %.1f%%  %s" (* 100.0 (/ (second e) (math/max 1 total))) (first e))))))
+
+(defn report ()
+  (let (draws (%table-get *log* :draws [])
+        inner (%table-get *log* :inner [])
+        rows (map (%table-get *log* :taken [])
+               (fn ([due at key])
+                 (let (drawn (seq/find draws (fn (d) (>= d at))))
+                   {:key key :due due :queued (- at due) :latency (if drawn (- drawn due) nil)})))
+        measured (seq/filter rows (fn (r) (not (nil? (:latency r)))))
+        latencies (sort (map measured :latency))
+        window (fn (ms) (math/floor (/ ms 10000))))
+    (io/puts (string/format "%d keys, %d drawn" (count rows) (count measured)))
+    (when (not (empty? latencies))
+      (io/puts (string/format "latency ms: p50 %.1f  p90 %.1f  p99 %.1f  max %.1f"
+                 (percentile latencies 0.5)
+                 (percentile latencies 0.9)
+                 (percentile latencies 0.99)
+                 (last latencies)))
+      (io/puts "by ten-second window: key latency p50 / max, then the longest ed-update and ed-view in it")
+      (let (by-window (seq/group-by measured (fn (r) (window (:due r))))
+            inner-by-window (seq/group-by inner (fn (entry) (window (first entry)))))
+        (doseq (k (sort (keys by-window)))
+          (let (ls (sort (map (get by-window k) :latency))
+                phases (get inner-by-window k [])
+                longest (fn (phase)
+                          (fold (seq/filter phases (fn (entry) (= (second entry) phase))) 0
+                            (fn (acc entry) (math/max acc (nth entry 2))))))
+            (io/puts (string/format "  %3ds  p50 %6.1f  max %6.1f  (%d keys)   update ≤ %5.1f  view ≤ %5.1f"
+                       (* k 10) (percentile ls 0.5) (last ls) (count ls) (longest :update) (longest :view))))))
+      (io/puts "slowest keys:")
+      (doseq (r (take (seq/sort-by measured (fn (r) (- (:latency r)))) 8))
+        (io/puts (string/format "  %7.1f ms  queued %6.1f  at %7.0f  %s"
+                   (:latency r) (:queued r) (:due r) (pr-str (:key r))))))))
+
+(let (t0 (os/now-ns)
+      pending (%table)
+      _ (%table-put pending :q (schedule))
+      m0 (pool/ed-find-file
+           (assoc (model/ed-init (editor/buffer/make-buffer "" "*scratch*")) :recent-files false)
+           *file*)
+      ;; at the end of a line: where a preview, eldoc and the tree all have work
+      at (let (spec (os/env "PROBE_AT")) (if spec (string/->number spec) 0.5))
+      m1 (model/ed-set-buf m0
+           (let (buf (model/ed-current-buf m0))
+             (editor/buffer/end-of-line
+               (editor/buffer/goto-char buf (math/floor (* (editor/buffer/buffer-length buf) at))))))
+      gc0 (reflect/call-if-bound '%gc-stats {})
+      profile? (= (os/env "PROBE_PROFILE") "1")
+      display {:enter (fn () nil)
+               :leave (fn () nil)
+               :size (fn () [*cols* *rows*])
+               :draw (fn (_frame) (log-append :draws (now-ms t0)))
+               :poll (poll-fn t0 pending)}
+      view (fn (m cols rows) (timed t0 :view (fn () (view/ed-view m cols rows))))
+      update (fn (m input cols rows)
+               (if (= input :done)
+                 (assoc m :done true)
+                 (timed t0 :update (fn () (input/ed-update m input cols rows))))))
+  (do
+    (when profile? (dev/profile-start 2000 (self)))
+    (editor/ui/ui-run m1 view update display)
+    (when profile?
+      (let (hist (dev/profile-stop)
+            ;; PROBE_FN=name: the frames ABOVE that function, summed — who is paying for it
+            target (os/env "PROBE_FN"))
+        (do
+          (top-stacks hist 40)
+          (when target
+            (let (callers (fold (seq/filter hist (fn (e) (includes? (:stack e) target)))
+                            {}
+                            (fn (acc e)
+                              (let (stack (:stack e)
+                                    path (string/join (take (drop stack (index-of stack target)) 6) " < "))
+                                (assoc acc path (+ (get acc path 0) (:count e)))))))
+              (doseq (e (take (seq/sort-by (seq callers) (fn ([_ c]) (- c))) 12))
+                (io/puts (str (second e) "  " (first e)))))))))
+    (report)
+    (let (gc1 (reflect/call-if-bound '%gc-stats {}))
+      (io/puts (string/format "gc: %d collections, %.1f ms paused in all"
+                 (- (:collections gc1 0) (:collections gc0 0))
+                 (/ (- (:pause-total-us gc1 0) (:pause-total-us gc0 0)) 1000.0))))))

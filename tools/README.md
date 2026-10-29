@@ -122,3 +122,19 @@ vt and the screen simply IS the screen: `screen` is current, `gone?` is
 It also fixed a whole class of green lies. Every check in the Python `drive_mspc` was passing
 on the pty's own echo rather than on anything the editor painted, because nothing knew when
 the editor had taken the terminal over. The emulator knows.
+
+## Measuring, not asserting
+
+`profile-turn.blsp` and `../bench/keystrokes.blsp` time one turn of `ed-update` / `ed-view`
+and report the mean. `probe-typing.blsp` runs the whole `ui-run` loop instead, with its
+timers, the idle beat and the replies from tasks. Keys are pressed on a typist's schedule, and
+each one is timed from when it was pressed to when the frame showing it is drawn. It reports
+p50 / max per ten-second window, next to the longest `ed-update` and `ed-view` in that window.
+When a key is slow and those two are not, the time went somewhere else in the loop.
+
+    BROOD_CONTRACTS=0 BROOD_GUI_HEADLESS=1 nest run tools/probe-typing.blsp -- src/commands.blsp
+
+Use `BROOD_CONTRACTS=0`, because an installed bedit checks no contracts and `nest run` does.
+`PROBE_DISABLE=a,b` drops idle jobs, which is how a slow phase is bisected.
+`PROBE_PROFILE=1 PROBE_FN=name` samples the loop and shows who calls `name`. `PROBE_WRAP=ns/fn,…`
+times individual functions where they are called. The header lists the other knobs.
