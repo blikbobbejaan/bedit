@@ -7,15 +7,12 @@ in brood's `docs/devlog.md`; decisions in brood's `docs/decisions/`; the open ba
 ## State when written — 2026-10-29
 
 - **brood v0.47.0** (ADR-506: 115 bare names moved into their modules; another session migrated
-  every sibling project). **v0.48.0** (ADR-507, `buffer-edit`'s tag before its transform) was
-  committed and waiting on CI when this was written. bedit main already calls the new order
-  (`32d8e2db`), so on nest 0.47.0 the collab, remote and hosted suites fail (39 tests), and
-  bedit's floor moves to >= 0.48.0 once it is tagged.
+  every sibling project). **v0.48.0** (ADR-507, `buffer-edit`'s tag before its transform; the
+  floor since `d299d348`): bedit main passes its full suite on it, 3370 tests.
 - **bedit v0.8.1** (`630cbec5`): the ADR-506 migration, floor 0.47.0, and a line's end-of-line
   note starting after the completion preview instead of under it. Released and on hive.
-- Installed: nest 0.47.0 (`7eba7669`) and bedit 0.8.1. **Do not `make install` bedit main
-  until nest is 0.48.0**: the bundle would call `buffer-edit` in the new order on a runtime
-  that has the old one.
+- Installed: nest 0.48.0 (`a67f4889`) and bedit main (`d299d348`: the word-index fix and the
+  `:font` setting, unreleased).
 - **Typing lag, measured** (`tools/probe-typing.blsp`: the real ui-run loop, keys pressed on a
   typist's schedule, timed from press to drawn frame). With contracts off, as a release runs,
   keys settle at p50 ~11 ms and max ~20 ms headless. The bad part was the first seconds in
