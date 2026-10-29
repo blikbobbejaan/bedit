@@ -147,7 +147,9 @@ src/themes.blsp             the theme registry (M-x theme-select): a live picker
                             adding one is data (theme.blsp is the palette; this is the registry)
 src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
                             hive packages that `:enhances bedit` at RUNTIME, into
-                            ~/.config/bedit/packages (the elpa model) — never the build's _deps
+                            ~/.config/bedit/packages (the elpa model) — never the build's _deps.
+                            A plugin's `(bedit-plugin)` map contributes `:themes` and
+                            `:term-emulators` (a terminal emulator row, terminal.blsp)
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model); the
                             row table every row↔line question reads (`ed-pane-rows`), from the
                             pane's start row
@@ -478,7 +480,12 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             it — C-c C-j / C-c C-k switch. The mouse reaches a program
                             that asked for it; the program's cursor shape and visibility
                             are painted; history above the screen keeps its colour and
-                            is capped; the mode line chip says which program and mode
+                            is capped; the mode line chip says which program and mode.
+                            The EMULATOR is a registry row (`register-term-emulator!`): the
+                            eight operations the worker calls, std/vt's as `:vt`, picked by
+                            the `:term-emulator` setting when a terminal starts (a name
+                            nothing registered falls back to `:vt` and says so); a plugin
+                            adds its own (ghostty-vt's `:ghostty`)
                             (named to dodge std's `term`, as formatter dodges `format`)
 src/section.blsp            SECTION TREES (magit-section) as data: a tree rendered to lines
                             plus parallel rows, walked and folded by index. Pure; moved from
