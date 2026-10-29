@@ -75,6 +75,27 @@ follow/mirror — over a Unix socket or authenticated TCP (`--listen`). See
 for the runbook, and [`ROADMAP.md`](ROADMAP.md) for the full status and what's
 next.
 
+From a bedit checkout, pass the same options to the editor after `nest run --`:
+
+```bash
+# Serve a shared session; omit --headless to open a host window too.
+nest run -- --name ed --serve --shared --headless notes.txt
+
+# In another terminal, from a bedit checkout on the same machine:
+nest run -- --attach ed --as alice
+
+# To accept connections from another machine:
+nest run -- --name ed --serve --shared --headless --listen 0.0.0.0:7457 notes.txt
+
+# On the other machine, use the cookie printed by the server and its reachable address:
+nest run -- --attach ed@HOST:7457 --cookie COOKIE --as alice
+```
+
+`--listen 7457` binds to loopback only. The server prints an attach command with a
+session guest cookie; replace `0.0.0.0` in its hint with the host's reachable address.
+Both machines need a bedit checkout and a compatible, GUI-enabled `nest` installation
+for the client window. Without `--shared`, each client gets an independent session.
+
 ## Layout
 
 ```
