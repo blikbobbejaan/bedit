@@ -483,6 +483,61 @@ empty output, which is what a bare exit-code check would do with it."
         (let (m2 (vcs-report-cmd m1 verb r))
           (if (nil? (:then op)) m2 ((:then op) m2 r)))))))
 
+;; ---- working-tree commands: off the loop, one at a time, in order ------------------
+;; A stage, an unstage, a discard, a claim: a command that changes this checkout and stays
+;; on this machine. It used to run inside the key, which is a few milliseconds on a small
+;; repository and a frozen window on a large one, or while another git holds the index lock.
+;; `vcs-launch` is wrong for these — it refuses a second command while one runs, and `s s s`
+;; down a list of files is three commands — so they QUEUE: each runs in a task once the one
+;; before it has landed, which is also the order git's index lock would force anyway.
+
+(defn vcs-run-queued (m program root args runner then)
+  "Queue the working-tree command `program args` in `root` — `(runner root args)`, returning
+`{:exit :stdout :stderr}` — to run OFF the loop after any already queued, journalled like
+every command, then fold `(then model result)`. Headless runs it at once."
+  (if (ed-headless?)
+    (let ([m0 r] (vcs-run m program args (fn () (runner root args)))) (then m0 r))
+    (vcs-queue-next (assoc m
+                      :vcs-queue
+                        (conj (or (:vcs-queue m) [])
+                          {:program program :root root :args args :runner runner :then then})))))
+
+(defn- vcs-queue-next (m)
+  ;; start the queue's head when nothing is running; the task closes over the runner, the
+  ;; root and the arguments alone, never the `then` (which may hold anything)
+  (let (queue (or (:vcs-queue m) []))
+    (if (or (:vcs-queue-proc m) (empty? queue))
+      m
+      (let (op (first queue)
+            runner (:runner op)
+            root (:root op)
+            args (:args op)
+            job (task (fn () (runner root args)) {:timeout *vcs-op-timeout-ms*})
+            [logged id] (vcs-journal-add m (vcs-entry (:program op) args)))
+        (assoc logged
+          :vcs-queue (vec (rest queue))
+          :vcs-queue-proc job
+          :vcs-queue-op {:then (:then op) :entry id})))))
+
+(check-allow :trusted
+  ;; a working-tree command, queued; quick, so no activity label, and no C-g: half a stage is
+  ;; a lock left behind
+  (register-task-reply :vcs-queue-proc 'vcsproc/vcs-apply-queued nil nil)
+  (sig vcs-apply-queued (model any -> model))
+  (defn vcs-apply-queued (m r)
+    "Fold a finished queued command through its `then`, then start the next. A nil `r` is the
+task having errored or timed out, said plainly."
+    (let (op (:vcs-queue-op m)
+          m1 (vcs-journal-finish (dissoc m :vcs-queue-op :vcs-queue-proc) (:entry op) r)
+          m2 (if (nil? r)
+               (message m1
+                 (str "failed: no result (timed out after "
+                   *vcs-op-timeout-ms*
+                   "ms)"
+                   (vcs-journal-note)))
+               ((:then op) m1 r)))
+      (vcs-queue-next m2))))
+
 ;; ---- the buffer type -------------------------------------------------------------
 ;; *vcs-process* — its own layer rather than a shared report keymap, because `k` clears the
 ;; log here.
