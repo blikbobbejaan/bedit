@@ -1,0 +1,136 @@
+(defmodule slowlog
+  "The SLOW-TURN LOG: every turn of the editor loop the watchdog reports slow (brood
+ADR-490), kept across sessions, and M-x slow-turns, which ranks what they were folding.
+
+A report always lands in `*Messages*` (`slow update 73ms on [:timer :idle]`), but that
+buffer dies with the session, so the question \"what makes the editor feel slow in a normal
+day\" had nothing to be answered from. Once `activate!` has run (`main` calls it), each
+report is also appended to `slow-turns.blsp` in the editor's state folder, one re-readable
+map per line, the file rotated to `slow-turns.old.blsp` at [[*slow-log-max-bytes*]]. Before
+that nothing is written, so a test that folds a `[:ui-slow …]` event never touches the
+user's file."
+  (:use model) ; ed-append-named, register-event-handler, message
+  (:use projects) ; editor-state-dir
+  (:use pool) ; ed-display-buffer — the report buffer
+  (:use interactive)) ; defcommand
+
+(def *slow-log-max-bytes* 262144) ; one generation is rotated out past this
+
+;; where reports are appended; nil until `activate!`
+(def *slow-log-file* nil)
+
+(defn slow-log-file ()
+  "Where slow turns are kept: `slow-turns.blsp` in the editor's state folder."
+  (path/join (editor-state-dir) "slow-turns.blsp"))
+
+(defn- rotated (file)
+  "The previous generation of `file`: `slow-turns.old.blsp` beside `slow-turns.blsp`."
+  (regex/replace "\\.blsp$" file ".old.blsp"))
+
+(defn activate! (&optional (file nil))
+  "Start keeping slow turns, in `file` (by default [[slow-log-file]]), creating its folder."
+  (let (target (or file (slow-log-file))
+        dir (path/dirname target))
+    (when (not (file/exists? dir)) (file/mkdir dir))
+    (def *slow-log-file* target)
+    nil))
+
+(defn deactivate! ()
+  "Stop keeping slow turns: nothing is written until the next [[activate!]]."
+  (def *slow-log-file* nil)
+  nil)
+
+(defn record! (report)
+  "Append `report` (`{:phase :tag :ms …}`) with the time it was made, as one line, when the
+log is active; rotate the file first once it has outgrown [[*slow-log-max-bytes*]].
+Best-effort: a write that fails loses one report, never the turn."
+  ;; a report that cannot be written (a full disk, a folder removed under us) is lost alone:
+  ;; the turn it describes has already happened, and the next report tries again
+  (when *slow-log-file*
+    (check-allow :discarded-catch
+      (try
+        (do
+          (when (> (or (file/size *slow-log-file*) 0) *slow-log-max-bytes*)
+            (file/rename *slow-log-file* (rotated *slow-log-file*)))
+          (file/spit-append *slow-log-file* (str (pr-str (assoc report :at (os/now))) "\n")))
+        (catch _ nil))))
+  nil)
+
+(defn read-reports (file)
+  "The reports kept in `file` and its previous generation, oldest first; a line that does not
+read back as a map is skipped, so a torn last line costs that one report."
+  (fold [(rotated file) file]
+    []
+    (fn (acc path)
+      (into acc
+        (if (file/exists? path)
+          (seq/keep (string/split (file/slurp path) "\n")
+            ;; a line that does not read (torn by a crash mid-write) is skipped: nil is the answer
+            (fn (line)
+              (let (form (check-allow :discarded-catch
+                           (try (reflect/read-string line) (catch _ nil))))
+                (when (map? form) form))))
+          [])))))
+
+(defn summary-lines (reports)
+  "One line per CAUSE (a report's phase and tag) in `reports`, the costliest first: how many
+times it was slow, the time it took in all, its worst, and how many of those turns were
+stopped by the loop's ceiling rather than finishing.
+
+    (slowlog/summary-lines [{:phase \"update\" :tag :lsp :ms 80} {:phase \"update\" :tag :lsp :ms 120}])   ;=> [\"  200 ms total   2×  worst 120 ms   update :lsp\"]"
+  (let (groups (seq/group-by reports (fn (r) [(:phase r) (pr-str (:tag r))]))
+        rows (map (seq groups)
+               (fn ([[phase tag] rs])
+                 (let (times (map rs (fn (r) (or (:ms r) 0)))
+                       stopped (count (seq/filter rs :interrupted)))
+                   {:total (reduce times 0 +)
+                    :count (count rs)
+                    :worst (reduce times 0 math/max)
+                    :stopped stopped
+                    :what (str phase " " tag)}))))
+    (vec (map (sort rows (fn (a b) (> (:total a) (:total b))))
+           (fn (row)
+             (string/format "%5d ms total  %3d×  worst %d ms   %s%s"
+               (:total row)
+               (:count row)
+               (:worst row)
+               (:what row)
+               (if (> (:stopped row) 0) (str "   (" (:stopped row) " stopped)") "")))))))
+
+(defn report-text (reports)
+  "The `*Slow turns*` buffer's text for `reports`."
+  (if (empty? reports)
+    "No slow turns recorded yet. The watchdog reports a turn of the editor loop that took\nlonger than its threshold; each is kept here across sessions.\n"
+    (str "Slow turns of the editor loop, by what they were folding, costliest first ("
+      (count reports)
+      " recorded):\n\n"
+      (string/join (summary-lines reports) "\n")
+      "\n")))
+
+(defn ed-ev-ui-slow (m input textrows cols rows)
+  "A slow turn the watchdog reported ([[model/ed-report-slow]]): kept in the log
+([[record!]]) and appended to `*Messages*` — `slow update 73ms on [:timer :idle]` — and not
+echoed: the reader is in the middle of something, and the line is for whoever goes looking
+for why a key felt late.
+
+An INTERRUPTED turn (brood ADR-491) says so: `interrupted update 2000ms on
+:lsp-diagnostics`. One the reader stopped — a command (`:input` true), by C-g — also echoes
+`Quit`, as Emacs does; a background event the loop's ceiling stopped stays in the log, since
+nobody asked for it and an echo would interrupt whatever they are reading."
+  (let (report (nth input 1)
+        {:keys [phase tag ms interrupted]} report
+        _ (record! report)
+        logged (ed-append-named m
+                 "*Messages*"
+                 (str (if interrupted "interrupted " "slow ") phase " " ms "ms on " (pr-str tag))))
+    (if (and interrupted (:input report)) (assoc logged :echo "Quit") logged)))
+
+(register-event-handler :ui-slow 'slowlog/ed-ev-ui-slow)
+
+(defcommand cmd-slow-turns
+  (m key)
+  "Show `*Slow turns*`: every slow turn of the editor loop kept across sessions, grouped by
+what it was folding (a key, a timer, an event), costliest first (M-x slow-turns)."
+  (ed-display-buffer m
+    "*Slow turns*"
+    (report-text (if *slow-log-file* (read-reports *slow-log-file*) []))))
