@@ -1778,15 +1778,52 @@ default (Emacs's `cursor-in-non-selected-windows`), nil when it is `false`."
       (= shape false) nil
       :else shape)))
 
-(defn- ed-pane-cursor-op (m pane buf cell)
+(defn- ed-held-spans (m pane buf)
+  "The spans `pane` already holds for `buf`, with no lexing: the buffer's own `:face-spans`,
+else the `:span-cache` entry while it was coloured from this rope and type — what the caret
+reads its face from every frame, so a miss is the default face rather than a re-lex."
+  (or (:face-spans buf)
+    (let (entry (map/get-in m [:span-cache (:path pane)]))
+      (when (and entry (= (:rope entry) (buffer-rope buf)) (= (:type entry) (:type buf)))
+        (:spans entry)))))
+
+(defn ed-face-at (spans at)
+  "The face of the span in `spans` (ascending `[start end face]`, or several as
+`ed-span-sources`) covering offset `at`, by bisection, or nil where none does.
+
+    (view/ed-face-at [[0 2 {:bold true}] [4 6 {:italic true}]] 5)   ;=> {:italic true}
+    (view/ed-face-at [[0 2 {:bold true}]] 3)   ;=> nil"
+  (cond
+    (nil? spans) nil
+    (map? spans)
+      (fold (:span-sources spans) nil (fn (found source) (or found (ed-face-at source at))))
+    :else
+      (let (v (if (vector? spans) spans (into [] spans))
+            n (count v)
+            i (ed-span-seek v n at))
+        (when (and (< i n) (<= (first (nth v i)) at)) (nth (nth v i) 2 nil)))))
+
+(defn- ed-pane-cursor-op (m pane buf cell preview-op)
   "The caret at point's `cell`, when it is on screen. The pane with the keyboard (selected,
 no minibuffer open) gets the configured style, blinking; any other gets `ed-other-cursor`,
 still, as Emacs marks where point is in a window you are not typing in. A buffer may hide
 its caret or name its shape — a terminal buffer's program does both (`:cursor-hidden`,
-`:cursor-shape`). Nil otherwise."
+`:cursor-shape`). Nil otherwise.
+
+`preview-op` is the text op painted at point before the caret (a completion preview or an
+input method's composition), nil when there is none: a block shows ITS first character in
+its face, since that is what the cell holds, and otherwise the character after point in
+its syntax face (`ed-held-spans`), so a bold keyword stays bold under the caret."
   (when (and cell (not (:cursor-hidden buf)))
     (if (and (:selected pane) (nil? (:minibuffer m)))
-      (ed-caret m (first cell) (second cell) (or (:cursor-shape buf) (ed-cursor-style m)))
+      (ed-caret m
+        (first cell)
+        (second cell)
+        (or (:cursor-shape buf) (ed-cursor-style m))
+        (if preview-op (nth preview-op 3) (buffer-char-after buf))
+        (if preview-op
+          (nth preview-op 4 nil)
+          (ed-face-at (ed-buffer-spans buf (ed-held-spans m pane buf)) (buffer-point buf))))
       (let (shape (ed-other-cursor m))
         (when shape (cursor (first cell) (second cell) shape *cursor*))))))
 
@@ -2027,7 +2064,7 @@ When it misses, the body and the gutter inside still answer from their own memos
           (fn () (ed-pane-static-ops m pane buf (or geometry (ed-pane-geometry pane buf)) push))))
       ;; the preview before the caret, so a block cursor sits ON its first character (a nil
       ;; of either is dropped by the flatten)
-      (list preview-op (ed-pane-cursor-op m pane buf cell)))))
+      (list preview-op (ed-pane-cursor-op m pane buf cell preview-op)))))
 
 (defn- ed-pane-region-group (pane scroll-frac layer-groups)
   "The scrolling layers (`layer-groups`, one op list per layer) as ONE op group wrapped in
@@ -2662,7 +2699,15 @@ bar). So the caret is consistent across buffers, wide by default, and user-confi
     (includes? (list :normal :visual) (:edit-state m)) :block
     :else (or (:cursor-style m) :block)))
 
-(defn- ed-caret (m row col shape)
+(defn- ed-caret-text (shown)
+  "What a block caret draws over its solid fill (brood ADR-515): the first character of
+`shown`, the text painted in the caret's cell, or a space where that cell shows none — a
+line's end, the buffer's end, a tab — so the caret is the same solid box everywhere."
+  (if (or (nil? shown) (= shown "") (includes? ["\n" "\t" "\r"] (string/substring shown 0 1)))
+    " "
+    (string/substring shown 0 1)))
+
+(defn- ed-caret (m row col shape under face)
   "The caret op at `row` `col`: `shape`, in the theme's text colour (brood ADR-440's cursor
 colour, so a light theme gets a dark caret), or a HOLLOW box while the window is unfocused
 (`:unfocused`, set by `:blur` and cleared by `:focus-in`): Emacs and every terminal show
@@ -2670,10 +2715,21 @@ where the caret is without claiming the keyboard. It does not blink then either.
 
 A focused caret carries its blink (`cursor-blink`, brood ADR-469): the GUI window blinks it on
 its own clock for [[model/ed-blink-count]] cycles and restarts it on every key, click and
-caret move, so a blink costs no turn of the loop. The terminal and the web mirror ignore it."
+caret move, so a blink costs no turn of the loop. The terminal and the web mirror ignore it.
+
+`under` is the text painted in the caret's cell and `face` its face (nil: the default). A
+focused block draws it over a solid fill in the window background, Emacs's box (brood
+ADR-515), keeping the face's weight and slant, so the character at point stays readable
+through the caret; [[ed-caret-text]] makes it a space where the cell is empty."
   (if (:unfocused m)
     (cursor row col :hollow *cursor*)
-    (cursor row col shape *cursor* (cursor-blink *blink-ms* (ed-blink-count m)))))
+    (cursor row
+      col
+      shape
+      *cursor*
+      (cursor-blink *blink-ms* (ed-blink-count m))
+      (ed-caret-text under)
+      face)))
 
 (defn ed-cursor (m panes cols rows)
   "Place the MINIBUFFER's caret: at its point (prompt + `:point`). A buffer pane's caret is
@@ -2690,7 +2746,25 @@ with no minibuffer open."
       ;; `N/M ` counter (when a selection prompt) + the prompt + the line editor's point.
       ;; the minibuffer caret is the SAME shape as every buffer (`ed-cursor-style`):
       ;; the configurable block by default, not a special-case bar.
-      (ed-caret m (ed-mb-row m rows) (ed-mb-caret-column mb cols) (ed-cursor-style m)))))
+      (ed-caret m
+        (ed-mb-row m rows)
+        (ed-mb-caret-column mb cols)
+        (ed-cursor-style m)
+        (ed-mb-caret-text m mb cols)
+        (when (:preedit m) face-preedit)))))
+
+(defn- ed-mb-caret-text (m mb cols)
+  "The text in the minibuffer caret's cell, which a block caret draws over its fill
+(brood ADR-515): an input method's composition when one is open (it is painted there), the
+input's character at point otherwise, and nil past its end or when the caret was held on
+the screen's last column, where the cell shows something else."
+  (let (input (mb-text mb)
+        input-point (mb-point mb))
+    (cond
+      (:preedit m) (map/get-in m [:preedit :text])
+      (>= (+ (ed-mb-input-col mb) input-point) cols) nil
+      (< input-point (string/length input)) (string/substring input input-point (inc input-point))
+      :else nil)))
 
 (defn- ed-mb-row (m rows)
   "The prompt's row: the first of the echo area, just below the mode line."
