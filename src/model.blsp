@@ -1279,9 +1279,9 @@ prompt whose line names a directory opens the directory), else the first row."
       (and prompt? (prompt? (mb-text mb))) -1
       :else 0)))
 (defn mb-source? (mb)
-  "True if `mb` produces candidates from either a fixed `:rank-source` (fuzzy-ranked,
-narrowable) or a `:candidates-fn` (computed each keystroke)."
-  (or (:rank-source mb) (:candidates-fn mb)))
+  "True if `mb` produces candidates from a fixed `:rank-source` (fuzzy-ranked, narrowable), a
+`:candidates-fn` (computed each keystroke) or an `:async-source` (computed off the loop)."
+  (or (:rank-source mb) (:candidates-fn mb) (:async-source mb)))
 
 (defn mb-rank-options (mb)
   "The `std/fuzzy` options minibuffer `mb` ranks with: its `:category` (`:file` ranks paths
@@ -1354,7 +1354,9 @@ fresh."
       ;; a big source being ranked OFF the loop: show what the session last answered. Never
       ;; rank inline here — this is called from the view and from every selection move, and
       ;; ranking on either is what made holding ↓ cost 210ms a step on a 27k-file project.
-      (and cache (:ranker mb)) (:cands cache)
+      (and cache (or (:ranker mb) (:async-source mb))) (:cands cache)
+      ;; an off-loop source with no answer yet lists nothing until its first one lands
+      (:async-source mb) ()
       ;; otherwise (small source, or no cache yet) recompute now — instant, and what the
       ;; per-keystroke and direct-text-set paths rely on
       :else (mb-rank mb (mb-text mb)))))
@@ -1435,6 +1437,41 @@ list until the reader gives up and retypes. A no-op when the cache is current."
 (register-idle-job :minibuffer-rerank
   {:order 70 :run 'model/ed-mb-reask :stale? 'model/mb-cands-stale?})
 
+;; ---- candidates computed off the loop (consult's async sources) ----------------
+;; A prompt whose candidates come from a PROGRAM run on the typed text — consult-ripgrep's
+;; `rg` over the project — names it as `:async-source`, a `(text) -> candidates` function.
+;; Each new text runs it in a task (`:mb-async`), cancelling the one it overtook, and the
+;; list keeps the last answer until the new one lands. A headless model (a test) runs it
+;; inline, as a session-ranked prompt ranks inline there.
+
+(defn- ed-mb-ask-async (m mb text)
+  ;; run `mb`'s `:async-source` on `text`: in a task, once per text, the previous run
+  ;; cancelled; inline when headless
+  (cond
+    (= (:asked mb) text) m
+    (ed-headless?)
+      (assoc m
+        :minibuffer (assoc mb :asked text :cand-cache {:for text :cands ((:async-source mb) text)}))
+    :else
+      (let (source (:async-source mb)
+            _ (when (:mb-async m) (task/cancel (:mb-async m))))
+        (assoc m
+          :minibuffer (assoc mb :asked text)
+          :mb-async (task/task (fn () {:for text :cands (source text)}))))))
+
+(defn ed-apply-mb-async (m answer)
+  "Fold an `:async-source` run's `answer` (`{:for text :cands …}`, nil when it failed) into
+the open prompt when it is still the text the prompt last asked about; the selection goes
+back to the first row, since the rows under it changed. A prompt closed or retyped since
+drops it."
+  (let (m1 (dissoc m :mb-async)
+        mb (:minibuffer m1))
+    (if (or (nil? answer) (nil? mb) (nil? (:async-source mb)) (not (= (:asked mb) (:for answer))))
+      m1
+      (assoc m1 :minibuffer (assoc (dissoc mb :sel) :cand-cache answer)))))
+
+(register-task-reply :mb-async 'model/ed-apply-mb-async nil nil {:cancel-on-quit? true})
+
 (defn ed-cache-mb-candidates (m)
   "Bring the open minibuffer's `:cand-cache` (`{:for <text> :cands …}`) up to date with the
 typed text — by ASKING its ranking session when it has one (the answer folds in later,
@@ -1450,6 +1487,7 @@ re-ask for the same text while the first answer was still in flight."
     (cond
       (or (nil? mb) (not (mb-source? mb))) m1
       (= (map/get-in mb [:cand-cache :for]) text) m1
+      (:async-source mb) (ed-mb-ask-async m1 mb text)
       (:ranker mb)
         (if (= (:asked mb) text)
           m1

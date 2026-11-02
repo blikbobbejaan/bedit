@@ -169,6 +169,9 @@ src/winner.blsp             C-c ← / C-c → window-layout undo and redo (Emacs
                             post-step row keeps the layouts the window SHAPE changed from
 src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
                             `:show-whitespace`, per mode through `scroll/ed-mode-setting`)
+src/rainbow.blsp             a tree-sitter buffer's brackets coloured by depth (Emacs rainbow-delimiters,
+                            `:rainbow-delimiters`): delimiter tokens of the held parse, the window's top
+                            depth from the tree; the Lisp modes colour theirs in their own lexer
 src/avy.blsp                jump to a visible position by label (Emacs avy): C-' char-timer, M-g w / e
                             word starts — targets from each pane's row table, over the read-char overlay
 src/embark.blsp             C-. act on the thing at point or the selected candidate (Emacs embark): the
