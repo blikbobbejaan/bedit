@@ -144,7 +144,9 @@ src/about.blsp              M-x version · --version · C-h C-a *About bedit* �
 src/slowlog.blsp            the SLOW-TURN LOG: every turn of the loop the watchdog reports slow (brood
                             ADR-490) kept across sessions in state/slow-turns.blsp (rotated at 256 KB),
                             and M-x slow-turns ranking them by what they were folding; on only once
-                            `main` activates it, so a test never writes the user's file
+                            `main` activates it, so a test never writes the user's file. The loop runs
+                            `(proc/flag :responsive true)` (brood ADR-517), so every `os/cmd` it makes
+                            arrives as `[:blocking-call …]` and is logged here too, phase `blocking`
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
 src/themes.blsp             the theme registry (M-x theme-select): a live picker that swaps the
                             whole palette AND the window font — a theme is a plain map, so
