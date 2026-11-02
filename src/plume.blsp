@@ -21,11 +21,12 @@ any of them live with `C-x C-e`. No package soup, no per-package config — one 
 ;; roles as the completion popup and the context menu. This layer keeps the ranking,
 ;; the marginalia annotators + column formatters, and the N/M counter.
 
-(def *plume-inset* 2) ; columns of margin each side of the inset candidate list (the pill floats inside)
+(def *plume-inset* 0) ; columns of margin each side of the candidate list: none, so it lines up with the prompt (Vertico)
 ;; ---- the annotator registry (the override seam) -----------------------------
 
 (def *plume-annotators*
-  ;; completion category -> a `(value mb) -> annotation-string|nil` fn, as a quoted symbol.
+  ;; completion category -> a `(value mb) -> annotation` fn, as a quoted symbol: the annotation
+  ;; is a vector of FIELDS (columns, `plume-columns`), a string (one field), or nil.
   ;; Add/replace an entry (or redefine the named fn) live to change a category's marginalia.
   {:file 'plume/plume-file-annotation
    :command 'plume/plume-command-annotation})
@@ -62,12 +63,12 @@ to `now-ms`; `\"\"` when `ms` is nil."
         :else (str (math/quot s 2592000) "mo ago")))))
 
 (defn plume-file-annotation (value mb)
-  "The `:file` category annotator: `<perms>  <size>  <relative-mtime>` for candidate
+  "The `:file` category annotator: `[perms size relative-mtime]` for candidate
 `value`, via one `file-stat` (the perms column shared with dired through
 `fileperm/perms-string`). `value` is resolved to a file by the prompt's `:path-of` when it
 has one (a path prompt's `~/…` and `$$` spelling), else against its `:anno-base` (a
 relative candidate's directory) when it isn't absolute; a trailing `/`
-(a directory marker) is dropped. `\"\"` when the file is gone. Redefine this (or swap the
+(a directory marker) is dropped. Three fields; none when the file is gone. Redefine this (or swap the
 `:file` entry of `*plume-annotators*`) to change the columns — the marginalia seam."
   (let (raw (if (string/ends-with? value "/")
               (string/substring value 0 (dec (string/length value)))
@@ -80,12 +81,10 @@ relative candidate's directory) when it isn't absolute; a trailing `/`
                :else (str base "/" raw))
         st (file/stat path))
     (if (nil? st)
-      ""
-      (str (perms-string st)
-        "  "
+      []
+      [(perms-string st)
         (string/pad-left (plume-human-size (:size st)) 6)
-        "  "
-        (plume-reltime (:mtime st) (os/now))))))
+        (plume-reltime (:mtime st) (os/now))])))
 
 ;; ---- the :command annotator: key · contract · doc ----------------------------
 
@@ -102,14 +101,16 @@ a command whose author narrowed or widened it shows that. Nil when nothing is de
                     s))
         (string/replace inner "->" "→")))))
 
+(def *command-contract* "model any → model") ; what every `defcommand` declares
+
 (defn plume-command-annotation (value mb)
-  "The `:command` category annotator (M-x): `<key>  <contract>  <doc>` for command name
-`value` — the key the live keymap binds it to (`:anno-keymap` on the prompt; blank when
-none), its declared contract ([[plume-contract-label]]) and the first line of its
-docstring. The contract is the point: every `defcommand` declares `model any -> model`,
-and here is where a reader sees that the command they are about to run honours it —
-or, for one that was redefined live, what it now claims (`C-x C-e` on a `defcommand`
-re-checks the body against this and says so in *Messages*)."
+  "The `:command` category annotator (M-x): `[key contract doc]` for command name `value` —
+the key the live keymap binds it to (`:anno-keymap` on the prompt), its declared contract
+([[plume-contract-label]]) and the first line of its docstring, each blank when there is
+none. The contract shows only when it is not `*command-contract*`: every `defcommand`
+declares that one, so on every row it said nothing, and the one row that differs — a
+command redefined live to claim something else (`C-x C-e` on a `defcommand` re-checks the
+body and says so in *Messages*) — is the one worth seeing."
   ;; `:anno-keys` is the prompt's precomputed `{command-tail -> key-sequence}`
   ;; (`keyhelp/ed-key-table`) — a map lookup. Asking the keymap per row instead walked the
   ;; whole thing twice per row per frame: 48 ms a keystroke in `M-x`, for fifteen rows.
@@ -125,20 +126,72 @@ re-checks the body against this and says so in *Messages*)."
               (nil? km) nil
               :else (keyhelp/ed-where-is-named km sym))
         contract (if (nil? sym) nil (plume-contract-label sym))
-        doc (if (nil? sym) nil (keyhelp/ed-doc sym))
-        parts (seq/reject (list key contract (if (nil? doc) nil (keyhelp/ed-first-line doc))) nil?))
-    (string/join parts "  ·  ")))
+        doc (if (nil? sym) nil (keyhelp/ed-doc sym)))
+    (if (nil? sym)
+      []
+      [(or key "")
+        (if (or (nil? contract) (= contract *command-contract*)) "" contract)
+        (if (nil? doc) "" (keyhelp/ed-first-line doc))])))
 
 ;; ---- the annotated row renderer + the counter -------------------------------
 
-(sig plume-annot-width (any &optional int -> int))
-(defn plume-annot-width (annots &optional (cols 80))
-  "The marginalia column width: the widest annotation, clamped to [0, cap] (0 ⇒ no column).
-The cap is 40 columns, or half the window when that is wider — a command's marginalia
-(key · contract · doc) wants the room, and a wide window has it, while the candidate
-label always keeps at least half."
-  (math/min (math/max 40 (math/quot cols 2))
-    (fold annots 0 (fn (w s) (math/max w (string/length s))))))
+(sig plume-annot-room (int -> int))
+(defn plume-annot-room (cols)
+  "The most cells the marginalia may take in a `cols`-wide list: 40, or half the window when
+that is wider — a command's (key, contract, doc) wants the room, and a wide window has it,
+while the candidate label always keeps at least half."
+  (math/max 40 (math/quot cols 2)))
+
+(defn- annotation-fields (annotation)
+  ;; an annotator's answer as its fields: a vector as it is, a string one field, nil none
+  (cond
+    (vector? annotation) annotation
+    (string? annotation) [annotation]
+    :else []))
+
+(sig fit-cells (string int -> string))
+(defn- fit-cells (s width)
+  ;; `s` cut to `width` display cells, its last kept cell an ellipsis, then padded to `width`
+  (string/pad-right-cells (if (> (string/display-width s) width)
+                            (str (string/clip-cells s (if (> width 0) (dec width) 0)) "…")
+                            s)
+    width))
+
+(sig room-for-last (int int -> int))
+(defn- room-for-last (widest room)
+  ;; the last column's width: its widest field, within `room`, never negative
+  (math/max 0 (math/min widest room)))
+
+(sig plume-columns (any int -> any))
+(defn plume-columns (annotations room)
+  "The marginalia of a list's rows laid out as COLUMNS, as Marginalia lays them: each
+annotation a vector of fields (a string is one, nil none), every field padded to the widest
+of its column across `annotations`, two spaces between, and the LAST column (a docstring, a
+date) cut with `…` to what is left of `room` display cells. A column no row fills is
+dropped. Every row comes back the same width, so a right-aligned key slot starts them all at
+one column; each is `\"\"` when no row has a field.
+
+    (plume/plume-columns [[\"C-x l\" \"Toggle\"] [\"\" \"Pick a theme\"]] 40)   ;=> (\"C-x l  Toggle      \" \"       Pick a theme\")"
+  (let (rows (map annotations annotation-fields)
+        widths (vec (map (range (fold rows 0 (fn (n row) (math/max n (count row)))))
+                      (fn (index)
+                        (fold rows
+                          0
+                          (fn (w row) (math/max w (string/display-width (nth row index ""))))))))
+        columns (seq/filter (range (count widths)) (fn (index) (> (nth widths index 0) 0))))
+    (if (empty? columns)
+      (map rows (fn (_) ""))
+      (let (lead (take columns (dec (count columns)))
+            final (last columns)
+            final-width (room-for-last (nth widths final 0)
+                          (- room (fold lead 0 (fn (w index) (+ w (nth widths index 0) 2))))))
+        (map rows
+          (fn (row)
+            (str (string/join (map lead
+                                (fn (index)
+                                  (str (fit-cells (nth row index "") (nth widths index 0)) "  ")))
+                   "")
+              (fit-cells (nth row final "") final-width))))))))
 
 (sig plume-clip (string int -> string))
 (defn plume-clip (s w)
