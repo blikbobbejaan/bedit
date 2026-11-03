@@ -256,9 +256,10 @@ the same answer without rebuilding it."
             table (wrap/rows-from buf
                     (ed-pane-top pane buf)
                     w
-                    (+ (inc (ed-pane-vrows pane buf)) skip)
-                    inlays))
-        (wrap/follow-point (if (= skip 0) table (into [] (drop table skip))) buf w))
+                    (inc (ed-pane-vrows pane buf))
+                    inlays
+                    skip))
+        (wrap/follow-point table buf w))
       nil)))
 
 (sig ed-pane-top-continued? (pane buffer -> bool))
@@ -488,13 +489,53 @@ from dividing the same screen up."
 ;; Characters lexed past the right edge on the per-line path, so a token straddling the edge
 ;; is still coloured by the rule that actually applies to it.
 
-(defn ed-fontify-clip (pane)
-  "How many characters of one line the per-line path lexes for `pane`: everything it could
-possibly show — its horizontal scroll plus its width — plus `ed-fontify-edge-slack`. A pane
-213 columns wide has no use for the thousandth character of a line, and lexing to the
-`*fontify-line-cap*` regardless was most of what the long-line path still cost."
-  (let ([px py pw ph] (or (:rect pane) [0 0 80 24]))
-    (+ (ed-pane-hscroll pane) (math/max 80 pw) ed-fontify-edge-slack)))
+(defn ed-fontify-clip (pane buf)
+  "The chars of each long line the per-line path lexes for `pane`, as `[low high lines]`:
+the char offsets `[low, high)` into a line it can show — its horizontal scroll to its width
+past it, `ed-fontify-edge-slack` either side — and, for a pane whose rows are counted
+(wrapped, truncated, scrolled per line — `scroll/ed-row-wise?`), `lines` mapping each line
+on screen to the `[low high]` its own rows show. What a pane shows of a megabyte line is a
+window of it: lexing from the line's start to the window, as this once did, cost the
+distance scrolled into the line, and the rows of a wrapped line far down it stayed plain.
+
+Data, so a band lexed for one window (`:clip` on it) is told from the window shown now."
+  (let ([px py pw ph] (or (:rect pane) [0 0 80 24])
+        hscroll (ed-pane-hscroll pane)
+        rows (when (ed-row-wise? buf (ed-row-extras buf)) (ed-pane-rows pane buf)))
+    [(math/max 0 (- hscroll ed-fontify-edge-slack))
+      (+ hscroll (math/max 80 pw) ed-fontify-edge-slack)
+      (if (nil? rows)
+        {}
+        (let (shown-by-line (fold rows
+                              {}
+                              (fn (acc row)
+                                (let (line (nth row 0)
+                                      from (nth row 1)
+                                      ;; a row cut short shows up to its clip's cut
+                                      shown (if (nth row 4 nil) (first (nth row 4)) (nth row 2))
+                                      held (get acc line))
+                                  (cond
+                                    (or (not (nil? (nth row 3 nil)))
+                                      (not (int? from))
+                                      (not (int? shown)))
+                                      acc
+                                    held
+                                      (assoc acc
+                                        line
+                                          [(math/min (first held) from)
+                                            (math/max (second held) shown)])
+                                    else (assoc acc line [from shown]))))))
+          (into {}
+            (map shown-by-line
+              (fn ([line [low high]])
+                [line [(math/max 0 (- low ed-fontify-edge-slack)) (+ high ed-fontify-edge-slack)]])))))]))
+
+(defn- ed-band-clip-ok (entry pane buf)
+  "`entry`, unless it is a long-line band lexed for another window of its lines than
+`pane` shows now (`:clip`, `ed-fontify-clip`) — then nil, so it is lexed again for this one."
+  (when entry
+    (let (clip (:clip entry))
+      (if (or (nil? clip) (= clip (ed-fontify-clip pane buf))) entry nil))))
 
 (sig ed-line-length (any int int int -> int))
 (defn- ed-line-length (rope nlines total line)
@@ -528,17 +569,26 @@ half of [[ed-long-lines?]], public only because `defmemo` defines a public funct
   (ed-long-lines-in? (buffer-rope buf) lo hi *fontify-line-cap*))
 
 (defn- ed-clipped-line-ranges (buf lo hi clip)
-  "The char range `[start end]` of each line in `[lo, hi)`, clipped to its first `clip`
-characters — what the long-line path colours, one line at a time."
+  "The char range `[start end]` of each line in `[lo, hi)` the long-line path colours, one
+line at a time: the window of it `clip` names (`ed-fontify-clip`'s `[low high lines]` — the
+line's own `[low high]` in `lines`, else `[low high]`), or, for an int `clip`, its first
+`clip` characters."
   (let (rope (buffer-rope buf)
         line-count (buffer-line-count buf)
-        total (buffer-length buf))
+        total (buffer-length buf)
+        [low high lines] (if (int? clip) [0 clip {}] clip))
     (map (range (math/max 0 lo) (math/min line-count hi))
       (fn (line)
-        (let (line-start (text/line->char rope line))
-          [line-start (+ line-start (math/min (ed-line-length rope line-count total line) clip))])))))
+        (let (line-start (text/line->char rope line)
+              length (ed-line-length rope line-count total line)
+              [from to] (get lines line [low high]))
+          ;; `if`, not `math/min`: these are rope offsets, ints, which `math/min` reads as numbers
+          (if (and (int? from) (int? to))
+            [(+ line-start (if (< from length) from length))
+              (+ line-start (if (< to length) to length))]
+            [line-start line-start]))))))
 
-(sig ed-clipped-line-spans (buffer any int int int -> seqable))
+(sig ed-clipped-line-spans (buffer any int int any -> seqable))
 (defn- ed-clipped-line-spans (buf fontify lo hi clip)
   "Spans for lines `[lo, hi)` lexed ONE LINE AT A TIME, each clipped to `clip` characters,
 in absolute coordinates. The long-line path."
@@ -650,7 +700,7 @@ compare: its tree's change ranges say whether it survives (`ed-tree-band-survive
      :base base
      :spans (shift-spans (fontify src) base)}))
 
-(sig ed-band-for (buffer any any int int int -> map))
+(sig ed-band-for (buffer any any int int any -> map))
 (defn- ed-band-for (buf fontify restart top vrows clip)
   "A fresh `:span-cache` entry for `buf`'s viewport `[top, top+vrows)`: spans lexed over
 that window widened by `ed-pane-margin` lines each side (so a later small scroll reuses
@@ -669,6 +719,9 @@ it), tagged with the rope, the `[blo bhi)` lines they cover, and the exact fonti
        :bhi band-high
        :src nil
        :base 0
+       ;; the window of its lines it was lexed for: another (a scroll, a row further down)
+       ;; is lexed again (`ed-band-clip-ok`)
+       :clip clip
        :spans (ed-clipped-line-spans buf fontify band-low band-high clip)}
       (ed-slice-entry buf
         fontify
@@ -711,7 +764,7 @@ of text no pane shows, not the parse."
 widened by `ed-pane-margin` each side (or, on the long-line path, just the viewport), marked
 `:tree? true` so `ed-tree-band-survives?` may keep it across an edit the tree says left it
 alone. Nil when the handle is gone — the caller falls back to the slice band."
-  (let ([_ band-low band-high] (ed-band-lines buf top vrows)
+  (let ([long? band-low band-high] (ed-band-lines buf top vrows)
         spans (ed-tree-range-spans buf (:tree tree-entry) faces band-low band-high clip))
     (when spans
       {:rope (buffer-rope buf)
@@ -721,6 +774,8 @@ alone. Nil when the handle is gone — the caller falls back to the slice band."
        :src nil
        :base 0
        :tree? true
+       ;; a long-line band holds only the window it was coloured for (`ed-band-clip-ok`)
+       :clip (when long? clip)
        :spans spans})))
 
 (defn- ed-tree-band-survives? (entry tree-entry buf top vrows)
@@ -841,7 +896,12 @@ nil when there is no current tree (or no face table), so the caller lexes a slic
   (let (found (ed-pane-tree m pane buf))
     (when found
       (let ([tree-entry faces] found)
-        (ed-tree-range-spans buf (:tree tree-entry) faces top (+ top vrows) (ed-fontify-clip pane))))))
+        (ed-tree-range-spans buf
+          (:tree tree-entry)
+          faces
+          top
+          (+ top vrows)
+          (ed-fontify-clip pane buf))))))
 
 ;; ---- bands coloured from a line-state cache (brood ADR-471) --------------------
 ;; A lexer mode with a `:line-lexer` (markdown, org, the `lex-*` formats) keeps the lines it
@@ -907,7 +967,7 @@ markup is gone — serves those instead: absolute already, valid as long as the 
       static static
       (nil? fontify) nil
       else
-        (let (entry (map/get-in m [:span-cache (:path pane)]))
+        (let (entry (ed-band-clip-ok (map/get-in m [:span-cache (:path pane)]) pane buf))
           ;; the common frame — same rope, viewport inside the band — answers before the
           ;; `:fontify-restart` lookup, which only the off-band-edit revalidation reads
           (if (ed-band-hits? entry buf top vrows)
@@ -934,7 +994,7 @@ markup is gone — serves those instead: absolute already, valid as long as the 
                         restart
                         top
                         (+ top vrows)
-                        (ed-fontify-clip pane)))))))))))
+                        (ed-fontify-clip pane buf)))))))))))
 
 (sig ed-layout-now (model -> (or nil layout)))
 (defn ed-layout-now (m)
@@ -1041,6 +1101,8 @@ mode does not fontify."
     (if (nil? fontify)
       [nil caches]
       (let (top (ed-pane-top pane buf)
+            ;; a long-line band lexed for another window of its lines is not this one's
+            old (ed-band-clip-ok old pane buf)
             vrows (ed-pane-vrows pane buf))
         ;; as `ed-pane-spans`: the unchanged band is recognised before the restart lookup
         ;; …but a carried band is only kept by `ed-behind-tree-band`, while the tree is out
@@ -1056,7 +1118,7 @@ mode does not fontify."
               (and faces (ed-tree-band-survives? old tree-entry buf top vrows))
                 [(assoc old :rope (buffer-rope buf)) caches]
               faces
-                [(or (ed-tree-band-for tree-entry faces buf top vrows (ed-fontify-clip pane))
+                [(or (ed-tree-band-for tree-entry faces buf top vrows (ed-fontify-clip pane buf))
                    (ed-slice-band buf fontify old top vrows pane))
                   caches]
               (nil? builder) [(ed-slice-band buf fontify old top vrows pane) caches]
@@ -1083,10 +1145,10 @@ the viewport, or a viewport on the long-line path, goes to `ed-band-for`."
                  (ed-band-window old buf top vrows restart)))
     (cond
       (ed-band-hits? old buf top vrows) old
-      (nil? window) (ed-band-for buf fontify restart top vrows (ed-fontify-clip pane))
+      (nil? window) (ed-band-for buf fontify restart top vrows (ed-fontify-clip pane buf))
       (= window [(:src old) (:base old)]) old
       (ed-long-lines? buf top (+ top vrows))
-        (ed-band-for buf fontify restart top vrows (ed-fontify-clip pane))
+        (ed-band-for buf fontify restart top vrows (ed-fontify-clip pane buf))
       else (ed-slice-entry buf fontify (:blo old) (:bhi old) window))))
 
 (defn- ed-refreshed-gutter-entry (old pane buf)

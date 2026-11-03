@@ -245,8 +245,12 @@ a later cell (point's line scrolled sideways, `follow-point`) it measures up to 
 ;; layout, never a wrong one, since every entry is checked against the text it is asked for.
 (def- *layout-min-chars* 4096) ; a line this long keeps its layout; a shorter one is cheap to redo
 (def- *layout-capacity* 4)
-(def- *tab-width* 8) ; `string/display-width`'s stops, which the rows are measured by
-(def *line-layouts* '()) ; `{:rope :start :length :w :layout}`, newest first
+(defn layout-tab-width ()
+  "The tab stops a kept layout was measured by — part of its key, so a buffer laid out at
+another tab width is laid out again: `*tab-width*` (brood ADR-537), which [[rows-from]]
+binds to the buffer's own (`conventions/tab-width`) and every measurement below reads."
+  *tab-width*)
+(def *line-layouts* '()) ; `{:rope :start :length :w :tab-width :layout}`, newest first
 
 (sig segment-index (vector int -> int))
 (defn- segment-index (segs at)
@@ -284,10 +288,12 @@ the one glyph whose width depends on its column)."
               (let (k (segment-index old-segs (- from delta)))
                 (when (= (first (nth old-segs k)) (- from delta)) k)))
           moved (when (int? j) (- col (nth old-cols j))))
-      (if (and (int? j) (int? moved) (or (= (math/mod moved *tab-width*) 0) (< old-tab-row j)))
+      (if (and (int? j)
+            (int? moved)
+            (or (= (math/mod moved (layout-tab-width)) 0) (< old-tab-row j)))
         [(into segs
            (map (seq/subvec old-segs j (count old-segs))
-             (fn (seg) [(+ (first seg) delta) (+ (second seg) delta)])))
+             (fn ([from to]) [(+ from delta) (+ to delta)])))
           (into cols (map (seq/subvec old-cols j (count old-cols)) (fn (c) (+ c moved))))
           (if (< old-tab-row j) tab-row (+ (- old-tab-row j) (count segs)))]
         (let (to (break-at source from col w)
@@ -331,7 +337,7 @@ it — or nil when the entry is of another line, another width, or an edit it ca
         old-len (:length entry)
         same? (and (= old-start start) (= old-len len)))
     (cond
-      (not (= (:w entry) w)) nil
+      (not (and (= (:w entry) w) (= (:tab-width entry) (layout-tab-width)))) nil
       (= old rope) (when same? (:layout entry))
       else
         (let (change (text/changed-range old rope)
@@ -369,6 +375,7 @@ there can answer (`layout-from-entry`), else laid out whole — and kept either 
         exact (seq/find *line-layouts*
                 (fn (entry)
                   (and (= (:w entry) w)
+                    (= (:tab-width entry) (layout-tab-width))
                     (= (:start entry) start)
                     (= (:length entry) len)
                     (= (:rope entry) rope)))))
@@ -379,7 +386,13 @@ there can answer (`layout-from-entry`), else laid out whole — and kept either 
                     (fn (acc entry) (if (nil? acc) (layout-from-entry entry rope start len w) acc)))
             result (or found (layout source w)))
         (def *line-layouts*
-          (take (cons {:rope rope :start start :length len :w w :layout result} *line-layouts*)
+          (take (cons {:rope rope
+                       :start start
+                       :length len
+                       :w w
+                       :tab-width (layout-tab-width)
+                       :layout result}
+                  *line-layouts*)
             *layout-capacity*))
         result))))
 
@@ -499,15 +512,14 @@ wrapped, or one row, as its policy in the row `extras` says (`rope-line-segments
 segments — none at all when a fold hides it. What a walk up or down the lines counts."
   (rope-line-rows (buffer-rope buf) line w extras))
 
-(defn- inlay-rows (inlays line limit acc)
-  "`acc` plus `line`'s inlay rows — `[line 0 nil text]` each — up to `limit`."
-  (fold (get inlays line [])
-    acc
-    (fn (a text) (if (>= (count a) limit) a (conj a [line 0 nil text])))))
+(defn- inlay-rows (texts line limit acc)
+  "`acc` plus inlay rows `[line 0 nil text]`, one per text of `texts`, up to `limit`."
+  (fold texts acc (fn (a text) (if (>= (count a) limit) a (conj a [line 0 nil text])))))
 
-(sig rows-step (any int int int int map vector -> vector))
-(defn- rows-step (rope n line w limit inlays acc)
-  "Tail-recursive: `acc` plus the rows of `line` and the lines after it, up to `limit`."
+(sig rows-step (any int int int int map int vector -> vector))
+(defn- rows-step (rope n line w limit inlays skip acc)
+  "Tail-recursive: `acc` plus the rows of `line` and the lines after it, up to `limit` — the
+first `skip` of `line`'s own rows left out (a pane started part-way down its top line)."
   (if (or (>= line n) (>= (count acc) limit))
     acc
     (rows-step rope
@@ -516,13 +528,18 @@ segments — none at all when a fold hides it. What a walk up or down the lines 
       w
       limit
       inlays
+      0
       (if (hidden? inlays line)
         acc
-        (let (with-inlays (inlay-rows inlays line limit acc)
+        (let (texts (get inlays line [])
+              with-inlays (inlay-rows (drop texts skip) line limit acc)
               segs (rope-line-segments rope line w inlays)
-              ;; only the rows the table has room for: a wrapped megabyte line has thousands
-              room (math/max 0 (- limit (count with-inlays))))
-          (fold (if (< room (count segs)) (seq/subvec segs 0 room) segs)
+              ;; the rows above the pane's start, and past what the table has room for, are
+              ;; never built: a wrapped megabyte line has thousands
+              from (math/min (count segs) (math/max 0 (- skip (count texts))))
+              room (math/max 0 (- limit (count with-inlays)))
+              to (math/min (count segs) (+ from room)))
+          (fold (seq/subvec segs from to)
             with-inlays
             (fn (a seg)
               ;; a clipped row keeps its clip as a fifth field, for the painter and a click
@@ -530,7 +547,7 @@ segments — none at all when a fold hides it. What a walk up or down the lines 
                 (conj a [line (first seg) (second seg) nil (nth seg 2)])
                 (conj a [line (first seg) (second seg) nil])))))))))
 
-;; The row table is memoised (`defmemo`, std/memo) on `[rope top w limit inlays]`: it is
+;; The row table is memoised (`defmemo`, std/memo) on `[rope top skip w limit inlays]`: it is
 ;; asked from the pure `view`, from three hit-test sites in `panes`, and from
 ;; `input/ed-point-into-view`, so there is no model to hang a cache on — and the table is a
 ;; pure function of those.
@@ -545,9 +562,9 @@ segments — none at all when a fold hides it. What a walk up or down the lines 
 ;; the memoised function takes the ROPE, not the buffer. Matched by `=`, not hashed: this
 ;; cache used to be a map keyed on the rope, and a rope hashes by its whole text.
 
-(defmemo rope-rows 8 (rope top w limit inlays)
+(defmemo rope-rows 8 (rope top skip w limit inlays)
   "The row table for `rows-from`, memoised on exactly what it depends on."
-  (rows-step rope (text/line-count rope) top w limit inlays []))
+  (rows-step rope (text/line-count rope) top w limit inlays skip []))
 
 (sig rows-from
   (buffer int
@@ -555,18 +572,23 @@ segments — none at all when a fold hides it. What a walk up or down the lines 
     int
     &optional
     map
+    int
     ->
     (vector (or (tuple int int (or nil int) (or nil string)) (tuple int int int nil vector)))))
 ;; check-allow: the cache only ever holds what `rows-step` built, so a hit has the declared
 ;; shape by construction — but it comes back out of the memo's store, which the checker
 ;; reads as unknown.
 (check-allow :trusted
-  (defn rows-from (buf top w limit &optional (inlays {}))
+  (defn rows-from (buf top w limit &optional (inlays {}) (skip 0))
     "The first `limit` screen rows from buffer line `top` down, each
 `[line from to inlay]` (and a fifth field, the CLIP, on a row cut short — see
 `one-row`) — a line's inlay rows, then its text segments in order, then the
 next line's — stopping at the buffer's end. What a `w`-wide, `limit`-tall pane shows; the
 row↔line owner's table. Memoised on its inputs — see `rope-rows`.
+
+With `skip`, the first `skip` rows of line `top` (its inlay rows, then its segments) are left
+out: a pane started part-way down a wrapped line asks for the rows from its start, and the
+rows above it are never built.
 
 `inlay` is nil for a row of the buffer's own text, and the derived text to paint for an
 INLAY row (`{line -> [text …]}` in `inlays`, keyed by the line each sits above). A reader
@@ -575,7 +597,7 @@ region fills — must skip the inlay rows; `panes/ed-rows-line-rows` is that fil
 everything in the editor goes through it. A tab spans to the BUFFER's stops
 (`conventions/tab-width`, bound as `*tab-width*` — brood ADR-537)."
     (binding (*tab-width* (conventions/tab-width buf))
-      (rope-rows (buffer-rope buf) (math/max 0 top) w limit (or inlays {})))))
+      (rope-rows (buffer-rope buf) (math/max 0 top) (math/max 0 skip) w limit (or inlays {})))))
 
 (sig row-of (any int -> int))
 (defn row-of (segs col)
