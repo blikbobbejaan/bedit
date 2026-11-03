@@ -32,6 +32,8 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use keyhelp) ; key / command labels, where-is, docstrings
   (:use scroll) ; ed-scroll / ed-max-top / ed-long-lines — keeping point on screen
   (:use autosave) ; auto-save sidecars + auto-revert
+  ;; a buffer's indent width / tab width / tabs / fill column, by mode, init.blsp and .editorconfig
+  (:use conventions :only [with-indent-width indent-width tab-width fill-column indentation])
   (:use model)) ; current-buffer accessors, the kill ring, message
 ;; Tree-sitter's structural motions (ruby/elixir-mode) are REQUIRED, not `:use`d. They
 ;; share several names with `sexp` — `point-defun-start`, `point-down`, … — and two `:use`s
@@ -415,28 +417,30 @@ walks it instead of parsing the text."
   ;; reads only the lines it inspects (brood ADR-483); a Lisp mode's (`brood-indent`,
   ;; `lisp-modes/lisp-indent-with`) finds its top-level form with the rope-native form scan
   ;; and copies that form out (brood ADR-488). RET in a large file flattens nothing.
+  ;; A tree-sitter indenter counts a level as the buffer's indent width
+  ;; (`conventions/indent-width` — its .editorconfig, the user's setting for the mode, the
+  ;; language's own), handed over as `conventions/*indent-width*`.
   (let (bol (buffer-point (beginning-of-line buf))
         svc (ed-mode-service buf :indent)
         lang (ed-mode-service buf :ts-lang)
         tree (when lang (held-tree-for held buf lang)))
-    (cond
-      (nil? svc) (ed-fallback-indent (buffer-rope buf) bol)
-      ;; only a tree-sitter mode has a tree, and its `deflanguage` indenter takes one
-      tree (svc (buffer-rope buf) bol tree)
-      else (svc (buffer-rope buf) bol))))
+    (with-indent-width (indent-width buf)
+      (fn ()
+        (cond
+          (nil? svc) (ed-fallback-indent (buffer-rope buf) bol)
+          ;; only a tree-sitter mode has a tree, and its `deflanguage` indenter takes one
+          tree (svc (buffer-rope buf) bol tree)
+          else (svc (buffer-rope buf) bol))))))
 
 (sig ed-reindent-line (buffer int -> buffer))
-(def ed-indent-tab-width 8) ; the columns a tab stands for when a mode indents with tabs
 
 (sig ed-indentation (buffer int -> string))
 (defn ed-indentation (buf target)
-  "The leading whitespace that reaches column `target` in `buf`: spaces, or — when its mode
-indents with tabs (the `:indent-tabs` facet; Go, Makefiles) — tabs, then spaces for the rest
-(Emacs `indent-tabs-mode`)."
-  (if (= true (ed-mode-service buf :indent-tabs))
-    (str (string/repeat "\t" (math/quot target ed-indent-tab-width))
-      (string/repeat " " (math/mod target ed-indent-tab-width)))
-    (string/repeat " " target)))
+  "The leading whitespace that reaches column `target` in `buf`: spaces, or — when it indents
+with tabs (Emacs `indent-tabs-mode`: Go and Makefiles by default, or as its .editorconfig or
+the user's `:indent-tabs` says) — tabs of its tab width, then spaces for the rest
+(`conventions/indentation`)."
+  (indentation buf target))
 
 (defn ed-reindent-line (buf target)
   "Reindent the current line of `buf` to `target` columns (`ed-indentation` — spaces, or
@@ -464,7 +468,6 @@ brood-mode, the previous line elsewhere (`M-x indent-line`)."
 
 ;; ---- region indent / dedent (TAB / Shift-TAB on a selection) ----------------
 
-(def ed-tab-width 2) ; columns Shift-TAB removes per dedent (brood indents by 2)
 (defn- ed-region-lines (buf)
   "`[first last]` (0-based, inclusive) — the lines the active region spans, or nil. The
 last line holds the last *selected* char, so a region ending at a line start doesn't pull
@@ -559,26 +562,52 @@ so a repeated TAB keeps acting on the same block (TAB on a region, `indent-regio
 
 (sig ed-dedent-line-at (buffer int int -> buffer))
 (defn ed-dedent-line-at (buf ln width)
-  "Remove up to `width` leading spaces/tabs from line `ln`; a no-op on a line with none."
+  "Move line `ln`'s text up to `width` COLUMNS left — its indentation rewritten at the
+column that leaves (`ed-indentation`: tabs where the buffer indents with them), so a tab
+counts as the columns it spans rather than one; a no-op on a line with none."
   (let (rope (buffer-rope buf)
         bol (text/line->char rope ln)
-        drop-n (math/min width (ed-rope-leading-ws rope bol)))
-    (if (= drop-n 0) buf (replace-region buf bol (+ bol drop-n) ""))))
+        length (ed-rope-leading-ws rope bol)
+        leading (text/slice rope bol (+ bol length))
+        column (string/display-width leading 0 (tab-width buf))
+        indentation (ed-indentation buf (math/max 0 (- column width))))
+    (if (or (= length 0) (= indentation leading))
+      buf
+      (replace-region buf bol (+ bol length) indentation))))
 
 (defcommand cmd-dedent
   (m key)
-  "Shift-TAB: dedent — remove up to a tab-width of leading whitespace from the current
+  "Shift-TAB: dedent — remove up to one indent level (the buffer's indent width:
+`conventions/indent-width`, 4 in Python, 2 in Brood) of leading whitespace from the current
 line, or from every line of the active region (one undo step, keeping the region)."
-  (let (buf (ed-current-buf m) rl (ed-region-lines buf))
+  (let (buf (ed-current-buf m)
+        rl (ed-region-lines buf)
+        width (indent-width buf))
     (if (nil? rl)
-      (ed-edit m (fn (b) (ed-dedent-line-at b (buffer-current-line b) ed-tab-width)))
+      (ed-edit m (fn (b) (ed-dedent-line-at b (buffer-current-line b) width)))
       (let ([first last] rl)
         (ed-edit m
           (fn (b)
-            (ed-map-region-lines b
-              first
-              last
-              (fn (bb ln) (ed-dedent-line-at bb ln ed-tab-width)))))))))
+            (ed-map-region-lines b first last (fn (bb ln) (ed-dedent-line-at bb ln width)))))))))
+
+(defcommand cmd-describe-indentation
+  (m key)
+  "Say the current buffer's indent width, tabs or spaces, tab width and fill column, and
+where each comes from — its .editorconfig, init.blsp, its mode (M-x describe-indentation)."
+  (message m (conventions/summary (ed-current-buf m))))
+
+(defcommand cmd-set-fill-column
+  (m key)
+  "Set the current buffer's fill column (M-q's width) to the prefix argument, or without one
+to point's column (Emacs `set-fill-column`, M-x set-fill-column) — this buffer only, over
+its .editorconfig and init.blsp."
+  (let (buf (ed-current-buf m)
+        column (or (current-prefix-arg m) (buffer-column buf)))
+    (if (< column 1)
+      (message m "fill column must be at least 1")
+      (message (ed-set-buf m (conventions/with-buffer-setting buf :fill-column column))
+        (str "fill column set to " column)))))
+(register-prefix-consuming 'commands/cmd-set-fill-column)
 
 (defcommand cmd-indent-sexp
   (m key)
@@ -1266,11 +1295,11 @@ on: nothing you cycle through is lost."
 ;; share it. This command is just the editor *policy*: find the paragraph, wrap it, put
 ;; it back (preserving the trailing blank-line separation).
 
-(defdyn *fill-column* 70)
-
 (defcommand cmd-fill-paragraph
   (m key)
-  "Re-wrap the paragraph around point to `*fill-column*` (M-q), preserving the blank-line
+  "Re-wrap the paragraph around point to the buffer's fill column (M-q;
+`conventions/fill-column` — its .editorconfig's `max_line_length`, the user's
+`:fill-column`, the mode's, else 70), preserving the blank-line
 separation after it. The paragraph's prefix — its indentation and a comment or quote marker
 (`string/fill-prefix`) — is kept on every line: without it, `;; aa` / `;; bb` came back as
 `;; aa ;; bb` and an indented paragraph lost its indentation."
@@ -1285,7 +1314,7 @@ separation after it. The paragraph's prefix — its indentation and a comment or
                 ;; the prefix as the paragraph's first non-blank line spells it
                 first-line (first (seq/reject (string/split para "\n")
                                     (fn (l) (= (string/trim l) ""))))
-                filled (string/fill para *fill-column* (string/fill-prefix (or first-line ""))))
+                filled (string/fill para (fill-column b) (string/fill-prefix (or first-line ""))))
             (replace-region b s e (if (string/ends-with? para "\n") (str filled "\n") filled))))))))
 
 ;; ---- read-only toggle / spit / revert (C-x C-q / C-x C-w / revert) ----
@@ -2927,7 +2956,7 @@ indentation is the part anyone wants converted."
   "Apply a whitespace transform over `ed-replace-span` and report."
   (let ([lo hi] (ed-replace-span m)
         before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
-        after (f before ed-tab-width))
+        after (f before (tab-width (ed-current-buf m))))
     (if (= before after)
       (message m (str "nothing to " verb))
       (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))

@@ -1,0 +1,209 @@
+(defmodule conventions
+  "The layout CONVENTIONS a buffer is edited with — indent width, tab width, tabs or spaces
+(Emacs `indent-tabs-mode`), fill column — resolved per buffer, and what a save does for a
+file whose `.editorconfig` asks (trailing whitespace, the final newline).
+
+Each value is the first of, most specific first:
+
+  1. the buffer's own (`:conventions` on the buffer — M-x set-fill-column)
+  2. the file's `.editorconfig` (`editorconfig`), read when the buffer was made
+  3. the user's init.blsp entry for the buffer's MODE (`:indent-width {python 4}`), the
+     most specific layer in its stack winning, as `scroll/ed-mode-key` finds it — so
+     `prog` reaches every code mode, as a `prog-mode-hook` does
+  4. the mode's own convention, a facet on its layer (`:indent-width 4` on python-mode,
+     declared once in its `deflanguage` spec; `:indent-tabs true` on Go and Makefiles)
+  5. the user's `:default` (or a bare value) for the setting
+  6. Emacs's defaults: an indent of 2, a tab of 8, spaces, a fill column of 70
+
+`.editorconfig` beats the user's per-mode setting because it is the PROJECT's statement of
+how its files are laid out, and a contributor editing someone else's repository should
+write what it says whatever their own taste — Emacs's editorconfig package applies it after
+the mode hooks for the same reason. `:editorconfig false` in init.blsp turns it off.
+
+An indent width may be `:tab`: one level is one tab, as wide as the tab width (Go, Makefiles,
+EditorConfig's `indent_size = tab`)."
+  (:use editor/buffer) ; buffer-rope / replace-region / amalgamate-undo — the save fix-ups
+  (:use model :only [ed-mode-service])
+  (:use scroll :only [ed-mode-key]))
+
+(def *builtin-defaults*
+  ;; Emacs's: `standard-indent` is 4 there, but bedit's text and Lisp buffers have always
+  ;; indented by 2, and a language that wants more says so
+  {:indent-width 2 :tab-width 8 :indent-tabs false :fill-column 70})
+
+(defdyn *user-settings* {})
+;; The init file's `:indent-width` / `:tab-width` / `:indent-tabs` / `:fill-column`, each a
+;; value or a per-mode map; re-bound by `config/apply-to-model` (`set-user-settings`) the way
+;; `scroll` holds `:long-lines`, since the indent commands have a buffer and no model.
+
+(defdyn *indent-width* nil)
+;; The indent width a tree-sitter indenter counts a level as, bound by
+;; `commands/ed-indent-target` around the `:indent` service call; nil leaves the language's
+;; own `:width`. A dynamic rather than an argument because the `:indent` service contract is
+;; `(text bol)` and the Lisp indenters, which are structural, take nothing more.
+
+(defn with-indent-width (width thunk)
+  "`(thunk)`, with a tree-sitter indenter counting a level as `width` columns
+(`*indent-width*`) — `commands/ed-indent-target` around its `:indent` service call."
+  (binding (*indent-width* width) (thunk)))
+
+(defn bound-indent-width ()
+  "The indent width [[with-indent-width]] bound, or nil outside one — what a generated
+`deflanguage` indenter counts a level as (`languages/spec-indent`)."
+  *indent-width*)
+
+(defn set-user-settings (settings)
+  "Make `settings` — `{:indent-width :tab-width :indent-tabs :fill-column :editorconfig}` from
+init.blsp — the user's. `config/apply-to-model` calls it at startup and on M-x reload-config."
+  ;; `defdyn`, not `def`: a `def` over a dynamic variable makes it a plain global, which a
+  ;; `binding` (a test's) can no longer rebind
+  (defdyn *user-settings* (dissoc settings :editorconfig))
+  (editorconfig/set-enabled (not (= false (:editorconfig settings))))
+  nil)
+
+(defn- user-value (key buf)
+  ;; `[found? value]`: the user's entry for `buf`'s mode, else nil
+  (let (setting (get *user-settings* key))
+    (when (map? setting)
+      (let (mode-key (ed-mode-key setting buf)) (when mode-key [true (get setting mode-key)])))))
+
+(defn- user-default (key)
+  (let (setting (get *user-settings* key))
+    (cond
+      (nil? setting) nil
+      (map? setting) (get setting :default)
+      else setting)))
+
+(defn setting (buf key)
+  "The value of convention `key` (`:indent-width` `:tab-width` `:indent-tabs` `:fill-column`)
+for `buf`, by the precedence the module describes. An `:indent-width` may come back `:tab`
+here; [[indent-width]] resolves it."
+  (let (own (get (:conventions buf) key)
+        from-file (get (:editorconfig buf) key)
+        user (user-value key buf)
+        facet (ed-mode-service buf key)
+        fallback (user-default key))
+    (cond
+      (not (nil? own)) own
+      (not (nil? from-file)) from-file
+      (and user (not (nil? (second user)))) (second user)
+      (not (nil? facet)) facet
+      (not (nil? fallback)) fallback
+      else (get *builtin-defaults* key))))
+
+(defn source (buf key)
+  "Where `buf`'s convention `key` comes from: `:buffer`, `:editorconfig`, `:user-mode` (the
+user's entry for its mode), `:mode`, `:user-default` or `:builtin` — for describing it."
+  (cond
+    (not (nil? (get (:conventions buf) key))) :buffer
+    (not (nil? (get (:editorconfig buf) key))) :editorconfig
+    (let (user (user-value key buf)) (and user (not (nil? (second user))))) :user-mode
+    (not (nil? (ed-mode-service buf key))) :mode
+    (not (nil? (user-default key))) :user-default
+    else :builtin))
+
+(defn tab-width (buf)
+  "The columns a tab spans in `buf` (Emacs `tab-width`)."
+  (let (width (setting buf :tab-width)) (if (and (int? width) (> width 0)) width 8)))
+
+(defn indent-width (buf)
+  "The columns one indent level is in `buf` — what TAB indents by, Shift-TAB dedents by — a
+`:tab` width being the tab width."
+  (let (width (setting buf :indent-width))
+    (cond
+      (= width :tab) (tab-width buf)
+      (and (int? width) (> width 0)) width
+      else 2)))
+
+(defn indent-tabs? (buf)
+  "True when indentation in `buf` is written with tabs (Emacs `indent-tabs-mode`)."
+  (= true (setting buf :indent-tabs)))
+
+(defn fill-column (buf)
+  "The column `buf`'s text is filled to (M-q; Emacs `fill-column`)."
+  (let (column (setting buf :fill-column)) (if (and (int? column) (> column 0)) column 70)))
+
+(defn indentation (buf column)
+  "The leading whitespace that reaches `column` in `buf`: spaces, or — when it indents with
+tabs — tabs of its tab width, then spaces for the rest."
+  (if (indent-tabs? buf)
+    (let (width (tab-width buf))
+      (str (string/repeat "\t" (math/quot column width))
+        (string/repeat " " (math/mod column width))))
+    (string/repeat " " column)))
+
+(defn with-buffer-setting (buf key value)
+  "`buf` with its own convention `key` set to `value` (nil clears it) — above every other
+source until the buffer is killed."
+  (let (own (or (:conventions buf) {}))
+    (assoc buf :conventions (if (nil? value) (dissoc own key) (assoc own key value)))))
+
+;; ---- what a save does --------------------------------------------------------------------
+
+(defn- trailing-run (rope line)
+  ;; `[from to]`: the spaces and tabs ending `line`, before its `\r\n` or `\n`; nil for none
+  (let (start (text/line->char rope line)
+        body (string/drop-suffix (string/drop-suffix (text/line rope line) "\n") "\r")
+        end (+ start (string/length body))
+        found (regex/find "[ \t]+$" body))
+    (when found [(- end (string/length (:text found))) end])))
+
+(defn- trim-trailing (buf)
+  ;; every line's trailing spaces and tabs removed, bottom up so the offsets above stay put,
+  ;; as ONE undo step
+  (let (rope (buffer-rope buf)
+        runs (seq/keep (reverse (range (text/line-count rope)))
+               (fn (line) (trailing-run rope line))))
+    ;; `amalgamate-undo` marks the NEXT edit as joining the last, so it goes before every
+    ;; edit but the first
+    (fold runs
+      buf
+      (fn (acc [from to])
+        (replace-region (if (= from (first (first runs))) acc (amalgamate-undo acc)) from to "")))))
+
+(defn prepare-for-save (buf)
+  "`buf` as its `.editorconfig` asks it to be written: trailing whitespace trimmed
+(`trim_trailing_whitespace = true`) and a final newline added (`insert_final_newline = true`)
+— edits on the buffer, as Emacs's before-save hook makes them, so what is on disk is what is
+shown. Unchanged when the file asks for neither."
+  (let (asks (or (:editorconfig buf) {})
+        trimmed (if (= true (:trim-trailing-whitespace asks)) (trim-trailing buf) buf)
+        length (text/length (buffer-rope trimmed)))
+    (if (and (= true (:insert-final-newline asks))
+          (> length 0)
+          (not (= (text/slice (buffer-rope trimmed) (dec length) length) "\n")))
+      (let (point (buffer-point trimmed)
+            joined (if (= (buffer-rope trimmed) (buffer-rope buf))
+                     trimmed
+                     (amalgamate-undo trimmed)))
+        (goto-char (replace-region joined length length "\n") point))
+      trimmed)))
+
+(defn summary (buf)
+  "One line saying `buf`'s conventions and where each came from — M-x describe-indentation."
+  (let (labels {:buffer "this buffer"
+                :editorconfig ".editorconfig"
+                :user-mode "init.blsp, this mode"
+                :mode "the mode"
+                :user-default "init.blsp"
+                :builtin "default"}
+        from (fn (key) (get labels (source buf key))))
+    (str "indent "
+      (indent-width buf)
+      " ("
+      (from :indent-width)
+      ") · "
+      (if (indent-tabs? buf) "tabs" "spaces")
+      " ("
+      (from :indent-tabs)
+      ") · "
+      "tab "
+      (tab-width buf)
+      " ("
+      (from :tab-width)
+      ") · "
+      "fill "
+      (fill-column buf)
+      " ("
+      (from :fill-column)
+      ")")))

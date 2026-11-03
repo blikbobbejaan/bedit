@@ -321,6 +321,18 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             the loop, and a live swap — drop a new .so in and reload, no
                             restart. An install or reload retypes every open line-lexer
                             stand-in as its parsed mode (`model/ed-grammars-arrived`)
+src/conventions.blsp        a buffer's INDENT WIDTH, TAB WIDTH, tabs-or-spaces and FILL COLUMN,
+                            resolved per buffer: its own (M-x set-fill-column) > its
+                            .editorconfig > the user's init.blsp entry for its mode > the mode's
+                            convention (a `deflanguage`'s indent `:width`, `:indent-tabs`,
+                            `:fill-column`: Python 4 / 79, Go a tab) > the user's `:default` >
+                            Emacs's. TAB / RET's indenter, Shift-TAB, M-q, tabify read it; a save
+                            trims and adds the final newline when .editorconfig asks.
+                            M-x describe-indentation says where each value came from
+src/editorconfig.blsp       `.editorconfig` (editorconfig.org): the parser, the section globs
+                            (`*` `**` `?` `[…]` `{a,b}` `{1..9}`), the walk up to `root = true`, and
+                            the result in the editor's terms — read once when a file buffer is
+                            made (`model/ed-stamp`). bedit's, not std's: nothing else wants it yet
 src/formatter.blsp          M-x format-buffer + format-on-save: the language's own
                             formatter (mix format, black, rubocop), declared per language
                             and run over the FILE, so a failing formatter costs nothing
