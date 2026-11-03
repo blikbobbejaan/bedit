@@ -2054,6 +2054,19 @@ supervised logger, so routes survive a restart."
 ;; Cap the ring like Emacs's `kill-ring-max` (default 60) so it can't grow forever.
 (def ed-kill-ring-max 60)
 
+;; ---- the user's clipboard: which one, and how it is reached ----------------------
+;; A model names the clipboard it shares its kills with, if any: the local window's OS
+;; clipboard (`:os-clipboard`), or — for a session served to a window elsewhere — the
+;; clipboard of the machine that window runs on (`:client-clipboard`, brood's
+;; `editor/serve/client-clipboard-*`, ADR-539). Never the daemon's: the user is not sitting
+;; at it, and on a shared host it is someone else's. Pure test models name neither.
+;;
+;; Writing is always a cast. Reading comes in two shapes: [[ed-clipboard-read]] answers now,
+;; for what cannot wait (a prompt's or a search's C-y); [[ed-clipboard-ask]] answers LATER,
+;; through a continuation, so a clipboard on the other end of a link costs the loop nothing
+;; while it answers. C-y in a buffer asks.
+
+;;
 ;; Reading the OS clipboard waits on the app that owns it — an X11 round trip on a fresh
 ;; display connection, a Wayland pipe — and a slow or wedged owner froze the window inside
 ;; every C-y (brood ADR-536 makes the read a blocking call the slow-turn log names). Nothing
@@ -2064,15 +2077,6 @@ supervised logger, so routes survive a restart."
 ;; The editor's own kills keep it known — they set the clipboard themselves. Until a read has
 ;; landed (the first instant after focus, a frontend that reports no focus — a terminal) a
 ;; yank reads it as it always did.
-
-(defn ed-adopt-clipboard-text (m clip)
-  "`m` with `clip` — what the OS clipboard holds — consed onto the kill ring as its freshest
-entry when it is text the ring's head is not (something copied in another app since our last
-kill). Emacs's `interprogram-paste-function`."
-  (let (ring (:kill-ring m))
-    (if (and (string? clip) (not (= clip "")) (not (= clip (first ring))))
-      (assoc m :kill-ring (take (cons clip ring) ed-kill-ring-max))
-      m)))
 
 (defdyn *clipboard-reader* os/clipboard-get)
 ;; What reads the OS clipboard — a `() -> text-or-nil`; a test binds a stand-in. Captured
@@ -2110,17 +2114,17 @@ captured now — stamped with the epoch it was asked under and when."
       :clipboard-asked-epoch (:clipboard-epoch m 0)
       :clipboard-read-at (os/now))))
 
-(defn ed-adopt-clipboard (m)
-  "If the OS clipboard holds text that isn't already the kill-ring head (i.e. something
-was copied in another app since our last kill), cons it on as the freshest entry so the
-next yank inserts it. Off unless the model opts into the OS clipboard (`:os-clipboard`, set
-by the live editor). What the clipboard holds is KNOWN once the read the window's focus
-started has landed ([[ed-clipboard-focus]]), and then nothing is read here; until then it is
-read now, best-effort: a missing / unavailable clipboard leaves the ring untouched."
+(defn ed-clipboard-read (m)
+  "The text on the clipboard model `m` shares, read NOW, or nil. The local window's OS
+clipboard (`:os-clipboard`): what the last off-loop read found once one has landed
+([[ed-clipboard-focus]], [[ed-clipboard-refresh]]) — nothing is read on the loop then — and
+until then a read now, best-effort. nil for a served session, whose client's clipboard is
+only ever asked ([[ed-clipboard-ask]]) — a read that waited on the link would stop the loop
+— and for a model with neither. A clipboard that cannot be read is nil, said in the log."
   (cond
-    (not (:os-clipboard m)) m
-    (:clipboard-known? m) (ed-adopt-clipboard-text m (:clipboard-text m))
-    else (ed-adopt-clipboard-text m (ed-read-clipboard))))
+    (not (:os-clipboard m)) nil
+    (:clipboard-known? m) (:clipboard-text m)
+    else (ed-read-clipboard)))
 
 (defn ed-clipboard-blur (m)
   "The window lost the keyboard (`:blur`): another app may copy now, so what the clipboard
@@ -2173,6 +2177,71 @@ what the last good read found, and the next refresh may try again."
     (if (or (= clip :clipboard-unread) (not (= (:clipboard-asked-epoch m) (:clipboard-epoch m 0))))
       m1
       (assoc m1 :clipboard-known? true :clipboard-text clip))))
+
+;; check-allow: the continuation is resolved late (`reflect/eval`), so its result is unknown
+;; to the checker; every `then` is a fold, and answers a model
+(sig ed-clipboard-ask (model symbol any -> model))
+(check-allow :trusted
+  (defn ed-clipboard-ask (m then data)
+    "Ask for the text on the clipboard model `m` shares and go on with `(then m' text data)`
+once it is known — `then` a symbol naming that fold, resolved when it runs (so a
+redefinition hot-swaps), `text` nil when the clipboard is empty or could not be read.
+
+A served session (`:client-clipboard`) asks its client over the link (brood's
+`editor/serve/client-clipboard-ask`, ADR-539) and returns at once with the ask recorded
+under `:clipboard-asks`; `then` runs when the `[:clipboard ref text]` event arrives
+([[ed-ev-clipboard]]) — the loop draws and takes keys meanwhile, and brood answers nil
+itself when the client says nothing in time. Any other model (or a served one with no
+client attached) reads now ([[ed-clipboard-read]]) and `then` runs within this fold.
+
+The local window needs no ask: its clipboard is read off the loop on focus and the idle beat
+([[ed-clipboard-focus]]), so [[ed-clipboard-read]] answers from that without waiting."
+    (let (asked (when (:client-clipboard m) (editor/serve/client-clipboard-ask)))
+      (if (nil? asked)
+        ((reflect/eval then) m (ed-clipboard-read m) data)
+        (assoc m :clipboard-asks (assoc (or (:clipboard-asks m) {}) asked {:then then :data data}))))))
+
+(defn ed-ev-clipboard (m input textrows cols rows)
+  "`[:clipboard ref text]`: the answer to an [[ed-clipboard-ask]] — its continuation run
+with `text`. Only the first answer to an ask counts: the client's real answer arriving after
+brood answered for it at the timeout (or the reverse) finds no ask and changes nothing."
+  (let (asked (nth input 1)
+        text (nth input 2)
+        pending (get (or (:clipboard-asks m) {}) asked))
+    (if (nil? pending)
+      m
+      ((reflect/eval (:then pending)) (assoc m :clipboard-asks (dissoc (:clipboard-asks m) asked))
+        (if (string? text) text nil)
+        (:data pending)))))
+
+(register-event-handler :clipboard 'model/ed-ev-clipboard)
+
+(defn ed-clipboard-write (m text)
+  "Put `text` on the clipboard model `m` shares (see [[ed-clipboard-read]]): the OS
+clipboard's (a no-op without one), or the attached client's — a cast, nothing waits. Nothing
+for a model with neither. Returns nil; [[ed-push-kill]] records the OS write on the model
+([[ed-clipboard-set-known]])."
+  (cond
+    ;; `os/clipboard-set` is itself a no-op without a clipboard, so nothing here is guarded:
+    ;; a stale name must raise, not leave every kill un-mirrored.
+    (:os-clipboard m) (do (os/clipboard-set text) nil)
+    (:client-clipboard m) (do (editor/serve/client-clipboard-set text) nil)
+    else nil))
+
+(defn ed-adopt-clipboard-text (m clip)
+  "`m` with `clip` — what the OS clipboard holds — consed onto the kill ring as its freshest
+entry when it is text the ring's head is not (something copied in another app since our last
+kill). Emacs's `interprogram-paste-function`."
+  (let (ring (:kill-ring m))
+    (if (and (string? clip) (not (= clip "")) (not (= clip (first ring))))
+      (assoc m :kill-ring (take (cons clip ring) ed-kill-ring-max))
+      m)))
+
+(defn ed-adopt-clipboard (m)
+  "[[ed-adopt-clipboard-text]] with what the clipboard holds now ([[ed-clipboard-read]]):
+something copied in another app since our last kill becomes the ring's freshest entry, so
+the next yank inserts it. A missing / unavailable clipboard leaves the ring untouched."
+  (ed-adopt-clipboard-text m (ed-clipboard-read m)))
 
 ;; ---- a guest's session: editing what it was given, nothing more (brood ADR-415) -------
 ;; A guest attaches over a link that can carry no code and reach nothing it was not given —
@@ -2259,9 +2328,15 @@ what the last good read found, and the next refresh may try again."
 
 (defn ed-kill-head (m)
   "`[m' text]`: the text a yank inserts now — the kill-ring head after adopting the ring
-the frames share and then the OS clipboard — or `[m' nil]` when the ring is empty."
+the frames share and then the clipboard as it reads now ([[ed-clipboard-read]]) — or
+`[m' nil]` when the ring is empty."
+  (ed-kill-head-with m (ed-clipboard-read m)))
+
+(defn ed-kill-head-with (m clip)
+  "[[ed-kill-head]] with the clipboard's text `clip` already known — what a yank that ASKED
+for it ([[ed-clipboard-ask]]) inserts."
   (let (shared (ed-adopt-shared-ring m)
-        m1 (ed-adopt-clipboard shared)
+        m1 (ed-adopt-clipboard-text shared clip)
         ;; a clipboard entry adopted here belongs to every frame's ring too
         m2 (if (= (:kill-ring m1) (:kill-ring shared)) m1 (ed-set-kill-ring m1 (:kill-ring m1)))
         ring (:kill-ring m2))
@@ -2286,8 +2361,8 @@ the frames share and then the OS clipboard — or `[m' nil]` when the ring is em
   "Push killed `text` onto the kill ring. If the previous command was also a kill,
 **append** to the current head entry instead of starting a new one — at the end for
 a forward kill, the front for a backward kill (Emacs's consecutive-kill coalescing).
-Otherwise cons a fresh entry. The new ring head is also mirrored to the OS clipboard
-(`os/clipboard-set`, itself a no-op without a clipboard) so every kill / copy is system-wide — Emacs's
+Otherwise cons a fresh entry. The new ring head is also mirrored to the user's clipboard
+([[ed-clipboard-write]]: the OS one, or a served session's client's) so every kill / copy is system-wide — Emacs's
 `interprogram-cut-function` / `select-enable-clipboard`; `cmd-yank` reads it back."
   (let (ring (:kill-ring (ed-adopt-shared-ring m))
         coalesce? (and (ed-kill-command? (:last-command m)) (not (empty? ring)))
@@ -2295,9 +2370,7 @@ Otherwise cons a fresh entry. The new ring head is also mirrored to the OS clipb
                (if forward? (str (first ring) text) (str text (first ring)))
                text)
         tail (if coalesce? (rest ring) ring))
-    ;; `os/clipboard-set` is itself a no-op without a clipboard, so nothing here is guarded:
-    ;; a stale name must raise, not leave every kill un-mirrored.
-    (when (:os-clipboard m) (os/clipboard-set head))
+    (ed-clipboard-write m head)
     (ed-set-kill-ring (if (:os-clipboard m) (ed-clipboard-set-known m head) m)
       (take (cons head tail) ed-kill-ring-max))))
 
