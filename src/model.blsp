@@ -2072,11 +2072,41 @@ kill). Emacs's `interprogram-paste-function`."
       (assoc m :kill-ring (take (cons clip ring) ed-kill-ring-max))
       m)))
 
+(defdyn *clipboard-reader* os/clipboard-get)
+;; What reads the OS clipboard — a `() -> text-or-nil`; a test binds a stand-in. Captured
+;; when a read is launched, since the task that runs it does not see this binding.
+
+(defdyn *clipboard-read-timeout-ms* 5000)
+;; How long an off-loop read may wait on the clipboard's owner before its task is killed and
+;; its slot freed. A Wayland offer whose pipe is never written has no deadline of its own.
+
+(defdyn *clipboard-refresh-ms* 2000)
+;; While the window has the keyboard, how stale what the clipboard holds may get before the
+;; idle beat reads it again: a program run from the editor (`xclip` in a terminal buffer)
+;; can copy without the focus ever moving.
+
+(defn- ed-read-clipboard-with (reader)
+  "What `reader` finds on the OS clipboard, or `:clipboard-unread` when the read failed — a
+read already waiting on a wedged owner (brood ADR-536), no display. Never nil for a
+failure: nil is an empty clipboard."
+  (try
+    (reader)
+    (catch e (do (log/warn (str "clipboard read failed: " (error-message e))) :clipboard-unread))))
+
 (defn- ed-read-clipboard ()
   "The OS clipboard's text, read now — nil when it has none or cannot be read."
-  (try
-    (os/clipboard-get)
-    (catch e (do (log/warn (str "clipboard read failed: " (error-message e))) nil))))
+  (let (clip (ed-read-clipboard-with *clipboard-reader*)) (if (= clip :clipboard-unread) nil clip)))
+
+(defn- ed-clipboard-launch (m)
+  "`m` with a read of the OS clipboard started in a task — the reader and its deadline
+captured now — stamped with the epoch it was asked under and when."
+  (let (reader *clipboard-reader*)
+    (assoc m
+      :clipboard-proc
+        (task/task (fn () (ed-read-clipboard-with reader))
+          {:timeout *clipboard-read-timeout-ms*})
+      :clipboard-asked-epoch (:clipboard-epoch m 0)
+      :clipboard-read-at (os/now))))
 
 (defn ed-adopt-clipboard (m)
   "If the OS clipboard holds text that isn't already the kill-ring head (i.e. something
@@ -2104,18 +2134,39 @@ the answer) reads nothing; a yank there reads as it always did."
   (if (or (not (:os-clipboard m)) (ed-headless?))
     m
     (do
+      ;; a read asked before the blur answers for a clipboard that may have changed since
       (when (:clipboard-proc m) (task/cancel (:clipboard-proc m)))
-      (assoc m
-        :clipboard-proc (task/task ed-read-clipboard {:timeout 5000})
-        :clipboard-asked-epoch (:clipboard-epoch m 0)))))
+      (ed-clipboard-launch m))))
 
-;; the clipboard read a focus change starts — no label: it is quick, and nobody asked for it
+(defn ed-clipboard-refresh-due? (m)
+  "Whether the idle beat should read the clipboard again: the editor mirrors it, has the
+keyboard (a window, or a terminal reporting focus — brood ADR-536), knows what it held as of
+a read [[*clipboard-refresh-ms*]] or more ago, and has no read in flight — one at a time,
+however long a wedged one takes to time out."
+  (and (:os-clipboard m)
+    (:clipboard-known? m)
+    (not (:unfocused m))
+    (nil? (:clipboard-proc m))
+    (not (ed-headless?))
+    (>= (- (os/now) (:clipboard-read-at m 0)) *clipboard-refresh-ms*)))
+
+(defn ed-clipboard-refresh (m)
+  "The idle beat's clipboard read: started off the loop when [[ed-clipboard-refresh-due?]]."
+  (if (ed-clipboard-refresh-due? m) (ed-clipboard-launch m) m))
+
+;; armed by activity, so an idle editor polls nothing; bounded by `*clipboard-refresh-ms*`
+(register-idle-job :clipboard-refresh
+  {:order 140 :run 'model/ed-clipboard-refresh :stale? 'model/ed-clipboard-refresh-due?})
+
+;; the clipboard read a focus change or the idle beat starts — no label: it is quick, and
+;; nobody asked for it
 (register-task-reply :clipboard-proc 'model/ed-apply-clipboard :clipboard-unread nil)
 (defn ed-apply-clipboard (m clip)
-  "Fold the clipboard read [[ed-clipboard-focus]] started: what it found is what the
-clipboard holds — unless the window lost focus or the editor set the clipboard since it was
-asked (the epoch moved), when it may be stale and is dropped. A read that failed or timed
-out (`:clipboard-unread`) leaves it unknown, so the next yank reads it."
+  "Fold a clipboard read: what it found is what the clipboard holds — unless the window
+lost focus or the editor set the clipboard since it was asked (the epoch moved), when it may
+be stale and is dropped. A read that failed or timed out (`:clipboard-unread`) frees the
+slot and changes nothing else: unknown stays unknown (the next yank reads it), known stays
+what the last good read found, and the next refresh may try again."
   (let (m1 (dissoc m :clipboard-proc :clipboard-asked-epoch))
     (if (or (= clip :clipboard-unread) (not (= (:clipboard-asked-epoch m) (:clipboard-epoch m 0))))
       m1

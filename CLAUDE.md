@@ -419,7 +419,8 @@ src/eval-commands.blsp      the C-x C-e family as commands (eval-last-sexp / -re
                             off the loop as a std/task, C-g cancels; loaded with the image (main)
 src/shell-command.blsp      M-! / M-| (Emacs shell-command): one `sh -c` in the buffer's dir, off
                             the loop, output to the echo area or a side pane; C-u M-| replaces
-                            the region. Loaded with the image (main)
+                            the region; C-g stops the command itself (brood ADR-514). Loaded
+                            with the image (main)
 src/sandbox.blsp            the Brood eval session's BACKEND over std's `editor/evalsession`:
                             find a runtime, start it on a generated eval-server script
                             (ADR-198), the pr-str-line codec, and session events -> UiEvent
