@@ -344,9 +344,12 @@ src/conventions.blsp        a buffer's INDENT WIDTH, TAB WIDTH, tabs-or-spaces a
                             .editorconfig > the user's init.blsp entry for its mode > the mode's
                             convention (a `deflanguage`'s indent `:width`, `:indent-tabs`,
                             `:fill-column`: Python 4 / 79, Go a tab) > the user's `:default` >
-                            Emacs's. TAB / RET's indenter, Shift-TAB, M-q, tabify read it; the
-                            view, row table, sideways scroll and click bind brood's `*tab-width*`
-                            to it (ADR-537), so a tab SHOWS at the buffer's width; a save trims
+                            Emacs's. TAB / RET's indenter, Shift-TAB, M-q, tabify read it; brood's
+                            `*tab-width*` (ADR-537) is bound to it once per turn
+                            (`input/ed-update`), per pane in the view, and by every `wrap`
+                            function handed a buffer (`with-tab-width`), so a tab SHOWS, moves
+                            and scrolls at the buffer's width, and an indent target is a COLUMN
+                            at it (a Makefile's tab stays a tab); a save trims
                             and adds the final newline when .editorconfig asks (a new file takes
                             its end_of_line; an existing one's mismatch is said, not converted).
                             M-x describe-indentation says where each value came from
