@@ -255,7 +255,13 @@ yet, search from the origin."
                (nil? match) (:origin is)
                (= (:dir is) :forward) match
                else (math/min (buffer-length (ed-current-buf m)) (inc (:match-end is)))))
-    (isearch-land m (isearch-remember m is) (str (:string is) ch) (:dir is) from false match)))
+    (isearch-land m
+      (isearch-remember m is)
+      (str (:string is) ch)
+      (:dir is)
+      from
+      (:wrapped is)
+      match)))
 
 (defn- isearch-yank (m is text)
   "Extend the search string with `text` (a paste) and re-search, anchored like a typed
@@ -339,7 +345,8 @@ An empty search string reuses the last search of its kind (`:isearch-last`)."
                 found (when (int? from) (isearch-find is buf dir from)))
             (if found
               (isearch-show m
-                (assoc is :wrapped (nil? match) :dir dir)
+                ;; wrapped stays wrapped for the rest of the search, as Emacs's `isearch-wrapped`
+                (assoc is :wrapped (or (= true (:wrapped is)) (nil? match)) :dir dir)
                 dir
                 (first found)
                 (second found))
@@ -492,28 +499,55 @@ once (the next turn) while it is going; nil otherwise."
 (register-timer-client :isearch-count 'isearch/isearch-count-timer 'isearch/isearch-count-step)
 
 (check-allow :trusted
-  (defmemo lazy-ranges-at 4 (rope from to lazy face)
-    "[[lazy-ranges]] over the chars `[from, to)`, remembered on what it reads (the face too,
-so a theme switch recomputes)."
-    (map (regex/rope-spans (:pattern lazy) rope from to {:fold? (:fold? lazy)})
-      (fn (span) [(first span) (second span) face]))))
+  (defmemo lazy-ranges-at 4 (rope windows lazy face)
+    "[[lazy-ranges]] over each char range `[from to]` of `windows`, remembered on what it
+reads (the face too, so a theme switch recomputes)."
+    (mapcat windows
+      (fn ([from to])
+        (map (regex/rope-spans (:pattern lazy) rope from to {:fold? (:fold? lazy)})
+          (fn (span) [(first span) (second span) face]))))))
+
+(sig lazy-windows (any int int any -> list))
+(defn- lazy-windows (rope top rows clip)
+  "The char ranges the lazy highlight searches for lines `top` through `top + rows`: whole
+lines, runs of them merged into one range, except that a line longer than the window a pane
+shows of it is searched over that window only — `clip` is `panes/ed-fontify-clip`'s
+`[low high lines]` (the offsets into a line the pane shows, per line for a row-wise pane),
+the same window the long-line colouring reads. With no `clip`, whole lines."
+  (let (lines (text/line-count rope)
+        size (text/length rope)
+        last-line (math/min (dec lines) (+ top rows))
+        [low high by-line] (or clip [0 nil {}]))
+    (reverse
+      (fold (range (math/min top last-line) (inc last-line))
+        '()
+        (fn (acc line)
+          (let (start (text/line->char rope line)
+                next (if (< line (dec lines)) (text/line->char rope (inc line)) size)
+                [from to] (or (get by-line line) [low high])
+                window (if (or (nil? to) (<= (- next start) (- to from)))
+                         [start next]
+                         [(math/min next (+ start from)) (math/min next (+ start to))])
+                previous (first acc))
+            ;; a whole line right after a whole line extends that range
+            (if (and previous (= (second previous) (first window)) (= (first window) start))
+              (cons [(first previous) (second window)] (rest acc))
+              (cons window acc))))))))
 
 (sig lazy-ranges (model any int int any -> any))
-(defn lazy-ranges (m buf top rows selected?)
+(defn lazy-ranges (m buf top rows selected? &optional (clip nil))
   "The lazy highlight: every match of the search in progress (or the query-replace) on the
 window's lines `top` through `top + rows`, as highlight ranges `[from to face-isearch-lazy]`
 — Emacs's `lazy-highlight`, in the selected window. The current match's own overlay is
-painted over its range. The cost is the window, not the buffer (`regex/rope-spans`)."
+painted over its range. The cost is the window, not the buffer: a long line is searched only
+over the part the pane shows of it (`clip`, [[lazy-windows]]), so a one-line multi-megabyte
+file costs its window too."
   (let (lazy (:isearch-lazy m))
     ;; only while a search or a replace is on: a left-over description paints nothing
     (if (or (nil? lazy) (not selected?) (and (nil? (:isearch m)) (nil? (:query-replace m))))
       '()
-      (let (rope (buffer-rope buf)
-            lines (text/line-count rope)
-            end-line (+ top rows 1)
-            from (text/line->char rope (math/min top (math/max 0 (dec lines))))
-            to (if (>= end-line lines) (text/length rope) (text/line->char rope end-line)))
-        (lazy-ranges-at rope from to lazy face-isearch-lazy)))))
+      (let (rope (buffer-rope buf))
+        (lazy-ranges-at rope (lazy-windows rope top rows clip) lazy face-isearch-lazy)))))
 
 ;; ---- leaving, and starting ----------------------------------------------------
 
@@ -553,7 +587,9 @@ the search state."
 ;; ---- entry points -----------------------------------------------------------
 
 (def *isearch-keys*
-  [:backspace :ctrl-s :ctrl-r :enter :escape :ctrl-g :ctrl-y :ctrl-w :alt-r :alt-c :alt-s])
+  [:backspace
+    :ctrl-s :ctrl-r :ctrl-meta-s :ctrl-meta-r :enter :escape :ctrl-g :ctrl-y :ctrl-w :alt-r
+    :alt-c :alt-s])
 
 (defn isearch-control-key? (input)
   "Whether an active isearch consumes `input`: a printable char (extends the search)
@@ -586,8 +622,9 @@ case folding (Emacs's `M-s` search map); any other key is handled as itself."
     (:meta-s is) (isearch-meta-s m is input)
     (string? input) (isearch-extend m is input)
     (= input :backspace) (isearch-backspace m is)
-    (= input :ctrl-s) (isearch-repeat m is :forward)
-    (= input :ctrl-r) (isearch-repeat m is :backward)
+    ;; C-M-s / C-M-r repeat too, as in Emacs's isearch-mode-map (they began the search)
+    (or (= input :ctrl-s) (= input :ctrl-meta-s)) (isearch-repeat m is :forward)
+    (or (= input :ctrl-r) (= input :ctrl-meta-r)) (isearch-repeat m is :backward)
     (= input :ctrl-y) (isearch-yank-kill m is)
     (= input :ctrl-w) (isearch-yank-word m is)
     (= input :alt-r) (isearch-toggle m is :regexp)
@@ -645,7 +682,7 @@ word search, `Backspace` steps back, `Enter`/`Esc` exit, `C-g` aborts."
   (let (fold? (qr-fold? qr)
         from (:from qr))
     (if (:regexp? qr)
-      (regex/rope-find from (buffer-rope buf) pos {:fold? fold?})
+      (regex/rope-find from (buffer-rope buf) pos {:fold? fold? :empty? true})
       (let (start (buffer-search-forward buf from pos fold?))
         (when start
           (let (end (+ start (string/length from)))
@@ -690,13 +727,23 @@ case — given the case of the text it replaces ([[replacement-for]])."
       :isearch-lazy nil
       :echo (str "Replaced " n " occurrence" (if (= n 1) "" "s")))))
 
-(sig qr-goto (model int -> model))
+(defn- qr-after (buf found pos)
+  "Where the replace looks next after `found`: `pos`, or — when `found` was EMPTY (a `^` or
+`$`) — a character on, as Emacs's `perform-replace` steps, so the same empty match is not
+found again; nil when there is no character left to step over."
+  (cond
+    (not (= (:start found) (:end found))) pos
+    (>= pos (buffer-length buf)) nil
+    else (inc pos)))
+
+(sig qr-goto (model (or nil int) -> model))
 (defn- qr-goto (m pos)
   "Highlight the next match at or after `pos` (a transient overlay, point at its start, the
-other matches in the window lit), or finish if there is none."
+other matches in the window lit), or finish if there is none — or no `pos` at all, past an
+empty match at the buffer's end ([[qr-after]])."
   (let (qr (qr-state m)
         buf (ed-current-buf m)
-        found (qr-find qr buf pos))
+        found (when (int? pos) (qr-find qr buf pos)))
     (if (nil? found)
       (qr-finish m)
       (assoc (ed-set-buf m (goto-char buf (:start found)))
@@ -734,7 +781,7 @@ a name, not a sentence."
       (str (string/upper (string/char-at to 0)) (string/substring to 1))
     else to))
 
-(sig qr-replace (model -> (tuple model int)))
+(sig qr-replace (model -> (tuple model (or nil int))))
 (defn- qr-replace (m)
   "Replace the current match with its replacement ([[qr-replacement]]) and return
 `[model' next-search-pos]` (the model with its count bumped, point just past the inserted
@@ -746,19 +793,20 @@ text). A buffer that refuses the edit (read-only) ends the replace there."
         to (qr-replacement qr found)
         [m2 replaced?] (ed-try-edit m (fn (b) (replace-region b start end to))))
     (if replaced?
-      [(assoc m2 :query-replace (assoc qr :count (inc (:count qr)))) (+ start (string/length to))]
+      [(assoc m2 :query-replace (assoc qr :count (inc (:count qr))))
+        (qr-after (ed-current-buf m2) found (+ start (string/length to)))]
       [(assoc m2 :query-replace (assoc qr :match nil)) (buffer-length (ed-current-buf m2))])))
 
 (defn- qr-matches (qr buf pos acc)
   "Every match at or after `pos`, non-overlapping, as a reversed list of `[start end
 replacement]` — the matches `!` will replace and what each becomes, found before any of
 them is."
-  (let (found (qr-find qr buf pos))
+  (let (found (when (int? pos) (qr-find qr buf pos)))
     (if (nil? found)
       acc
       (qr-matches qr
         buf
-        (:end found)
+        (qr-after buf found (:end found))
         (cons [(:start found) (:end found) (qr-replacement qr found)] acc)))))
 
 (sig qr-replace-at (buffer (list (tuple int int string)) -> buffer))
@@ -817,7 +865,8 @@ or Enter/Esc/C-g/Delete. Any other key finishes the replace and is dispatched no
   (let (qr (qr-state m))
     (cond
       (or (= input "y") (= input " ")) (let ([m2 pos] (qr-replace m)) (qr-goto m2 pos))
-      (or (= input "n") (= input :delete)) (qr-goto m (:end (:found qr)))
+      (or (= input "n") (= input :delete))
+        (qr-goto m (qr-after (ed-current-buf m) (:found qr) (:end (:found qr))))
       (= input "!") (qr-all m)
       (= input ".") (let ([m2 _] (qr-replace m)) (qr-finish m2))
       else (qr-finish m)))) ; q / Enter / Esc / C-g
