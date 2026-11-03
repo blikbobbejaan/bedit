@@ -204,6 +204,11 @@ src/savehist.blsp           minibuffer answers kept per prompt across sessions (
                             `:savehist`): seeds the prompt's ↑ / M-p history; off until `main` turns it on
 src/saveplace.blsp          a file reopens where it was left (Emacs save-place, `:save-place`): its
                             point kept when its buffer is killed or the editor quits
+src/solong.blsp             so-long (Emacs so-long-mode, `:so-long-threshold`): a file opened with a line
+                            longer than the threshold truncates (`:long-lines :truncate` on the buffer)
+                            and the per-line services (show-paren, rainbow, whitespace, spell, eldoc)
+                            skip it; the long line is found by sampling every threshold-th char.
+                            M-x so-long-mode toggles it
 src/statusbar.blsp          the mode line as extensible segments (render ops + click/hover zones in one pass),
                             and the chip REGISTRY (`register-modeline-segment`): a feature puts
                             its chip on the bar when its module loads — presence (collab), the
