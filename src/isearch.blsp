@@ -1,35 +1,29 @@
 (defmodule isearch
-  "Incremental search (`C-s` / `C-r`) and query-replace (`M-%`) — modal mini-loops
-that run *beside* the keymap, like the completion popup (`complete`). When `:isearch`
-(or `:query-replace`) is set on the model, `input/ed-update` routes keys here instead
-of dispatching them; the search consumes printable chars (extend), `C-s`/`C-r`
-(seq/repeat), `Backspace`, `Enter`/`Esc` (exit), and `C-g` (abort), and any *other* key
+  "Incremental search (`C-s` / `C-r`, `C-M-s` / `C-M-r` by regexp, `M-s w` by words) and
+query-replace (`M-%`, `C-M-%` by regexp) — modal mini-loops that run *beside* the keymap,
+like the completion popup (`complete`). When `:isearch` (or `:query-replace`) is set on the
+model, `input/ed-update` routes keys here instead of dispatching them; the search consumes
+printable chars (extend), `C-s`/`C-r` (repeat), `Backspace`, `M-r` / `M-c` / `M-s w` (the
+regexp, case and word toggles), `Enter`/`Esc` (exit), and `C-g` (abort), and any *other* key
 exits the search and is then dispatched normally (Emacs isearch).
 
-The match is highlighted by setting the buffer's point + mark around it, so the
-existing region reverse-video draws it — no view change. Search itself rides on the
-`std/buffer` primitives `buffer-search-forward` / `buffer-search-backward` (the
-language gap this feature closed; see CLAUDE.md's prime directive). Pure
-data→data over the model apart from reading the buffer."
+The match is a transient overlay (`face-isearch`); every OTHER match in the window is lit too
+(`face-isearch-lazy`, Emacs's lazy highlight, [[lazy-ranges]]), and the prompt counts them —
+`3/17 I-search: foo` (Emacs 27's `isearch-lazy-count`). The count is never taken on a key: it
+runs in slices on a timer of its own once typing pauses ([[isearch-count-step]]), so a 50 MB
+buffer types as fast as a small one and says `?/N+` while it is still counting.
+
+A literal search rides `std/buffer`'s `buffer-search-forward` / `-backward`; a regexp or
+word search, `std/regex`'s rope search (`regex/rope-find`, brood ADR-540) — both read the
+rope in place, never flattening the buffer. Pure data→data over the model apart from
+reading the buffer."
   (:use editor/buffer) ; buffer-search-forward/backward, push-mark, goto-char, point/length
-  (:use theme) ; face-isearch — the match highlight (src/theme.blsp)
-  (:use model)) ; ed-current-buf / ed-set-buf
+  (:use theme) ; face-isearch / face-isearch-lazy — the match highlights (src/theme.blsp)
+  (:use memo) ; defmemo — the window's lazy highlight, asked every frame
+  (:use model)) ; ed-current-buf / ed-set-buf / register-timer-client
 ;; The match highlight is the theme's `face-isearch`, read when the overlay is made (not
 ;; copied at load, which kept the old palette's yellow after a theme switch) — distinct
 ;; from the region, and it never touches the user's mark.
-
-;; ---- prompt -----------------------------------------------------------------
-
-(defn- isearch-prompt (dir string failing? wrapped?)
-  "The echo-area label for an isearch state: `I-search: foo`, with a `Failing ` /
-`Wrapped ` prefix and a ` backward` infix as the state dictates."
-  (str (cond wrapped? "Wrapped " failing? "Failing " else "")
-    "I-search"
-    (if (= dir :backward) " backward" "")
-    ": "
-    string))
-
-;; ---- search core ------------------------------------------------------------
 
 ;; ---- case: fold, unless you typed a capital ---------------------------------
 ;; Emacs' rule, and it is two settings working together. `case-fold-search` is `t`, so
@@ -38,7 +32,9 @@ data→data over the model apart from reading the buffer."
 ;;
 ;; The effect is that you never think about it. `foo` finds `Foo` and `FOO`; `Foo` finds
 ;; only `Foo`. Asking for case is typing it, which is the one gesture that cannot be
-;; ambiguous — where a toggle is a mode you have to remember you are in.
+;; ambiguous — where a toggle is a mode you have to remember you are in. The toggle is there
+;; anyway (M-c, Emacs's `isearch-toggle-case-fold`) for the search the rule gets wrong:
+;; `foo` that must not find `Foo`.
 
 (defn search-fold? (pattern)
   "Should a search for `pattern` ignore case? Yes unless the pattern contains a character
@@ -46,27 +42,111 @@ with an upper-case form — `string/has-upper?`, which answers no for a digit, a
 CJK, since those are not a decision about case."
   (not (string/has-upper? pattern)))
 
-(defn- isearch-find (buf dir string from)
-  "The match start for `string` in `dir` relative to char offset `from`, or nil:
-forward = first occurrence at/after `from`; backward = last occurrence before `from`.
-Case-folded unless `string` says otherwise ([[search-fold?]])."
-  (let (fold? (search-fold? string))
-    (if (= dir :forward)
-      (buffer-search-forward buf string from fold?)
-      (buffer-search-backward buf string from fold?))))
+(defn regexp-fold? (pattern)
+  "[[search-fold?]] for a regexp: the letter after a backslash is syntax, not a decision
+about case — `\\W` and `\\S` are classes — so it does not count (Emacs's
+`isearch-no-upper-case-p` with its regexp flag)."
+  (search-fold? (regex/replace "\\\\." pattern "")))
 
-(defn- isearch-show (m is dir start)
-  "Highlight the match at `start` (length from `is`'s string) with a transient overlay
-and move **point** there — its end for a forward search, its start for a backward one.
-The match shows via `:overlays` (the view's `face-isearch`), so the user's mark is
-left untouched. Records the match on `:isearch`."
+;; ---- what is being searched for ---------------------------------------------
+;; A search state `is` is `{:dir :string :origin :match :match-end :wrapped :mode :case …}`.
+;; `:mode` is `:literal` (C-s), `:regexp` (C-M-s, M-r) or `:word` (M-s w — the words typed,
+;; whatever lies between them in the buffer); `:case` is nil (the rule above) or the M-c
+;; override, `:fold` / `:sensitive`.
+
+(defn- isearch-mode (is)
+  "The search's kind: `:literal`, `:regexp` or `:word`."
+  (or (:mode is) :literal))
+
+(defn- isearch-fold? (is)
+  "Does this search ignore case — the M-c override, else the rule for its kind."
+  (case (:case is)
+    :fold true
+    :sensitive false
+    (if (= (isearch-mode is) :regexp)
+      (regexp-fold? (:string is))
+      (search-fold? (:string is)))))
+
+(defn word-search-regexp (string)
+  "The pattern a word search for `string` runs: its words in order, anything but word
+characters between them, starting at a word boundary — Emacs's `word-search-regexp` in its
+LAX form (no boundary after the last word, so the word being typed matches as it grows). Nil
+when `string` has no words.
+
+    (isearch/word-search-regexp \"foo  bar\")   ;=> \"\\\\bfoo\\\\W+bar\""
+  (let (words (seq/filter (regex/split "\\W+" string) (fn (word) (not (= word "")))))
+    (if (empty? words)
+      nil
+      (str "\\b" (string/join (map words regex/escape) "\\W+")))))
+
+(defn- isearch-pattern (is)
+  "The search as a regexp (Brood's dialect) — what the count and the lazy highlight run, and
+what a regexp or word search searches for. Nil when there is nothing to search for."
+  (let (string (:string is))
+    (cond
+      (= string "") nil
+      (= (isearch-mode is) :regexp) string
+      (= (isearch-mode is) :word) (word-search-regexp string)
+      else (regex/escape string))))
+
+(defn- isearch-incomplete? (is)
+  "Is this a regexp search whose pattern is still being typed — an open group or set, a
+trailing backslash? It is not searched then (Emacs's `[incomplete input]`)."
+  (and (= (isearch-mode is) :regexp) (regex/incomplete? (:string is))))
+
+;; ---- the prompt --------------------------------------------------------------
+
+(defn- isearch-prompt (is)
+  "The echo-area label for a search state: `I-search: foo`, with a `Failing ` / `Wrapped `
+prefix, the kind (`Regexp I-search`, `Word I-search`), a `case-sensitive` the M-c override
+asked for, a ` backward` infix, and ` [incomplete input]` while a regexp is unfinished."
+  (let (string (:string is)
+        failing? (and (not (= string "")) (nil? (:match is)) (not (:incomplete is)))
+        words (str (cond (:wrapped is) "wrapped " failing? "failing " else "")
+                (if (= (:case is) :sensitive) "case-sensitive " "")
+                (case (isearch-mode is)
+                  :regexp "regexp "
+                  :word "word "
+                  "")
+                "I-search"
+                (if (= (:dir is) :backward) " backward" "")))
+    (str (string/upper (string/substring words 0 1))
+      (string/substring words 1)
+      ": "
+      string
+      (if (:incomplete is) " [incomplete input]" ""))))
+
+;; ---- the search core ----------------------------------------------------------
+
+(defn- isearch-find (is buf dir from)
+  "`[start end]` of the match for `is` in `dir` from char offset `from`, or nil. A literal
+search: forward the first occurrence at/after `from`, backward the last one STARTING before
+it. A regexp or word search: forward the first match at/after `from`, backward the one
+starting last while ENDING by `from` (Emacs's `re-search-backward`)."
+  (let (string (:string is)
+        fold? (isearch-fold? is))
+    (if (= (isearch-mode is) :literal)
+      (let (start (if (= dir :forward)
+                    (buffer-search-forward buf string from fold?)
+                    (buffer-search-backward buf string from fold?)))
+        (when start [start (+ start (string/length string))]))
+      (let (pattern (isearch-pattern is)
+            found (cond
+                    (nil? pattern) nil
+                    (= dir :forward) (regex/rope-find pattern (buffer-rope buf) from {:fold? fold?})
+                    else (regex/rope-find-backward pattern (buffer-rope buf) from {:fold? fold?})))
+        (when found [(:start found) (:end found)])))))
+
+(defn- isearch-show (m is dir start end)
+  "Highlight the match `[start end)` with a transient overlay and move **point** there — its
+end for a forward search, its start for a backward one. The match shows via `:overlays`
+(the view's `face-isearch`), so the user's mark is left untouched. Records the match on
+`:isearch`."
   (let (buf (ed-current-buf m)
-        end (+ start (string/length (:string is)))
         point (if (= dir :forward) end start))
     (assoc (ed-set-buf m (goto-char buf point))
       :overlays [{:start start :end end :face face-isearch}]
-      :echo (isearch-prompt dir (:string is) false (:wrapped is))
-      :isearch (assoc is :match start :dir dir :failed nil))))
+      :isearch (assoc is :match start :match-end end :dir dir :failed nil :incomplete false))))
 
 ;; A miss is remembered as what it proves: no occurrence of the string in `dir` from `from`,
 ;; in that exact text. Typing on into a failing search can then never match either — every
@@ -75,48 +155,67 @@ left untouched. Records the match on `:isearch`."
 ;; skipped. It is the one isearch key that cost more than the frame: a failing search reads
 ;; the whole rest of the buffer, ~9 ms on a 44k-line file, and it did that again for every
 ;; character typed after the first miss. The rope is part of the proof, so an edit that
-;; lands mid-search (a revert, a collaborator) searches afresh.
+;; lands mid-search (a revert, a collaborator) searches afresh. LITERAL only: a regexp that
+;; fails can match once it grows (`fo` → `fo|ba`), and so can a word search.
 (defn- isearch-known-miss? (is buf string dir from)
   "Does the search state `is` already prove that extending its string finds nothing in `dir`
 from `from` in `buf`'s text — `string` being its string extended?"
   (let (failed (:failed is))
     (and failed
+      (= (isearch-mode is) :literal)
+      (nil? (:case is))
       (string/starts-with? string (:string is))
       (= (:from failed) from)
       (= (:dir failed) dir)
       (= (:rope failed) (buffer-rope buf)))))
 
-(defn- isearch-land (m is string dir from wrapped?)
-  "Re-search `string` in `dir` from `from` and update the model: an empty string
-resets to the origin (no match); a hit highlights it; a miss is a failing state that
-leaves point where it was."
+(defn- isearch-land (m is string dir from wrapped? &optional (stay nil))
+  "Re-search `string` in `dir` from `from` and update the model: an empty string resets to
+the origin (no match); an unfinished regexp keeps the match it had; a hit highlights it; a
+miss is a failing state that leaves point where it was. `stay` (a regexp or word search
+growing backward) is the current match's start, kept when the grown pattern still matches
+there — Emacs's `looking-at` before it searches back."
   (let (buf (ed-current-buf m)
-        is2 (assoc is :string string :wrapped wrapped? :dir dir :failed nil))
+        is2 (assoc is :string string :wrapped wrapped? :dir dir :failed nil :incomplete false))
     (cond
       (= string "")
-        (assoc m
-          :echo (isearch-prompt dir "" false false)
-          :overlays nil
-          :isearch (assoc is2 :match nil :wrapped false))
+        (assoc m :overlays nil :isearch (assoc is2 :match nil :match-end nil :wrapped false))
+      (isearch-incomplete? is2)
+        (assoc m :isearch (assoc is2 :incomplete true :wrapped (:wrapped is)))
       else
-        (let (start (if (isearch-known-miss? is buf string dir from)
-                      nil
-                      (isearch-find buf dir string from)))
-          (if (nil? start)
+        (let (here (when (and (int? stay) (= dir :backward) (not (= (isearch-mode is2) :literal)))
+                     (isearch-find is2 buf :forward stay))
+              found (cond
+                      (and here (= (first here) stay)) here
+                      (isearch-known-miss? is buf string dir from) nil
+                      else (isearch-find is2 buf dir from)))
+          (if (nil? found)
             (assoc m
-              :echo (isearch-prompt dir string true wrapped?)
               :overlays nil
               ;; what the miss PROVES, for the next key (`isearch-known-miss?`)
-              :isearch (assoc is2 :match nil :failed {:from from :dir dir :rope (buffer-rope buf)}))
-            (isearch-show m is2 dir start))))))
+              :isearch
+                (assoc is2
+                  :match nil
+                  :match-end nil
+                  :failed {:from from :dir dir :rope (buffer-rope buf)}))
+            (isearch-show m is2 dir (first found) (second found)))))))
+
+(defn- isearch-from (is)
+  "Where a search re-run in place starts: the current match (its start forward, its end
+backward, so it can find that match again), or the origin with no match."
+  (let (match (:match is))
+    (cond
+      (nil? match) (:origin is)
+      (= (:dir is) :forward) match
+      else (:match-end is))))
 
 ;; ---- the key handlers -------------------------------------------------------
 
 ;; DEL walks BACK through the search, the way Emacs's `isearch-delete-char` does: every
-;; step that changed it — a typed char, a paste, a C-s or C-r — pushes the state it replaced
-;; (point included) onto `:history`, and DEL pops one. It used to drop the last char and
-;; search again from the origin, which after three C-s's threw away the three matches you
-;; had stepped through.
+;; step that changed it — a typed char, a paste, a C-s or C-r, a toggle — pushes the state it
+;; replaced (point included) onto `:history`, and DEL pops one. It used to drop the last char
+;; and search again from the origin, which after three C-s's threw away the three matches
+;; you had stepped through.
 
 (defn- isearch-remember (m is)
   "`is` with the state it is about to replace pushed onto its `:history`."
@@ -130,21 +229,22 @@ leaves point where it was."
 the match grows in place: forward from the match start, backward from the match *end*
 (so the new char extends the hit leftward rather than jumping to an earlier one). With
 no match yet, search from the origin."
-  (let (dir (:dir is)
-        match (:match is)
-        from (cond
-               (nil? match) (:origin is)
-               (= dir :forward) match
-               else (+ match (string/length (:string is)))))
-    ; backward: the match end
-    (isearch-land m (isearch-remember m is) (str (:string is) ch) dir from false)))
+  (isearch-land m
+    (isearch-remember m is)
+    (str (:string is) ch)
+    (:dir is)
+    (isearch-from is)
+    false
+    (:match is)))
 
 (defn- isearch-yank (m is text)
   "Extend the search string with `text` (a paste) and re-search, anchored like a typed
-char; nothing happens for an empty `text`."
-  (if (or (nil? text) (= text ""))
-    m
-    (isearch-extend m is text)))
+char; nothing happens for an empty `text`. A regexp search takes the text literally
+(Emacs's `isearch-yank-string` quotes it)."
+  (cond
+    (or (nil? text) (= text "")) m
+    (= (isearch-mode is) :regexp) (isearch-extend m is (regex/escape text))
+    else (isearch-extend m is text)))
 
 (defn- isearch-yank-kill (m is)
   "C-y: paste the kill ring's head (the OS clipboard adopted first) into the search —
@@ -158,27 +258,28 @@ before any match) to the end of the word after it — into the search string, so
 grows by the text under the cursor: Emacs `isearch-yank-word-or-char`."
   (let (buf (ed-current-buf m)
         match (:match is)
-        end (if (nil? match) (:origin is) (+ match (string/length (:string is))))
+        end (if (nil? match) (:origin is) (:match-end is))
         after (buffer-point (forward-word (goto-char buf end)))
         text (text/slice (buffer-rope buf) end after))
     (isearch-yank m is text)))
 
 (defn- isearch-backspace (m is)
-  "DEL: undo the last step of the search — the char or paste that extended it, or the
-C-s / C-r that moved it — back to the match and point it had before. At the start of the
-search there is nothing to undo."
+  "DEL: undo the last step of the search — the char or paste that extended it, the C-s /
+C-r that moved it, the toggle that changed it — back to the match and point it had before.
+At the start of the search there is nothing to undo."
   (let (history (or (:history is) '()))
     (if (empty? history)
       m
       (let (prev (dissoc (assoc (first history) :history (rest history)) :point)
-            m1 (ed-set-buf m (goto-char (ed-current-buf m) (:point (first history))))
-            s (:string prev))
+            m1 (ed-set-buf m (goto-char (ed-current-buf m) (:point (first history)))))
         (if (nil? (:match prev))
-          (assoc m1
-            :echo (isearch-prompt (:dir prev) s (not (= s "")) (:wrapped prev))
-            :overlays nil
-            :isearch prev)
-          (isearch-show m1 prev (:dir prev) (:match prev)))))))
+          (assoc m1 :overlays nil :isearch prev)
+          (isearch-show m1 prev (:dir prev) (:match prev) (:match-end prev)))))))
+
+(defn- isearch-last-key (is)
+  "Where this kind of search remembers its last string: a regexp's apart from a string's,
+as Emacs keeps `regexp-search-ring` apart from `search-ring`."
+  (if (= (isearch-mode is) :regexp) :isearch-last-regexp :isearch-last))
 
 (defn- isearch-repeat (m is0 dir)
   "Find the next match in `dir` (`C-s` / `C-r`), as Emacs does:
@@ -190,34 +291,195 @@ search there is nothing to undo."
     wraps round the buffer (`Wrapped I-search`). Wrapping on the first miss moved the reader
     without telling them they had passed the last match.
 
-An empty search string reuses the last search (`:isearch-last`)."
+An empty search string reuses the last search of its kind (`:isearch-last`)."
   (let (is (isearch-remember m is0)
         s (:string is))
     (if (= s "")
-      (let (last (or (:isearch-last m) ""))
+      (let (last (or (get m (isearch-last-key is)) ""))
         (if (= last "")
-          (assoc m :echo (isearch-prompt dir "" false false) :isearch (assoc is :dir dir))
+          (assoc m :isearch (assoc is :dir dir))
           (isearch-land m is last dir (:origin is) false)))
       (let (buf (ed-current-buf m)
             match (:match is)
             len (buffer-length buf))
         (if (and (int? match) (not (= dir (:dir is))))
-          (isearch-show m (assoc is :dir dir) dir match)
+          (isearch-show m (assoc is :dir dir) dir match (:match-end is))
           (let (from (cond
                        ;; failing: this key wraps
                        (nil? match) (if (= dir :forward) 0 len)
                        ;; past this hit (no overlap)
-                       (= dir :forward) (+ match (string/length s))
+                       (= dir :forward) (:match-end is)
                        else match)
-                start (isearch-find buf dir s from))
-            (if start
-              (isearch-show m (assoc is :wrapped (nil? match) :dir dir) dir start)
-              (let (failed (assoc m
-                             :echo (isearch-prompt dir s true (:wrapped is))
-                             :isearch (assoc is :match nil :dir dir)))
+                found (isearch-find is buf dir from))
+            (if found
+              (isearch-show m
+                (assoc is :wrapped (nil? match) :dir dir)
+                dir
+                (first found)
+                (second found))
+              (let (failed (assoc m :isearch (assoc is :match nil :match-end nil :dir dir)))
                 ;; the first miss past a match keeps that match on screen; a miss with
                 ;; nothing matched clears it
                 (if (int? match) failed (assoc failed :overlays nil))))))))))
+
+(defn- isearch-toggle (m is what)
+  "M-r / M-s w / M-c: flip the search to or from a regexp search (`:regexp`), a word search
+(`:word`), or its case folding (`:case`), and search again in place — the current match
+kept when it still matches. DEL undoes the toggle."
+  (let (is1 (dissoc (isearch-remember m is) :failed)
+        is2 (case what
+              :regexp (assoc is1 :mode (if (= (isearch-mode is1) :regexp) :literal :regexp))
+              :word (assoc is1 :mode (if (= (isearch-mode is1) :word) :literal :word))
+              (assoc is1 :case (if (isearch-fold? is1) :sensitive :fold))))
+    (isearch-land m is2 (:string is2) (:dir is2) (isearch-from is2) (:wrapped is2) (:match is2))))
+
+;; ---- the match count and the lazy highlight -----------------------------------
+;; Emacs 27's `isearch-lazy-count` puts `3/17` before the prompt, and `lazy-highlight` lights
+;; every other match in the window. Both come from ONE description of the search, kept on
+;; the model as `:isearch-lazy` `{:pattern :fold?}` — the search as a regexp, whatever its
+;; kind — which the view reads for the window ([[lazy-ranges]]) and the count reads for the
+;; buffer.
+;;
+;; The count is the part that could freeze the editor: it reads the WHOLE buffer, and a key
+;; must not. So it is never taken on a key. A timer of its own ([[isearch-count-timer]]) arms
+;; once typing pauses and counts a slice at a time ([[isearch-count-step]]): `regex/rope-count`
+;; over `*isearch-count-slice*` characters, as many slices as `*isearch-count-budget-ms*`
+;; allows, then the loop takes the next key before the next turn of the timer. The slices
+;; add up to exactly the whole count (brood ADR-540), and the prompt says `?/N+` until the
+;; last one. Each slice is kept (`[from n]`), so the ORDINAL of the match you are on is the
+;; slices before it plus a count of at most one slice — the same bound — rather than a
+;; recount from the top.
+
+(defdyn *isearch-count-slice* 262144) ; characters per slice of the count
+(defdyn *isearch-count-budget-ms* 3) ; how long one turn of the count timer may count
+(defdyn *isearch-count-delay-ms* 100) ; the pause before a count starts (Emacs waits too)
+
+(defn- isearch-lazy-spec (m is)
+  "The search as `{:pattern :fold?}`, or nil when there is nothing to search for. An
+unfinished regexp keeps the one it had, so the highlights do not blink while a group is
+typed."
+  (cond
+    (:incomplete is) (:isearch-lazy m)
+    (isearch-pattern is) {:pattern (isearch-pattern is) :fold? (isearch-fold? is)}
+    else nil))
+
+(defn- isearch-count-key (m)
+  "What the count in progress counts — `[pattern fold? rope]` — or nil when no search is
+active. The rope is part of it: an edit makes it a different count."
+  (let (lazy (:isearch-lazy m))
+    (when (and (:isearch m) lazy)
+      [(:pattern lazy) (:fold? lazy) (buffer-rope (ed-current-buf m))])))
+
+(defn- isearch-count-current (m)
+  "The count kept on the model when it is of the current search, else nil."
+  (let (count (:isearch-count m)
+        key (isearch-count-key m))
+    (when (and key count (= (:key count) key)) count)))
+
+(defn- isearch-count-index (is count)
+  "The ordinal of the current match among all of them — the matches starting before it,
+plus one — or nil when there is no match or the count has not reached it yet. The kept
+slices give the matches before the slice it is in; one bounded count gives the rest."
+  (let (at (:match is)
+        frontier (:resume count))
+    (when (and (int? at) (or (nil? frontier) (< at frontier)))
+      (let ([pattern fold? rope] (:key count)
+            [before from _] (fold (:slices count)
+                              [0 0 0]
+                              ;; the last slice starting at or before the match, and the
+                              ;; matches in the slices before it
+                              (fn ([before chosen total] [slice-from n])
+                                (if (<= slice-from at)
+                                  [total slice-from (+ total n)]
+                                  [before chosen total]))))
+        (+ before 1 (first (regex/rope-count pattern rope from at {:fold? fold?})))))))
+
+(defn- isearch-count-prefix (m is)
+  "The count before the prompt: `3/17 `, `?/17 ` with no current match, `3/17+ ` / `?/17+ `
+while the count is still going, nothing before it starts."
+  (let (count (isearch-count-current m))
+    (if (or (nil? count) (= (:string is) ""))
+      ""
+      (let (index (isearch-count-index is count))
+        (str (if (nil? index) "?" index)
+          "/"
+          (:total count)
+          (if (nil? (:resume count)) "" "+")
+          " ")))))
+
+(defn- isearch-refresh (m)
+  "The echo area and the lazy-highlight description, recomputed from the search state —
+what every key and every slice of the count ends with."
+  (let (is (:isearch m))
+    (if (nil? is)
+      m
+      (let (m1 (assoc m :isearch-lazy (isearch-lazy-spec m is)))
+        (assoc m1 :echo (str (isearch-count-prefix m1 is) (isearch-prompt is)))))))
+
+(defn isearch-count-due? (m)
+  "Is there counting left to do for the search in progress?"
+  (let (key (isearch-count-key m)
+        count (isearch-count-current m))
+    (and (not (nil? key)) (or (nil? count) (not (nil? (:resume count)))))))
+
+(defn isearch-count-timer (m)
+  "The count's timer, for `model/register-timer-client`: an idle one-shot while there is
+counting to do — `*isearch-count-delay-ms*` after the last key before the count starts, at
+once (the next turn) while it is going; nil otherwise."
+  (when (isearch-count-due? m)
+    {:after (if (nil? (isearch-count-current m)) *isearch-count-delay-ms* 1) :idle? true}))
+
+(defn isearch-count-step (m)
+  "One turn of the count: slices of `*isearch-count-slice*` characters counted until
+`*isearch-count-budget-ms*` has gone (at least one), kept on `:isearch-count`
+`{:key :slices :resume :total}`, and the prompt redrawn. A no-op with no search."
+  (let (key (isearch-count-key m))
+    (if (nil? key)
+      m
+      (let ([pattern fold? rope] key
+            start (or (isearch-count-current m) {:key key :slices [] :resume 0 :total 0})
+            deadline (+ (os/now) *isearch-count-budget-ms*))
+        (letrec (slice (fn (count)
+                         (let (from (:resume count)
+                               [n resume] (regex/rope-count pattern
+                                            rope
+                                            from
+                                            (+ from *isearch-count-slice*)
+                                            {:fold? fold?})
+                               next {:key key
+                                     :slices (conj (:slices count) [from n])
+                                     :resume resume
+                                     :total (+ (:total count) n)})
+                           (if (or (nil? resume) (>= (os/now) deadline)) next (slice next)))))
+          (isearch-refresh (assoc m :isearch-count (if (nil? (:resume start)) start (slice start)))))))))
+
+(register-timer-client :isearch-count 'isearch/isearch-count-timer 'isearch/isearch-count-step)
+
+(check-allow :trusted
+  (defmemo lazy-ranges-at 4 (rope from to lazy face)
+    "[[lazy-ranges]] over the chars `[from, to)`, remembered on what it reads (the face too,
+so a theme switch recomputes)."
+    (map (regex/rope-spans (:pattern lazy) rope from to {:fold? (:fold? lazy)})
+      (fn (span) [(first span) (second span) face]))))
+
+(sig lazy-ranges (model any int int any -> any))
+(defn lazy-ranges (m buf top rows selected?)
+  "The lazy highlight: every match of the search in progress (or the query-replace) on the
+window's lines `top` through `top + rows`, as highlight ranges `[from to face-isearch-lazy]`
+— Emacs's `lazy-highlight`, in the selected window. The current match's own overlay is
+painted over its range. The cost is the window, not the buffer (`regex/rope-spans`)."
+  (let (lazy (:isearch-lazy m))
+    ;; only while a search or a replace is on: a left-over description paints nothing
+    (if (or (nil? lazy) (not selected?) (and (nil? (:isearch m)) (nil? (:query-replace m))))
+      '()
+      (let (rope (buffer-rope buf)
+            lines (text/line-count rope)
+            end-line (+ top rows 1)
+            from (text/line->char rope (math/min top (math/max 0 (dec lines))))
+            to (if (>= end-line lines) (text/length rope) (text/line->char rope end-line)))
+        (lazy-ranges-at rope from to lazy face-isearch-lazy)))))
+
+;; ---- leaving, and starting ----------------------------------------------------
 
 (defn isearch-exit (m)
   "Finish the search: leave point at the match, push the *origin* onto the mark ring
@@ -229,11 +491,14 @@ the search state. A no-op if no search is active."
       (let (buf (ed-current-buf m)
             p (buffer-point buf)
             ;; push origin onto the mark ring, then restore point to the match, no region
-            b2 (clear-mark (goto-char (push-mark (goto-char buf (:origin is))) p)))
+            b2 (clear-mark (goto-char (push-mark (goto-char buf (:origin is))) p))
+            last-key (isearch-last-key is))
         (assoc (ed-set-buf m b2)
           :isearch nil
+          :isearch-lazy nil
+          :isearch-count nil
           :overlays nil
-          :isearch-last (if (= (:string is) "") (:isearch-last m) (:string is))
+          last-key (if (= (:string is) "") (get m last-key) (:string is))
           :echo "")))))
 
 (defn isearch-abort (m)
@@ -244,46 +509,73 @@ the search state."
       m
       (assoc (ed-set-buf m (clear-mark (goto-char (ed-current-buf m) (:origin is))))
         :isearch nil
+        :isearch-lazy nil
+        :isearch-count nil
         :overlays nil
         :echo "quit"))))
 
 ;; ---- entry points -----------------------------------------------------------
 
-(def *isearch-keys* [:backspace :ctrl-s :ctrl-r :enter :escape :ctrl-g :ctrl-y :ctrl-w])
+(def *isearch-keys*
+  [:backspace :ctrl-s :ctrl-r :enter :escape :ctrl-g :ctrl-y :ctrl-w :alt-r :alt-c :alt-s])
 
 (defn isearch-control-key? (input)
   "Whether an active isearch consumes `input`: a printable char (extends the search)
 or one of its control keys. Any other key exits the search and is dispatched normally."
   (or (string? input) (includes? *isearch-keys* input)))
 
-(defn isearch-start (m dir)
-  "Begin an incremental search in `dir` (`:forward` / `:backward`) from point."
+(defn isearch-start (m dir &optional (mode :literal))
+  "Begin an incremental search in `dir` (`:forward` / `:backward`) from point — a `mode`
+`:literal` (C-s), `:regexp` (C-M-s) or `:word` (M-s w) search."
   (let (p (buffer-point (ed-current-buf m)))
-    (assoc m
-      :echo (isearch-prompt dir "" false false)
-      :isearch {:dir dir :string "" :origin p :match nil :wrapped false})))
+    (isearch-refresh (assoc m
+                       :isearch-count nil
+                       :isearch {:dir dir :string "" :origin p :match nil :wrapped false :mode mode}))))
+
+(defn- isearch-meta-s (m is input)
+  "The key after `M-s` inside a search: `w` toggles a word search, `r` a regexp search, `c`
+case folding (Emacs's `M-s` search map); any other key is handled as itself."
+  (let (is1 (dissoc is :meta-s)
+        m1 (assoc m :isearch is1))
+    (case input
+      "w" (isearch-toggle m1 is1 :word)
+      "r" (isearch-toggle m1 is1 :regexp)
+      "c" (isearch-toggle m1 is1 :case)
+      (isearch-dispatch m1 is1 input))))
+
+(defn- isearch-dispatch (m is input)
+  "One isearch control key, folded into the search."
+  (cond
+    (:meta-s is) (isearch-meta-s m is input)
+    (string? input) (isearch-extend m is input)
+    (= input :backspace) (isearch-backspace m is)
+    (= input :ctrl-s) (isearch-repeat m is :forward)
+    (= input :ctrl-r) (isearch-repeat m is :backward)
+    (= input :ctrl-y) (isearch-yank-kill m is)
+    (= input :ctrl-w) (isearch-yank-word m is)
+    (= input :alt-r) (isearch-toggle m is :regexp)
+    (= input :alt-c) (isearch-toggle m is :case)
+    (= input :alt-s) (assoc m :isearch (assoc is :meta-s true))
+    (or (= input :enter) (= input :escape)) (isearch-exit m)
+    (= input :ctrl-g) (isearch-abort m)
+    else m))
 
 (defn isearch-handle (m input)
   "Fold one isearch control key into the search (gated by `isearch-control-key?`):
-printable chars extend, `C-s`/`C-r` repeat, `C-y` pastes the kill ring, `C-w` pulls in the next word of the
-buffer, `Backspace` steps back, `Enter`/`Esc` exit, `C-g` aborts."
-  (let (is (:isearch m))
-    (cond
-      (string? input) (isearch-extend m is input)
-      (= input :backspace) (isearch-backspace m is)
-      (= input :ctrl-s) (isearch-repeat m is :forward)
-      (= input :ctrl-r) (isearch-repeat m is :backward)
-      (= input :ctrl-y) (isearch-yank-kill m is)
-      (= input :ctrl-w) (isearch-yank-word m is)
-      (or (= input :enter) (= input :escape)) (isearch-exit m)
-      (= input :ctrl-g) (isearch-abort m)
-      else m)))
+printable chars extend, `C-s`/`C-r` repeat, `C-y` pastes the kill ring, `C-w` pulls in the
+next word of the buffer, `M-r` / `M-c` / `M-s w` toggle a regexp search, case folding and a
+word search, `Backspace` steps back, `Enter`/`Esc` exit, `C-g` aborts."
+  (isearch-refresh (isearch-dispatch m (:isearch m) input)))
 
-;; ---- query-replace (M-%) ----------------------------------------------------
+;; ---- query-replace (M-%, C-M-%) ----------------------------------------------
 ;; A second modal mini-loop, sharing the search core. `:query-replace` carries
-;; `{:from :to :match :count}`; each match is highlighted with a transient overlay
-;; and the user answers y/n/!/./q. Two minibuffer prompts (from, then to) precede it
-;; — see `commands/cmd-query-replace`.
+;; `{:from :to :regexp? :match :found :count}`; each match is highlighted with a transient
+;; overlay (and every other one in the window lit, as in a search) and the user answers
+;; y/n/!/./q. Two minibuffer prompts (from, then to) precede it — see
+;; `commands/cmd-query-replace` and `cmd-query-replace-regexp`.
+;;
+;; A regexp's replacement may refer to what matched: `\&` is the whole match, `\1`…`\9` its
+;; groups and `\\` a backslash (Emacs's syntax, [[expand-replacement]]).
 
 ;; The query-replace state, as the commands below read it. `:match` is nil between the
 ;; start and the first `qr-goto`; every replace runs at a match, and `qr-match` says so.
@@ -297,9 +589,59 @@ buffer, `Backspace` steps back, `Enter`/`Esc` exit, `C-g` aborts."
   "The current match's start — set by `qr-goto` before any replace can run."
   (or (:match qr) (error "query-replace is not at a match")))
 
+(defn- qr-fold? (qr)
+  "Does this replace ignore case — the search rule for its kind."
+  (if (:regexp? qr) (regexp-fold? (:from qr)) (search-fold? (:from qr))))
+
 (defn- qr-prompt (qr)
   "The echo-area prompt for a query-replace at a match."
-  (str "Query replacing " (:from qr) " with " (:to qr) ": (y/n/!/./q)"))
+  (str "Query replacing "
+    (if (:regexp? qr) "regexp " "")
+    (:from qr)
+    " with "
+    (:to qr)
+    ": (y/n/!/./q)"))
+
+(defn- qr-find (qr buf pos)
+  "The next match of the replace at or after `pos`, as `regex/find`'s map
+(`{:start :end :text :groups}`), or nil."
+  (let (fold? (qr-fold? qr)
+        from (:from qr))
+    (if (:regexp? qr)
+      (regex/rope-find from (buffer-rope buf) pos {:fold? fold?})
+      (let (start (buffer-search-forward buf from pos fold?))
+        (when start
+          (let (end (+ start (string/length from)))
+            {:start start :end end :text (text/slice (buffer-rope buf) start end) :groups []}))))))
+
+(defn expand-replacement (to found)
+  "The replacement template `to` with its references filled in from `found` (a match map,
+as `regex/find` answers): `\\&` the whole match, `\\1`…`\\9` a group (empty when it did not
+take part), `\\\\` a backslash — Emacs's `replace-match` syntax. Any other text is itself.
+
+    (isearch/expand-replacement \"\\\\2, \\\\1\" (regex/find \"(\\\\w+) (\\\\w+)\" \"jane doe\"))   ;=> \"doe, jane\"
+    (isearch/expand-replacement \"<\\\\&>\" (regex/find \"o+\" \"foo\"))                       ;=> \"<oo>\""
+  (regex/replace "\\\\([&0-9\\\\])"
+    to
+    (fn (reference)
+      (let (what (:text (first (:groups reference))))
+        (cond
+          (= what "&") (:text found)
+          (= what "\\") "\\"
+          (= what "0") (:text found)
+          else
+            (let (group (nth (:groups found) (- (string/char->int what) (string/char->int "1")) nil))
+              (if (nil? group) "" (:text group))))))))
+
+(defn- qr-replacement (qr found)
+  "The text that replaces the match `found`: a regexp's template expanded
+([[expand-replacement]]), then — when the search folded and the template was typed in lower
+case — given the case of the text it replaces ([[replacement-for]])."
+  (let (to (:to qr)
+        expanded (if (:regexp? qr) (expand-replacement to found) to))
+    (if (= to (string/fold-case to))
+      (replacement-for (:text found) expanded (qr-fold? qr))
+      expanded)))
 
 (defn qr-finish (m)
   "End query-replace: clear the state + the match overlay, and report the count."
@@ -308,21 +650,24 @@ buffer, `Backspace` steps back, `Enter`/`Esc` exit, `C-g` aborts."
     (assoc m
       :query-replace nil
       :overlays nil
+      :isearch-lazy nil
       :echo (str "Replaced " n " occurrence" (if (= n 1) "" "s")))))
 
 (sig qr-goto (model int -> model))
 (defn- qr-goto (m pos)
-  "Highlight the next match of `:from` at or after `pos` (a transient overlay, point
-at its start), or finish if there is none."
+  "Highlight the next match at or after `pos` (a transient overlay, point at its start, the
+other matches in the window lit), or finish if there is none."
   (let (qr (qr-state m)
         buf (ed-current-buf m)
-        start (buffer-search-forward buf (:from qr) pos (search-fold? (:from qr))))
-    (if (nil? start)
+        found (qr-find qr buf pos))
+    (if (nil? found)
       (qr-finish m)
-      (assoc (ed-set-buf m (goto-char buf start))
-        :overlays [{:start start :end (+ start (string/length (:from qr))) :face face-isearch}]
+      (assoc (ed-set-buf m (goto-char buf (:start found)))
+        :overlays [{:start (:start found) :end (:end found) :face face-isearch}]
+        :isearch-lazy
+          {:pattern (if (:regexp? qr) (:from qr) (regex/escape (:from qr))) :fold? (qr-fold? qr)}
         :echo (qr-prompt qr)
-        :query-replace (assoc qr :match start)))))
+        :query-replace (assoc qr :match (:start found) :found found)))))
 
 (defn replacement-for (matched to fold?)
   "The text to put in place of `matched`, given the replacement `to`.
@@ -341,6 +686,7 @@ a name, not a sentence."
     (not fold?) to
     (not (= to (string/fold-case to))) to
     (= matched "") to
+    (= to "") to
     ;; ALL CAPS in, all caps out — but only when there is a letter to be sure about, so
     ;; `---` does not count as upper case
     (and (= matched (string/upper matched)) (not (= matched (string/fold-case matched))))
@@ -353,43 +699,43 @@ a name, not a sentence."
 
 (sig qr-replace (model -> (tuple model int)))
 (defn- qr-replace (m)
-  "Replace the current match with `:to` — case-adjusted to the text it is replacing when
-the search folded ([[replacement-for]]) — and return `[model' next-search-pos]` (the model
-with its count bumped, point just past the inserted text). A buffer that refuses the edit
-(read-only) ends the replace there."
+  "Replace the current match with its replacement ([[qr-replacement]]) and return
+`[model' next-search-pos]` (the model with its count bumped, point just past the inserted
+text). A buffer that refuses the edit (read-only) ends the replace there."
   (let (qr (qr-state m)
         start (qr-match qr)
-        end (+ start (string/length (:from qr)))
-        matched (text/slice (buffer-rope (ed-current-buf m)) start end)
-        to (replacement-for matched (:to qr) (search-fold? (:from qr)))
+        found (:found qr)
+        end (:end found)
+        to (qr-replacement qr found)
         [m2 replaced?] (ed-try-edit m (fn (b) (replace-region b start end to))))
     (if replaced?
       [(assoc m2 :query-replace (assoc qr :count (inc (:count qr)))) (+ start (string/length to))]
       [(assoc m2 :query-replace (assoc qr :match nil)) (buffer-length (ed-current-buf m2))])))
 
-(defn- qr-matches (buf from pos acc)
-  "Every match of `from` at or after `pos`, non-overlapping, as a reversed list of starts
-— the matches `!` will replace, found before any of them is."
-  (let (start (buffer-search-forward buf from pos (search-fold? from)))
-    (if (nil? start)
+(defn- qr-matches (qr buf pos acc)
+  "Every match at or after `pos`, non-overlapping, as a reversed list of `[start end
+replacement]` — the matches `!` will replace and what each becomes, found before any of
+them is."
+  (let (found (qr-find qr buf pos))
+    (if (nil? found)
       acc
-      (qr-matches buf from (+ start (math/max 1 (string/length from))) (cons start acc)))))
+      (qr-matches qr
+        buf
+        (:end found)
+        (cons [(:start found) (:end found) (qr-replacement qr found)] acc)))))
 
-(defn- qr-replace-at (buf from to starts)
-  "`buf` with the match at each of `starts` (ascending, found in `buf` before any edit)
-replaced by `to`, case-adjusted per match. Front to back, each start shifted by what the
-replacements before it added or removed, so point ends after the last one."
-  (let (n (string/length from)
-        fold? (search-fold? from))
-    (first (fold starts
-             [buf 0]
-             (fn (acc start)
-               (let ([b shift] acc
-                     at (+ start shift)
-                     matched (text/slice (buffer-rope b) at (+ at n))
-                     replacement (replacement-for matched to fold?))
-                 [(replace-region b at (+ at n) replacement)
-                   (+ shift (- (string/length replacement) n))]))))))
+(sig qr-replace-at (buffer (list (tuple int int string)) -> buffer))
+(defn- qr-replace-at (buf replacements)
+  "`buf` with each `[start end text]` of `replacements` (ascending, found in `buf` before any
+edit) put in. Front to back, each span shifted by what the replacements before it added or
+removed, so point ends after the last one."
+  (first (fold replacements
+           [buf 0]
+           (fn (acc replacement)
+             (let ([b shift] acc
+                   [start end text] replacement)
+               [(replace-region b (+ start shift) (+ end shift) text)
+                 (+ shift (- (string/length text) (- end start)))])))))
 
 (defn- qr-all (m)
   "Replace the current match and every one after it, then finish (`!`). All of them are
@@ -399,12 +745,12 @@ ONE edit in one `undo-group`, so a single undo puts every occurrence back — ne
         match (:match qr))
     (if (nil? match)
       (qr-finish m)
-      (let (starts (reverse (qr-matches (ed-current-buf m) (:from qr) match '()))
+      (let (replacements (reverse (qr-matches qr (ed-current-buf m) match '()))
             [m2 replaced?] (ed-try-edit m
-                             (fn (b)
-                               (undo-group b (fn (g) (qr-replace-at g (:from qr) (:to qr) starts))))))
+                             (fn (b) (undo-group b (fn (g) (qr-replace-at g replacements))))))
         (qr-finish (if replaced?
-                     (assoc m2 :query-replace (assoc qr :count (+ (:count qr) (count starts))))
+                     (assoc m2
+                       :query-replace (assoc qr :count (+ (:count qr) (count replacements))))
                      (assoc m2 :query-replace qr)))))))
 
 (def *qr-keys* ["y" "n" " " "!" "." "q"])
@@ -415,12 +761,18 @@ or Enter/Esc/C-g/Delete. Any other key finishes the replace and is dispatched no
   (or (and (string? input) (includes? *qr-keys* input))
     (includes? [:enter :escape :ctrl-g :delete] input)))
 
-(defn qr-start (m from to)
-  "Begin query-replace of `from` → `to` from point; jump to the first match."
-  (if (= from "")
-    (message m "(nothing to replace)")
-    (qr-goto (assoc m :query-replace {:from from :to to :match nil :count 0})
-      (buffer-point (ed-current-buf m)))))
+(defn qr-start (m from to &optional (options {}))
+  "Begin query-replace of `from` → `to` from point; jump to the first match. `options`:
+`:regexp?` makes `from` a regexp and lets `to` refer to its groups (C-M-%)."
+  (cond
+    (= from "") (message m "(nothing to replace)")
+    (and (:regexp? options) (regex/incomplete? from))
+      (message m (str "Invalid regexp: " from " [incomplete input]"))
+    else
+      (qr-goto (assoc m
+                 :query-replace
+                   {:from from :to to :regexp? (= true (:regexp? options)) :match nil :count 0})
+        (buffer-point (ed-current-buf m)))))
 
 (defn qr-handle (m input)
   "Fold one query-replace answer key: y/space replace+advance, n/Delete skip, ! all,
@@ -428,9 +780,7 @@ or Enter/Esc/C-g/Delete. Any other key finishes the replace and is dispatched no
   (let (qr (qr-state m))
     (cond
       (or (= input "y") (= input " ")) (let ([m2 pos] (qr-replace m)) (qr-goto m2 pos))
-      (or (= input "n") (= input :delete))
-        (qr-goto m
-          (+ (qr-match qr) (string/length (:from qr))))
+      (or (= input "n") (= input :delete)) (qr-goto m (:end (:found qr)))
       (= input "!") (qr-all m)
       (= input ".") (let ([m2 _] (qr-replace m)) (qr-finish m2))
       else (qr-finish m)))) ; q / Enter / Esc / C-g
