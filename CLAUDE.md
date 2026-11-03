@@ -107,8 +107,17 @@ src/scroll.blsp             keeping point on screen: the scroll-margin clamp, ho
                             visual-line-mode), the `:long-lines` setting for its mode, the line's
                             KIND (`:line-kinds`: a section heading truncates, its body wraps),
                             the mode's `:long-lines` facet, the setting's `:default`
-src/autosave.blsp           `#file#` auto-save sidecars + auto-revert of files changed on disk
-                            (idle-beat jobs)
+src/autosave.blsp           `#file#` auto-save sidecars (owner-only, on the idle beat and a timer of
+                            their own) + auto-revert of files changed on disk; the note a visit
+                            shows when a sidecar is newer than its file
+src/recover.blsp            M-x recover-this-file / recover-session: a sidecar's text put back as one
+                            undoable edit (Emacs's), from the open and recent files
+src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `supervise`): a loop that
+                            dies abnormally has every file buffer whose text its file lacks
+                            auto-saved from the buffer PROCESSES (they outlive it), its window
+                            closed, and a fresh loop started over the registry's buffers — given up
+                            after `*restart-max*` restarts a minute, so a fault on every start
+                            cannot spin
 src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the idle beat — in
                             the sandbox child for a brood buffer (its own session client), an
                             in-image task otherwise; folds into the model's diagnostics cache

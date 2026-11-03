@@ -54,6 +54,9 @@ saves; C-x C-c / Esc / the window close button quits."
   (:use slowlog) ; slow turns of the loop kept across sessions, M-x slow-turns
   (:use treewarm) ; a large tree-sitter buffer's parse, warmed off the loop
   (:use autosave) ; `#file#` sidecars + auto-revert
+  (:use recover) ; M-x recover-this-file / recover-session — the sidecars put back
+  (:use lifeline) ; the loop under a supervisor: a dead loop auto-saves and restarts
+  (:use editor/buffer-registry :only [registry-entries]) ; a restarted loop finds its buffers
   (:use lsp-commands) ; LSP autostart / text push / signature, and the `:lsp-…` events
   (:use projects) ; project-root — the current project shown on the model
   (:use config) ; init-config / window-mode — the user init file (~/.config/bedit/init.blsp)
@@ -241,8 +244,95 @@ with `(bound? 'ns/fn)`."
           (log/info (str "packages: loaded " (count loaded) " — " (string/join loaded ", ")))))
       (doseq (w (config-warnings cfg)) (log/warn w)))))
 
+(defn- appearance-of (cfg)
+  "The type setup the window was given (`window-font`, plus the config's line height), for
+`appearance/apply!`. The window has no getter for any of it, so this is what lets Ctrl+wheel
+step from the real size and `M-x preset-save` name what you are actually looking at
+(src/appearance.blsp) instead of a guess."
+  {:family (:family (window-font cfg))
+   :height (:height (window-font cfg))
+   :line-height (config/setting cfg :line-height)})
+
+(defn- open-window (cfg)
+  "The native window (a {:enter :leave :size :draw :poll :window} map), set up from `cfg`.
+`:app-id` is how the desktop identifies it as *this* app — without it the window matches no
+installed .desktop entry and GNOME paints its generic fallback icon (config/*app-id*,
+assets/README.md). `:title` is only the pre-first-event placeholder; `input` sets the real
+one (`ed-window-title`) from then on. `config/*window-options*` carries `:key-repeat :os`: a
+held key repeats at the desktop's own delay and rate (brood ADR-441, input.blsp's key-repeat
+section). Opened by the loop process, which polls it: a window's input goes to the process
+that opened it."
+  (let (disp (gui-display (assoc config/*window-options* :title *app-name*)))
+    (do (configure-window cfg disp) disp)))
+
+(defn- run-loop (supervisor m disp)
+  "Run `ui-run` on `m` in `disp`, this process being the editor: the logger routed here,
+blocking calls reported (brood ADR-517), and `supervisor` (`lifeline/supervise`) told the
+window and buffer registry, so it can save and restart if this loop dies. THE FLIP
+(docs/actor-architecture.md): every pool buffer in the live window is backed by its own
+process — `hosted/hosted-reconcile` at the loop tail hosts each slot as it appears — and
+named in the buffer registry, so a second frame (C-x 5 2), or this loop's successor, links
+its slots to the same processes (docs/frames-plan.md). Tests/headless models never set
+`:host-buffers?`, so the pure suite stays pure."
+  (do
+    (start-editor-logging)
+    ;; the loop must keep answering: a native call that blocks it is reported (brood ADR-517)
+    (slowlog/responsive!)
+    (lifeline/announce! supervisor (:window disp) (:buffer-reg m) (frames/frames-live-of m))
+    (ui-run m ed-view ed-update disp)))
+
+(defn- start-loop (supervisor cfg file directory? project buffer)
+  "The first editor loop: open the window on the launch `buffer` (a directory argument —
+`bedit .` — shows its dired listing over the scratch buffer), then [[run-loop]]."
+  (let (disp (open-window cfg)
+        started (live-model buffer project disp cfg)
+        ;; dired auto-loads on the qualified call
+        m (if directory? (dired/ed-show-dired started (path/absolute file)) started)
+        recovery (when (and file (not directory?)) (ed-recovery-note (path/absolute file))))
+    (do
+      ;; discovered on launch → known for C-x p p (once: the project the model settled on,
+      ;; which a directory's dired may have resolved afresh)
+      (remember-project! (:project-root m))
+      (load-packages-later cfg)
+      (run-loop supervisor
+        (frames/frames-registry-start (appearance/apply! (assoc (if recovery (message m recovery) m)
+                                                           :host-buffers? true)
+                                        (appearance-of cfg)))
+        disp))))
+
+(defn- restart-loop (supervisor cfg state)
+  "A loop started after the last one died (`lifeline/supervise`): a fresh window over every
+buffer in the registry — their processes outlived the loop, so the text is all there —
+showing the first file buffer, the live flags the dead loop announced carried over, and the
+echo area saying what happened. Its layout, minibuffer and transient state are gone."
+  (let (registry (:registry state)
+        entries (registry-entries registry)
+        file-entry (seq/find (if (vector? entries) entries []) (fn (e) (:file (or (:meta e) {}))))
+        show (if file-entry (:name file-entry) "*scratch*")
+        disp (open-window cfg)
+        seeded (frames/frames-seed-model registry show (:live state))
+        m (config/apply-to-model (assoc (dissoc seeded :frame?) :window (:window disp)) cfg))
+    (run-loop supervisor
+      (message (appearance/apply! m (appearance-of cfg))
+        "the editor's loop died and was restarted — every buffer is here; check *Messages*")
+      disp)))
+
+(defn- report-death (death)
+  "Say on stderr and in the log that the editor's loop died, what was auto-saved, and
+whether it is being restarted — the one record a crash leaves outside the window."
+  (let (line (str "bedit: the editor loop died ("
+               (:reason death)
+               "); auto-saved "
+               (count (:saved death))
+               " unsaved file(s)"
+               (if (empty? (:saved death)) "" (str ": " (string/join (:saved death) ", ")))
+               (if (:restarting? death) " — restarting" " — not restarting")))
+    (do (io/puts line :to (io/stderr-port)) (log/warn line))))
+
 (defn- run-window (file)
-  "Open the local window on `file` (nil for a scratch session) and run the `ui-run` loop."
+  "Open the local window on `file` (nil for a scratch session) and run the editor loop under
+`lifeline/supervise`: a loop that dies has its unsaved buffers auto-saved and is restarted
+over the same buffers. Returns when the editor quits."
   (let (cfg (init-config) ; ~/.config/bedit/init.blsp (created on first launch)
         ;; `bedit .` / `bedit some/dir` — open dired, not a text file
         directory? (and file (file/dir? file))
@@ -259,42 +349,11 @@ with `(bound? 'ns/fn)`."
         ;; after the grammars: a file of a parsed language with a line-lexer stand-in is typed by
         ;; whether its grammar is ready (`model/ed-grammar-fallback`), so it must be declared first
         buffer (launch-buffer file directory? project cfg)
-        ;; the native window (a {:enter :leave :size :draw :poll :window} map). `:app-id`
-        ;; is how the desktop identifies it as *this* app — without it the window matches
-        ;; no installed .desktop entry and GNOME paints its generic fallback icon
-        ;; (config/*app-id*, assets/README.md). `:title` is only the pre-first-event
-        ;; placeholder; `input` sets the real one (`ed-window-title`) from then on.
-        ;; `config/*window-options*` carries `:key-repeat :os`: a held key repeats at the
-        ;; desktop's own delay and rate (brood ADR-441, input.blsp's key-repeat section)
-        disp (gui-display (assoc config/*window-options* :title *app-name*))
-        started (live-model buffer project disp cfg)
-        ;; A directory argument (`bedit .`) opens its dired listing over the scratch buffer.
-        ;; dired lives in `commands`; the qualified `dired/ed-show-dired` call auto-loads it.
-        m (if directory? (dired/ed-show-dired started (path/absolute file)) started))
-    (configure-window cfg disp)
-    ;; discovered on launch → known for C-x p p (once: the project the model settled on,
-    ;; which a directory's dired may have resolved afresh)
-    (remember-project! (:project-root m))
-    (start-editor-logging)
-    (load-packages-later cfg)
-    ;; the loop must keep answering: a native call that blocks it is reported (brood ADR-517)
-    (slowlog/responsive!)
-    ;; THE FLIP (docs/actor-architecture.md): every pool buffer in the live window is
-    ;; backed by its own process — `hosted/hosted-reconcile` at the loop tail hosts
-    ;; each slot as it appears (files, *Messages*, dired, occur — no call-site
-    ;; cooperation). Tests/headless models never set this flag, so the pure suite
-    ;; stays pure.
-    ;; …and named in the buffer registry (`frames/frames-registry-start`), so a second
-    ;; frame (C-x 5 2) links its slots to the same processes (docs/frames-plan.md).
-    ;; Record the type setup the window was just given (`window-font`, plus the
-    ;; config's line height) on the model. The window has no getter for any of it, so
-    ;; this is what lets Ctrl+wheel step from the real size and `M-x preset-save` name
-    ;; what you are actually looking at (src/appearance.blsp) instead of a guess.
-    (ui-run (frames/frames-registry-start (appearance/apply! (assoc m :host-buffers? true)
-                                            {:family (:family (window-font cfg))
-                                             :height (:height (window-font cfg))
-                                             :line-height (config/setting cfg :line-height)}))
-      ed-view ed-update disp)))
+        outcome (lifeline/supervise (fn (supervisor)
+                                      (start-loop supervisor cfg file directory? project buffer))
+                  (fn (supervisor state) (restart-loop supervisor cfg state))
+                  report-death))
+    (if (= outcome :died) 1 nil)))
 
 (defn main (& args)
   "Open the editor in a native window. With a `file` argument (`nest run <path>`)

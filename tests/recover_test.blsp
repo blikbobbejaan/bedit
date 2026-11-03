@@ -1,0 +1,141 @@
+;; Not losing work: the auto-save sidecars written private, offered back on a visit and
+;; recovered by command (`recover`), the loop that dies saved and restarted (`lifeline`),
+;; and a CRLF file written back with its own line endings.
+(defmodule recover-test
+  (:use autosave) ; sidecar paths, the recovery note, the auto-save timer
+  (:use recover) ; recover-this-file / recover-session
+  (:use lifeline) ; emergency-save! / supervise
+  (:use model)
+  (:use input)
+  (:use pool)
+  (:use main)
+  (:use editor/buffer)
+  (:use editor/buffer-registry)
+  (:use test))
+
+(purge-stale-temp "bedit-recover-")
+
+(defn- cur (m) (ed-current-buf m))
+
+(defn- fixture-file (text)
+  "A fresh file holding `text` in its own temp directory; its path."
+  (let (dir (temp-dir "bedit-recover-")
+        _ (file/mkdir dir)
+        path (path/join dir "notes.txt"))
+    (do (file/spit path text) path)))
+
+(defn- mode-bits (path) (math/mod (:mode (file/stat path)) 512))
+
+(describe "auto-save sidecars are private, and say when they are worth recovering"
+  (test "a sidecar is written owner-only, whatever the umask gives a plain write"
+    (let (path (fixture-file "secret\n")
+          m (ed-update (ed-init (find-file-buffer path)) "x" 80 24))
+      (ed-auto-save-write (:due (ed-auto-save-due m)))
+      (assert= (mode-bits (ed-auto-save-path path)) 384) ; 0600
+      (assert= (file/slurp (ed-auto-save-path path)) "xsecret\n")))
+  (test "a sidecar newer than its file is noted on a visit; one older than it is not"
+    (let (path (fixture-file "v1\n")
+          sidecar (ed-auto-save-path path))
+      (assert= (ed-recovery-note path) nil)
+      (file/spit sidecar "unsaved\n")
+      ;; the file older than its sidecar: the session that wrote the sidecar never saved
+      (os/cmd "touch" ["-d" "1 hour ago" path])
+      (is (includes? (ed-recovery-note path) "M-x recover-this-file"))
+      (is (includes? (:echo (ed-find-file (ed-init (make-buffer "")) path)) "recover-this-file"))
+      ;; saved since: the sidecar is stale
+      (os/cmd "touch" ["-d" "2 hours ago" sidecar])
+      (assert= (ed-recovery-note path) nil)))
+  (test "the auto-save timer is armed while something is unwritten, and not after the round"
+    (let (path (fixture-file "t\n")
+          m (ed-update (ed-init (find-file-buffer path)) "x" 80 24))
+      (is (int? (:after (ed-auto-save-timer m))))
+      (assert= (ed-auto-save-timer (ed-auto-save! (assoc m :auto-saved-at 0))) nil)
+      (assert= (ed-auto-save-timer (ed-init (find-file-buffer path))) nil)
+      (ed-remove-auto-save path))))
+
+(describe "M-x recover-this-file"
+  (test "asks, then puts the sidecar's text back as one undoable edit"
+    (let (path (fixture-file "on disk\n")
+          _ (file/spit (ed-auto-save-path path) "recovered text\n")
+          m (ed-init (find-file-buffer path))
+          asked (cmd-recover-this-file m nil)
+          done (ed-update asked "y" 80 24))
+      (is (includes? (:echo asked) "Recover notes.txt"))
+      (assert= (buffer-text (cur done)) "recovered text\n")
+      (is (buffer-modified? (cur done)))
+      (assert= (buffer-text (undo (cur done))) "on disk\n")))
+  (test "n leaves the buffer alone; no sidecar says so"
+    (let (path (fixture-file "on disk\n")
+          m (ed-init (find-file-buffer path)))
+      (is (includes? (:echo (cmd-recover-this-file m nil)) "no auto-save data"))
+      (file/spit (ed-auto-save-path path) "other\n")
+      (assert= (buffer-text (cur (ed-update (cmd-recover-this-file m nil) "n" 80 24))) "on disk\n")))
+  (test "recover-session offers the open files with newer auto-save data"
+    (let (path (fixture-file "on disk\n")
+          _ (file/spit (ed-auto-save-path path) "newer\n")
+          _ (os/cmd "touch" ["-d" "1 hour ago" path])
+          m (ed-init (find-file-buffer path)))
+      (is (includes? (ed-recoverable-files m) path)))))
+
+(describe "a loop that dies is saved and restarted"
+  (test "emergency-save! writes a sidecar for each buffer process whose text the file lacks"
+    (let (changed (fixture-file "old\n")
+          same (fixture-file "same\n")
+          registry (registry-start)
+          _ (registry-share registry "changed" "new\n" {:file changed})
+          _ (registry-share registry "same" "same\n" {:file same})
+          _ (registry-share registry "*scratch*" "no file" {})
+          saved (emergency-save! registry))
+      (assert= saved [changed])
+      (assert= (file/slurp (ed-auto-save-path changed)) "new\n")
+      (assert= (mode-bits (ed-auto-save-path changed)) 384)
+      (refute (file/exists? (ed-auto-save-path same)))
+      (registry-stop registry)))
+  (test "a CRLF file's buffer process is compared with the file's decoded text"
+    (let (path (fixture-file "a\r\nb\r\n")
+          registry (registry-start)
+          _ (registry-share registry "crlf" "a\nb\n" {:file path :eol :crlf}))
+      (assert= (emergency-save! registry) [])
+      (registry-stop registry)))
+  (test "supervise restarts a loop that raised, after saving, and returns when one quits"
+    (let (path (fixture-file "old\n")
+          registry (registry-start)
+          _ (registry-share registry "notes.txt" "unsaved\n" {:file path})
+          test-process (self)
+          outcome (supervise (fn (supervisor)
+                               (do
+                                 (announce! supervisor nil registry {:gui true})
+                                 (error "the loop broke")))
+                    (fn (supervisor state)
+                      ;; the restarted loop sees what the dead one announced, then quits
+                      (send test-process [:restarted (:live state)]))
+                    ;; called in the supervising process — this one
+                    (fn (death) (send test-process [:death death])))
+          death (receive ([:death d] d) (after 2000 {})))
+      (assert= outcome :quit)
+      (assert= (receive ([:restarted live] live) (after 2000 :never)) {:gui true})
+      (assert= (:saved death) [path])
+      (is (:restarting? death))
+      (assert= (file/slurp (ed-auto-save-path path)) "unsaved\n")
+      (registry-stop registry)))
+  (test "a loop that keeps dying is let go"
+    (let (registry (registry-start)
+          outcome (supervise (fn (supervisor)
+                               (do (announce! supervisor nil registry {}) (error "boom")))
+                    (fn (supervisor state) (error "boom again"))))
+      (assert= outcome :died)
+      (registry-stop registry)))
+  (test "restart-allowed? counts only the deaths inside the window"
+    (is (restart-allowed? [] 0))
+    (refute (restart-allowed? [1 2 3] 10))
+    (is (restart-allowed? [1 2] 10))))
+
+(describe "a CRLF file keeps its line endings"
+  (test "visited, edited and saved, it is written with CRLF again"
+    (let (path (fixture-file "one\r\ntwo\r\n")
+          m (ed-find-file (ed-init (make-buffer "")) path))
+      (assert= (buffer-text (cur m)) "one\ntwo\n")
+      (assert= (buffer-eol (cur m)) :crlf)
+      (ed-save-buf-at (ed-update m "x" 80 24)
+        (or (ed-buffer-index-by-file m path) (error "the visited file is not in the pool")))
+      (assert= (file/slurp path) "xone\r\ntwo\r\n"))))

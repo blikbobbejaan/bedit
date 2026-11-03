@@ -1,0 +1,122 @@
+(defmodule lifeline
+  "The editor's loop under a supervisor. The loop (`ui-run`) is one process; every buffer's
+text lives in a process of its own, named in the buffer registry, and neither depends on the
+loop. So the loop dying need not lose anything: `supervise` runs it as a child of `main`,
+and when it ends ABNORMALLY — a panic in a native call, an error outside update and view —
+writes an auto-save sidecar for every file buffer whose text the file does not hold
+(`emergency-save!`, from the buffer processes), closes the dead loop's window and starts a
+fresh loop that adopts every buffer from the registry. A loop that keeps dying is let go
+once it has been restarted `*restart-max*` times inside `*restart-window-ms*`, its sidecars
+written, so a fault that recurs on every start cannot spin. A clean quit ends the loop normally, and `main`
+with it, as before.
+
+Mechanism only: what a loop IS — how it opens its window, how a restarted one is seeded —
+is `main`'s, handed in as functions."
+  (:use editor/buffer) ; buffer-sync / buffer-text / eol-decode
+  (:use editor/buffer-registry) ; registry-entries
+  (:use autosave)) ; ed-auto-save-path
+
+(def *restart-max* 3)
+(def *restart-window-ms* 60000)
+
+(defn- unsaved-text (entry)
+  "`[path text]` for registry `entry` when it is a file buffer whose process holds text the
+file does not (a file that is missing counts, unless the text is empty), else nil. Read from
+the buffer process with a timeout, so a process that died too is skipped, not waited on."
+  (let (path (:file (or (:meta entry) {})))
+    (when path
+      (let (snapshot (buffer-sync (:proc entry) buffer-text 1000))
+        (when (vector? snapshot)
+          (let (text (second snapshot)
+                on-disk (when (file/exists? path)
+                          (check-allow :discarded-catch
+                            (try (:text (eol-decode (file/slurp path))) (catch e nil)))))
+            (when (if (nil? on-disk) (not (= text "")) (not (= text on-disk))) [path text])))))))
+
+(defn emergency-save! (registry)
+  "Write an auto-save sidecar (`#file#`, owner-only) for every file buffer in `registry`
+whose text its file does not hold — what a loop that died left unsaved, read from the
+buffer processes, which outlive it. Returns the paths it wrote; a sidecar that cannot be
+written is logged and the rest still are."
+  (let (entries (registry-entries registry))
+    (if (not (vector? entries))
+      []
+      (into []
+        (seq/keep entries
+          (fn (entry)
+            (let (unsaved (unsaved-text entry))
+              (when unsaved
+                (let ([path text] unsaved)
+                  (check-allow :discarded-catch
+                    (try
+                      (do (file/spit-private (ed-auto-save-path path) text) path)
+                      (catch e
+                        (do
+                          (log/warn (str "emergency auto-save of "
+                                      path
+                                      " failed: "
+                                      (error-message e)))
+                          nil)))))))))))))
+
+(defn restart-allowed? (deaths now)
+  "Whether a loop that died at `now` may be started again, given the times of the earlier
+`deaths`: fewer than `*restart-max*` of them inside the last `*restart-window-ms*`.
+
+    (lifeline/restart-allowed? [] 1000)   ;=> true
+    (lifeline/restart-allowed? [100 200 300] 1000)   ;=> false
+    (lifeline/restart-allowed? [100 200 300] 90000)   ;=> true"
+  (< (count (seq/filter deaths (fn (at) (< (- now at) *restart-window-ms*)))) *restart-max*))
+
+(defn announce! (supervisor window registry live)
+  "Tell `supervisor` (the process running [[supervise]]) what a fresh loop is: its window
+id, the buffer registry its buffers are named in, and `live`, what a restarted loop should
+carry over. Called by the loop process once its model exists."
+  (when supervisor
+    (send supervisor [:lifeline/loop (self) {:window window :registry registry :live live}])))
+
+(defn- close-window! (window)
+  "Close the dead loop's `window`: a window outlives the process that opened it, frozen on
+its last frame, and its input would go to a mailbox nobody reads."
+  (when (and window (gui/available?))
+    (check-allow :discarded-catch (try (gui/close window) (catch e nil)))))
+
+(defn- watch (supervisor restart on-death child state deaths)
+  "The supervisor's loop over one child: take its announcement, and on its death save,
+close, and restart it or stop (see [[supervise]])."
+  (receive
+    ([:lifeline/loop ^child announced] (watch supervisor restart on-death child announced deaths))
+    ([:down _ ^child reason] (if (= reason :normal)
+                               :quit (let (now (os/now)
+                                     registry (:registry state)
+                                     saved (if (nil? registry) [] (emergency-save! registry))
+                                     restarting? (and (not (nil? registry))
+                                                   (restart-allowed? deaths now)))
+                                 (do
+                                   (close-window! (:window state))
+                                   (when on-death
+                                     (on-death {:reason reason
+                                                :saved saved
+                                                :restarting? restarting?}))
+                                   (if restarting?
+                                     (let (next (spawn (fn () (restart supervisor state))))
+                                       (do
+                                         (monitor next)
+                                         (watch supervisor
+                                           restart
+                                           on-death
+                                           next
+                                           state
+                                           (conj deaths now))))
+                                     :died)))))))
+
+(defn supervise (start restart &optional (on-death nil))
+  "Run the editor loop `(start supervisor)` in a child process and keep it running: when the
+loop ends abnormally, write the unsaved buffers' sidecars ([[emergency-save!]]), close its
+window, and run `(restart supervisor state)` in a fresh child, where `state` is what the dead
+loop announced ([[announce!]]) — `{:window :registry :live}`. `on-death`, when given, is
+called with `{:reason :saved :restarting?}`, for the log. Returns `:quit` when a loop ends
+normally (the editor quit), `:died` after a loop died with no restart allowed
+([[restart-allowed?]]) or without having announced a registry to restart from."
+  (let (supervisor (self)
+        first-child (spawn (fn () (start supervisor))))
+    (do (monitor first-child) (watch supervisor restart on-death first-child {} []))))
