@@ -1,0 +1,106 @@
+;; A buffer's tab width reaches every measure, not only the paint: the row table, a row or
+;; line motion's goal column, the scroll clamp, the indenters' columns, the remembered
+;; layouts — so what point does agrees with what the view shows (src/conventions.blsp
+;; `with-tab-width`, bound once per turn in `input/ed-update` and by every `wrap` function
+;; handed a buffer; brood ADR-537).
+(defmodule tabwidth-test
+  (:use test)
+  (:use model)
+  (:use input) ; ed-update
+  (:use commands) ; cmd-visual-line-mode
+  (:use conventions) ; *user-settings*, with-buffer-setting
+  (:use editorconfig) ; *enabled*
+  (:use editor/buffer))
+
+(purge-stale-temp "bedit-tabwidth-")
+
+(defn- cur (m) (ed-current-buf m))
+(defn- with-tab (m width) (ed-set-buf m (with-buffer-setting (cur m) :tab-width width)))
+(defn- press (m keys cols) (fold keys m (fn (acc k) (ed-update acc k cols 24))))
+
+(describe "row and column measures agree with the view"
+  (test "the row segments a motion reads are the rows the view lays out"
+    (let (m (with-tab (cmd-visual-line-mode (ed-init (make-buffer "\t\t\t\tabcdefghij\nnext")) nil)
+              4)
+          b (cur m)
+          extras (scroll/ed-row-extras b))
+      ;; 4 tabs at 4 = 16 cells, then 10: one row at 30 cells wide, as the view has it
+      (assert= (vec (wrap/line-segments b 0 30 extras)) [[0 14]])
+      (assert= (count (seq/filter (wrap/rows-from b 0 30 10 extras) (fn (row) (= (first row) 0))))
+        1)))
+  (test "C-n from a wrapped tab line that is ONE row moves to the next line"
+    (let (m (with-tab (cmd-visual-line-mode (ed-init (make-buffer "\t\t\t\tabcdefghij\nnext")) nil)
+              4)
+          moved (press m [:ctrl-a :ctrl-n] 34))
+      (assert= (buffer-current-line (cur moved)) 1)))
+  (test "C-n keeps the column the view shows: the end of `\\tfoo` at a tab of 4 is column 7"
+    (let (m (with-tab (ed-init (make-buffer "\tfoo\nabcdefghijklmnop")) 4)
+          moved (press m [:ctrl-e :ctrl-n] 80))
+      (assert= (buffer-column (cur moved)) 7)))
+  (test "the scroll clamp counts a wrapped tab line's rows at the buffer's width"
+    ;; at 8 the tab line takes two rows of 20; at 4 it takes one
+    (let (m (with-tab (cmd-visual-line-mode (ed-init (make-buffer "\t\tabcdefghij\nx")) nil) 4)
+          b (cur m))
+      (assert= (wrap/row-count b 0 1 20) 1)
+      (assert= (wrap/line-rows b 0 20 (scroll/ed-row-extras b)) 1))))
+
+(describe "indent targets are columns"
+  (test "TAB after a tab-indented Makefile recipe line writes a tab, not a space"
+    (let (m (ed-init (make-buffer "all:\n\tgcc x.c\n" "/p/Makefile" "/p/Makefile"))
+          at-end (ed-set-buf m (goto-char (cur m) (string/length "all:\n\tgcc x.c")))
+          entered (press at-end [:enter :tab] 80))
+      (assert= (buffer-text (cur entered)) "all:\n\tgcc x.c\n\t\n")))
+  (test "the fallback indent of a line under two tabs is 16 columns at 8, written as spaces"
+    (let (m (ed-init (make-buffer "\t\tx\ny" "/p/a.txt" "/p/a.txt"))
+          on-y (ed-set-buf m (goto-char (cur m) 4)))
+      (assert= (commands/ed-indent-target (cur on-y)) 16)
+      (assert= (commands/ed-indent-target (with-buffer-setting (cur on-y) :tab-width 4)) 8))))
+
+(describe "a tab width past brood's cap"
+  (test "an .editorconfig tab_width of 2000 is clamped, and the buffer still renders"
+    (let (m (ed-init (assoc (make-buffer "\tx" "/p/a.txt" "/p/a.txt")
+                       :editorconfig {:tab-width 2000})))
+      (assert= (tab-width (cur m)) 1024)
+      (is (vector? (view/ed-view m 40 8)))))
+  (test "init.blsp's :tab-width refuses one past 1024"
+    (is (config/tab-width-valid? 1024))
+    (is (not (config/tab-width-valid? 2000)))
+    (is (not (config/tab-width-valid? {'go 2000})))))
+
+(describe "a new tab width is laid out again"
+  (test "M-x reload-config with a new :tab-width moves the same text's rows and caret"
+    (let (m (cmd-visual-line-mode (ed-init (make-buffer "\t\tabcdefghij\nx" "/p/a.txt" "/p/a.txt"))
+              nil)
+          b (cur m)
+          extras (scroll/ed-row-extras b)
+          caret (fn (frame)
+                  (nth (seq/find frame (fn (op) (and (vector? op) (= (first op) :cursor)))) 2))
+          at-end (ed-set-buf m (goto-char b 2))
+          wide-rows (wrap/rows-from b 0 20 10 extras)
+          wide-caret (caret (view/ed-view at-end 30 8)))
+      (binding (*user-settings* {:tab-width 4})
+        (assert= (count (wrap/rows-from b 0 20 10 extras)) 2)
+        (is (not (= (wrap/rows-from b 0 20 10 extras) wide-rows)))
+        (assert= (caret (view/ed-view at-end 30 8)) (- wide-caret 8))))))
+
+(describe "a raw tab never reaches the painter"
+  (test "every text op of a frame over tab-indented lines is tab-free"
+    (let (m (ed-init (make-buffer "\tfoo\n\t\tbar\tbaz\n" "/p/a.txt" "/p/a.txt"))
+          texts (seq/keep (view/ed-view m 60 10)
+                  (fn (op) (when (and (vector? op) (= (first op) :text)) (str (nth op 3 ""))))))
+      (is (not (empty? texts)))
+      (is (not (any? texts (fn (text) (includes? text "\t"))))))))
+
+(describe ":editorconfig false is in force before the first buffer"
+  :isolated (test "a served session's first file does not read its .editorconfig"
+    (let (dir (temp-dir "bedit-tabwidth-")
+          _ (file/mkdir dir)
+          _ (file/spit (path/join dir ".editorconfig") "[*]\nindent_size = 7\n")
+          file (path/join dir "a.txt")
+          _ (file/spit file "x\n")
+          served (remote/ed-served-model (find-file-buffer file)
+                   file
+                   {:config {:editorconfig false} :note nil}))
+      (startup/prepare-buffer-settings {})
+      (assert= (indent-width (cur served)) 2)
+      (is (nil? (:editorconfig (cur served)))))))
