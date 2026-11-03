@@ -1,0 +1,291 @@
+;; The git porcelain off the loop: no key runs git on the editor's own process.
+;;
+;; Every test that drives a command does it the way the live loop does — `editor/ui/*loop*`
+;; bound to this process, so `ed-headless?` is false and work goes to tasks whose replies come
+;; HERE — and with `(proc/flag :responsive :refuse)` (brood ADR-517) on this process, so a git
+;; (any `os/cmd`) run on it raises `E0048` instead of quietly holding it. The replies are then
+;; delivered through the loop's own update (`input/ed-update`), under the same flag,
+;; until nothing is in flight: the folds are on the loop too.
+;;
+;; Coverage:
+;;   - the repo's root, its git dir (a worktree's `.git` file followed) and the sequencer's
+;;     state are read from the disk, with no process
+;;   - every porcelain key that used to run git first now runs none on the loop, and its
+;;     follow-up (a prompt filled, a question asked, a command queued) lands
+;;   - a prompt opens at once, fills when the refs land, keeps what was typed, and its answer
+;;     runs the command through the queue
+;;   - `u` then `s` on a file leaves it staged: what a read's answer queues goes first
+;;   - C-g cancels a read in flight; the working-tree commands queued behind it still run
+;;   - a fold that raises is said, and the queue behind it still runs
+;;   - `c c` asks git whether anything is staged off the loop, and C-c C-s signs off with no git
+
+(defmodule gitasync-test
+  (:use test)
+  (:use model)
+  (:use pool)
+  (:use editor/buffer)
+  (:use input) ; ed-update — the loop's own update, which routes a task's reply
+  (:use-internals gitcore)
+  (:use-internals vcsproc))
+
+;; ---- a repository -----------------------------------------------------------------
+
+(defn- ga-git (dir args) (os/cmd "git" args {:cwd dir}))
+
+(defn- ga-out (dir args) (string/trim (:stdout (ga-git dir args) "")))
+
+(defn- ga-repo (name files)
+  "A repo with one commit holding `files` (`{path content}`), on `main`, with a branch `other`."
+  (let (dir (path/temp (str "bedit-gitasync-test-" name "-")))
+    (do
+      (os/cmd "rm" ["-rf" dir] {:cwd "/"})
+      (file/mkdir dir)
+      (ga-git dir ["init" "-q" "-b" "main"])
+      (ga-git dir ["config" "user.email" "t@example.com"])
+      (ga-git dir ["config" "user.name" "Test"])
+      (ga-git dir ["config" "commit.gpgsign" "false"])
+      (doseq (kv files) (file/spit (path/join dir (first kv)) (second kv)))
+      (ga-git dir ["add" "-A"])
+      (ga-git dir ["commit" "-qm" "base"])
+      (ga-git dir ["branch" "other"])
+      dir)))
+
+(defn- ga-status (dir)
+  "A model showing *git-status* for `dir`, opened from a file in it — built headless, the way
+every other git test builds one."
+  (let (m0 (ed-init (make-buffer ""))
+        m1 (ed-find-file m0
+             (path/join dir
+               (str (first (seq/reject (file/ls dir) (fn (f) (string/starts-with? f "."))))))))
+    (gitstatus/cmd-git-status m1 nil)))
+
+;; ---- the loop's shape: a loop bound, blocking calls refused -------------------------
+
+(defn- ga-live (thunk)
+  "Run `thunk` as the live loop would — its git off the loop, the replies to this process —
+with every blocking call on this process refused, so one that is not off the loop raises."
+  (let (previous (proc/flag :responsive :refuse))
+    (try (binding (editor/ui/*loop* (self)) (thunk)) (finally (proc/flag :responsive previous)))))
+
+(defn- ga-busy-slot (m)
+  "A registered off-loop job the model has in flight, or nil."
+  (seq/find (keys (ed-task-reply-table)) (fn (slot) (not (nil? (get m slot))))))
+
+(defn- ga-settle (m)
+  "Deliver every reply the model waits on through the loop's dispatcher, as the loop would,
+until nothing is in flight — each reply a barrier, never a sleep."
+  (let (slot (ga-busy-slot m))
+    (if (nil? slot)
+      m
+      (let (handle (get m slot)
+            event (receive
+                    ([:task-done ^handle value] [:task-done handle value])
+                    ([:task-error ^handle reason] [:task-error handle reason])
+                    ([:task-timeout ^handle] [:task-timeout handle])
+                    (after 30000 (error "ga-settle: no reply for " slot))))
+        (ga-settle (ga-live (fn () (ed-update m event 80 24))))))))
+
+(defn- ga-run (m command)
+  "Press `command` (a symbol) on `m` as the live loop would, then let everything it started land."
+  (ga-settle (ga-live (fn () ((reflect/eval command) m nil)))))
+
+(defn- ga-answer (m text)
+  "Answer the minibuffer prompt `m` is showing with `text`, on the loop."
+  (ga-live (fn () ((:on-complete (:minibuffer m)) (dissoc m :minibuffer) text))))
+
+(defn- ga-key (m c)
+  "Answer the one-key question `m` is asking with `c`, on the loop."
+  (ga-live (fn () ((:then (:read-char m)) (dissoc m :read-char) c))))
+
+(defn- ga-names (m)
+  "The candidates the open prompt completes over."
+  (into [] (mb-candidates (:minibuffer m))))
+
+;; ---- where the repo is: the disk, not a process -------------------------------------
+
+(describe "git off the loop: the repo is found on the disk"
+  (test "the root, the git dir and the sequencer state, with every process refused"
+    (let (dir (ga-repo "disk" {"a.txt" "a\n"})
+          sub (path/join dir "deep" "er")
+          _ (file/mkdir sub)
+          found (ga-live (fn ()
+                           {:root (git-toplevel sub)
+                            :dir (git-dir dir)
+                            :none (git-toplevel "/")
+                            :sequencer (git-sequencer dir)})))
+      (assert= (:root found) dir)
+      (assert= (:dir found) (path/join dir ".git"))
+      (assert= (:none found) nil)
+      (assert= (:sequencer found) nil)))
+  (test "a worktree's `.git` is a file: its git dir is the one it points at"
+    (let (dir (ga-repo "worktree" {"a.txt" "a\n"})
+          tree (str dir "-tree")
+          _ (os/cmd "rm" ["-rf" tree] {:cwd "/"})
+          _ (ga-git dir ["worktree" "add" "-q" tree "other"])
+          expected (ga-out tree ["rev-parse" "--absolute-git-dir"])
+          found (ga-live (fn () {:root (git-toplevel tree) :dir (git-dir tree)})))
+      (assert= (:root found) tree)
+      (assert= (:dir found) expected)))
+  (test "a merge stopped on a conflict reads as one, from the disk"
+    (let (dir (ga-repo "seq" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "main side\n")
+          _ (ga-git dir ["commit" "-qam" "main"])
+          _ (ga-git dir ["checkout" "-q" "other"])
+          _ (file/spit (path/join dir "a.txt") "other side\n")
+          _ (ga-git dir ["commit" "-qam" "other"])
+          _ (ga-git dir ["merge" "-q" "main"]))
+      (assert= (:kind (ga-live (fn () (git-sequencer dir)))) :merge))))
+
+;; ---- every key: no git on the loop -------------------------------------------------
+
+(def- ga-keys
+  ;; the porcelain commands that ran git (or asked for git's answer) before they could go
+  ;; on — each pressed from *git-status*
+  '[gitcommit/cmd-git-commit
+     gitcommit/cmd-git-commit-amend gitcommit/cmd-git-commit-reword gitcommit/cmd-git-commit-fixup
+     gitcommit/cmd-git-rebase-reword-commit gitrefs/cmd-git-checkout gitrefs/cmd-git-checkout-local
+     gitrefs/cmd-git-branch-spinoff gitrefs/cmd-git-branch-rename gitrefs/cmd-git-branch-reset
+     gitrefs/cmd-git-branch-delete gitrefs/cmd-git-branch-upstream gitrefs/cmd-git-stash-apply
+     gitrefs/cmd-git-tag-delete gitrefs/cmd-git-reset-hard gitrefs/cmd-git-create-branch
+     gitremote/cmd-git-push gitremote/cmd-git-push-upstream gitremote/cmd-git-push-elsewhere
+     gitremote/cmd-git-pull-elsewhere gitremote/cmd-git-remote-list gitremote/cmd-git-remote-remove
+     gitsequence/cmd-git-sequence-continue gitsequence/cmd-git-rebase-upstream
+     gitsequence/cmd-git-rebase-interactive gitsequence/cmd-git-merge gitsequence/cmd-git-bisect-log
+     gitsequence/cmd-git-rebase-autosquash git/cmd-git-worktree-list git/cmd-git-submodule-list
+     git/cmd-git-worktree-goto git/cmd-git-ignore-private git/cmd-git-note-add
+     git/cmd-git-patch-create gitstatus/cmd-git-status gitstatus/cmd-git-unstage-all
+     gitstatus/cmd-git-stage-all gitstatus/cmd-git-refresh gitview/cmd-git-log gitview/cmd-git-refs
+     gitview/cmd-git-diff gitview/cmd-git-find-file])
+
+(defn- ga-blocked (m command)
+  "What pressing `command` (and letting what it started land) raised on the loop, or nil."
+  (check-allow :discarded-catch
+    (try (do (ga-run m command) nil) (catch e (str command ": " (error-message e))))))
+
+(describe "git off the loop: no key runs git on the editor's process"
+  (test "every porcelain key, and what it starts, runs its git in a task"
+    (let (dir (ga-repo "keys" {"a.txt" "a\n" "b.txt" "b\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          _ (ga-git dir ["add" "a.txt"])
+          m (ga-status dir))
+      (assert= (into [] (seq/keep ga-keys (fn (command) (ga-blocked m command)))) []))))
+
+;; ---- a prompt opens at once and fills when git answers --------------------------------
+
+(describe "git off the loop: a prompt"
+  (test "b b opens its prompt at once, fills it when the refs land, and keeps what was typed"
+    (let (dir (ga-repo "prompt" {"a.txt" "a\n"})
+          m0 (ga-status dir)
+          asked (ga-live (fn () (gitrefs/cmd-git-checkout m0 nil))))
+      ;; open, listing nothing yet, the refs being read in a task
+      (is (not (nil? (:minibuffer asked))))
+      (is (not (nil? (:vcs-gather-proc asked))))
+      (assert= (ga-names asked) [])
+      (let (typed (map/assoc-in asked
+                    [:minibuffer :edit]
+                    (ed-mb-set-text (map/get-in asked [:minibuffer :edit]) "oth"))
+            landed (ga-settle typed))
+        (assert= (mb-text (:minibuffer landed)) "oth")
+        (is (includes? (ga-names landed) "other"))
+        (let (done (ga-settle (ga-answer landed "other")))
+          (assert= (ga-out dir ["symbolic-ref" "--short" "HEAD"]) "other")
+          (is (nil? (:vcs-queue-proc done)))))))
+  (test "a prompt answered before its refs landed is left alone when they do"
+    (let (dir (ga-repo "prompt-early" {"a.txt" "a\n"})
+          asked (ga-live (fn () (gitrefs/cmd-git-checkout (ga-status dir) nil)))
+          answered (ga-answer asked "other")
+          done (ga-settle answered))
+      (is (nil? (:minibuffer done)))
+      (assert= (ga-out dir ["symbolic-ref" "--short" "HEAD"]) "other")))
+  (test "a prompt with nothing to offer closes and says so when git answers"
+    (let (dir (ga-repo "no-stash" {"a.txt" "a\n"})
+          done (ga-run (ga-status dir) 'gitrefs/cmd-git-stash-apply))
+      (is (nil? (:minibuffer done)))
+      (assert= (:echo done) "there are no stashes"))))
+
+;; ---- the queue: in order, through a read ----------------------------------------------
+
+(describe "git off the loop: the queue"
+  (test "u then s on a staged file leaves it staged: the unstage its read queues goes first"
+    (let (dir (ga-repo "order" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          _ (ga-git dir ["add" "a.txt"])
+          m0 (ga-status dir)
+          pressed (ga-live (fn ()
+                             (git-do (gitstatus/cmd-git-unstage-all m0 nil)
+                               "stage"
+                               ["add" "--" "a.txt"])))
+          done (ga-settle pressed))
+      (assert= (ga-out dir ["diff" "--cached" "--name-only"]) "a.txt")
+      (is (not (vcs-queue-busy? done)))))
+  (test "C-g cancels the read in flight; the stage queued behind it still runs"
+    (let (dir (ga-repo "quit" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          m0 (ga-status dir)
+          asked (ga-live (fn ()
+                           (git-do (gitrefs/cmd-git-checkout m0 nil) "stage" ["add" "--" "a.txt"])))
+          [quit cancelled?] (ga-live (fn () (ed-cancel-quit-jobs asked)))
+          done (ga-settle quit))
+      (is cancelled?)
+      (is (includes? (:echo quit) "cancelled"))
+      (assert= (ga-out dir ["diff" "--cached" "--name-only"]) "a.txt")
+      (assert= (ga-out dir ["symbolic-ref" "--short" "HEAD"]) "main")
+      (is (not (vcs-queue-busy? done)))))
+  (test "a fold that raises is said, and the command queued behind it still runs"
+    (let (dir (ga-repo "raise" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          m0 (ga-status dir)
+          pressed (ga-live (fn ()
+                             (git-do (git-gather m0
+                                       "boom"
+                                       dir
+                                       (fn (_dir) 1)
+                                       (fn (_m _answer) (error "boom")))
+                               "stage"
+                               ["add" "--" "a.txt"])))
+          ;; the failure is logged (an error, on stderr with no logger running): captured, so
+          ;; it is asserted rather than left in the run's output
+          ;; (a model holds ropes, which a message cannot carry: what is asserted is sent)
+          logged (with-err-str (let (settled (ga-settle pressed))
+                                 (send (self)
+                                   [:ga-settled (:echo settled) (vcs-queue-busy? settled)])))
+          [echo busy?] (receive
+                         ([:ga-settled echo busy?] [echo busy?])
+                         (after 0 (error "ga: never settled"))))
+      (is (includes? logged "a queued step's fold failed: boom"))
+      (is (includes? echo "boom"))
+      (assert= (ga-out dir ["diff" "--cached" "--name-only"]) "a.txt")
+      (is (not busy?)))))
+
+;; ---- committing ---------------------------------------------------------------------
+
+(describe "git off the loop: committing"
+  (test "c c with nothing staged asks — once git has said so off the loop"
+    (let (dir (ga-repo "commit-empty" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          m (ga-run (ga-status dir) 'gitcommit/cmd-git-commit))
+      (is (not (nil? (:read-char m))))
+      (is (includes? (:echo m) "Nothing is staged"))
+      (let (opened (ga-settle (ga-key m "y")))
+        (assert= (buffer-name (ed-current-buf opened)) "*git-commit*")
+        (assert= (ga-out dir ["diff" "--cached" "--name-only"]) "a.txt"))))
+  (test "c c with a stage opens the message, and C-c C-s signs off with no git"
+    (let (dir (ga-repo "commit-sign" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          _ (ga-git dir ["add" "a.txt"])
+          opened (ga-run (ga-status dir) 'gitcommit/cmd-git-commit)
+          signed (ga-live (fn () (gitcommit/cmd-git-commit-signoff opened nil))))
+      (assert= (buffer-name (ed-current-buf opened)) "*git-commit*")
+      (is (includes? (buffer-text (ed-current-buf signed)) "Signed-off-by: Test <t@example.com>")))))
+
+;; ---- the project's files ------------------------------------------------------------
+
+(describe "git off the loop: the project's files"
+  (test "C-x p f opens at once and lists what git tracks when the walk lands"
+    (let (dir (ga-repo "project" {"a.txt" "a\n" "lib.txt" "l\n"})
+          m0 (ga-status dir)
+          asked (ga-live (fn () (commands/cmd-project-find-file m0 nil))))
+      (is (not (nil? (:minibuffer asked))))
+      (is (not (nil? (:project-scan asked))))
+      (let (landed (ga-settle asked))
+        (is (includes? (ga-names landed) "lib.txt"))))))

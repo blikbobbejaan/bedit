@@ -446,7 +446,8 @@ src/eval-commands.blsp      the C-x C-e family as commands (eval-last-sexp / -re
                             off the loop as a std/task, C-g cancels; loaded with the image (main)
 src/shell-command.blsp      M-! / M-| (Emacs shell-command): one `sh -c` in the buffer's dir, off
                             the loop, output to the echo area or a side pane; C-u M-| replaces
-                            the region. Loaded with the image (main)
+                            the region; C-g stops the command itself (brood ADR-514). Loaded
+                            with the image (main)
 src/sandbox.blsp            the Brood eval session's BACKEND over std's `editor/evalsession`:
                             find a runtime, start it on a generated eval-server script
                             (ADR-198), the pr-str-line codec, and session events -> UiEvent
@@ -583,8 +584,10 @@ src/vcscore.blsp            the VCS layer, whichever system the project uses (Em
 src/vcsproc.blsp            what every VCS's command line shares: the PROCESS LOG (`$`,
                             *vcs-process*, magit's `magit-process-buffer`) — git and mur
                             commands in the order they ran, exit code, duration, output,
-                            credentials redacted, `\r` progress applied — `vcs-run` (journalled)
-                            and `vcs-launch` (OFF the loop, for the network), `vcs-report-cmd`,
+                            credentials redacted, `\r` progress applied — `vcs-launch` (OFF the loop,
+                            for the network), the working-tree QUEUE (`vcs-run-queued`, and
+                            `vcs-gather` for a read a key waits on: refs, is anything staged —
+                            in a task, in order, C-g cancels a read), `vcs-report-cmd`,
                             `vcs-confirm`, a unified diff's faces, and a file's hunks as
                             sections (`vcs-hunk-sections`, std's `diff`) with the file line a
                             diff line is (`vcs-hunk-line`) — git's and mur's diffs are one tree,
@@ -635,8 +638,10 @@ src/git.blsp                the TOP of the git porcelain (Magit's): `:use`s ever
 src/gitcore.blsp            the ground under it: `git-git` (never prompting), the repo a
                             buffer is about, `git status --porcelain -z`, upstream and
                             ahead/behind, refs / remotes / stashes, which operation is
-                            half-done in .git (the SEQUENCER). One logged seam: `git-run` /
-                            `git-run-hunk`, `git-do` to refresh after, `git-launch-op` for
+                            half-done in .git (the SEQUENCER) — the root, the git dir and the
+                            sequencer read from the DISK, no process. One logged seam: `git-run` /
+                            `git-run-then`, `git-do` to refresh after, `git-gather` for what a key
+                            must ask git first (all queued off the loop), `git-launch-op` for
                             network commands OFF the loop — git's side of vcsproc's log
                             and runner.
                             Knows nothing of the status buffer: it refreshes it by name

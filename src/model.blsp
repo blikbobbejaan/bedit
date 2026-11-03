@@ -2054,21 +2054,125 @@ supervised logger, so routes survive a restart."
 ;; Cap the ring like Emacs's `kill-ring-max` (default 60) so it can't grow forever.
 (def ed-kill-ring-max 60)
 
+;; Reading the OS clipboard waits on the app that owns it — an X11 round trip on a fresh
+;; display connection, a Wayland pipe — and a slow or wedged owner froze the window inside
+;; every C-y (brood ADR-536 makes the read a blocking call the slow-turn log names). Nothing
+;; outside the editor can put text on the clipboard while the editor's window has the
+;; keyboard: another app copies while it is focused, so the editor is told (`:blur`) before
+;; and (`:focus-in`) after. So the clipboard is read OFF the loop when the window regains
+;; focus, and a yank uses what that read found (`:clipboard-text`, `:clipboard-known?`).
+;; The editor's own kills keep it known — they set the clipboard themselves. Until a read has
+;; landed (the first instant after focus, a frontend that reports no focus — a terminal) a
+;; yank reads it as it always did.
+
+(defn ed-adopt-clipboard-text (m clip)
+  "`m` with `clip` — what the OS clipboard holds — consed onto the kill ring as its freshest
+entry when it is text the ring's head is not (something copied in another app since our last
+kill). Emacs's `interprogram-paste-function`."
+  (let (ring (:kill-ring m))
+    (if (and (string? clip) (not (= clip "")) (not (= clip (first ring))))
+      (assoc m :kill-ring (take (cons clip ring) ed-kill-ring-max))
+      m)))
+
+(defdyn *clipboard-reader* os/clipboard-get)
+;; What reads the OS clipboard — a `() -> text-or-nil`; a test binds a stand-in. Captured
+;; when a read is launched, since the task that runs it does not see this binding.
+
+(defdyn *clipboard-read-timeout-ms* 5000)
+;; How long an off-loop read may wait on the clipboard's owner before its task is killed and
+;; its slot freed. A Wayland offer whose pipe is never written has no deadline of its own.
+
+(defdyn *clipboard-refresh-ms* 2000)
+;; While the window has the keyboard, how stale what the clipboard holds may get before the
+;; idle beat reads it again: a program run from the editor (`xclip` in a terminal buffer)
+;; can copy without the focus ever moving.
+
+(defn- ed-read-clipboard-with (reader)
+  "What `reader` finds on the OS clipboard, or `:clipboard-unread` when the read failed — a
+read already waiting on a wedged owner (brood ADR-536), no display. Never nil for a
+failure: nil is an empty clipboard."
+  (try
+    (reader)
+    (catch e (do (log/warn (str "clipboard read failed: " (error-message e))) :clipboard-unread))))
+
+(defn- ed-read-clipboard ()
+  "The OS clipboard's text, read now — nil when it has none or cannot be read."
+  (let (clip (ed-read-clipboard-with *clipboard-reader*)) (if (= clip :clipboard-unread) nil clip)))
+
+(defn- ed-clipboard-launch (m)
+  "`m` with a read of the OS clipboard started in a task — the reader and its deadline
+captured now — stamped with the epoch it was asked under and when."
+  (let (reader *clipboard-reader*)
+    (assoc m
+      :clipboard-proc
+        (task/task (fn () (ed-read-clipboard-with reader))
+          {:timeout *clipboard-read-timeout-ms*})
+      :clipboard-asked-epoch (:clipboard-epoch m 0)
+      :clipboard-read-at (os/now))))
+
 (defn ed-adopt-clipboard (m)
   "If the OS clipboard holds text that isn't already the kill-ring head (i.e. something
 was copied in another app since our last kill), cons it on as the freshest entry so the
-next yank inserts it — Emacs's `interprogram-paste-function`. Off unless the model opts
-into the OS clipboard (`:os-clipboard`, set by the live editor); best-effort otherwise: a
-missing / unavailable clipboard leaves the ring untouched."
+next yank inserts it. Off unless the model opts into the OS clipboard (`:os-clipboard`, set
+by the live editor). What the clipboard holds is KNOWN once the read the window's focus
+started has landed ([[ed-clipboard-focus]]), and then nothing is read here; until then it is
+read now, best-effort: a missing / unavailable clipboard leaves the ring untouched."
+  (cond
+    (not (:os-clipboard m)) m
+    (:clipboard-known? m) (ed-adopt-clipboard-text m (:clipboard-text m))
+    else (ed-adopt-clipboard-text m (ed-read-clipboard))))
+
+(defn ed-clipboard-blur (m)
+  "The window lost the keyboard (`:blur`): another app may copy now, so what the clipboard
+holds is no longer known, and a read still in flight may answer from before that copy."
   (if (not (:os-clipboard m))
     m
-    (let (clip (try
-                 (os/clipboard-get)
-                 (catch e (do (log/warn (str "clipboard read failed: " (error-message e))) nil)))
-          ring (:kill-ring m))
-      (if (and (string? clip) (not (= clip "")) (not (= clip (first ring))))
-        (assoc m :kill-ring (take (cons clip ring) ed-kill-ring-max))
-        m))))
+    (assoc (dissoc m :clipboard-known?) :clipboard-epoch (inc (:clipboard-epoch m 0)))))
+
+(defn ed-clipboard-focus (m)
+  "The window has the keyboard again (`:focus-in`): read the clipboard OFF the loop, so the
+next yank finds what another app copied without waiting on that app. Headless (no loop for
+the answer) reads nothing; a yank there reads as it always did."
+  (if (or (not (:os-clipboard m)) (ed-headless?))
+    m
+    (do
+      ;; a read asked before the blur answers for a clipboard that may have changed since
+      (when (:clipboard-proc m) (task/cancel (:clipboard-proc m)))
+      (ed-clipboard-launch m))))
+
+(defn ed-clipboard-refresh-due? (m)
+  "Whether the idle beat should read the clipboard again: the editor mirrors it, has the
+keyboard (a window, or a terminal reporting focus — brood ADR-536), knows what it held as of
+a read [[*clipboard-refresh-ms*]] or more ago, and has no read in flight — one at a time,
+however long a wedged one takes to time out."
+  (and (:os-clipboard m)
+    (:clipboard-known? m)
+    (not (:unfocused m))
+    (nil? (:clipboard-proc m))
+    (not (ed-headless?))
+    (>= (- (os/now) (:clipboard-read-at m 0)) *clipboard-refresh-ms*)))
+
+(defn ed-clipboard-refresh (m)
+  "The idle beat's clipboard read: started off the loop when [[ed-clipboard-refresh-due?]]."
+  (if (ed-clipboard-refresh-due? m) (ed-clipboard-launch m) m))
+
+;; armed by activity, so an idle editor polls nothing; bounded by `*clipboard-refresh-ms*`
+(register-idle-job :clipboard-refresh
+  {:order 140 :run 'model/ed-clipboard-refresh :stale? 'model/ed-clipboard-refresh-due?})
+
+;; the clipboard read a focus change or the idle beat starts — no label: it is quick, and
+;; nobody asked for it
+(register-task-reply :clipboard-proc 'model/ed-apply-clipboard :clipboard-unread nil)
+(defn ed-apply-clipboard (m clip)
+  "Fold a clipboard read: what it found is what the clipboard holds — unless the window
+lost focus or the editor set the clipboard since it was asked (the epoch moved), when it may
+be stale and is dropped. A read that failed or timed out (`:clipboard-unread`) frees the
+slot and changes nothing else: unknown stays unknown (the next yank reads it), known stays
+what the last good read found, and the next refresh may try again."
+  (let (m1 (dissoc m :clipboard-proc :clipboard-asked-epoch))
+    (if (or (= clip :clipboard-unread) (not (= (:clipboard-asked-epoch m) (:clipboard-epoch m 0))))
+      m1
+      (assoc m1 :clipboard-known? true :clipboard-text clip))))
 
 ;; ---- a guest's session: editing what it was given, nothing more (brood ADR-415) -------
 ;; A guest attaches over a link that can carry no code and reach nothing it was not given —
@@ -2194,7 +2298,16 @@ Otherwise cons a fresh entry. The new ring head is also mirrored to the OS clipb
     ;; `os/clipboard-set` is itself a no-op without a clipboard, so nothing here is guarded:
     ;; a stale name must raise, not leave every kill un-mirrored.
     (when (:os-clipboard m) (os/clipboard-set head))
-    (ed-set-kill-ring m (take (cons head tail) ed-kill-ring-max))))
+    (ed-set-kill-ring (if (:os-clipboard m) (ed-clipboard-set-known m head) m)
+      (take (cons head tail) ed-kill-ring-max))))
+
+(defn ed-clipboard-set-known (m text)
+  "`m` after the editor put `text` on the OS clipboard: the epoch moved, so a read asked
+before this answers nothing over it, and — when what the clipboard holds was known (the
+window reports its focus) — known to be `text`. Not made known otherwise: a frontend that
+reports no focus would then never read another app's copy again."
+  (let (moved (assoc m :clipboard-epoch (inc (:clipboard-epoch m 0))))
+    (if (:clipboard-known? m) (assoc moved :clipboard-text text) moved)))
 
 (defn ed-drag-copy (m)
   "Emacs `mouse-drag-copy-region`: when a mouse drag-select ends with a real region,

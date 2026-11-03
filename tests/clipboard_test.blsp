@@ -1,0 +1,147 @@
+;; The OS clipboard and the yank: what another app copied is read OFF the loop when the
+;; window regains focus, and a yank uses what that read found instead of waiting on the app
+;; that owns the clipboard (brood ADR-536 makes the read a blocking call a responsive loop is
+;; told of).
+;;
+;; Coverage:
+;;   - a yank with the clipboard known inserts it and makes no blocking call
+;;   - a yank with it unknown (no focus seen yet, a terminal) reads it, as it always did
+;;   - losing focus forgets it; regaining focus starts a read in a task (live only)
+;;   - a read is dropped when the window lost focus, or the editor set the clipboard, since
+;;     it was asked
+;;   - a kill keeps a known clipboard known as what it killed, and leaves an unknown one unknown
+;;
+;; No test here touches the real clipboard: these run on a desktop, where a test that set it would
+;; replace what its user copied and one that read it would race the others for the reader.
+;; Reads go through a stand-in (`*clipboard-reader*`); a kill through `ed-clipboard-set-known`.
+
+(defmodule clipboard-test
+  (:use test)
+  (:use model)
+  (:use input) ; ed-update — a key through the loop's own update
+  (:use editor/buffer))
+
+(defn- cb-model (fields)
+  "An editor on an empty buffer that mirrors the OS clipboard, with `fields` over it."
+  (merge (assoc (ed-init (make-buffer "")) :os-clipboard true) fields))
+
+(defn- cb-blocking-calls (thunk)
+  "`[value natives]`: what `thunk` returned, run in a process that reports its blocking calls
+(brood ADR-517), and the natives that held it."
+  (let (me (self))
+    (spawn (fn ()
+             (proc/flag :responsive true)
+             (let (value (thunk)
+                   natives (letrec (drain (fn (acc)
+                                            (receive
+                                              ([:blocking-call facts] (drain (conj acc
+                                                                               (:native facts))))
+                                              (after 0 acc))))
+                             (drain [])))
+               (send me [:cb-done value natives]))))
+    (receive ([:cb-done value natives] [value natives]) (after 20000 (error "cb: no answer")))))
+
+(describe "the clipboard and the yank"
+  (test "a yank with the clipboard known inserts what another app copied, reading nothing"
+    (let ([text natives] (cb-blocking-calls (fn ()
+                                              (buffer-text (ed-current-buf (ed-update (cb-model {:clipboard-known? true
+                                                                                                 :clipboard-text "copied elsewhere"
+                                                                                                 :kill-ring (list "ring-top")})
+                                                                             :ctrl-y 80 24))))))
+      (assert= text "copied elsewhere")
+      (assert= natives [])))
+  (test "a yank with the clipboard unknown reads it, as it always did"
+    (let (adopted (binding (*clipboard-reader* (fn () "read at the yank"))
+                    (ed-adopt-clipboard (cb-model {:kill-ring (list "ring-top")}))))
+      (assert= (first (:kill-ring adopted)) "read at the yank")))
+  (test "without :os-clipboard nothing is known, read or started"
+    (let (m (ed-init (make-buffer "")))
+      (assert= (ed-clipboard-blur m) m)
+      (assert= (binding (editor/ui/*loop* (self)) (ed-clipboard-focus m)) m)))
+  (test "losing focus forgets it; regaining focus reads it in a task, and only in a live loop"
+    (let (known (cb-model {:clipboard-known? true :clipboard-text "x"})
+          blurred (ed-clipboard-blur known)
+          focused (binding (editor/ui/*loop* (self) *clipboard-reader* (fn () "stand-in"))
+                    (ed-clipboard-focus blurred)))
+      (is (nil? (:clipboard-known? blurred)))
+      (assert= (:clipboard-epoch blurred) 1)
+      (is (not (nil? (:clipboard-proc focused))))
+      (assert= (:clipboard-asked-epoch focused) 1)
+      (task/cancel (:clipboard-proc focused))
+      ;; headless there is no loop for the answer: nothing starts
+      (is (nil? (:clipboard-proc (ed-clipboard-focus blurred))))))
+  (test "a read that lands as asked is what the clipboard holds"
+    (let (landed (ed-apply-clipboard (cb-model {:clipboard-proc :job :clipboard-asked-epoch 0})
+                   "from the browser"))
+      (is (:clipboard-known? landed))
+      (assert= (:clipboard-text landed) "from the browser")
+      (is (nil? (:clipboard-proc landed)))))
+  (test "a read asked before the window lost focus again, or before a kill, is dropped"
+    (let (asked (cb-model {:clipboard-proc :job :clipboard-asked-epoch 0})
+          after-blur (ed-apply-clipboard (ed-clipboard-blur asked) "stale")
+          after-kill (ed-apply-clipboard (ed-clipboard-set-known asked "killed") "stale")
+          failed (ed-apply-clipboard asked :clipboard-unread))
+      (is (nil? (:clipboard-known? after-blur)))
+      (is (nil? (:clipboard-known? after-kill)))
+      (is (nil? (:clipboard-known? failed)))
+      (is (nil? (:clipboard-proc failed)))))
+  (test "a kill keeps a known clipboard known as what it killed, and an unknown one unknown"
+    (let (known (ed-clipboard-set-known (cb-model {:clipboard-known? true :clipboard-text "old"})
+                  "killed")
+          unknown (ed-clipboard-set-known (cb-model {}) "killed"))
+      (assert= (:clipboard-text known) "killed")
+      (is (:clipboard-known? known))
+      (is (nil? (:clipboard-known? unknown))))))
+
+;; ---- staying fresh while focused, and a read that never answers ---------------------
+
+(defn- cb-live (thunk)
+  "Run `thunk` as the live loop would: its tasks' replies come to this process."
+  (binding (editor/ui/*loop* (self)) (thunk)))
+
+(defn- cb-reply (handle)
+  "Task `handle`'s reply event, as the loop's dispatcher would hand it on."
+  (receive
+    ([:task-done ^handle value] [:task-done handle value])
+    ([:task-error ^handle reason] [:task-error handle reason])
+    ([:task-timeout ^handle] [:task-timeout handle])
+    (after 20000 (error "cb-reply: the clipboard read never answered, nor timed out"))))
+
+(describe "the clipboard while the editor has the keyboard"
+  (test "the idle beat reads it again once it is a refresh old — never unfocused, unknown, or twice"
+    (let (fresh (cb-model {:clipboard-known? true :clipboard-text "x" :clipboard-read-at (os/now)})
+          stale (assoc fresh :clipboard-read-at 0))
+      (cb-live (fn ()
+                 (is (not (ed-clipboard-refresh-due? fresh)))
+                 (is (ed-clipboard-refresh-due? stale))
+                 (is (not (ed-clipboard-refresh-due? (assoc stale :unfocused true))))
+                 (is (not (ed-clipboard-refresh-due? (dissoc stale :clipboard-known?))))
+                 (is (not (ed-clipboard-refresh-due? (assoc stale :clipboard-proc :job))))))
+      ;; headless: no loop for the answer
+      (is (not (ed-clipboard-refresh-due? stale)))))
+  (test "a refresh reads what another program copied while the editor had the keyboard"
+    (let (m (cb-model {:clipboard-known? true :clipboard-text "old" :clipboard-read-at 0})
+          asked (binding (*clipboard-reader* (fn () "copied by xclip"))
+                  (cb-live (fn () (ed-clipboard-refresh m))))
+          landed (cb-live (fn () (ed-update asked (cb-reply (:clipboard-proc asked)) 80 24))))
+      (assert= (:clipboard-text landed) "copied by xclip")
+      (is (nil? (:clipboard-proc landed)))))
+  (test "a read that never answers times out, frees its slot, and the next refresh reads again"
+    (let (m (cb-model {:clipboard-known? true :clipboard-text "before" :clipboard-read-at 0})
+          hung (binding (*clipboard-reader* (fn () (receive (:never-sent nil)))
+                         *clipboard-read-timeout-ms* 200)
+                 (cb-live (fn () (ed-clipboard-refresh m))))
+          handle (:clipboard-proc hung)
+          ;; one in flight: the beat starts no second read beside it
+          again (binding (*clipboard-refresh-ms* 0) (cb-live (fn () (ed-clipboard-refresh hung))))
+          timed-out (cb-live (fn () (ed-update again (cb-reply handle) 80 24)))
+          next (binding (*clipboard-refresh-ms* 0 *clipboard-reader* (fn () "after"))
+                 (cb-live (fn () (ed-clipboard-refresh timed-out)))))
+      (assert= (:clipboard-proc again) handle)
+      (is (nil? (:clipboard-proc timed-out)))
+      ;; what the last good read found still stands
+      (assert= (:clipboard-text timed-out) "before")
+      (is (not (nil? (:clipboard-proc next))))
+      (is (not (= (:clipboard-proc next) handle)))
+      (let (landed (cb-live (fn () (ed-update next (cb-reply (:clipboard-proc next)) 80 24))))
+        (assert= (:clipboard-text landed) "after")))))

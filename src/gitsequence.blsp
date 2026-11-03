@@ -58,17 +58,22 @@ forgotten."
 
 (defn- git-sequence-step (m step)
   "Run `step` on whatever operation is in flight. The one command behind three keys,
-because git already knows which verb it is."
-  (let (root (git-resolve-root m))
-    (cond
-      (nil? root) (message m "not in a git repository")
-      else
-        (let (seq (git-sequencer root)
-              argv (if (nil? seq) nil (git-sequence-argv seq step)))
-          (cond
-            (nil? seq) (message m "nothing in progress")
-            (nil? argv) (message m (str "a " (:verb seq) " has no " step " — answer good or bad"))
-            else (git-do m (string/join argv " ") (append git-no-editor argv)))))))
+because git already knows which verb it is. Which one is read behind any command still
+queued (a `s` of the resolved file before `r c` must land first) — from the disk, so the
+read itself is instant."
+  (git-with-root m
+    (fn (m0 root)
+      (git-gather m0
+        "sequencer"
+        root
+        git-sequencer
+        (fn (mm seq)
+          (let (argv (if (nil? seq) nil (git-sequence-argv seq step)))
+            (cond
+              (nil? seq) (message mm "nothing in progress")
+              (nil? argv)
+                (message mm (str "a " (:verb seq) " has no " step " — answer good or bad"))
+              else (git-do mm (string/join argv " ") (append git-no-editor argv)))))))))
 
 (defcommand cmd-git-sequence-continue
   (m key)
@@ -175,17 +180,17 @@ that has stopped part-way."
 (defcommand cmd-git-rebase-upstream
   (m key)
   "Rebase the current branch onto its upstream — the common case, with no prompt."
-  (let (root (git-resolve-root m))
-    (cond
-      (nil? root) (message m "not in a git repository")
-      (nil? (git-upstream root)) (message m "this branch has no upstream to rebase onto")
-      else
-        (git-do m
-          "rebase"
-          (append git-no-editor
-            ["rebase"]
-            (transient/ed-transient-args m)
-            [(git-upstream root)])))))
+  (let (args (transient/ed-transient-args m))
+    (git-with-root m
+      (fn (m0 root)
+        (git-gather m0
+          "upstream"
+          root
+          git-upstream
+          (fn (mm upstream)
+            (if (nil? upstream)
+              (message mm "this branch has no upstream to rebase onto")
+              (git-do mm "rebase" (append git-no-editor ["rebase"] args [upstream])))))))))
 
 ;; ---- cherry-pick (A) and revert (V) ------------------------------------------
 ;; Both take a commit and both can stop on a conflict, so both lead into the sequencer.
@@ -328,21 +333,24 @@ or the status buffer — then edit the plan in a buffer."
       (git-pick-commit m
         "Rebase interactively from commit: "
         (fn (mm c)
-          (let (onto (str c "^")
-                commits (git-log-commits root [(str onto "..HEAD")]))
-            (if (empty? commits)
-              (message mm (str "nothing to rebase from " c))
-              (ed-show-named (assoc mm :git-root root :git-rebase-onto onto)
-                "*git-rebase-todo*"
-                (git-rebase-todo-text commits)
-                :git-rebase))))))))
+          (let (onto (str c "^"))
+            (git-gather mm
+              "log"
+              root
+              (fn (dir) (git-log-commits dir [(str onto "..HEAD")]))
+              (fn (m1 commits)
+                (if (empty? commits)
+                  (message m1 (str "nothing to rebase from " c))
+                  (ed-show-named (assoc m1 :git-root root :git-rebase-onto onto)
+                    "*git-rebase-todo*"
+                    (git-rebase-todo-text commits)
+                    :git-rebase))))))))))
 
 (defn- git-rebase-todo-file (root)
-  "Where the composed todo is written for git to copy in. Under `.git`, so it shares the
-repo's lifetime and permissions rather than living in a world-readable temp dir — a todo
-names every commit subject you are about to rewrite."
-  (path/join (git-output root ["rev-parse" "--absolute-git-dir"])
-    "bedit-rebase-todo"))
+  "Where the composed todo is written for git to copy in. Under `.git` ([[gitcore/git-dir]],
+read from the disk), so it shares the repo's lifetime and permissions rather than living in a
+world-readable temp dir — a todo names every commit subject you are about to rewrite."
+  (path/join (or (git-dir root) (path/join root ".git")) "bedit-rebase-todo"))
 
 (defn- git-rebase-plan (m root onto lines)
   "Run an interactive rebase of `root` onto `onto` following the plan `lines`, with no
@@ -406,14 +414,27 @@ ancestor of HEAD."
     (git-pick-commit m
       prompt
       (fn (mm c)
-        (let (plan (git-plan-for root c verb))
-          (cond
-            (nil? plan) (message mm (str c " is not in HEAD's history"))
-            (nil? confirm) (git-rebase-plan mm root (first plan) (second plan))
-            else
-              (vcsproc/vcs-confirm mm
+        (git-with-plan mm
+          root
+          c
+          verb
+          nil
+          (fn (m1 plan)
+            (if (nil? confirm)
+              (git-rebase-plan m1 root (first plan) (second plan))
+              (vcsproc/vcs-confirm m1
                 (str confirm " " c "?")
-                (fn (m2) (git-rebase-plan m2 root (first plan) (second plan))))))))))
+                (fn (m2) (git-rebase-plan m2 root (first plan) (second plan)))))))))))
+
+(defn- git-with-plan (m root target verb after then)
+  "Read the plan rewriting `target` (`git-plan-for`) off the loop and hand it to `(then model
+plan)` — or say `target` is not in HEAD's history."
+  (git-gather m
+    "log"
+    root
+    (fn (dir) (git-plan-for dir target verb after))
+    (fn (mm plan)
+      (if (nil? plan) (message mm (str target " is not in HEAD's history")) (then mm plan)))))
 
 (defcommand cmd-git-rebase-edit-commit
   (m key)
@@ -428,13 +449,12 @@ ancestor of HEAD."
 (defn git-reword-at (m root target msg)
   "Rewrite `target`'s message to `msg`: pick it, then amend it with an `exec` line, and pick
 everything after — the whole of `r w`, as one plan."
-  (let (plan (git-plan-for root
-               target
-               "pick"
-               [(str "exec git commit --amend --only --allow-empty -m " (os/shell-quote msg))]))
-    (if (nil? plan)
-      (message m (str target " is not in HEAD's history"))
-      (git-rebase-plan m root (first plan) (second plan)))))
+  (git-with-plan m
+    root
+    target
+    "pick"
+    [(str "exec git commit --amend --only --allow-empty -m " (os/shell-quote msg))]
+    (fn (mm plan) (git-rebase-plan mm root (first plan) (second plan)))))
 
 ;; ---- fixup and squash: commits aimed at an earlier commit --------------------------
 ;; `c f` makes a `fixup! <subject>` commit of what is staged, aimed at the commit you pick;
@@ -566,11 +586,7 @@ checks out a commit half way between them and asks you about it."
   (m key)
   "What the bisect has established so far (B l) — the answers you have given and what they
 ruled out."
-  (let (root (git-resolve-root m))
-    (if (nil? root)
-      (message m "not in a git repository")
-      (let ([m1 r] (git-run (assoc m :git-root root) ["bisect" "log"]))
-        (vcsproc/vcs-show-report m1 "*git-bisect*" (:stdout r "") :git-text {:action :pop})))))
+  (git-run-report m ["bisect" "log"] "*git-bisect*"))
 
 (def git-bisect-transient
   {:name 'git-bisect
