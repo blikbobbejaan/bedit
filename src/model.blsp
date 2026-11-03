@@ -730,6 +730,18 @@ job not worth announcing). Called at the feature's load; re-registering replaces
 running them registered them. What the reply dispatcher, the activity indicator and C-g read."
   (registry/entries :model/task-replies))
 
+(defn ed-quit-note (m text)
+  "`m` with `text` noted for C-g to say: what a job's `:on-quit` hook stopped or dropped (a
+shell command, the read a checkout was waiting on). Said by C-g after its own word, not in
+place of it — a hook's `message` was overwritten by C-g's \"quit\" the moment it returned."
+  (assoc m :quit-notes (conj (or (:quit-notes m) []) text)))
+
+(defn ed-take-quit-notes (m)
+  "`[model' text]`: the notes the quit's hooks left ([[ed-quit-note]]), joined — nil when
+there are none — and the model without them."
+  (let (notes (or (:quit-notes m) []))
+    [(dissoc m :quit-notes) (if (empty? notes) nil (string/join notes "; "))]))
+
 (defn ed-cancel-quit-jobs (m)
   "`[model cancelled?]`: every registered job that opted into `:cancel-on-quit?` and is in
 flight, killed (`task/cancel` — a hard kill, so a runaway loop dies too), its slot freed and
@@ -1534,19 +1546,23 @@ the default slot, `<slot>-open` / `<slot>-label` for a caller's own."
     [:ready-open :ready-label]
     [(keyword (str (->string slot) "-open")) (keyword (str (->string slot) "-label"))]))
 
-(defn ed-open-when-ready (m label produce open &optional (key :default))
-  "Run `produce` (a `() -> candidates` thunk that closes over what it needs, never the
+;; check-allow: `open` is an opaque caller-supplied `(model candidates) -> model`; the
+;; declaration is the contract (ADR-341's `:trusted`)
+(check-allow :trusted
+  (sig ed-open-when-ready (model string fn fn &optional any -> model))
+  (defn ed-open-when-ready (m label produce open &optional (key :default))
+    "Run `produce` (a `() -> candidates` thunk that closes over what it needs, never the
 model) off the loop, then fold `(open m candidates)`: the prompt opens when the slow call
 answers. `label` names the wait in the activity chip; `key` names the CALLER, whose calls
 share one slot — a second overtakes its first, another caller's runs beside it. C-g
 cancels, a failed call says so; a headless model (a test) runs it inline."
-  (if (ed-headless?)
-    (open m (produce))
-    (let (slot (ed-ready-slot key)
-          [open-field label-field] (ed-ready-fields slot))
-      (do
-        (when (get m slot) (task/cancel (get m slot)))
-        (assoc m slot (task/task produce) open-field open label-field label)))))
+    (if (ed-headless?)
+      (open m (produce))
+      (let (slot (ed-ready-slot key)
+            [open-field label-field] (ed-ready-fields slot))
+        (do
+          (when (get m slot) (task/cancel (get m slot)))
+          (assoc m slot (task/task produce) open-field open label-field label))))))
 
 (defn ed-apply-ready (m answer &optional (slot :ready-wait))
   "Fold an [[ed-open-when-ready]] call's `answer` (waiting in `slot`) through the `open` it
@@ -2137,10 +2153,6 @@ failure: nil is an empty clipboard."
     (reader)
     (catch e (do (log/warn (str "clipboard read failed: " (error-message e))) :clipboard-unread))))
 
-(defn- ed-read-clipboard ()
-  "The OS clipboard's text, read now — nil when it has none or cannot be read."
-  (let (clip (ed-read-clipboard-with *clipboard-reader*)) (if (= clip :clipboard-unread) nil clip)))
-
 (defn- ed-clipboard-launch (m)
   "`m` with a read of the OS clipboard started in a task — the reader and its deadline
 captured now — stamped with the epoch it was asked under and when."
@@ -2159,10 +2171,56 @@ clipboard (`:os-clipboard`): what the last off-loop read found once one has land
 until then a read now, best-effort. nil for a served session, whose client's clipboard is
 only ever asked ([[ed-clipboard-ask]]) — a read that waited on the link would stop the loop
 — and for a model with neither. A clipboard that cannot be read is nil, said in the log."
+  (second (ed-clipboard-read-now m)))
+
+(def *clipboard-race-ms* 250)
+;; How long a yank pressed while the focus read is still out waits for THAT read's answer
+;; before reading itself — which would only find the reader busy with it.
+
+(defn ed-clipboard-read-now (m)
+  "`[model' text]`: [[ed-clipboard-read]] with what the reading did to the model. A read
+already in flight (the window has just regained focus) is the answer to wait for, briefly
+(`*clipboard-race-ms*`) — a read of our own beside it finds the reader busy and nil, and the
+yank took the stale ring head. A clipboard that cannot be read is SAID, once, until a read
+succeeds again ([[ed-clipboard-unreadable]]): yanking the ring head in silence for ever was
+the failure."
   (cond
-    (not (:os-clipboard m)) nil
-    (:clipboard-known? m) (:clipboard-text m)
-    else (ed-read-clipboard)))
+    (not (:os-clipboard m)) [m nil]
+    (:clipboard-known? m) [m (:clipboard-text m)]
+    (:clipboard-proc m)
+      (let (landed (ed-await-clipboard m *clipboard-race-ms*))
+        (if (:clipboard-known? landed)
+          [landed (:clipboard-text landed)]
+          (ed-clipboard-read-direct landed)))
+    else (ed-clipboard-read-direct m)))
+
+(defn- ed-clipboard-read-direct (m)
+  "`[model' text]` of a read made now, on the loop: the fallback before any off-loop read
+has landed (and where none can: a frontend that reports no focus)."
+  (let (clip (ed-read-clipboard-with *clipboard-reader*))
+    (if (= clip :clipboard-unread)
+      [(ed-clipboard-unreadable m) nil]
+      [(dissoc m :clipboard-unreadable-said) clip])))
+
+(defn- ed-await-clipboard (m wait-ms)
+  "`m` with the clipboard read in flight folded in, when its answer arrives within
+`wait-ms` — a selective receive of that read's own reply — else `m` as it was, the read still
+out (its reply then lands as any other)."
+  (let (handle (:clipboard-proc m))
+    (receive
+      ([:task-done ^handle value] (ed-apply-clipboard m value))
+      ([:task-error ^handle _reason] (ed-apply-clipboard m :clipboard-unread))
+      ([:task-timeout ^handle] (ed-apply-clipboard m :clipboard-unread))
+      (after wait-ms m))))
+
+(defn ed-clipboard-unreadable (m)
+  "`m` after a clipboard read failed: said once — `the OS clipboard is not answering` — and
+not again until a read succeeds, so a wedged owner (brood ADR-536) is known about without a
+message on every yank."
+  (if (:clipboard-unreadable-said m)
+    m
+    (assoc (message m "the OS clipboard is not answering — yanks use the kill ring until it does")
+      :clipboard-unreadable-said true)))
 
 (defn ed-clipboard-blur (m)
   "The window lost the keyboard (`:blur`): another app may copy now, so what the clipboard
@@ -2212,9 +2270,13 @@ be stale and is dropped. A read that failed or timed out (`:clipboard-unread`) f
 slot and changes nothing else: unknown stays unknown (the next yank reads it), known stays
 what the last good read found, and the next refresh may try again."
   (let (m1 (dissoc m :clipboard-proc :clipboard-asked-epoch))
-    (if (or (= clip :clipboard-unread) (not (= (:clipboard-asked-epoch m) (:clipboard-epoch m 0))))
-      m1
-      (assoc m1 :clipboard-known? true :clipboard-text clip))))
+    (cond
+      (= clip :clipboard-unread) (ed-clipboard-unreadable m1)
+      (not (= (:clipboard-asked-epoch m) (:clipboard-epoch m 0))) m1
+      else
+        (assoc (dissoc m1 :clipboard-unreadable-said)
+          :clipboard-known? true
+          :clipboard-text clip))))
 
 ;; check-allow: the continuation is resolved late (`reflect/eval`), so its result is unknown
 ;; to the checker; every `then` is a fold, and answers a model
@@ -2236,7 +2298,7 @@ The local window needs no ask: its clipboard is read off the loop on focus and t
 ([[ed-clipboard-focus]]), so [[ed-clipboard-read]] answers from that without waiting."
     (let (asked (when (:client-clipboard m) (editor/serve/client-clipboard-ask)))
       (if (nil? asked)
-        ((reflect/eval then) m (ed-clipboard-read m) data)
+        (let ([read text] (ed-clipboard-read-now m)) ((reflect/eval then) read text data))
         (assoc m :clipboard-asks (assoc (or (:clipboard-asks m) {}) asked {:then then :data data}))))))
 
 (defn ed-ev-clipboard (m input textrows cols rows)
@@ -2279,7 +2341,7 @@ kill). Emacs's `interprogram-paste-function`."
   "[[ed-adopt-clipboard-text]] with what the clipboard holds now ([[ed-clipboard-read]]):
 something copied in another app since our last kill becomes the ring's freshest entry, so
 the next yank inserts it. A missing / unavailable clipboard leaves the ring untouched."
-  (ed-adopt-clipboard-text m (ed-clipboard-read m)))
+  (let ([read text] (ed-clipboard-read-now m)) (ed-adopt-clipboard-text read text)))
 
 ;; ---- a guest's session: editing what it was given, nothing more (brood ADR-415) -------
 ;; A guest attaches over a link that can carry no code and reach nothing it was not given —
@@ -2368,7 +2430,7 @@ the next yank inserts it. A missing / unavailable clipboard leaves the ring unto
   "`[m' text]`: the text a yank inserts now — the kill-ring head after adopting the ring
 the frames share and then the clipboard as it reads now ([[ed-clipboard-read]]) — or
 `[m' nil]` when the ring is empty."
-  (ed-kill-head-with m (ed-clipboard-read m)))
+  (let ([read text] (ed-clipboard-read-now m)) (ed-kill-head-with read text)))
 
 (defn ed-kill-head-with (m clip)
   "[[ed-kill-head]] with the clipboard's text `clip` already known — what a yank that ASKED

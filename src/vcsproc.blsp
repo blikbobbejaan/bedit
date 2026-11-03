@@ -457,24 +457,45 @@ or commit killed mid-write leaves `index.lock` behind)."
 `{:exit :stdout :stderr}` — and report when it lands, then run `then`, a
 `(model result) -> model` (nil for nothing more).
 
-Refuses to start a second operation while one is in flight: two lands at once is not a
-thing anyone means, and the in-flight slot holds exactly one handle. Headless runs it
+Refuses a second operation while one is in flight or waiting: two lands at once is not a
+thing anyone means, and the in-flight slot holds exactly one handle. It takes its turn in
+the working-tree queue (`vcs-run-queued`): a pull or a commit writes the index too, so `k`
+then `F u` must not race the discard for `index.lock` — the pull starts when the commands
+before it have landed, and a command pressed while it runs waits for it. Headless runs it
 synchronously, because there is no loop to hand the reply to."
     (cond
       (vcs-op-running m) (message m (str (vcs-op-running m) " is already running"))
+      (vcs-launch-waiting m) (message m (str (vcs-launch-waiting m) " is already waiting to run"))
       (ed-headless?)
         (let ([m0 r] (vcs-run m program args (fn () (runner root args)))
               m1 (vcs-report-cmd m0 verb r))
-          (if (nil? then) m1 (then m1 r)))
+          (if (nil? then) m1 (vcs-pinned m1 root (fn (mm) (then mm r)))))
       else
-      ;; the entry is journalled when the command STARTS, so an in-flight pull reads as
-      ;; `run git pull` while it is still out there — which is the question you have when
-      ;; one is slow. `vcs-apply-op` completes it; the entry times itself.
-        (let (job (task (fn () (runner root args)) {:timeout *vcs-op-timeout-ms*})
-              [logged id] (vcs-journal-add m (vcs-entry program args)))
-          (assoc (message logged (str verb "…"))
-            :vcs-op-proc job
-            :vcs-op {:verb verb :root root :then then :entry id})))))
+        (vcs-queue-next (vcs-enqueue (message m (str verb "…"))
+                          {:kind :launch
+                           :program program
+                           :verb verb
+                           :root root
+                           :args args
+                           :runner runner
+                           :then then})))))
+
+(defn- vcs-launch-waiting (m)
+  "The verb of a network operation queued but not started, or nil."
+  (:verb (seq/find (or (:vcs-queue m) []) (fn (op) (= (:kind op) :launch)))))
+
+(defn- vcs-start-launch (m op)
+  "Start the queued network operation `op`. The entry is journalled when the command STARTS,
+so an in-flight pull reads as `run git pull` while it is still out there — which is the
+question you have when one is slow. `vcs-apply-op` completes it; the entry times itself."
+  (let (runner (:runner op)
+        root (:root op)
+        args (:args op)
+        job (task (fn () (runner root args)) {:timeout *vcs-op-timeout-ms*})
+        [logged id] (vcs-journal-add m (vcs-entry (:program op) args)))
+    (assoc logged
+      :vcs-op-proc job
+      :vcs-op {:verb (:verb op) :root root :then (:then op) :entry id})))
 
 (check-allow :trusted
   ;; a command that can outlast a frame — network, so a task
@@ -488,14 +509,16 @@ empty output, which is what a bare exit-code check would do with it."
           verb (or (:verb op) "command")
           m1 (vcs-journal-finish (dissoc m :vcs-op :vcs-op-proc) (:entry op) r))
       (if (nil? r)
-        (message m1
-          (str verb
-            " failed: no result (timed out after "
-            *vcs-op-timeout-ms*
-            "ms)"
-            (vcs-journal-note)))
+        (vcs-queue-next (message m1
+                          (str verb
+                            " failed: no result (timed out after "
+                            *vcs-op-timeout-ms*
+                            "ms)"
+                            (vcs-journal-note))))
         (let (m2 (vcs-report-cmd m1 verb r))
-          (if (nil? (:then op)) m2 ((:then op) m2 r)))))))
+          (if (nil? (:then op))
+            (vcs-queue-next m2)
+            (vcs-continue m2 (:root op) (:then op) r)))))))
 
 ;; ---- working-tree commands: off the loop, one at a time, in order ------------------
 ;; A stage, an unstage, a discard, a claim: a command that changes this checkout and stays
@@ -518,7 +541,8 @@ empty output, which is what a bare exit-code check would do with it."
 `{:exit :stdout :stderr}` — to run OFF the loop after any already queued, journalled like
 every command, then fold `(then model result)`. Headless runs it at once."
   (if (ed-headless?)
-    (let ([m0 r] (vcs-run m program args (fn () (runner root args)))) (then m0 r))
+    (let ([m0 r] (vcs-run m program args (fn () (runner root args))))
+      (vcs-pinned m0 root (fn (mm) (then mm r))))
     (vcs-queue-next (vcs-enqueue m
                       {:kind :command
                        :program program
@@ -535,17 +559,72 @@ read in a failure (`git branch failed or timed out`). Not journalled — the pro
 the commands that changed something. C-g cancels it, and every read queued behind it:
 nothing is half-done by abandoning a read. Headless runs it at once."
   (if (ed-headless?)
-    (then m (collect root))
+    (vcs-pinned m root (fn (mm) (then mm (collect root))))
     (vcs-queue-next (vcs-enqueue m
                       {:kind :read :label label :root root :collect collect :then then}))))
+
+(defn vcs-gather-holding (m label root collect then)
+  "[[vcs-gather]] for a read whose answer is what the reader is about to work in — the
+message an amend opens on, the branch a rename renames: until it lands the keyboard is HELD
+(a read-char that says what it waits for and keeps it), so keys typed meanwhile are not
+run as commands in the buffer underneath — `c a` then typing a message used to stage,
+unstage and discard in *git-status*. C-g lets go and cancels the read."
+  (if (ed-headless?)
+    (vcs-gather m label root collect then)
+    (vcs-gather (vcs-hold m label) label root collect then)))
+
+(defn- vcs-hold (m label)
+  "`m` holding the keyboard while `label` is read."
+  (assoc (message m (str label "… (C-g cancels)"))
+    :read-char
+      {:then (fn (mm _key) (vcs-hold mm label))
+       :on-cancel 'vcsproc/vcs-hold-cancel
+       :vcs-hold true}))
+
+(defn- vcs-let-go (m)
+  "`m` with the keyboard let go, when a read was holding it."
+  (if (map/get-in m [:read-char :vcs-hold]) (dissoc m :read-char) m))
+
+(defn vcs-hold-cancel (m)
+  "C-g while a read holds the keyboard: cancel the reads (the held one with them) and say
+which, as C-g's own clean-up does ([[vcs-gather-quit]])."
+  (let (handle (:vcs-gather-proc m))
+    (do
+      (when handle (task/cancel handle))
+      (vcs-gather-quit (dissoc (vcs-let-go m) :vcs-gather-proc) true))))
 
 (defn- vcs-enqueue (m op)
   "`m` with `op` at the back of the working-tree queue."
   (assoc m :vcs-queue (conj (or (:vcs-queue m) []) op)))
 
 (defn vcs-queue-busy? (m)
-  "Whether a queued working-tree command or read is running now."
-  (or (not (nil? (:vcs-queue-proc m))) (not (nil? (:vcs-gather-proc m)))))
+  "Whether a queued working-tree command, read or network operation is running now."
+  (or (not (nil? (:vcs-queue-proc m)))
+    (not (nil? (:vcs-gather-proc m)))
+    (not (nil? (:vcs-op-proc m)))))
+
+;; ---- the repo a follow-up runs in ------------------------------------------------
+;; A follow-up — what a read's answer, a command's result, a prompt's answer or a y/n does
+;; next — used to find its repo again when it RAN, from the buffer the reader was in by
+;; then. Off the loop that is later: `U`, then a switch to a file in repo B before the read
+;; landed, unstaged everything in B. So each follow-up runs with the repo it was asked in
+;; PINNED (`:vcs-pinned-root`), and a porcelain's root resolution reads the pin first
+;; (`gitcore/git-resolve-root`, `murcore/mur-resolve-root`).
+
+(defn vcs-pinned-root (m)
+  "The repo the follow-up running now was asked in, or nil outside one."
+  (:vcs-pinned-root m))
+
+(defn vcs-pinned (m root then)
+  "`(then model)` with `root` pinned as the repo it runs in — nothing pinned for a nil
+`root` — and the pin as it was restored after, so a follow-up's own follow-ups carry theirs."
+  (if (nil? root)
+    (then m)
+    (let (previous (:vcs-pinned-root m)
+          result (then (assoc m :vcs-pinned-root root)))
+      (if (nil? previous)
+        (dissoc result :vcs-pinned-root)
+        (assoc result :vcs-pinned-root previous)))))
 
 (defn- vcs-queue-next (m)
   ;; start the queue's head when nothing is running; the task closes over the runner (or the
@@ -556,27 +635,32 @@ nothing is half-done by abandoning a read. Headless runs it at once."
       (let (op (first queue)
             root (:root op)
             waiting (assoc m :vcs-queue (vec (rest queue))))
-        (if (= (:kind op) :read)
-          (let (collect (:collect op))
-            (assoc waiting
-              :vcs-gather-proc (task (fn () (collect root)) {:timeout *vcs-op-timeout-ms*})
-              :vcs-gather-op {:then (:then op) :label (:label op)}))
+        (case (:kind op)
+          :read
+            (let (collect (:collect op))
+              (assoc waiting
+                :vcs-gather-proc (task (fn () (collect root)) {:timeout *vcs-op-timeout-ms*})
+                :vcs-gather-op {:then (:then op) :label (:label op) :root root}))
+          :launch (vcs-start-launch waiting op)
           (let (runner (:runner op)
                 args (:args op)
                 job (task (fn () (runner root args)) {:timeout *vcs-op-timeout-ms*})
                 [logged id] (vcs-journal-add waiting (vcs-entry (:program op) args)))
-            (assoc logged :vcs-queue-proc job :vcs-queue-op {:then (:then op) :entry id})))))))
+            (assoc logged
+              :vcs-queue-proc job
+              :vcs-queue-op {:then (:then op) :entry id :root root})))))))
 
-(defn- vcs-continue (m then answer)
-  "Fold a queued step's `answer` through its `then`, with what that queues put AHEAD of what
-was already waiting, then start the next. A `then` that raises is said in the echo area and
-the queue carries on — a fold that threw would otherwise leave its successors queued for
+(defn- vcs-continue (m root then answer)
+  "Fold a queued step's `answer` through its `then` — in the repo `root` it was asked in
+([[vcs-pinned]]), whatever buffer the reader is in now — with what that queues put AHEAD of
+what was already waiting, then start the next. A `then` that raises is said in the echo area
+and the queue carries on — a fold that threw would otherwise leave its successors queued for
 good, since the loop keeps the model from before a failed update."
   (let (waiting (or (:vcs-queue m) [])
         cleared (assoc m :vcs-queue [])
         m1 (check-allow :discarded-catch
              (try
-               (then cleared answer)
+               (vcs-pinned cleared root (fn (mm) (then mm answer)))
                (catch e
                  (do
                    (log/error (str "vc: a queued step's fold failed: " (error-message e)))
@@ -600,7 +684,7 @@ task having errored or timed out, said plainly."
                             *vcs-op-timeout-ms*
                             "ms)"
                             (vcs-journal-note))))
-        (vcs-continue m1 (:then op) r)))))
+        (vcs-continue m1 (:root op) (:then op) r)))))
 
 (check-allow :trusted
   ;; a read a command waits on (a prompt's candidates, the branch a push goes from); the
@@ -615,22 +699,35 @@ task having errored or timed out, said plainly."
     "Fold a finished `vcs-gather`: its answer through its `then`, or — when the task errored
 or timed out — say so and carry on with the queue."
     (let (op (:vcs-gather-op m)
-          m1 (dissoc m :vcs-gather-op :vcs-gather-proc))
+          ;; the keyboard is let go whichever way the read ended
+          m1 (vcs-let-go (dissoc m :vcs-gather-op :vcs-gather-proc)))
       (if (= (first event) :task-done)
-        (vcs-continue m1 (:then op) (nth event 2))
+        (vcs-continue m1 (:root op) (:then op) (nth event 2))
         (vcs-queue-next (message m1
                           (str (:label op "a read")
                             " failed or timed out"
                             (if (= (first event) :task-error) (str ": " (nth event 2 "")) ""))))))))
 
-(defn vcs-gather-quit (m)
-  "C-g's clean-up for a read in flight (`:on-quit`; its task is already cancelled): forget
-it and every read queued behind it — what they were going to ask is what C-g abandons — and
-carry on with the working-tree commands still queued, which the reader did ask for."
-  (let (label (map/get-in m [:vcs-gather-op :label] "a read")
-        commands (into [] (seq/reject (or (:vcs-queue m) []) (fn (op) (= (:kind op) :read)))))
-    (vcs-queue-next (message (assoc (dissoc m :vcs-gather-op) :vcs-queue commands)
-                      (str label " cancelled")))))
+(defn vcs-gather-quit (m &optional (said-here? false))
+  "C-g's clean-up for the reads (`:on-quit`; the one in flight already cancelled): forget it
+and every read queued behind it — what they were going to ask is what C-g abandons — and
+carry on with the working-tree commands still queued, which the reader did ask for. What was
+dropped is SAID: a quiet C-g left the command that was waiting on the read (a checkout, a
+commit) simply never happening. Left as a note C-g's own message carries
+(`model/ed-quit-note`), or said here when C-g came to the hold rather than to the command
+loop (`said-here?`)."
+  (let (in-flight (map/get-in m [:vcs-gather-op :label])
+        queued (map (seq/filter (or (:vcs-queue m) []) (fn (op) (= (:kind op) :read))) :label)
+        labels (if (nil? in-flight) queued (cons in-flight queued))
+        commands (into [] (seq/reject (or (:vcs-queue m) []) (fn (op) (= (:kind op) :read))))
+        note (str "cancelled reading "
+               (string/join (seq/distinct labels) ", ")
+               " — what was waiting on it did not run")
+        m1 (vcs-let-go (assoc (dissoc m :vcs-gather-op) :vcs-queue commands)))
+    (vcs-queue-next (cond
+                      (empty? labels) m1
+                      said-here? (message m1 note)
+                      else (ed-quit-note m1 note)))))
 
 ;; ---- the buffer type -------------------------------------------------------------
 ;; *vcs-process* — its own layer rather than a shared report keymap, because `k` clears the
@@ -665,7 +762,15 @@ carry on with the working-tree commands still queued, which the reader did ask f
 uses (git's discard and reset, mur's drop and restore) — and the prompt NAMES what is
 about to happen (`Reset --hard to abc123, losing all uncommitted changes?`) rather than
 asking whether you are sure. \"Are you sure?\" is answered yes by reflex; a sentence that
-says what will be lost is not."
-  (ed-read-char m
-    (str prompt " (y/n) ")
-    (fn (mm c) (if (ed-yes-key? c) (then mm) (message mm "cancelled")))))
+says what will be lost is not.
+
+Asked inside a follow-up, the answer runs in the repo that follow-up was pinned to
+([[vcs-pinned]]) — and the question names that repo when the reader has moved to a buffer
+in another, so a `reset --hard` asked of repo A is never answered as though about B."
+  (let (root (vcs-pinned-root m)
+        here (vcs/root (pool/ed-default-dir m))
+        elsewhere? (and root here (not (= root here))))
+    (ed-read-char m
+      (str (if elsewhere? (str "[" (path/basename root) "] ") "") prompt " (y/n) ")
+      (fn (mm c)
+        (if (ed-yes-key? c) (vcs-pinned mm root then) (message mm "cancelled"))))))
