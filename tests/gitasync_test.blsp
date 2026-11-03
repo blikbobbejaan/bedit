@@ -177,10 +177,10 @@ until nothing is in flight — each reply a barrier, never a sleep."
     (let (dir (ga-repo "prompt" {"a.txt" "a\n"})
           m0 (ga-status dir)
           asked (ga-live (fn () (gitrefs/cmd-git-checkout m0 nil))))
-      ;; open, listing nothing yet, the refs being read in a task
+      ;; open, listing at most the ref at point yet, the refs being read in a task
       (is (not (nil? (:minibuffer asked))))
       (is (not (nil? (:vcs-gather-proc asked))))
-      (assert= (ga-names asked) [])
+      (is (<= (count (ga-names asked)) 1))
       (let (typed (map/assoc-in asked
                     [:minibuffer :edit]
                     (ed-mb-set-text (map/get-in asked [:minibuffer :edit]) "oth"))
@@ -224,10 +224,11 @@ until nothing is in flight — each reply a barrier, never a sleep."
           m0 (ga-status dir)
           asked (ga-live (fn ()
                            (git-do (gitrefs/cmd-git-checkout m0 nil) "stage" ["add" "--" "a.txt"])))
-          [quit cancelled?] (ga-live (fn () (ed-cancel-quit-jobs asked)))
+          quit (ga-live (fn () (commands/cmd-keyboard-quit asked nil)))
           done (ga-settle quit))
-      (is cancelled?)
-      (is (includes? (:echo quit) "cancelled"))
+      ;; C-g says what it dropped, after its own word — not overwritten by it
+      (assert= (:echo quit)
+        "quit — cancelled reading git refs — what was waiting on it did not run")
       (assert= (ga-out dir ["diff" "--cached" "--name-only"]) "a.txt")
       (assert= (ga-out dir ["symbolic-ref" "--short" "HEAD"]) "main")
       (is (not (vcs-queue-busy? done)))))
@@ -289,3 +290,130 @@ until nothing is in flight — each reply a barrier, never a sleep."
       (is (not (nil? (:project-scan asked))))
       (let (landed (ga-settle asked))
         (is (includes? (ga-names landed) "lib.txt"))))))
+
+;; ---- a follow-up acts in the repo it was asked in --------------------------------------
+;; Each of these presses a key in repo A, moves to a file in repo B before what the key
+;; started has landed, and then lets it land: A is acted on, B is left alone.
+
+(defn- ga-visit (m dir file)
+  "`m` moved to `file` in `dir` — another repo's buffer — as a reader would between a key
+and its answer."
+  (ed-find-file m (path/join dir file)))
+
+(describe "git off the loop: a follow-up acts in the repo it was asked in"
+  (test "U in repo A, then a move to repo B: A is unstaged, B's stage stays"
+    (let (a (ga-repo "pin-unstage-a" {"a.txt" "a\n"})
+          b (ga-repo "pin-unstage-b" {"b.txt" "b\n"})
+          _ (file/spit (path/join a "a.txt") "a2\n")
+          _ (ga-git a ["add" "a.txt"])
+          _ (file/spit (path/join b "b.txt") "b2\n")
+          _ (ga-git b ["add" "b.txt"])
+          pressed (ga-live (fn () (gitstatus/cmd-git-unstage-all (ga-status a) nil)))
+          moved (ga-visit pressed b "b.txt")
+          done (ga-settle moved))
+      (assert= (ga-out a ["diff" "--cached" "--name-only"]) "")
+      (assert= (ga-out b ["diff" "--cached" "--name-only"]) "b.txt")
+      (is (not (vcs-queue-busy? done)))))
+  (test "b b answered in repo A, then a move to repo B: A checks out, B stays on main"
+    (let (a (ga-repo "pin-checkout-a" {"a.txt" "a\n"})
+          b (ga-repo "pin-checkout-b" {"b.txt" "b\n"})
+          asked (ga-live (fn () (gitrefs/cmd-git-checkout (ga-status a) nil)))
+          answered (ga-answer asked "other")
+          done (ga-settle (ga-visit answered b "b.txt")))
+      (assert= (ga-out a ["symbolic-ref" "--short" "HEAD"]) "other")
+      (assert= (ga-out b ["symbolic-ref" "--short" "HEAD"]) "main")
+      (is (not (vcs-queue-busy? done)))))
+  (test "b x on repo A's current branch, its question answered from repo B: A is reset, and the question names A"
+    (let (a (ga-repo "pin-reset-a" {"a.txt" "a\n"})
+          b (ga-repo "pin-reset-b" {"b.txt" "b\n"})
+          _ (file/spit (path/join a "a.txt") "a edited\n")
+          _ (file/spit (path/join b "b.txt") "b edited\n")
+          asked (ga-live (fn () (gitrefs/cmd-git-branch-reset (ga-status a) nil)))
+          branch (ga-settle (ga-answer asked "main"))
+          started (ga-answer branch "HEAD")
+          question (ga-settle (ga-visit started b "b.txt")))
+      (is (not (nil? (:read-char question))))
+      (is (string/starts-with? (:echo question) (str "[" (path/basename a) "] Reset main --hard")))
+      (ga-settle (ga-key question "y"))
+      (assert= (file/slurp (path/join a "a.txt")) "a\n")
+      (assert= (file/slurp (path/join b "b.txt")) "b edited\n"))))
+
+;; ---- what is typed while a read is out --------------------------------------------------
+
+(describe "git off the loop: the keyboard while an answer is on its way"
+  (test "c a holds the keys until HEAD's message lands — `s` typed meanwhile stages nothing"
+    (let (dir (ga-repo "hold-amend" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          asked (ga-live (fn () (gitcommit/cmd-git-commit-amend (ga-status dir) nil)))
+          typed (ga-live (fn () (ed-update asked "s" 80 24))))
+      (is (map/get-in asked [:read-char :vcs-hold]))
+      (is (map/get-in typed [:read-char :vcs-hold]))
+      (is (includes? (:echo typed) "C-g cancels"))
+      (assert= (into [] (seq/filter (or (:vcs-queue typed) []) (fn (op) (= (:kind op) :command))))
+        [])
+      (let (landed (ga-settle typed))
+        (assert= (buffer-name (ed-current-buf landed)) "*git-commit*")
+        (is (includes? (buffer-text (ed-current-buf landed)) "base"))
+        (is (nil? (:read-char landed)))
+        (assert= (ga-out dir ["diff" "--cached" "--name-only"]) ""))))
+  (test "C-g while a read holds the keys lets go, cancels it, and says what"
+    (let (dir (ga-repo "hold-quit" {"a.txt" "a\n"})
+          asked (ga-live (fn () (gitcommit/cmd-git-commit-reword (ga-status dir) nil)))
+          quit (ga-live (fn () (ed-update asked :ctrl-g 80 24)))
+          done (ga-settle quit))
+      (is (nil? (:read-char quit)))
+      (is (includes? (:echo quit) "cancelled reading git log -1"))
+      (assert= (buffer-name (ed-current-buf done)) "*git-status*"))))
+
+;; ---- a prompt's default, from its first keystroke ---------------------------------------
+
+(describe "git off the loop: a prompt's default before git answers"
+  (test "RET at once on X s (reset --soft) takes the commit at point"
+    (let (dir (ga-repo "seed-reset" {"a.txt" "a\n"})
+          base (ga-out dir ["rev-parse" "HEAD"])
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          _ (ga-git dir ["commit" "-qam" "second"])
+          m0 (ga-status dir)
+          ;; point on the base commit in the recent-commits list
+          rows (sectionbuf/sb-rows m0)
+          at (seq/index-where rows
+               (fn (row)
+                 (and row
+                   (:heading? row)
+                   (= (:type row) :commit)
+                   (= (:subject (:value row)) "base"))))
+          on-base (ed-apply m0 (fn (buffer) (ed-goto-line buffer (inc at))))
+          asked (ga-live (fn () (gitrefs/cmd-git-reset-soft on-base nil)))
+          done (ga-settle (ga-answer asked "")))
+      (assert= (ga-out dir ["rev-parse" "HEAD"]) base)
+      (is (not (vcs-queue-busy? done)))))
+  (test "RET at once on a start point takes HEAD when no commit is at point — never silence"
+    (let (dir (ga-repo "seed-start" {"a.txt" "a\n"})
+          head (ga-out dir ["rev-parse" "HEAD"])
+          m0 (ga-visit (ga-status dir) dir "a.txt")
+          named (ga-answer (ga-live (fn () (gitrefs/cmd-git-branch-create-only m0 nil))) "fresh")
+          done (ga-settle (ga-answer named "")))
+      (assert= (ga-out dir ["rev-parse" "fresh"]) head)
+      (is (not (vcs-queue-busy? done))))))
+
+;; ---- a network operation takes its turn ----------------------------------------------
+
+(describe "git off the loop: a network operation waits its turn"
+  (test "k then F u: the pull waits for the discard queued before it, and runs after"
+    (let (dir (ga-repo "launch-order" {"a.txt" "a\n"})
+          _ (file/spit (path/join dir "a.txt") "a2\n")
+          m0 (ga-status dir)
+          pressed (ga-live (fn ()
+                             (git-launch-op (git-do m0 "discard" ["checkout" "--" "a.txt"])
+                               "pull"
+                               ["--version"])))
+          ;; the discard runs; the launch waits in the queue behind it
+          waiting? (and (not (nil? (:vcs-queue-proc pressed))) (nil? (:vcs-op-proc pressed)))
+          done (ga-settle pressed))
+      (is waiting?)
+      (assert= (file/slurp (path/join dir "a.txt")) "a\n")
+      (is (nil? (:vcs-op done)))
+      (is (not (vcs-queue-busy? done)))
+      ;; and the journal ran them in the order pressed
+      (assert= (into [] (map (vcs-journal done) (fn (entry) (first (:args entry)))))
+        ["checkout" "--version"]))))
