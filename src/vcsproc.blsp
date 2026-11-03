@@ -4,9 +4,12 @@ the PROCESS LOG (`$`, Magit's `magit-process-buffer`) — every command a VCS po
 its exit code, how long it took and its output — and running one OFF the loop (`vcs-launch`),
 for a command that talks to a network (git's pull and push, mur's land and update).
 
-A porcelain runs its commands through `vcs-run` (journalled, synchronous) or `vcs-launch`
-(journalled, in a task), naming the PROGRAM, so the log reads `git push` beside `mur land`
-in the order they ran. Nothing here knows any one VCS's arguments or output."
+A porcelain runs its commands through `vcs-launch` (a network one, in a task) or the
+working-tree queue (`vcs-run-queued`, one at a time, in order, each in a task) — journalled,
+naming the PROGRAM, so the log reads `git push` beside `mur land` in the order they ran — and
+asks what a key must know first (the refs to complete over, whether anything is staged)
+through the same queue (`vcs-gather`). No key runs a VCS on the loop; `vcs-run` is the
+synchronous form headless runs use. Nothing here knows any one VCS's arguments or output."
   (:use editor/keymap :only [keymap-bind]) ; the *vcs-process* keymap
   (:use editor/layers :only [register-type-layers]) ; its buffer type
   (:use model) ; message / ed-apply / ed-buffer-index-by-name / ed-headless? / register-task-reply
@@ -501,6 +504,14 @@ empty output, which is what a bare exit-code check would do with it."
 ;; `vcs-launch` is wrong for these — it refuses a second command while one runs, and `s s s`
 ;; down a list of files is three commands — so they QUEUE: each runs in a task once the one
 ;; before it has landed, which is also the order git's index lock would force anyway.
+;;
+;; A READ the next step depends on queues too (`vcs-gather`): the refs a prompt completes
+;; over, whether anything is staged before `c c`, the branch a push goes from. Behind the
+;; commands, because `s` then `c c` must find the stage done; and in a task, because `git
+;; for-each-ref` on a monorepo or a network filesystem takes as long as any other git. What
+;; a step's `then` queues runs NEXT, ahead of anything queued after it was asked for: `u`
+;; reads whether the repo has a commit, then unstages, and an `s` pressed meanwhile must not
+;; land in between.
 
 (defn vcs-run-queued (m program root args runner then)
   "Queue the working-tree command `program args` in `root` — `(runner root args)`, returning
@@ -508,27 +519,70 @@ empty output, which is what a bare exit-code check would do with it."
 every command, then fold `(then model result)`. Headless runs it at once."
   (if (ed-headless?)
     (let ([m0 r] (vcs-run m program args (fn () (runner root args)))) (then m0 r))
-    (vcs-queue-next (assoc m
-                      :vcs-queue
-                        (conj (or (:vcs-queue m) [])
-                          {:program program :root root :args args :runner runner :then then})))))
+    (vcs-queue-next (vcs-enqueue m
+                      {:kind :command
+                       :program program
+                       :root root
+                       :args args
+                       :runner runner
+                       :then then}))))
+
+(defn vcs-gather (m label root collect then)
+  "Read `(collect root)` OFF the loop, queued behind any working-tree command still to run
+(so it sees what they did), and fold `(then model answer)`. `collect` runs in a task: plain
+data in and out, so it must close over no model, no rope and no `then`. `label` names the
+read in a failure (`git branch failed or timed out`). Not journalled — the process log is
+the commands that changed something. C-g cancels it, and every read queued behind it:
+nothing is half-done by abandoning a read. Headless runs it at once."
+  (if (ed-headless?)
+    (then m (collect root))
+    (vcs-queue-next (vcs-enqueue m
+                      {:kind :read :label label :root root :collect collect :then then}))))
+
+(defn- vcs-enqueue (m op)
+  "`m` with `op` at the back of the working-tree queue."
+  (assoc m :vcs-queue (conj (or (:vcs-queue m) []) op)))
+
+(defn vcs-queue-busy? (m)
+  "Whether a queued working-tree command or read is running now."
+  (or (not (nil? (:vcs-queue-proc m))) (not (nil? (:vcs-gather-proc m)))))
 
 (defn- vcs-queue-next (m)
-  ;; start the queue's head when nothing is running; the task closes over the runner, the
-  ;; root and the arguments alone, never the `then` (which may hold anything)
+  ;; start the queue's head when nothing is running; the task closes over the runner (or the
+  ;; collector), the root and the arguments alone, never the `then` (which may hold anything)
   (let (queue (or (:vcs-queue m) []))
-    (if (or (:vcs-queue-proc m) (empty? queue))
+    (if (or (vcs-queue-busy? m) (empty? queue))
       m
       (let (op (first queue)
-            runner (:runner op)
             root (:root op)
-            args (:args op)
-            job (task (fn () (runner root args)) {:timeout *vcs-op-timeout-ms*})
-            [logged id] (vcs-journal-add m (vcs-entry (:program op) args)))
-        (assoc logged
-          :vcs-queue (vec (rest queue))
-          :vcs-queue-proc job
-          :vcs-queue-op {:then (:then op) :entry id})))))
+            waiting (assoc m :vcs-queue (vec (rest queue))))
+        (if (= (:kind op) :read)
+          (let (collect (:collect op))
+            (assoc waiting
+              :vcs-gather-proc (task (fn () (collect root)) {:timeout *vcs-op-timeout-ms*})
+              :vcs-gather-op {:then (:then op) :label (:label op)}))
+          (let (runner (:runner op)
+                args (:args op)
+                job (task (fn () (runner root args)) {:timeout *vcs-op-timeout-ms*})
+                [logged id] (vcs-journal-add waiting (vcs-entry (:program op) args)))
+            (assoc logged :vcs-queue-proc job :vcs-queue-op {:then (:then op) :entry id})))))))
+
+(defn- vcs-continue (m then answer)
+  "Fold a queued step's `answer` through its `then`, with what that queues put AHEAD of what
+was already waiting, then start the next. A `then` that raises is said in the echo area and
+the queue carries on — a fold that threw would otherwise leave its successors queued for
+good, since the loop keeps the model from before a failed update."
+  (let (waiting (or (:vcs-queue m) [])
+        cleared (assoc m :vcs-queue [])
+        m1 (check-allow :discarded-catch
+             (try
+               (then cleared answer)
+               (catch e
+                 (do
+                   (log/error (str "vc: a queued step's fold failed: " (error-message e)))
+                   (message cleared (str "version control: " (error-message e)))))))
+        ahead (or (:vcs-queue m1) []))
+    (vcs-queue-next (assoc m1 :vcs-queue (into ahead waiting)))))
 
 (check-allow :trusted
   ;; a working-tree command, queued; quick, so no activity label, and no C-g: half a stage is
@@ -539,15 +593,44 @@ every command, then fold `(then model result)`. Headless runs it at once."
     "Fold a finished queued command through its `then`, then start the next. A nil `r` is the
 task having errored or timed out, said plainly."
     (let (op (:vcs-queue-op m)
-          m1 (vcs-journal-finish (dissoc m :vcs-queue-op :vcs-queue-proc) (:entry op) r)
-          m2 (if (nil? r)
-               (message m1
-                 (str "failed: no result (timed out after "
-                   *vcs-op-timeout-ms*
-                   "ms)"
-                   (vcs-journal-note)))
-               ((:then op) m1 r)))
-      (vcs-queue-next m2))))
+          m1 (vcs-journal-finish (dissoc m :vcs-queue-op :vcs-queue-proc) (:entry op) r))
+      (if (nil? r)
+        (vcs-queue-next (message m1
+                          (str "failed: no result (timed out after "
+                            *vcs-op-timeout-ms*
+                            "ms)"
+                            (vcs-journal-note))))
+        (vcs-continue m1 (:then op) r)))))
+
+(check-allow :trusted
+  ;; a read a command waits on (a prompt's candidates, the branch a push goes from); the
+  ;; whole event, because nil is an answer a read can give (no upstream) and a failure is not
+  (register-task-reply :vcs-gather-proc
+    'vcsproc/vcs-apply-gather
+    nil
+    "vc"
+    {:folds-event? true :cancel-on-quit? true :on-quit 'vcsproc/vcs-gather-quit})
+  (sig vcs-apply-gather (model any -> model))
+  (defn vcs-apply-gather (m event)
+    "Fold a finished `vcs-gather`: its answer through its `then`, or — when the task errored
+or timed out — say so and carry on with the queue."
+    (let (op (:vcs-gather-op m)
+          m1 (dissoc m :vcs-gather-op :vcs-gather-proc))
+      (if (= (first event) :task-done)
+        (vcs-continue m1 (:then op) (nth event 2))
+        (vcs-queue-next (message m1
+                          (str (:label op "a read")
+                            " failed or timed out"
+                            (if (= (first event) :task-error) (str ": " (nth event 2 "")) ""))))))))
+
+(defn vcs-gather-quit (m)
+  "C-g's clean-up for a read in flight (`:on-quit`; its task is already cancelled): forget
+it and every read queued behind it — what they were going to ask is what C-g abandons — and
+carry on with the working-tree commands still queued, which the reader did ask for."
+  (let (label (map/get-in m [:vcs-gather-op :label] "a read")
+        commands (into [] (seq/reject (or (:vcs-queue m) []) (fn (op) (= (:kind op) :read)))))
+    (vcs-queue-next (message (assoc (dissoc m :vcs-gather-op) :vcs-queue commands)
+                      (str label " cancelled")))))
 
 ;; ---- the buffer type -------------------------------------------------------------
 ;; *vcs-process* — its own layer rather than a shared report keymap, because `k` clears the
