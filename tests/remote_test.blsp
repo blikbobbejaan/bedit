@@ -293,3 +293,68 @@
     (is (not (model/ed-guest-allows-name? "shell-command")))
     (is (not (model/ed-guest-allows? 'git/cmd-git-status)))
     (is (model/ed-guest-allows? :self-insert))))
+
+;; A private session outlives its window (brood ADR-519): a dropped client's session parks,
+;; its buffers' sidecars written at once, and attaching again under the same name takes it
+;; back. A served `:close` (the window already gone) writes them and ends, asking nothing.
+(purge-stale-temp "bedit-remote-")
+
+(defn- r-fixture-file (text)
+  ;; a fresh file holding `text` in its own temp directory; its path
+  (let (dir (temp-dir "bedit-remote-")
+        _ (file/mkdir dir)
+        path (path/join dir "notes.txt"))
+    (do (file/spit path text) path)))
+
+(defn- r-await-file (path tries)
+  ;; `path`'s text once the off-loop writer has made it, else nil — polled, since the
+  ;; writer is a process of its own with no reply to wait on
+  (cond
+    (file/exists? path) (file/slurp path)
+    (<= tries 0) nil
+    else (receive (after 20 (r-await-file path (dec tries))))))
+
+(defn- r-named-client (mgr report)
+  ;; attach as "ann", say the session, then die when told — the dropped link
+  (send mgr [:attach (self) 80 24 {:name "ann"}])
+  (receive
+    ([:attached s] (do (send report [:session s]) (receive (:die nil))))
+    (after 2000 (send report [:session nil]))))
+
+(describe "remote — a private session outlives its window"
+  (test "a lost client's buffers are auto-saved at once, unthrottled"
+    (let (path (r-fixture-file "text\n")
+          typed (ed-update (assoc (ed-init (find-file-buffer path)) :auto-saved-at (os/now))
+                  "x" 80 24)
+          m (ed-ev-client-lost typed [:client-lost] 24 80 24))
+      (assert= (r-await-file (autosave/ed-auto-save-path path) 100) "xtext\n")
+      (is (includes? (:echo m) "auto-saved"))))
+
+  (test "a served :close ends the session with its sidecars written, asking nothing"
+    (let (path (r-fixture-file "text\n")
+          typed (ed-update (ed-init (find-file-buffer path)) "y" 80 24)
+          m (ed-served-update typed :close 80 24))
+      (is (:done m))
+      (assert= (r-await-file (autosave/ed-auto-save-path path) 100) "ytext\n")))
+
+  (test "an ordinary input still folds through ed-update"
+    (let (m (ed-served-update (ed-init (make-buffer "")) "z" 80 24))
+      (assert= (buffer-text (ed-current-buf m)) "z")))
+
+  (test "attaching again under the same name gets the parked session, typing intact"
+    (let (me (self)
+          mgr (spawn (editor/serve/serve-manager (r-empty-model)
+                       ed-view
+                       ed-served-update
+                       {:resume-ms 60000}))
+          client (spawn (r-named-client mgr me))
+          session (receive ([:session s] s) (after 2000 nil)))
+      (is (not (nil? session)))
+      (doseq (k (string/->list "Kept9")) (send session [:key k]))
+      (r-drain-frames :none)
+      (send client :die)
+      (receive (after 300 nil)) ; the session notices the client's death and parks
+      (send mgr [:attach me 80 24 {:name "ann"}])
+      (assert= (receive ([:attached s] s) (after 2000 :none)) session)
+      (is (r-frame-has? (r-drain-frames :none) "Kept9"))
+      (exit session :kill))))
