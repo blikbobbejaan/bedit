@@ -27,6 +27,7 @@ gives the ride-one-caret pairing view on demand. See `docs/remote-multiplayer-pl
   (:use input) ; ed-update
   (:use collab) ; collab-share-slot — hosting + presence for the served buffer
   (:use config) ; init-config — the :share-name participant default
+  (:use startup) ; the startup path a served session shares with the window
   (:use editor/buffer-registry) ; registry-start — the shared daemon's file -> process directory
   (:use autosave :only [ed-auto-save-now!]) ; a lost window's buffers written at once
   (:use system)) ; argv — the CLI dispatch reads it
@@ -189,13 +190,37 @@ Precondition: `remote-main?` is true."
 (def *served-welcome*
   "bedit — served over a Brood node link (the emacsclient / --daemon model).\n\nThis session runs on the daemon; your window just paints its frames and ships keys.\nEach client gets its own buffer. C-x C-c / the window close button detaches.\n")
 
-(defn ed-serve-model (file)
+(defn ed-served-model (buffer file cfg)
+  "A served session's model on `buffer` (opened from `file`, nil for a scratch): prepared
+from the daemon's init `cfg` as the window's is (`startup/prepare-model` — init.blsp's model
+settings, recentf, save-place), with the CLIENT's clipboard (`:client-clipboard`, brood
+ADR-539) — never the daemon's OS clipboard (`:os-clipboard` stays off) — and nothing
+GUI-local: no `:window`, no `:gui`, because the frame is rendered here and painted on the
+client's window. The participant name is the client's, from its attach identity, so the
+host's `:share-name` is not seeded. An init file that does not read says so in the echo
+area, as the window's does. A guest's session gives up the on-disk memory when its
+identity arrives (`input/ed-ev-client-opts`)."
+  (let (placed (if (and file (setting cfg :save-place)) (saveplace/restore-place buffer) buffer)
+        prepared (dissoc (prepare-model (assoc (ed-init placed)
+                                          :project-root (launch-project file false)
+                                          :client-clipboard true)
+                           cfg)
+                   :participant)
+        unread (first (init-read-warnings)))
+    (if (nil? unread) prepared (message prepared unread))))
+
+(defn ed-serve-model (file &optional cfg)
   "The `make-model` thunk for one served session: a fresh editor model, opening `file`
-(or a scratch buffer when nil). Deliberately the pure `ed-init` model — no `gui-display`,
-no `:window`, no `:gui` — because the frame is rendered on the daemon and painted on the
-*client's* window; a served session owns nothing GUI-local. Called once per attaching client
-(so sessions are independent — Slice 1)."
-  (fn () (ed-init (if (nil? file) (make-buffer *served-welcome*) (find-file-buffer file)))))
+(or a scratch buffer when nil). Called once per attaching client, in the session's own
+process (so sessions are independent — Slice 1). With the daemon's init `cfg` it is the
+live editor's model ([[ed-served-model]]) and the session's loop is marked responsive (a
+native call that blocks it is reported, brood ADR-517); without one it is the pure `ed-init`
+model, which tests build."
+  (fn ()
+    (let (buffer (if (nil? file) (make-buffer *served-welcome*) (find-file-buffer file)))
+      (if (nil? cfg)
+        (ed-init buffer)
+        (do (slowlog/responsive!) (ed-served-model buffer file cfg))))))
 
 ;; ---- a private session outlives its window (brood ADR-519) ------------------------
 ;; A private session's buffers live in its own model, so when the window went the work
@@ -240,7 +265,29 @@ and drop its caches while it does — the served sessions live in their own proc
   (proc/hibernate)
   (receive (_ (ed-serve-park))))
 
-(defn- ed-serve-run (name)
+(defn- ed-serve-prepare (cfg)
+  "Prepare this daemon's runtime from its init `cfg` as the window prepares its own
+(`startup`): grammars, the slow-turn log, the colours and `:theme`, the installed packages
+— every session renders and parses with them. Minibuffer history (savehist) only when the
+daemon listens on no TCP port: it is one store for the whole runtime, and a TCP daemon hands
+out guest cookies, whose sessions must not be offered the owner's past answers. What the
+init file gets wrong is printed here, the daemon's console, and the first thing that did not
+read is in each session's echo area too."
+  (prepare-runtime cfg (nil? (remote-listen-addr (argv))))
+  (let (warning (apply-look cfg)) (when warning (io/puts (str "  " warning))))
+  (load-packages-later cfg (fn (level line) (io/puts (str "  " line)))))
+
+(defn- ed-window (cfg)
+  "A native window for a served session's frames, set up from `cfg` — this machine's init
+file: its font, inset and text settings, and its colours, as a local window's
+(`startup/configure-window`)."
+  (let (disp (gui-display *window-options*))
+    (do
+      (configure-window cfg disp)
+      (let (warning (apply-look cfg)) (when warning (io/puts warning)))
+      disp)))
+
+(defn- ed-serve-run (name cfg)
   "Keep this runtime alive after `serve`/`serve-shared` registered (both are non-blocking).
 With `--headless`, park forever — the pure background daemon (`ed-serve-park`). Otherwise open
 the operator's OWN window attached to this runtime's session (`attach-display-local` over
@@ -256,25 +303,28 @@ machine should pass `--headless`."
       (io/puts "  opening a local host window — close it to stop serving.")
       ;; the host is a participant too: its window attaches with an identity, so a
       ;; collab session shows the host's name on its caret like anyone else's
-      (attach-display-local (gui-display *window-options*)
-        {:name (remote-participant (argv))}))))
+      (attach-display-local (ed-window cfg) {:name (remote-participant (argv))}))))
 
 (defn ed-serve (&optional file)
   "Run bedit as a daemon (ADR-090): register a session manager under the node's serve name,
 then keep the runtime alive (`ed-serve-run`). Each `ed-attach` (or `nest attach`) gets its own
 editor session over the link. By default the host also gets its **own local window** onto a
 session (so serving isn't blind); `--headless` skips it (a pure background daemon). The runtime
-must already be a node — launch with `bedit --name NAME --serve [file]`. Blocks."
-  (let (name (remote-node-name (argv)))
+must already be a node — launch with `bedit --name NAME --serve [file]`. The daemon and its
+sessions are prepared from its init file as the window is (`ed-serve-prepare`,
+`ed-served-model`). Blocks."
+  (let (name (remote-node-name (argv))
+        cfg (init-config))
     (let (guests (remote-ensure-node name))
-      (serve (ed-serve-model file) ed-view ed-served-update {:resume-ms *served-resume-ms*})
+      (ed-serve-prepare cfg)
+      (serve (ed-serve-model file cfg) ed-view ed-served-update {:resume-ms *served-resume-ms*})
       (io/puts (str "bedit daemon '"
                  name
                  "' serving"
                  (if (nil? file) "" (str " " file))
                  " (private buffer per client; a dropped client's session waits a day for it)."))
       (io/puts (str "  attach from another terminal:  " (remote-attach-hint name guests)))
-      (ed-serve-run name))))
+      (ed-serve-run name cfg))))
 
 ;; ---- --serve --shared: shared content, a cursor per client (src/collab.blsp) -----
 ;; THE collaborative mode (`--collab` is an alias; the old fan-ONE-model/one-cursor
@@ -304,17 +354,21 @@ to the process's current text, so a late joiner sees the live document, not the 
 on disk)."
   (if (nil? file) (make-buffer *collab-welcome* "*shared*") (find-file-buffer file)))
 
-(defn ed-serve-collab-model (file proc &optional reg)
+(defn ed-serve-collab-model (file proc &optional reg cfg)
   "The `make-model` thunk for one SHARED session: a fresh editor model on the collab
 buffer for `file`, with pool slot 0 backed by shared buffer process `proc`
 (`collab-share-slot` — runs in the session process, so the subscription's pushes land on
 the session's own mailbox) and the daemon's file registry on `:collab-reg` (so every
 OTHER file this session visits is auto-shared too — `collab-autoshare`). Each session is
 otherwise independent — its own cursor, panes, kill ring — which is the point: shared
-content, per-participant everything else."
+content, per-participant everything else. With the daemon's init `cfg` the session is
+prepared as a private one is ([[ed-served-model]]); without one it is the pure model."
   (fn ()
-    (collab-share-slot (assoc (ed-init (ed-collab-buffer file)) :collab-reg reg)
-      0 proc)))
+    (let (buffer (ed-collab-buffer file)
+          base (if (nil? cfg)
+                 (ed-init buffer)
+                 (do (slowlog/responsive!) (ed-served-model buffer file cfg))))
+      (collab-share-slot (assoc base :collab-reg reg) 0 proc))))
 
 (defn ed-serve-collab (&optional file)
   "Run bedit as the SHARED (collaborative) daemon: spawn ONE buffer process owning
@@ -325,24 +379,26 @@ else's). Launch as `bedit --name ed --serve --shared [file]`; clients attach wit
 `bedit --attach ed --as NAME`. The host gets its own window too (`--headless` to opt
 out). Undo history and markers are per-session and transient on the shared buffer (v1 —
 see `src/collab.blsp`). Blocks."
-  (let (name (remote-node-name (argv)))
+  (let (name (remote-node-name (argv))
+        cfg (init-config))
     ;; the node comes up FIRST, so the buffer process's pid carries the node's
     ;; stamp from birth — one less place for the pre-node-start `nonode` stamp
     ;; (now equality-normalized in the kernel, but why invite it) to appear
     (let (guests (remote-ensure-node name))
+      (ed-serve-prepare cfg)
       (let (reg (registry-start {:mirror true})
             buf (ed-collab-buffer file)
             proc (if (nil? (buffer-file buf))
                    (spawn-buffer buf) ; the scratch welcome — not registry-tracked
                    (collab-registry-share reg buf)))
-        (serve (ed-serve-collab-model file proc reg) ed-view ed-update)
+        (serve (ed-serve-collab-model file proc reg cfg) ed-view ed-update)
         (io/puts (str "bedit daemon '"
                    name
                    "' serving"
                    (if (nil? file) "" (str " " file))
                    " (SHARED — one document, everyone their own caret)."))
         (io/puts (str "  attach:  " (remote-attach-hint name guests) " [--as NAME]"))
-        (ed-serve-run name)))))
+        (ed-serve-run name cfg)))))
 
 (defn ed-attach (spec)
   "Open a native window and attach it to the bedit daemon named `spec` (\"name\" for a
@@ -355,7 +411,10 @@ whose `std` includes `attach-display` (rebuild `../brood` with `./configure --wi
 make install`) — a clear error says so if it's missing."
   (if (bound? 'editor/serve/attach-display)
     (editor/serve/attach-display spec
-      (gui-display *window-options*)
+      ;; set up from THIS machine's init file, read without writing one: the window and
+      ;; its fonts are here. The session's kills and yanks reach this machine's clipboard
+      ;; through it (brood ADR-539)
+      (ed-window (config/peek-init))
       ;; the session's guest cookie (`--cookie`, from the daemon's attach hint), else the
       ;; machine cookie — which only reaches a daemon on this machine's own nodes
       (remote-arg-after (argv) "--cookie")

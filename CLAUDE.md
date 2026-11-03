@@ -89,6 +89,11 @@ feature work — surfacing it is half the point of this project.
 
 ```
 src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop
+src/startup.blsp            the ONE startup path the window and `--serve` share: the runtime's
+                            (grammars, slow-turn log, savehist, colours + `:theme`, packages), a
+                            model's (init.blsp's model settings, recentf, save-place), a window's
+                            (font, inset, text settings, window mode — an attached client's from
+                            ITS machine's init file)
 src/model.blsp              the ui-run model: buffer pool, panes, kill ring, minibuffer, *Messages*,
                             the timers — and the REGISTRIES the rest plugs into: idle-beat jobs
                             (`register-idle-job`), off-loop task replies, inbound `[:tag …]`
@@ -701,7 +706,11 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             guest's session runs an allowlist (`model/ed-guest-allows?`). A
                             private session whose window drops PARKS for a day (brood ADR-519),
                             its sidecars written at once; attaching again under the same name
-                            takes it back as it was
+                            takes it back as it was. A session starts as the window does
+                            (src/startup.blsp) and its kills and yanks go to the CLIENT's
+                            clipboard over the link (`:client-clipboard`, brood ADR-539) — never
+                            the daemon's. A guest keeps the host's config and loses recentf and
+                            save-place; a `--listen` daemon keeps savehist off
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
