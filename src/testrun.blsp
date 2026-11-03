@@ -162,6 +162,7 @@ first decoded line does not."
                                        :passed 0
                                        :failed 0
                                        :last-group nil
+                                       :running? true
                                        :adapter-id adapter-id
                                        :decoder (testadapter/init (testadapter/for-toolchain adapter-id))})
                            (str "testing "
@@ -477,16 +478,32 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
       m
       (testrun-fold-line m (test-line-event-line e) cols rows))))
 
+(defn- testrun-finished (m)
+  "`m` with the run it shows no longer running — its runner exited, its warm session
+answered for the last time or went away, or it was stopped."
+  (map/assoc-in m [:testrun :running?] false))
+
 (impl UiEvent
   test-done-event
   ;; Non-zero exit with no summary = the run itself broke (a load error, a crash) —
   ;; say so; a clean exit already reported via the summary.
   (ui-event-fold (e m textrows cols rows)
-    (let (code (test-done-event-code e))
-      (if (and (testrun-current? m (test-done-event-gen e)) code (not (= code 0)))
-        (message (ed-append-named m *tests-buffer* (str "\n[runner exited " code "]\n"))
+    (let (code (test-done-event-code e)
+          current? (testrun-current? m (test-done-event-gen e))
+          m1 (if current? (testrun-finished m) m))
+      (if (and current? code (not (= code 0)))
+        (message (ed-append-named m1 *tests-buffer* (str "\n[runner exited " code "]\n"))
           (str "test runner exited " code " — see " *tests-buffer*))
-        m))))
+        m1))))
+
+(defn testrun-live (m)
+  "The test run C-x C-c would kill (`model/register-exit-query`), from its start until it
+finishes however it does (`testrun-finished`)."
+  (if (map/get-in m [:testrun :running?])
+    [(str *tests-buffer* ": " (map/get-in m [:testrun :label] "a test run"))]
+    []))
+
+(register-exit-query :testrun 'testrun/testrun-live)
 
 ;; ---- the warm node: the same suite, without the VM boot ---------------------------
 ;; An Elixir run costs a VM start and a compile before its first verdict — a second and a
@@ -659,6 +676,7 @@ be left looking like one in progress."
                                          :passed 0
                                          :failed 0
                                          :last-group nil
+                                         :running? true
                                          :adapter-id (get backend :adapter)
                                          :decoder nil})
                              (str "testing " label "… (warm)"))
@@ -702,7 +720,9 @@ something you have to trust."
 (defn testrun-warm-reply (m reply cols rows)
   "Fold one reply from a warm session: a `:more` chunk is one finished test, and the final
 one is the summary (or the reason there is not going to be one)."
-  (let (restart (map/get-in m [:testrun :warm-restart] "the restart command for this language"))
+  (let (restart (map/get-in m [:testrun :warm-restart] "the restart command for this language")
+        ;; every reply that is not a `:more` chunk is the run's last
+        done (testrun-finished m))
     (cond
       (not (warm-current? m reply)) m
       ;; a chunk is one finished test, or one `spy` entry from inside one — the same two
@@ -712,18 +732,18 @@ one is the summary (or the reason there is not going to be one)."
       (get reply :more) (testrun-apply-event m [:test (get reply :test)] cols rows)
       (get reply :ok)
         (let (summary (warm-summary (get reply :summary {})))
-          (testrun-apply-summary (ed-append-named m *tests-buffer* (warm-reload-note summary))
+          (testrun-apply-summary (ed-append-named done *tests-buffer* (warm-reload-note summary))
             summary cols rows))
       ;; You asked for this one. `cmd-test-stop` normally forgets the run before its
       ;; replies land, so this is the ordering where they beat it — and a run you stopped
       ;; must not be reported as a run that failed.
-      (get reply :stopped) (message m "test run stopped")
+      (get reply :stopped) (message done "test run stopped")
       ;; `{:timeout true}` is the session's own answer for a child that stopped talking
       (get reply :timeout)
-        (message (ed-append-named m *tests-buffer* "\n[the test session stopped answering]\n")
+        (message (ed-append-named done *tests-buffer* "\n[the test session stopped answering]\n")
           (str "test session stopped answering — " restart))
       else
-        (message (ed-append-named m
+        (message (ed-append-named done
                    *tests-buffer*
                    (str "\n[" (or (get reply :error) "the run failed") "]\n"))
           (str "tests: " (or (get reply :error) "the run failed"))))))
@@ -773,8 +793,12 @@ session's says nothing a run needs.)"
 (defn warm-down-of (session m &optional code)
   "`session` went away. A respawn usually follows, but until its banner lands nothing may be
 sent to it — so the next run takes the cold path rather than queueing behind a boot it
-cannot see. Whatever the exit `code`, the answer is the same."
-  (map/assoc-in m [:warm-tests session :ready] nil))
+cannot see. Whatever the exit `code`, the answer is the same — and a run that was in
+flight in it is over, since nothing is left to answer it."
+  (let (m1 (map/assoc-in m [:warm-tests session :ready] nil))
+    (if (and (map/get-in m [:testrun :warm-id]) (= session (map/get-in m [:testrun :warm-session])))
+      (testrun-finished m1)
+      m1)))
 
 (defn warm-reply (session m reply gen)
   "One reply from a warm session, with the frame the loop put on the model (`:frame`) — a
@@ -873,7 +897,8 @@ the compile that made it fast."
           (warm-call backend :stop (list id) false)
           ;; …and forget it here too. Its stragglers are already on the way, and a verdict
           ;; for a run you stopped should not keep filling the buffer.
-          (message (session/ids-used (update m :testrun dissoc :warm-id) (inc id))
+          (message (session/ids-used (testrun-finished (update m :testrun dissoc :warm-id))
+                     (inc id))
             "test run stopped"))
       (nil? proc) (message m "no test run in progress")
       else

@@ -93,7 +93,9 @@ src/model.blsp              the ui-run model: buffer pool, panes, kill ring, min
                             the timers — and the REGISTRIES the rest plugs into: idle-beat jobs
                             (`register-idle-job`), off-loop task replies, inbound `[:tag …]`
                             event handlers, feature timers, process deaths
-                            (`register-down-handler`). The core names no feature: a
+                            (`register-down-handler`), and what is still running when
+                            C-x C-c asks (`register-exit-query`: a compile, a test run,
+                            the app, a terminal, a push). The core names no feature: a
                             module registers its rows when it loads
 src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
                             over the live keymap, `\[command]` substitution, docstrings
@@ -108,7 +110,8 @@ src/scroll.blsp             keeping point on screen: the scroll-margin clamp, ho
                             KIND (`:line-kinds`: a section heading truncates, its body wraps),
                             the mode's `:long-lines` facet, the setting's `:default`
 src/autosave.blsp           `#file#` auto-save sidecars (owner-only, on the idle beat and a timer of
-                            their own) + auto-revert of files changed on disk; the note a visit
+                            their own) + auto-revert of files changed on disk (one undoable edit, std's
+                            `revert-buffer`); the note a visit
                             shows when a sidecar is newer than its file
 src/recover.blsp            M-x recover-this-file / recover-session: a sidecar's text put back as one
                             undoable edit (Emacs's), from the open and recent files
