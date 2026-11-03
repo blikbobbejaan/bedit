@@ -8,10 +8,26 @@
 ;; scroll (`model`) both ask it. Measured in display cells (`string/display-width`, so a
 ;; tab or a wide glyph counts what it paints), with tab stops the LINE's (ADR-342).
 ;;
+;;
 ;; A segment is `[from to]` — char offsets into the line, `to` exclusive, the newline
-;; never included — and a line is a list of them: one when it fits, `'([0 0])` when empty.
+;; never included — and a line is a vector of them: one when it fits, `[[0 0]]` when empty.
 ;; A line that is not wrapped (truncated or scrolled — see "long lines" below) is ONE
 ;; segment over the whole line with a clip beside it, `[0 len [cut ellipsis]]`.
+;;
+;; ---- what a row costs: the window, never the line ------------------------------------
+;; A minified file or a log can hold a line of a megabyte, and every keystroke asks for its
+;; rows several times over (the row table, the scroll clamp, the cursor's row). So nothing
+;; here reads a whole line to lay out one row:
+;;
+;;   - a row is decided from a WINDOW of the line, the chars from its start on, a little more
+;;     than two rows' worth — sliced from the rope where the line lives, never the line as a
+;;     string. Where the row ends depends on those chars and on its start column (a tab spans
+;;     to the line's stop), nothing else: whether the rest of the line fits is whether the
+;;     row's measure reaches the line's end.
+;;   - one row of a truncated or scrolled line is the same window, cut.
+;;   - a WRAPPED long line's rows are kept (`*line-layouts*`, below) and an edit inside it
+;;     lays out again only from just above the edit to where the new rows fall back into
+;;     step with the old ones.
 (defmodule wrap
   "Where a buffer line falls on screen rows: wrapped into `[from to]` segments at most `w`
 cells wide (`visual-line-mode`, breaking after the last space that fits, else mid-word), or
@@ -20,48 +36,77 @@ line that scrolls sideways). Per line (`line-policy`). The one place the rows ar
 so the view, the cursor, the mouse and the scroll agree."
   (:use editor/buffer) ; buffer-rope — a line's text for `line-segments`
   (:use memo)) ; defmemo — the row table is asked for over and over while nothing changes
-(defn- break-at (text from col w)
-  "The char offset (absolute in `text`) where the row starting at `from` (display column
-`col` of the line) ends: after the last space among the chars that fit in `w` cells,
-else at the last char that fits (a word longer than the row breaks mid-word), and at
-least one char on, so a glyph wider than the row still advances.
 
-Asked of the whole line, never of a copy of its tail: `width->index` measures from the
-line's start to the cell `col + w` (so a tab spans to the LINE's stop) and
-`last-index-of` looks back from there, both native. Copying the rest of the line per row
-made a long paragraph O(length² / width) in allocation alone."
-  (let (hard (string/width->index text (+ col w))
-        hard (if (<= hard from) (inc from) hard)
-        ;; the last space in [from, hard) — the row keeps it, the next starts clean
-        space (string/last-index-of text " " hard))
-    (if (or (< space from) (>= hard (string/length text))) hard (inc space))))
+;; A LINE SOURCE is `[text start length]`: the line is `length` chars of `text` (a rope or a
+;; string — `text/slice` reads either) from char `start`, its newline not counted.
+(def- *window-slack* 16) ; chars a row's window holds past two rows' worth of cells
 
-(sig segments-step (string int int int int int list -> list))
-(defn- segments-step (text len width from col w acc)
-  "Tail-recursive: the segments of `text` from char `from` (display column `col`) on,
-consed onto `acc` newest first. `width` is the whole line's display width, so whether
-the rest fits is one subtraction rather than a measure of the rest."
-  (cond
-    (>= from len) (reverse acc)
-    (<= (- width col) w) (reverse (cons [from len] acc))
-    else
-      (let (to (break-at text from col w))
-        (segments-step text
-          len
-          width
-          to
-          (+ col (string/display-width (string/substring text from to) col))
-          w
-          (cons [from to] acc)))))
+(sig source-piece ((tuple any int int) int int -> string))
+(defn- source-piece (source from to)
+  ;; chars `[from, to)` of the line `source` holds
+  (let ([text start _] source) (text/slice text (+ start from) (+ start to))))
 
-(sig segments (string int -> (list (vector int))))
+(sig break-in ((tuple any int int) int int int int -> int))
+(defn- break-in (source from col w span)
+  "The char offset (in the line) where the row starting at `from` (display column `col`)
+ends, read from a window of `span` chars from `from`: after the last space among the chars
+that fit in `w` cells, else at the last char that fits (a word longer than the row breaks
+mid-word), at least one char on (a glyph wider than the row still advances), and the line's
+length when the rest of it fits. A window whose every char fits stops short of the line only
+when it holds zero-width chars; it is widened and asked again."
+  (let (len (nth source 2)
+        end (math/min len (+ from span))
+        window (source-piece source from end)
+        hard (string/width->index window w col))
+    (cond
+      (and (>= hard (- end from)) (< end len)) (break-in source from col w (* 2 span))
+      (>= (+ from hard) len) len
+      else
+        (let (hard (if (<= hard 0) 1 hard)
+              ;; the last space before the cut — the row keeps it, the next starts clean
+              space (string/last-index-of window " " hard))
+          (+ from (if (< space 0) hard (inc space)))))))
+
+(sig break-at ((tuple any int int) int int int -> int))
+(defn- break-at (source from col w)
+  ;; `break-in` over a window of two rows' worth of cells and some slack
+  (break-in source from col w (+ (* 2 w) *window-slack*)))
+
+;; A layout is `[segs cols tab-row]`: the row segments, the display column each row starts
+;; on, and the index of the last row holding a tab (-1: none) — the one thing that makes a
+;; row's break depend on where it starts (`relayout-step`).
+
+(sig layout-step ((tuple any int int) int int int vector vector int -> (tuple vector vector int)))
+(defn- layout-step (source from col w segs cols tab-row)
+  "Tail-recursive: the layout of `source` from char `from` (display column `col`) on, its
+rows conj'ed onto `segs`, their columns onto `cols`, `tab-row` the last so far with a tab."
+  (if (>= from (nth source 2))
+    [segs cols tab-row]
+    (let (to (break-at source from col w)
+          piece (source-piece source from to))
+      (layout-step source
+        to
+        (+ col (string/display-width piece col))
+        w
+        (conj segs [from to])
+        (conj cols col)
+        (if (includes? piece "\t") (count segs) tab-row)))))
+
+(sig layout ((tuple any int int) int -> (tuple vector vector int)))
+(defn- layout (source w)
+  "The layout of the whole line `source` holds at width `w` (`[segs cols tab-row]`).
+`[[0 len]]` its one row when `w` is 0 (no width, no wrapping), `[[0 0]]` for an empty line."
+  (if (or (<= w 0) (= (nth source 2) 0))
+    [[[0 (nth source 2)]] [0] -1]
+    (layout-step source 0 0 w [] [] -1)))
+
 (defn segments (text w)
   "The `[from to]` row segments of `text` (one line, no newline) at most `w` cells wide:
-`'([0 len])` when it fits (or `w` is 0 — no width, no wrapping), `'([0 0])` for an empty
-line. A row is what `break-at` says."
-  (let (len (string/length text)
-        width (string/display-width text))
-    (if (or (<= w 0) (<= width w)) (list [0 len]) (segments-step text len width 0 0 w '()))))
+`[[0 len]]` when it fits (or `w` is 0 — no width, no wrapping), `[[0 0]]` for an empty line.
+A row is what `break-at` says.
+
+    (wrap/segments \"the quick brown fox\" 10)   ;=> [[0 10] [10 19]]"
+  (first (layout [text 0 (string/length text)] w)))
 
 (sig rope-line-text (any int -> string))
 (defn rope-line-text (rope line)
@@ -116,6 +161,30 @@ was first built for.
         ;; the setting and the facets are data: a value that is not a policy reads as scrolling
         (if (keyword? policy) policy :scroll)))))
 
+(sig source-one-row-in ((tuple any int int) int string int -> vector))
+(defn- source-one-row-in (source w ellipsis span)
+  "`one-row` of the line `source` holds from its start, read from a window of `span` chars:
+widened when every char of it fits and the line goes on (zero-width chars)."
+  (let (len (nth source 2)
+        end (math/min len span)
+        window (source-piece source 0 end)
+        ;; the char at cell `w` — the window's end when all of it fits
+        fits (string/width->index window w))
+    (cond
+      (<= w 0) [0 len]
+      (and (>= fits end) (< end len)) (source-one-row-in source w ellipsis (* 2 span))
+      (>= fits len) [0 len]
+      else
+        (let (ellipsis-cells (string/display-width ellipsis)
+              room? (> w ellipsis-cells)
+              avail (if room? (- w ellipsis-cells) w))
+          [0 len [(string/width->index window avail) (if room? ellipsis "")]]))))
+
+(sig source-one-row ((tuple any int int) int string -> vector))
+(defn- source-one-row (source w ellipsis)
+  ;; `source-one-row-in` over a window of two rows' worth of cells and some slack
+  (source-one-row-in source w ellipsis (+ (* 2 w) *window-slack*)))
+
 (sig one-row (string int int string -> vector))
 (defn one-row (text from-cell w ellipsis)
   "The ONE row `text` shows from display cell `from-cell` on in a `w`-cell row:
@@ -124,20 +193,25 @@ fit in the cells the `ellipsis` leaves, and it is painted after them. The cut ne
 a glyph (a wide one that would straddle it is left for the next scroll), and a row too
 narrow to hold the ellipsis and a character keeps the cells for text and shows none.
 
+From the line's start it reads a window of the line, not the line (`source-one-row`); from
+a later cell (point's line scrolled sideways, `follow-point`) it measures up to that cell.
+
     (wrap/one-row \"abcdefgh\" 0 5 \"…\")   ;=> [0 8 [4 \"…\"]]
     (wrap/one-row \"abcdefgh\" 4 5 \"…\")   ;=> [4 8]
     (wrap/one-row \"ab日本cd\" 0 4 \"…\")   ;=> [0 6 [2 \"…\"]]"
-  (let (len (string/length text)
-        width (string/display-width text)
-        from (if (<= from-cell 0) 0 (string/width->index text from-cell))
-        from-col (if (= from 0) 0 (string/display-width (string/substring text 0 from))))
-    (if (or (<= w 0) (<= (- width from-col) w))
-      [from len]
-      (let (ellipsis-cells (string/display-width ellipsis)
-            room? (> w ellipsis-cells)
-            avail (if room? (- w ellipsis-cells) w)
-            cut (string/width->index text (+ from-col avail)))
-        [from len [(if (< cut from) from cut) (if room? ellipsis "")]]))))
+  (if (<= from-cell 0)
+    (source-one-row [text 0 (string/length text)] w ellipsis)
+    (let (len (string/length text)
+          from (string/width->index text from-cell)
+          from-col (if (= from 0) 0 (string/display-width (string/substring text 0 from)))
+          window (string/substring text from len))
+      (if (or (<= w 0) (>= (string/width->index window w from-col) (- len from)))
+        [from len]
+        (let (ellipsis-cells (string/display-width ellipsis)
+              room? (> w ellipsis-cells)
+              avail (if room? (- w ellipsis-cells) w)
+              cut (+ from (string/width->index window avail from-col)))
+          [from len [(if (< cut from) from cut) (if room? ellipsis "")]])))))
 
 ;; The mark beside a wrapped row that its line continues past (Emacs's right fringe arrow,
 ;; painted in the pane's scrollbar column), and the one in the gutter of the rows that
@@ -145,18 +219,202 @@ narrow to hold the ellipsis and a character keeps the cells for text and shows n
 (def continuation-mark "↩")
 (def continued-mark "↪")
 
-(sig segments-for (string int keyword &optional string -> list))
+;; ---- a wrapped long line's rows, kept across edits -----------------------------------
+;; Laying a wrapped line out costs a window per row, so a megabyte line is thousands of
+;; windows — fine once, not once per keystroke. A line of `*layout-min-chars*` or more keeps
+;; its layout in `*line-layouts*` (the last few, newest first): `[segs cols tab-row]`, each row's
+;; segment, the display column it starts on and the last row with a tab, beside the rope and
+;; where the line sat in it.
+;;
+;; Asked again with a NEW rope, an entry is checked against it by `text/changed-range` (where
+;; the two texts differ, native) rather than thrown away:
+;;
+;;   - the edit was elsewhere (after the line, or before it with the line merely moved) —
+;;     the rows stand as they were;
+;;   - the edit was inside the line — the rows are laid out again from TWO rows above the
+;;     row it touched (a row's break looks no further than its window, and the row two above
+;;     an edit ends before the edit's row begins — so everything above that is untouched, with
+;;     a row to spare), and only until a new row starts where an old one did, shifted by what
+;;     the edit added, at a column the same distance from a tab stop (or with no tab after
+;;     it, the one glyph whose width depends on its column): from there the text is
+;;     the old text and the rows are the old rows, shifted. Typing in the middle of a
+;;     megabyte line lays out two or three rows.
+;;
+;; Correct against a full layout by construction, and tested that way (wrap_test's "kept
+;; layout" cases). Process-wide like `defmemo`'s store: a race between two processes costs a
+;; layout, never a wrong one, since every entry is checked against the text it is asked for.
+(def- *layout-min-chars* 4096) ; a line this long keeps its layout; a shorter one is cheap to redo
+(def- *layout-capacity* 4)
+(def- *tab-width* 8) ; `string/display-width`'s stops, which the rows are measured by
+(def *line-layouts* '()) ; `{:rope :start :length :w :layout}`, newest first
+
+(sig segment-index (vector int -> int))
+(defn- segment-index (segs at)
+  ;; the last row of `segs` whose start is at or before char `at` (0 when none is), by halving
+  (letrec (go (fn (low high)
+                (if (>= low high)
+                  low
+                  (let (middle (math/quot (+ low high 1) 2))
+                    (if (<= (first (nth segs middle)) at) (go middle high) (go low (dec middle)))))))
+    (go 0 (dec (count segs)))))
+
+(sig relayout-step
+  ((tuple any int int) int
+    int
+    int
+    int
+    int
+    (tuple vector vector int)
+    vector
+    vector
+    int
+    ->
+    (tuple vector vector int)))
+(defn- relayout-step (source from col w edit-end delta old segs cols tab-row)
+  "Tail-recursive: the layout of `source` with the rows from `from` (column `col`) on laid
+out onto `segs` / `cols` / `tab-row` — until a row starts at or past `edit-end` exactly where
+an `old` row did (shifted by `delta`), and from there the old rows, shifted. The old rows
+are those rows only when the text after is measured the same: the new start column is the
+old one plus a whole number of tab stops, or no old row from there on holds a tab (a tab is
+the one glyph whose width depends on its column)."
+  (if (>= from (nth source 2))
+    [segs cols tab-row]
+    (let ([old-segs old-cols old-tab-row] old
+          j (when (>= from edit-end)
+              (let (k (segment-index old-segs (- from delta)))
+                (when (= (first (nth old-segs k)) (- from delta)) k)))
+          moved (when (int? j) (- col (nth old-cols j))))
+      (if (and (int? j) (int? moved) (or (= (math/mod moved *tab-width*) 0) (< old-tab-row j)))
+        [(into segs
+           (map (seq/subvec old-segs j (count old-segs))
+             (fn (seg) [(+ (first seg) delta) (+ (second seg) delta)])))
+          (into cols (map (seq/subvec old-cols j (count old-cols)) (fn (c) (+ c moved))))
+          (if (< old-tab-row j) tab-row (+ (- old-tab-row j) (count segs)))]
+        (let (to (break-at source from col w)
+              piece (source-piece source from to))
+          (relayout-step source
+            to
+            (+ col (string/display-width piece col))
+            w
+            edit-end
+            delta
+            old
+            (conj segs [from to])
+            (conj cols col)
+            (if (includes? piece "\t") (count segs) tab-row)))))))
+
+(defn- relayout (source old at edit-end delta w)
+  "The layout of the line `source` holds, from its `old` one and an edit that replaced the
+line's chars from `at` with ones ending at `edit-end` (`delta` more chars)."
+  (let ([old-segs old-cols old-tab-row] old
+        r (math/max 0 (- (segment-index old-segs at) 2))
+        ;; the rows kept above `r` may hold a tab; which is the last of them is not kept, so
+        ;; the row just above stands for it — at worst a resync later is passed up
+        [segs cols tab-row] (relayout-step source
+                              (first (nth old-segs r))
+                              (nth old-cols r)
+                              w
+                              edit-end
+                              delta
+                              [old-segs old-cols old-tab-row]
+                              (seq/subvec old-segs 0 r)
+                              (seq/subvec old-cols 0 r)
+                              (math/min old-tab-row (dec r))))
+    (if (empty? segs) [[[0 0]] [0] -1] [segs cols tab-row])))
+
+(defn- layout-from-entry (entry rope start len w)
+  "The layout of the line `[start, start + len)` of `rope` at width `w` from a kept `entry`
+— its own when the line is untouched, laid out again from the edit when the edit is inside
+it — or nil when the entry is of another line, another width, or an edit it cannot follow."
+  (let (old (:rope entry)
+        old-start (:start entry)
+        old-len (:length entry)
+        same? (and (= old-start start) (= old-len len)))
+    (cond
+      (not (= (:w entry) w)) nil
+      (= old rope) (when same? (:layout entry))
+      else
+        (let (change (text/changed-range old rope)
+              [changed old-end new-end] (or change [0 0 0]))
+          (if (or (nil? change)
+                (not (and (int? changed)
+                       (int? old-end)
+                       (int? new-end)
+                       (int? old-start)
+                       (int? old-len))))
+            (when same? (:layout entry))
+            (let (delta (- new-end old-end))
+              (cond
+                ;; after the line's newline: the line is as it was
+                (> changed (+ old-start old-len)) (when same? (:layout entry))
+                ;; before the newline above it: the line only moved
+                (< old-end old-start)
+                  (when (and (= start (+ old-start delta)) (= len old-len)) (:layout entry))
+                ;; inside it
+                (and (>= changed old-start)
+                  (<= old-end (+ old-start old-len))
+                  (= start old-start)
+                  (= len (+ old-len delta)))
+                  (let (at (- changed old-start)
+                        edit-end (- new-end old-start))
+                    ;; ints by construction; the guard is what tells the checker so
+                    (when (and (int? at) (int? edit-end) (int? delta))
+                      (relayout [rope start len] (:layout entry) at edit-end delta w)))
+                else nil)))))))
+
+(defn- kept-layout (source w)
+  "`layout` of the long line `source` holds (a rope's), from `*line-layouts*` when an entry
+there can answer (`layout-from-entry`), else laid out whole — and kept either way."
+  (let ([rope start len] source
+        exact (seq/find *line-layouts*
+                (fn (entry)
+                  (and (= (:w entry) w)
+                    (= (:start entry) start)
+                    (= (:length entry) len)
+                    (= (:rope entry) rope)))))
+    (if exact
+      (:layout exact)
+      (let (found (reduce *line-layouts*
+                    nil
+                    (fn (acc entry) (if (nil? acc) (layout-from-entry entry rope start len w) acc)))
+            result (or found (layout source w)))
+        (def *line-layouts*
+          (take (cons {:rope rope :start start :length len :w w :layout result} *line-layouts*)
+            *layout-capacity*))
+        result))))
+
+(sig rope-line-source (any int -> (tuple any int int)))
+(defn- rope-line-source (rope line)
+  "Line `line` of `rope` as a line source, `[rope start length]` — its newline not counted,
+none of its text read."
+  (let (lines (text/line-count rope))
+    (if (>= line lines)
+      [rope (text/length rope) 0]
+      (let (start (text/line->char rope line)
+            next (if (< (inc line) lines) (text/line->char rope (inc line)) (text/length rope))
+            newline? (and (> next start) (= (text/slice rope (dec next) next) "\n")))
+        [rope start (- next start (if newline? 1 0))]))))
+
+(defn- source-segments (source w policy ellipsis)
+  "The row segments of the line `source` holds under long-line `policy`: wrapped (a long
+rope line's kept, `kept-layout`), or its one row."
+  (case policy
+    :truncate [(source-one-row source w ellipsis)]
+    :scroll [(source-one-row source w "")]
+    (if (or (<= w 0) (< (nth source 2) *layout-min-chars*) (string? (first source)))
+      (first (layout source w))
+      ;; a kept layout comes back out of `*line-layouts*`, which the checker reads as
+      ;; unknown: it is `layout`'s `[segs cols]` by construction, and the guard says so
+      (let (segs (first (kept-layout source w))) (if (vector? segs) segs [[0 0]])))))
+
 (defn segments-for (text w policy &optional (ellipsis "…"))
   "The row segments of one line `text` in a `w`-cell row under long-line `policy`: its
 wrapped `segments` for `:wrap`, else its ONE row (`one-row`) — ending in `ellipsis` for
 `:truncate`, clipped at the edge for `:scroll`.
 
-    (wrap/segments-for \"the quick brown fox\" 10 :truncate)   ;=> ([0 19 [9 \"…\"]])
-    (wrap/segments-for \"the quick brown fox\" 10 :scroll)   ;=> ([0 19 [10 \"\"]])"
-  (case policy
-    :truncate (list (one-row text 0 w ellipsis))
-    :scroll (list (one-row text 0 w ""))
-    (segments text w)))
+    (wrap/segments-for \"the quick brown fox\" 10 :truncate)   ;=> [[0 19 [9 \"…\"]]]
+    (wrap/segments-for \"the quick brown fox\" 10 :scroll)   ;=> [[0 19 [10 \"\"]]]"
+  (source-segments [text 0 (string/length text)] w policy ellipsis))
 
 (sig follow-point (vector buffer int &optional int -> vector))
 (defn follow-point (rows buf w &optional (margin 8))
@@ -190,16 +448,15 @@ scan of the rows for one that is clipped."
                   [line (first shown) (second shown) nil]
                   [line (first shown) (second shown) nil shown-clip]))))))))
 
-(sig rope-line-segments (any int int &optional map -> (list vector)))
 (defn- rope-line-segments (rope line w &optional (extras {}))
-  "`segments-for` line `line` of `rope` (its text without the newline), `w` cells wide,
-under the line's policy in the row `extras` (`line-policy`)."
-  (segments-for (rope-line-text rope line)
+  "The row segments of line `line` of `rope`, `w` cells wide, under the line's policy in the
+row `extras` (`line-policy`) — read from the rope a window at a time, never the whole line
+(`source-segments`)."
+  (source-segments (rope-line-source rope line)
     w
     (line-policy extras line)
     (or (get (get extras :long-lines) :ellipsis) "…")))
 
-(sig line-segments (buffer int int &optional map -> (list vector)))
 (defn line-segments (buf line w &optional (extras {}))
   "The row segments of buffer line `line` (its text without the newline), `w` cells wide:
 wrapped, or one row, as its policy in the row `extras` says (`rope-line-segments`)."
@@ -261,14 +518,17 @@ segments — none at all when a fold hides it. What a walk up or down the lines 
       inlays
       (if (hidden? inlays line)
         acc
-        (fold (rope-line-segments rope line w inlays)
-          (inlay-rows inlays line limit acc)
-          (fn (a seg)
-            (cond
-              (>= (count a) limit) a
+        (let (with-inlays (inlay-rows inlays line limit acc)
+              segs (rope-line-segments rope line w inlays)
+              ;; only the rows the table has room for: a wrapped megabyte line has thousands
+              room (math/max 0 (- limit (count with-inlays))))
+          (fold (if (< room (count segs)) (seq/subvec segs 0 room) segs)
+            with-inlays
+            (fn (a seg)
               ;; a clipped row keeps its clip as a fifth field, for the painter and a click
-              (nth seg 2 nil) (conj a [line (first seg) (second seg) nil (nth seg 2)])
-              else (conj a [line (first seg) (second seg) nil]))))))))
+              (if (nth seg 2 nil)
+                (conj a [line (first seg) (second seg) nil (nth seg 2)])
+                (conj a [line (first seg) (second seg) nil])))))))))
 
 ;; The row table is memoised (`defmemo`, std/memo) on `[rope top w limit inlays]`: it is
 ;; asked from the pure `view`, from three hit-test sites in `panes`, and from
@@ -315,21 +575,16 @@ region fills — must skip the inlay rows; `panes/ed-rows-line-rows` is that fil
 everything in the editor goes through it."
     (rope-rows (buffer-rope buf) (math/max 0 top) w limit (or inlays {}))))
 
-(sig row-of-step (list int int -> int))
-(defn- row-of-step (segs col i)
-  "Tail-recursive: the index of the segment holding `col`, from `i` on; the last one
-when none does."
-  (cond
-    (>= i (dec (count segs))) (dec (count segs))
-    (< col (second (nth segs i))) i
-    else (row-of-step segs col (inc i))))
-
-(sig row-of (list int -> int))
+(sig row-of (any int -> int))
 (defn row-of (segs col)
   "Which of a line's `segs` holds char column `col`: the segment whose `[from to)` spans
 it, or the last one for a column at the end (point after the last char sits on the last
-row, and an empty line's point on its one row)."
-  (if (empty? segs) 0 (row-of-step segs col 0)))
+row, and an empty line's point on its one row). Found by halving: the segments tile the
+line in order, so the one holding `col` is the last that starts at or before it — a
+megabyte line wraps into thousands of rows.
+
+    (wrap/row-of [[0 10] [10 19]] 10)   ;=> 1"
+  (if (empty? segs) 0 (segment-index (if (vector? segs) segs (vec segs)) col)))
 
 (sig row-count-step (any int int int map int int -> int))
 (defn- row-count-step (rope line to-line w inlays limit acc)
