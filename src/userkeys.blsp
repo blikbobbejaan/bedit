@@ -1,0 +1,191 @@
+(defmodule userkeys
+  "Key bindings from the user's init file: `:keys`, the global map (Emacs's
+`global-set-key`), and `:mode-keys`, one mode's map (`define-key` in `markdown-mode-map`).
+
+    (config
+      :keys {\"C-c f\" project-find-file   ; bind
+             \"<f5>\" compile
+             \"C-z\" nil}                  ; unbind
+      :mode-keys {markdown {\"C-c C-c\" markdown-preview}})
+
+A key is written the way help prints it (std's `key-parse`, brood ADR-535); a command is
+named by its M-x name or a qualified symbol, and the keymap binds the SYMBOL, late-bound, as
+every built-in binding is — redefining the command still hot-swaps the key.
+
+The bindings are not written into the layers. A mode's layer may live in a module that has
+not loaded yet, and a layer is `def`'d data the editor shares. Instead `:user-keys` (the
+compiled bindings, on the model) AMENDS the layers as dispatch resolves them
+([[ed-user-scope]], which `input/ed-scope` returns): a mode's bindings onto the layer of that
+name, the global ones onto the model scope's base layer — the profile's, Emacs's global map
+or whichever Vim state is in force. Help asks the same scope, so `C-h k` and `C-h w` report
+a user binding as the dispatcher runs it.
+
+Each binding goes INTO the layer's own keymap (`keymap-bind`), so it takes that one key
+sequence there and nothing else. Layers merge prefixes deeply (brood ADR-535), so a global
+`C-c f` still works in a mode that binds its own `C-c` keys; a mode's binding for the SAME
+sequence wins in its buffers, as in Emacs."
+  (:use editor/keymap)) ; key-parse, keymap-bind — read a key, bind it into a layer's keymap
+
+;; ---- reading the init file's bindings ---------------------------------------
+
+(defn ed-user-mode-name (name)
+  "The name a mode is known by in `:mode-keys`: its layer's name as the mode line shows it,
+with Emacs's `-mode` suffix and a keyword's colon dropped — `markdown`, `markdown-mode` and
+`:markdown` all name `markdown`."
+  (let (text (->string name)
+        text-length (string/length text))
+    (if (and (> text-length 5) (string/ends-with? text "-mode"))
+      (string/substring text 0 (- text-length 5))
+      text)))
+
+(defn- keymap-spelling (command)
+  "`command` spelled as the keymaps spell a command, `module/cmd-name`: the M-x registry keeps
+it under its package root too (`bedit/commands/cmd-find-file`), and help that asks the
+keymap which key runs `commands/cmd-find-file` compares symbols — so a user binding spelled
+the registry's way would run, and never be named."
+  (let (parts (string/split (->string command) "/"))
+    (if (> (count parts) 2) (symbol (string/join (seq/take-last parts 2) "/")) command)))
+
+(defn- user-command (value known-globals)
+  "`[command problem]` for a binding's VALUE: the command symbol to bind (nil to unbind), or
+a problem to report. A bare name is an M-x name (`find-file`); a qualified symbol is taken
+as written when it is defined, else as the command of that M-x name."
+  (if (nil? value)
+    [nil nil]
+    (if (not (or (symbol? value) (string? value)))
+      [nil (str "a command is named by a symbol or a string, not " (pr-str value))]
+      (let (text (->string value)
+            qualified? (includes? text "/")
+            name (interactive/command-friendly-name (last (string/split text "/")))
+            known (interactive/command-sym name))
+        (cond
+          (and qualified? (includes? known-globals (symbol text))) [(symbol text) nil]
+          (not (nil? known)) [(keymap-spelling known) nil]
+          else [nil (str "no command named " text " (M-x lists them)")])))))
+
+(defn- user-bindings (keys where known-globals)
+  "`[bindings warnings]` for one `{key-description command}` map: each binding a
+`[sequence command]`, shortest sequence first (so `C-c` then `C-c f` reads as a prefix
+rebound and then filled), and a warning per key that does not read or command that is not
+one. `where` names the map in a warning (`:keys`, `:mode-keys markdown`)."
+  (let (parsed (map (or keys {})
+                 (fn ([description value])
+                   (let (sequence (key-parse description)
+                         [command problem] (user-command value known-globals)
+                         label (str "init.blsp: " where " " (pr-str description) " — "))
+                     (cond
+                       (failure? sequence) [nil (str label (error-message sequence))]
+                       problem [nil (str label problem)]
+                       else [[sequence command] nil]))))
+        bindings (seq/sort-by (seq/filter (map parsed first) (fn (b) (not (nil? b))))
+                   (fn ([sequence _]) [(count sequence) (key-description sequence)])))
+    [(vec bindings) (vec (seq/filter (map parsed second) string?))]))
+
+(defn- layer-ref-name (ref)
+  "The `:mode-keys` name of layer reference `ref` WITHOUT resolving it: a map's `:name`, a
+symbol's by its shape — `languages/elixir-mode-layer`, `languages/toml-fallback-layer` and
+`beam/beam-spy-layer` name `elixir`, `toml`, `beam-spy`, as every registered layer's does.
+Resolving would load the module of a mode that has not been used yet."
+  (if (map? ref)
+    (ed-user-mode-name (:name ref))
+    (let (tail (last (string/split (->string ref) "/"))
+          bare (if (string/ends-with? tail "-layer")
+                 (string/substring tail 0 (- (string/length tail) 6))
+                 tail)
+          primary (if (string/ends-with? bare "-fallback")
+                    (string/substring bare 0 (- (string/length bare) 9))
+                    bare))
+      (ed-user-mode-name primary))))
+
+(defn ed-user-mode-names ()
+  "Every mode name `:mode-keys` can reach that is known now: each layer a buffer type is
+registered with (std's `editor/layers/*type-layers*`), the system layers, and the
+keybinding profiles' layers (`vim-normal`, `emacs`). A mode whose module has not loaded is
+known only once it registers — in a released editor, whose image carries every module's
+registrations, that is at startup; from source, when the module first loads."
+  (into #{}
+    (append (map (seq/distinct (append (mapcat editor/layers/*type-layers* second)
+                                 editor/layers/*system-layers*))
+              layer-ref-name)
+      (keymaps/profile-layer-names))))
+
+(defn ed-user-keys (keys mode-keys)
+  "The init file's `:keys` and `:mode-keys` compiled: `{:global bindings :modes {mode-name
+bindings} :warnings [...]}`, each `bindings` a vector of `[key-sequence command]`. What
+`config/apply-to-model` puts on the model as `:user-keys` and [[ed-user-scope]] amends the
+layers with. A mode no registered layer is named is warned about but still bound: its
+module may not have loaded yet."
+  (let (known-globals (reflect/global-names)
+        [global global-warnings] (user-bindings keys ":keys" known-globals)
+        known-modes (if (empty? mode-keys) #{} (ed-user-mode-names))
+        modes (map (or mode-keys {})
+                (fn ([mode bindings])
+                  (let (name (ed-user-mode-name mode)
+                        [compiled warnings] (user-bindings bindings
+                                              (str ":mode-keys " name)
+                                              known-globals))
+                    [name
+                      [compiled
+                        (if (contains? known-modes name)
+                          warnings
+                          (into [(str "init.blsp: :mode-keys "
+                                   name " — no mode by that name is loaded"
+                                   " (not loaded yet? its keys apply once it is; the mode line names"
+                                   " a buffer's mode)")]
+                            warnings))]]))))
+    {:global global
+     :modes (into {} (map modes (fn ([name [bindings _]]) [name bindings])))
+     :warnings (into global-warnings (mapcat modes (fn ([_ [_ warnings]]) warnings)))}))
+
+(defn ed-user-key-warnings (keys mode-keys)
+  "Every problem with the init file's bindings, as readable lines: a key that does not read
+(std's `key-parse` says which word), a command that is not one. Empty when they all bind."
+  (:warnings (ed-user-keys keys mode-keys)))
+
+;; ---- amending the layers dispatch resolves through --------------------------
+
+;; Memoised on the layer's keymap and the bindings (`defmemo` compares with `=`, immediate for
+;; the same values): dispatch amends the same few layers on every keystroke, and the keymap
+;; it gets back is the same until a layer is redefined or the config reloaded.
+(memo/defmemo ed-user-keymap
+  16
+  (keymap bindings)
+  "`keymap` with each `[sequence command]` of `bindings` bound into it (`keymap-bind`), a nil
+command binding the key to nothing — which shadows it, as Emacs's `(global-set-key k nil)`."
+  (fold bindings keymap (fn (acc [sequence command]) (keymap-bind acc sequence command))))
+
+(defn- user-layer (ref bindings)
+  "Layer `ref` with `bindings` bound into its keymap — the layer itself, as a map, when there
+are any; `ref` untouched (still late-bound) when there are none."
+  (if (empty? bindings)
+    ref
+    (let (layer (if (symbol? ref) (reflect/eval ref) ref))
+      (assoc layer :keymap (ed-user-keymap (or (:keymap layer) {}) bindings)))))
+
+(defn- user-layers (layers user base-bindings)
+  "The layer list `layers` with each layer amended by the user's bindings for its mode, and
+the last (the scope's base) by `base-bindings` too."
+  (let (refs (vec (or layers '()))
+        last-index (dec (count refs)))
+    (map (range (count refs))
+      (fn (index)
+        (let (ref (nth refs index)
+              layer (if (symbol? ref) (reflect/eval ref) ref)
+              name (:name layer)
+              own (if (nil? name) [] (or (get (:modes user) (ed-user-mode-name name)) []))
+              bindings (if (= index last-index) (into own base-bindings) own))
+          (user-layer ref bindings))))))
+
+(defn- user-bound? (user)
+  (and (map? user) (or (not (empty? (:global user))) (not (empty? (:modes user))))))
+
+(defn ed-user-scope (buffer m)
+  "The scope contexts dispatch resolves a key through — `buffer`'s mode layers, then the
+model's profile layers — with the init file's bindings (`:user-keys`, [[ed-user-keys]])
+amended into them: each mode's into the layer of that name wherever it sits, the global ones
+into the model's base layer. Just `(list buffer m)` when the init file binds nothing."
+  (let (user (:user-keys m))
+    (if (not (user-bound? user))
+      (list buffer m)
+      (list {:layers (user-layers (:layers buffer) user [])}
+        {:layers (user-layers (:layers m) user (:global user))}))))
