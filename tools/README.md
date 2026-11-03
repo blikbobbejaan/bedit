@@ -139,3 +139,9 @@ Use `BROOD_CONTRACTS=0`, because an installed bedit checks no contracts and `nes
 `PROBE_DISABLE=a,b` drops idle jobs, which is how a slow phase is bisected.
 `PROBE_PROFILE=1 PROBE_FN=name` samples the loop and shows who calls `name`. `PROBE_WRAP=ns/fn,…`
 times individual functions where they are called. The header lists the other knobs.
+
+`probe-long-line.blsp` asks the layout question: what one typed character costs on a buffer
+with a megabyte line (as opened, truncated, scrolled) and a 200 KB wrapped line, median of a
+few turns each. A cost that grows with the line rather than the screen shows here first.
+
+    BROOD_CONTRACTS=0 BROOD_GUI_HEADLESS=1 nest run tools/probe-long-line.blsp

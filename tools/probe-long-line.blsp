@@ -1,0 +1,113 @@
+;; tools/probe-long-line.blsp — what one edit costs on a buffer with one very long line.
+;;
+;; The layout question of a minified file or a log with a multi-megabyte line: does a
+;; keystroke pay for what is on screen, or for the whole line? Builds a model at the GUI
+;; window's grid over a synthetic file, puts point in the middle of its long line, and
+;; times `ed-update` of one typed character followed by `ed-view` of the result — the turn
+;; a keystroke costs — for each case, as the median of a few runs:
+;;
+;;     BROOD_CONTRACTS=0 nest run tools/probe-long-line.blsp
+;;
+;; Cases: a 1 MB single line as it opens (`.txt`, whatever the so-long check and the
+;; mode decide), the same forced to wrap, and a 200 KB line in a markdown file (which
+;; wraps by default) with so-long turned back off — the wrapped layout itself.
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(def *cols* 213)
+(def *rows* 49)
+(def *runs* (let (n (os/env "PROBE_RUNS")) (if n (string/->number n) 5)))
+
+(defn long-line (n)
+  "A line of `n` chars that reads like minified code: short tokens, a space now and then."
+  (let (unit "a=b+c;d(e,f)?g:h; ")
+    (string/substring (string/repeat unit (inc (math/quot n (string/length unit)))) 0 n)))
+
+(defn write-fixture (name text)
+  (let (dir (str (or (os/env "TMPDIR") "/tmp") "/bedit-long-line-probe"))
+    (os/cmd "mkdir" ["-p" dir])
+    (let (path (str dir "/" name))
+      (file/spit path text)
+      path)))
+
+(defn model-of (path)
+  (let (m0 (pool/ed-find-file (model/ed-init (editor/buffer/make-buffer "" "*scratch*")) path)
+        m1 (input/ed-update m0 [:timer :spinner] *cols* *rows*)
+        buf (model/ed-current-buf m1)
+        ;; point to the middle of the long line (line 1; line 0 is a short header)
+        start (text/line->char (editor/buffer/buffer-rope buf) 1)
+        middle (+ start (math/quot (string/length (wrap/line-text buf 1)) 2)))
+    (model/ed-set-buf m1 (editor/buffer/goto-char buf middle))))
+
+(defn turn-ms (m key)
+  "One keystroke's turn: the update, then the view of what it made. Returns `[ms model]`."
+  (let (started (os/now-ns)
+        next (input/ed-update m key *cols* *rows*)
+        _frame (view/ed-view next *cols* *rows*)
+        ms (/ (- (os/now-ns) started) 1000000.0))
+    [ms next]))
+
+(defn median (xs) (nth (sort xs) (math/quot (count xs) 2)))
+
+(defn measure (label m)
+  "Type `*runs*` characters one turn at a time, then move point a row with C-n, and print
+each phase's median."
+  (let ([typed m2] (fold (range *runs*)
+                     [[] m]
+                     (fn (acc i)
+                       (let ([times model] acc
+                             [ms next] (turn-ms model "x"))
+                         [(conj times ms) next])))
+        [moved _] (fold (range *runs*)
+                    [[] m2]
+                    (fn (acc i)
+                      (let ([times model] acc
+                            [ms next] (turn-ms model (if (math/even? i) :ctrl-n :ctrl-p)))
+                        [(conj times ms) next]))))
+    (io/puts (string/format "%-44s type %9.2f ms   C-n/C-p %9.2f ms   (%s)"
+               label
+               (median typed)
+               (median moved)
+               (scroll/ed-long-lines (model/ed-current-buf m2) 1)))))
+
+(def *big* (write-fixture "big.txt" (str "header\n" (long-line 1000000) "\nfooter\n")))
+(def *wide* (write-fixture "wide.md" (str "# header\n" (long-line 200000) "\nfooter\n")))
+
+(defn with-policy (m policy)
+  (model/ed-set-buf m (assoc (model/ed-current-buf m) :long-lines policy)))
+
+(defn so-long-off (m)
+  "The model with so-long's safeguard taken off its buffer, where there is one to take off."
+  (if (bound? 'solong/ed-so-long-off)
+    (solong/ed-so-long-off m)
+    m))
+
+(when (not (os/env "PROBE_SKIP")) (let (big (model-of *big*)
+      wide (model-of *wide*))
+  (measure "1 MB line, as opened" big)
+  (measure "1 MB line, :truncate" (with-policy (so-long-off big) :truncate))
+  (measure "1 MB line, :scroll (so-long off)" (so-long-off big))
+  (when (os/env "PROBE_BIG_WRAP") (measure "1 MB line, :wrap" (with-policy (so-long-off big) :wrap)))
+  (measure "200 KB line in markdown, so-long off" (so-long-off wide))))
+
+;; PROBE_PROFILE=1: sample the typed turns of the 1 MB line as opened and print the hottest
+;; functions (inclusive) — where a turn's time goes, when it is not where it should be.
+(when (os/env "PROBE_PROFILE")
+  (let (m (model-of *big*)
+        policy (os/env "PROBE_PROFILE")
+        m (if (= policy "1") m (with-policy (so-long-off m) (keyword policy))))
+    (dev/profile-start 2000)
+    (fold (range *runs*) m (fn (model _) (second (turn-ms model "x"))))
+    (let (hist (dev/profile-stop)
+          total (fold hist 0 (fn (acc e) (+ acc (:count e))))
+          inclusive (fold hist
+                      {}
+                      (fn (acc e)
+                        (fold (seq/distinct (:stack e))
+                          acc
+                          (fn (a name) (assoc a name (+ (or (get a name) 0) (:count e)))))))
+          ranked (seq/sort-by (seq inclusive) (fn ([_ c]) (- c))))
+      (doseq (e (take ranked 40))
+        (io/puts (string/format "  %5.1f%%  %s" (* 100.0 (/ (second e) (math/max 1 total))) (first e)))))))

@@ -212,6 +212,8 @@ suppressed (no false red) rather than scanning the rest of the buffer.
         bm (ed-mode-service buf :bracket-match)
         faces [face-bracket-here face-bracket-match face-bracket-error])
     (cond
+      ;; so-long: no bracket match on a buffer whose line may be a megabyte of brackets
+      (solong/so-long? buf) '()
       bm-tree (ed-bracket-tree-overrides-at tree (buffer-rope buf) (buffer-point buf) bm-tree faces)
       (nil? bm) '()
       else (ed-bracket-overrides-at (buffer-rope buf) (buffer-point buf) bm faces))))
@@ -610,8 +612,8 @@ row's text. Bottom line first."
 ;; Render ops carry absolute screen coordinates, so a pane simply offsets every
 ;; op by its rect's origin `(x, y)` and clips text to its width `w`.
 
-(sig ed-row-slice (any int int (or nil int) int -> (tuple string int int)))
-(defn- ed-row-slice (rope line from to w)
+(sig ed-row-slice (any int int (or nil int) int &optional (or nil int) -> (tuple string int int)))
+(defn- ed-row-slice (rope line from to w &optional (known-col nil))
   "`[vis from-col base]` for the chars `[from, to)` of `line` a `w`-wide row shows (`to` nil
 for the rest of the line): the text it paints, the display column that text starts at on
 its line, and the buffer offset of its first character.
@@ -619,7 +621,11 @@ its line, and the buffer offset of its first character.
 The line is read as rope SLICES — its bounds from the line index, then only the chars the
 row shows (and, h-scrolled, the ones left of it) — not as the whole line's text with its
 newline stripped and then substringed: two fewer copies of every visible line on every
-frame that re-renders it."
+frame that re-renders it.
+
+`known-col` is the display column `from` sits at when the caller already knows it — the row
+after another row of the same wrapped line starts where that one ended — so a row in the
+middle of a megabyte line does not measure the line's text before it."
   (let (bol (text/line->char rope line)
         len (- (ed-line-end rope line) bol)
         ;; `if`, not `math/min`: the checker reads `math/min` of two ints as a `number`, and
@@ -631,8 +637,48 @@ frame that re-renders it."
         ;; file of 12,000-character lines that was a 12 KB copy per row per frame.
         end (let (cap (if (nil? to) (+ h w) to)) (if (< cap len) cap len)))
     [(ed-fit (text/slice rope (+ bol h) (+ bol (if (< end h) h end))) w)
-      (if (= h 0) 0 (string/display-width (text/slice rope bol (+ bol h))))
+      (cond
+        (= h 0) 0
+        (and (int? known-col) (= h from)) known-col
+        else (string/display-width (text/slice rope bol (+ bol h))))
       (+ bol h)]))
+
+(defn- ed-row-start-cols (rope table)
+  "Per row of a pane's row `table`, the display column its text starts at when the row
+before it was the same line's and ended where it starts (a wrapped line's next row: that
+row's column plus its width), else nil — so only the FIRST row of a line on screen measures
+the line's text before it (`ed-row-slice`)."
+  (first
+    (fold table
+      [[] nil]
+      (fn (acc row)
+        (let ([cols previous] acc
+              line (nth row 0)
+              from (nth row 1)
+              to (nth row 2)
+              inlay (nth row 3 nil)
+              bol (text/line->char rope line)
+              start (+ bol from)
+              end (when (int? to) (+ bol to))
+              ;; the guard also tells the checker the offsets are ints: a row is untyped data
+              wrapped? (and (nil? inlay) (int? start) (int? end) (nil? (nth row 4 nil)))
+              ;; this row's start column: handed on by the row before, else — for a
+              ;; wrapped row, whose end the next row needs — measured here, once
+              col (cond
+                    (not (nil? inlay)) nil
+                    (and previous (= (first previous) line) (= (second previous) from))
+                      (nth previous 2)
+                    (not wrapped?) nil
+                    (= from 0) 0
+                    (int? start) (string/display-width (text/slice rope bol start))
+                    else nil)
+              ;; where a wrapped row ends, and the column there, for the row after it
+              next (when (and wrapped? (int? col) (int? start) (int? end))
+                     [line
+                       to
+                       (+ col
+                         (string/display-width (text/slice rope start end) col))]))
+          [(conj cols col) next])))))
 
 (sig ed-row-ops (int int int string int int any any any any -> any))
 (defn- ed-row-ops (row x w vis from-col base plain? spans ranges overrides)
@@ -829,15 +875,20 @@ deps (`ed-visible-lines`) are read back rather than rebuilt; a wrapped pane's ro
                       spans
                       top
                       (fold table -1 (fn (acc row) (math/max acc (first row)))))))
-      (map table
-        (fn (row)
+      (map (seq/zip table (ed-row-start-cols rope table))
+        (fn ([row known-col])
           (let (line (nth row 0)
                 from (nth row 1)
                 to (nth row 2)
                 inlay (nth row 3 nil)
                 clip (nth row 4 nil))
             (if (nil? inlay)
-              (let ([vis from-col base] (ed-row-slice rope line from (if clip (first clip) to) w)
+              (let ([vis from-col base] (ed-row-slice rope
+                                          line
+                                          from
+                                          (if clip (first clip) to)
+                                          w
+                                          known-col)
                     ;; a wrapped row its line goes on past ends in the continuation mark,
                     ;; painted just past the text (`ed-with-ellipsis`: the scrollbar column)
                     ellipsis (cond
@@ -854,9 +905,10 @@ deps (`ed-visible-lines`) are read back rather than rebuilt; a wrapped pane's ro
                     content [vis
                               from-col
                               w
-                              (ed-ranges-on-line (ed-rebase-ranges line-spans base)
-                                0
-                                (string/length vis))
+                              (ed-rebase-ranges (ed-ranges-on-line line-spans
+                                                  base
+                                                  (+ base (string/length vis)))
+                                base)
                               ellipsis])
                 [line
                   vis
@@ -1906,7 +1958,8 @@ participants' selections tinted in their colour, and the hovered clickable row's
   (let (top (ed-pane-top pane buf)
         rows (ed-pane-vrows pane buf))
     (append (rainbow/ranges m (map/get-in pane [:payload :buffer]) buf top rows)
-      (if (= true (ed-mode-setting (:show-whitespace m) buf false))
+      (if (and (= true (ed-mode-setting (:show-whitespace m) buf false))
+            (not (solong/so-long? buf)))
         (whitespace/ranges buf top rows)
         '())
       (if (= true (:spell-check? m)) (spell/spell-ranges buf) '())
