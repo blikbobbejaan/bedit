@@ -30,8 +30,10 @@ rust-analyzer's completion items routinely carry — round-trips correctly. (A m
 character split across two stdout reads is reassembled by the subprocess reader before it
 reaches us, so a large frame no longer desyncs.)
 
-Caveats: document positions use 0-based **character** columns, which equal LSP's UTF-16
-code units for ASCII. Document sync is INCREMENTAL when the server offers it
+Positions on the wire are LSP's: 0-based lines and UTF-16 code-unit columns, where a
+character beyond the Basic Multilingual Plane (an emoji) counts two. The buffer counts
+characters, so every column crosses [[lsp-column->units]] going out and
+[[lsp-units->column]] coming in, against the line it is on. Document sync is INCREMENTAL when the server offers it
 (`textDocumentSync` change kind 2): the editor sends the splices its buffer recorded
 ([[lsp-content-changes]]), not the document — see [[lsp-sync-document]]."
   (:use model) ; ed-current-buf — the source reads the current buffer
@@ -440,7 +442,10 @@ Both forms are in the wild and a client has to read both: Expert and rust-analyz
 offsets, gopls and several TypeScript servers send the substring."
   (let (l (:label param))
     (cond
-      (vector? l) (when (= (count l) 2) [(first l) (second l)])
+      ;; the offsets are UTF-16 units into the label, like every LSP column
+      (vector? l)
+        (when (= (count l) 2)
+          [(lsp-utf16->index label (first l)) (lsp-utf16->index label (second l))])
       (string? l)
         (let (i (index-of label l))
           (when i [i (+ i (string/length l))]))
@@ -612,6 +617,45 @@ afresh. `[state' frames]`."
   "`s`'s length in UTF-16 code units — LSP's column unit: a character beyond the Basic
 Multilingual Plane (an emoji) is two."
   (fold (string/->codepoints s) 0 (fn (acc code) (+ acc (if (> code 65535) 2 1)))))
+
+(defn- lsp-line-text (rope line)
+  ;; line `line` (0-based) of `rope`, "" past its end — a server may name a line the buffer
+  ;; no longer has
+  (if (and (>= line 0) (< line (text/line-count rope))) (text/line rope line) ""))
+
+(sig lsp-column->units (rope int int -> int))
+(defn lsp-column->units (rope line column)
+  "The LSP column (UTF-16 code units) of char `column` on 0-based `line` of `rope` — what
+every position the editor SENDS must be in: past an emoji, a character column is one short
+per emoji. The line is cut at its length.
+
+    (lsp/lsp-column->units (text/from-string \"a😀b\") 0 2)   ;=> 3"
+  (let (text (lsp-line-text rope line))
+    (lsp-utf16-length (string/substring text 0 (math/min (math/max 0 column) (string/length text))))))
+
+(sig lsp-units->column (rope int int -> int))
+(defn lsp-units->column (rope line units)
+  "The char column on 0-based `line` of `rope` at LSP column `units` (UTF-16 code units) —
+what every position a server SENDS is in, so an edit, a jump or a diagnostic past an emoji
+lands where the server meant rather than one character on per emoji. Capped at the line.
+
+    (lsp/lsp-units->column (text/from-string \"a😀b\") 0 3)   ;=> 2"
+  (lsp-utf16->index (lsp-line-text rope line) (math/max 0 units)))
+
+(defn lsp-buffer-units (buf)
+  "The LSP column of point in `buf` ([[lsp-column->units]] of its line and column)."
+  (lsp-column->units (buffer-rope buf) (buffer-current-line buf) (buffer-column buf)))
+
+(defn lsp-localize-diagnostics (items rope)
+  "Diagnostics in bedit's shape ([[lsp-diagnostic]], 1-based) with each `:col` turned from
+the server's UTF-16 units into a char column of `rope`, the buffer they are about — so the
+underline sits on the token past an emoji, not one character on per emoji."
+  (into []
+    (map items
+      (fn (item)
+        ;; a server's numbers arrive as JSON numbers: whole ones, read as integers
+        (let (line (math/floor (dec (:line item))))
+          (assoc item :col (inc (lsp-units->column rope line (math/floor (dec (:col item)))))))))))
 
 (defn- lsp-rope-position (rope offset)
   "The LSP `{:line :character}` of char `offset` in `rope`."
@@ -1524,7 +1568,7 @@ is not this buffer's (completion's prepare step normally synced it just before).
         request {:uri uri
                  :lang (lsp-language-id file)
                  :line (buffer-current-line buf)
-                 :char (buffer-column buf)})
+                 :char (lsp-buffer-units buf)})
     (if (and synced (= (buffer-rope synced) (buffer-rope buf)))
       request
       (assoc request :text (buffer-text buf)))))
