@@ -2057,21 +2057,61 @@ supervised logger, so routes survive a restart."
 ;; clipboard (`:os-clipboard`), or — for a session served to a window elsewhere — the
 ;; clipboard of the machine that window runs on (`:client-clipboard`, brood's
 ;; `editor/serve/client-clipboard-*`, ADR-539). Never the daemon's: the user is not sitting
-;; at it, and on a shared host it is someone else's. Pure test models name neither. These
-;; two are the seam every kill and yank goes through.
+;; at it, and on a shared host it is someone else's. Pure test models name neither.
+;;
+;; Writing is always a cast. Reading comes in two shapes: [[ed-clipboard-read]] answers now,
+;; for what cannot wait (a prompt's or a search's C-y); [[ed-clipboard-ask]] answers LATER,
+;; through a continuation, so a clipboard on the other end of a link costs the loop nothing
+;; while it answers. C-y in a buffer asks.
 
 (defn ed-clipboard-read (m)
-  "The text on the clipboard model `m` shares, or nil: the OS clipboard's for the local
-window (`:os-clipboard`), the attached client's for a served session (`:client-clipboard` —
-asked over the link and waited for no longer than brood's timeout), nil for a model with
-neither. A clipboard that cannot be read is nil, said in the log."
-  (cond
-    (:os-clipboard m)
-      (try
-        (os/clipboard-get)
-        (catch e (do (log/warn (str "clipboard read failed: " (error-message e))) nil)))
-    (:client-clipboard m) (editor/serve/client-clipboard-get)
-    else nil))
+  "The text on the clipboard model `m` shares, read NOW, or nil: the OS clipboard's for the
+local window (`:os-clipboard`); nil for a served session, whose client's clipboard is only
+ever asked ([[ed-clipboard-ask]]) — a read that waited on the link would stop the loop — and
+for a model with neither. A clipboard that cannot be read is nil, said in the log."
+  (if (:os-clipboard m)
+    (try
+      (os/clipboard-get)
+      (catch e (do (log/warn (str "clipboard read failed: " (error-message e))) nil)))
+    nil))
+
+;; check-allow: the continuation is resolved late (`reflect/eval`), so its result is unknown
+;; to the checker; every `then` is a fold, and answers a model
+(sig ed-clipboard-ask (model symbol any -> model))
+(check-allow :trusted
+  (defn ed-clipboard-ask (m then data)
+    "Ask for the text on the clipboard model `m` shares and go on with `(then m' text data)`
+once it is known — `then` a symbol naming that fold, resolved when it runs (so a
+redefinition hot-swaps), `text` nil when the clipboard is empty or could not be read.
+
+A served session (`:client-clipboard`) asks its client over the link (brood's
+`editor/serve/client-clipboard-ask`, ADR-539) and returns at once with the ask recorded
+under `:clipboard-asks`; `then` runs when the `[:clipboard ref text]` event arrives
+([[ed-ev-clipboard]]) — the loop draws and takes keys meanwhile, and brood answers nil
+itself when the client says nothing in time. Any other model (or a served one with no
+client attached) reads now ([[ed-clipboard-read]]) and `then` runs within this fold.
+
+A clipboard read off the loop for the local window would be one more branch here: start the
+read, record the ask, deliver `[:clipboard ref text]` to the loop."
+    (let (asked (when (:client-clipboard m) (editor/serve/client-clipboard-ask)))
+      (if (nil? asked)
+        ((reflect/eval then) m (ed-clipboard-read m) data)
+        (assoc m :clipboard-asks (assoc (or (:clipboard-asks m) {}) asked {:then then :data data}))))))
+
+(defn ed-ev-clipboard (m input textrows cols rows)
+  "`[:clipboard ref text]`: the answer to an [[ed-clipboard-ask]] — its continuation run
+with `text`. Only the first answer to an ask counts: the client's real answer arriving after
+brood answered for it at the timeout (or the reverse) finds no ask and changes nothing."
+  (let (asked (nth input 1)
+        text (nth input 2)
+        pending (get (or (:clipboard-asks m) {}) asked))
+    (if (nil? pending)
+      m
+      ((reflect/eval (:then pending)) (assoc m :clipboard-asks (dissoc (:clipboard-asks m) asked))
+        (if (string? text) text nil)
+        (:data pending)))))
+
+(register-event-handler :clipboard 'model/ed-ev-clipboard)
 
 (defn ed-clipboard-write (m text)
   "Put `text` on the clipboard model `m` shares (see [[ed-clipboard-read]]): the OS
@@ -2084,17 +2124,19 @@ for a model with neither. Returns nil."
     (:client-clipboard m) (do (editor/serve/client-clipboard-set text) nil)
     else nil))
 
-(defn ed-adopt-clipboard (m)
-  "If the user's clipboard ([[ed-clipboard-read]]) holds text that isn't already the
-kill-ring head (i.e. something was copied in another app since our last kill), cons it on
-as the freshest entry so the next yank inserts it — Emacs's `interprogram-paste-function`.
-A model with no clipboard, or a clipboard that is empty or unavailable, leaves the ring
+(defn ed-adopt-clipboard-text (m clip)
+  "If `clip` — the user's clipboard text — isn't already the kill-ring head (i.e. something
+was copied in another app since our last kill), cons it on as the freshest entry so the
+next yank inserts it — Emacs's `interprogram-paste-function`. nil or empty leaves the ring
 untouched."
-  (let (clip (ed-clipboard-read m)
-        ring (:kill-ring m))
+  (let (ring (:kill-ring m))
     (if (and (string? clip) (not (= clip "")) (not (= clip (first ring))))
       (assoc m :kill-ring (take (cons clip ring) ed-kill-ring-max))
       m)))
+
+(defn ed-adopt-clipboard (m)
+  "[[ed-adopt-clipboard-text]] with the clipboard read now ([[ed-clipboard-read]])."
+  (ed-adopt-clipboard-text m (ed-clipboard-read m)))
 
 ;; ---- a guest's session: editing what it was given, nothing more (brood ADR-415) -------
 ;; A guest attaches over a link that can carry no code and reach nothing it was not given —
@@ -2181,9 +2223,15 @@ untouched."
 
 (defn ed-kill-head (m)
   "`[m' text]`: the text a yank inserts now — the kill-ring head after adopting the ring
-the frames share and then the OS clipboard — or `[m' nil]` when the ring is empty."
+the frames share and then the clipboard as it reads now ([[ed-clipboard-read]]) — or
+`[m' nil]` when the ring is empty."
+  (ed-kill-head-with m (ed-clipboard-read m)))
+
+(defn ed-kill-head-with (m clip)
+  "[[ed-kill-head]] with the clipboard's text `clip` already known — what a yank that ASKED
+for it ([[ed-clipboard-ask]]) inserts."
   (let (shared (ed-adopt-shared-ring m)
-        m1 (ed-adopt-clipboard shared)
+        m1 (ed-adopt-clipboard-text shared clip)
         ;; a clipboard entry adopted here belongs to every frame's ring too
         m2 (if (= (:kill-ring m1) (:kill-ring shared)) m1 (ed-set-kill-ring m1 (:kill-ring m1)))
         ring (:kill-ring m2))

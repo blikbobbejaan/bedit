@@ -709,8 +709,11 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             takes it back as it was. A session starts as the window does
                             (src/startup.blsp) and its kills and yanks go to the CLIENT's
                             clipboard over the link (`:client-clipboard`, brood ADR-539) — never
-                            the daemon's. A guest keeps the host's config and loses recentf and
-                            save-place; a `--listen` daemon keeps savehist off
+                            the daemon's; a C-y ASKS (`model/ed-clipboard-ask`) and lands at the
+                            spot it marked when the answer comes, the loop never waiting. A guest
+                            keeps the host's config and loses recentf and save-place; a `--listen`
+                            daemon keeps savehist off. A session whose loop dies loses its
+                            buffers — no lifeline or hosting there yet (brood KI-334)
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
