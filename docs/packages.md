@@ -269,11 +269,15 @@ Built on Part 1 and on the config registries from
    keybindings take effect with no restart** — which genuinely beats Emacs's
    restart-or-autoload dance, and is a direct payoff of the late-bound design.
 4. **All of it off the loop.** Registry HTTP, tarball download and extraction take
-   *seconds*, so they run in a worker that streams progress into the buffer —
-   `src/procstream.blsp` is the shared streaming-subprocess worker the test and app runners
-   already ride, and this is the same shape (a `:packages` handler). A network fetch on the
-   `ui-run` loop would freeze the editor, which is precisely the class of thing the actor
-   work removed.
+   *seconds*, so they run in a worker. **Done (2026-11-04)** for the runtime package manager
+   (`src/packages.blsp`): the list fetch, an install and an update are a `std/task` in the
+   model's `:package-job` slot — one at a time, C-g cancels it, C-x C-c asks while it runs —
+   and the `*Packages*` status line says what is running and how the last one ended, with
+   the registry's REASON when it failed (brood ADR-559 made the registry calls answer a
+   failure carrying it instead of nil or a bare raise). An install lands in a staging dir and
+   is moved into place only once it verified and enhances this bedit, so a failed, refused
+   or cancelled install keeps the copy that was there. A network fetch on the `ui-run` loop
+   would freeze the editor, which is precisely the class of thing the actor work removed.
 5. **`M-x package-upgrade` / `package-delete` / the lockfile.** `project.lock.blsp` in the
    config dir is a **reproducible editor config**: version + sha256 per package, so the
    same editor comes up on another machine — what Emacs users needed straight.el / elpaca
