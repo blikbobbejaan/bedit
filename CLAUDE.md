@@ -467,7 +467,9 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             names bedit's tables use that it lacks), fetching and building a
                             declared one off the loop at exactly its pinned revision (std's
                             `grammar-install`, which writes a manifest beside the .so: revision,
-                            commit, hash — brood ADR-583), moving one back to its pin, and a
+                            commit, hash — brood ADR-583; a library with no manifest is
+                            compared by its SHAPE, `grammar-fingerprint`, with the pin's
+                            recorded `:fingerprint`), moving one back to its pin, and a
                             live swap — drop a new .so in and reload, no restart. An install or
                             reload retypes every open line-lexer stand-in as its parsed mode
                             (`model/ed-grammars-arrived`)
