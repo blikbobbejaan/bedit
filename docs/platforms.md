@@ -54,6 +54,9 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 - On Windows, `$HOME` is `C:\Users\…` while the editor names the home `C:/Users/…`; a typed
   `/x/C:/y` now starts over at the drive, as Emacs reads it there (brood ADR-592).
 
+- Tests aged files with GNU `touch -d "1 hour ago"`, which macOS's `touch` does not read;
+  they use `touch -t`.
+
 ## Not fixed
 
 - M-x mur-browse opens a URL with `open` (macOS) or `xdg-open` — through `sh`, so not on
