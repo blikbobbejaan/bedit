@@ -1,0 +1,352 @@
+;; Editing a file as root (`src/sudoedit.blsp`, over brood's `sudo`, ADR-588): `/sudo::PATH`
+;; in find-file, M-x sudo-edit, a sudo buffer saved through sudo, the password read masked and
+;; never kept, the sidecar private. sudo is STOOD IN FOR: `sudo/*program*` is bound to a shell
+;; script that takes sudo's flags, keeps its credential cache as a file, and runs the command
+;; as the test's own user — no test runs the real sudo.
+(defmodule sudoedit-test
+  (:use sudoedit)
+  (:use autosave)
+  (:use model)
+  (:use input)
+  (:use pool)
+  (:use main)
+  (:use editor/buffer)
+  (:use test))
+
+(purge-stale-temp "bedit-sudoedit-")
+
+;; std's `sudo` loaded now: `binding` needs its `*program*` declared, and a qualified name
+;; only loads its module when it is CALLED
+(require-one 'sudo)
+
+(defn- stub-source (state)
+  (str "#!/bin/sh\n"
+    "state="
+    (os/shell-quote state)
+    "\n"
+    "noninteractive=0; from_stdin=0; ignore_cache=0; validate=0\n"
+    "while [ $# -gt 0 ]; do\n"
+    "  case \"$1\" in\n"
+    "    -n) noninteractive=1 ;; -S) from_stdin=1 ;; -k) ignore_cache=1 ;; -v) validate=1 ;;\n"
+    "    -p|-u) shift ;;\n"
+    "    --) shift; break ;;\n"
+    "    *) break ;;\n"
+    "  esac\n"
+    "  shift\n"
+    "done\n"
+    "needs_password=1\n"
+    "[ -f \"$state/nopasswd\" ] && needs_password=0\n"
+    "[ -f \"$state/cached\" ] && [ $ignore_cache = 0 ] && needs_password=0\n"
+    "if [ $needs_password = 1 ]; then\n"
+    "  if [ $from_stdin = 1 ] && [ $noninteractive = 0 ]; then\n"
+    "    IFS= read -r typed\n"
+    "    if [ \"$typed\" != secret ]; then echo 'Sorry, try again.' >&2; exit 1; fi\n"
+    "    touch \"$state/cached\"\n"
+    "  else\n"
+    "    echo 'sudo: a password is required' >&2; exit 1\n"
+    "  fi\n"
+    "fi\n"
+    "[ $validate = 1 ] && exit 0\n"
+    "exec \"$@\"\n"))
+
+(defn- with-stub (body)
+  "`(body dir path)` with sudo stood in for by a script in a fresh temp `dir`, and `path` a
+file there holding `hosts`'s text. The script answers the password `secret`; a `nopasswd`
+file in `dir` makes it need none."
+  (let (dir (temp-dir "bedit-sudoedit-")
+        stub (path/join dir "sudo")
+        path (path/join dir "hosts"))
+    (do
+      (file/mkdir dir)
+      (file/spit stub (stub-source dir))
+      (os/cmd "chmod" ["+x" stub])
+      (file/spit path "127.0.0.1 localhost\n")
+      (binding (sudo/*program* stub *config-base* dir) (body dir path)))))
+
+(defn- type-text (m text)
+  (fold (string/->graphemes text) m (fn (acc key) (ed-update acc key 80 24))))
+
+(describe "TRAMP's sudo path"
+  (test "is read as a user, a host and a path"
+    (assert= (parse-sudo-path "/sudo::/etc/hosts") {:user "root" :host "" :path "/etc/hosts"})
+    (assert= (parse-sudo-path "/sudo:www@:/srv/a") {:user "www" :host "" :path "/srv/a"})
+    (assert= (parse-sudo-path "/sudo:localhost:/etc/x")
+      {:user "root" :host "localhost" :path "/etc/x"})
+    (assert= (parse-sudo-path "/etc/hosts") nil)
+    (assert= (parse-sudo-path "/sudo:") nil))
+  (test "names only this machine"
+    (is (local-host? ""))
+    (is (local-host? "localhost"))
+    (is (local-host? (os/hostname)))
+    (is (not (local-host? "elsewhere.example"))))
+  (test "a remote host is refused, and says why"
+    (let (m (ed-find-file (ed-init (make-buffer "")) "/sudo:root@elsewhere.example:/etc/hosts"))
+      (is (includes? (:echo m) "only this machine"))))
+  (test "is spelled back for a user"
+    (assert= (sudo-spec "/etc/hosts") "/sudo::/etc/hosts")
+    (assert= (sudo-spec "/srv/a" "www") "/sudo:www@:/srv/a")))
+
+(describe "C-x C-f /sudo::PATH"
+  (test "opens the file as root when sudo needs no password"
+    (with-stub (fn (dir path)
+                 (do
+                   (file/spit (path/join dir "nopasswd") "")
+                   (let (m (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path))
+                         b (ed-current-buf m))
+                     (do
+                       (is (= true (:sudo b)))
+                       (assert= (:sudo-user b) "root")
+                       (assert= (buffer-file b) path)
+                       (assert= (buffer-text b) "127.0.0.1 localhost\n")
+                       (is (not (buffer-modified? b)))
+                       (is (includes? (:echo m) "as root"))))))))
+  (test "asks for the password, masked, and opens the file once it is typed"
+    (with-stub
+      (fn (dir path)
+        (let (asked (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path)))
+          (do
+            (is (map/get-in asked [:minibuffer :masked]))
+            (is (map/get-in asked [:minibuffer :no-history]))
+            (let (m (ed-update (type-text asked "secret") :enter 80 24)
+                  b (ed-current-buf m))
+              (do
+                (is (nil? (:minibuffer m)))
+                (is (= true (:sudo b)))
+                (assert= (buffer-text b) "127.0.0.1 localhost\n")
+                ;; the password is nowhere on the model
+                (is (not (includes? (pr-str (dissoc m :buffers)) "secret"))))))))))
+  (test "a wrong password opens nothing and says sudo's reason"
+    (with-stub (fn (dir path)
+                 (let (asked (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path))
+                       m (ed-update (type-text asked "wrong") :enter 80 24))
+                   (do
+                     (is (not (= true (:sudo (ed-current-buf m)))))
+                     (is (includes? (:echo m) "Sorry"))))))))
+
+(describe "a sudo buffer is saved through sudo"
+  (test "C-x C-s writes the file, in place, and the buffer is saved"
+    (with-stub (fn (dir path)
+                 (do
+                   (file/spit (path/join dir "nopasswd") "")
+                   (os/cmd "chmod" ["640" path])
+                   (let (mode-before (:mode (file/stat path))
+                         opened (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path))
+                         edited (ed-update opened "#" 80 24)
+                         saved (ed-save-buf-at edited (ed-current-index edited)))
+                     (do
+                       (assert= (file/slurp path) "#127.0.0.1 localhost\n")
+                       (assert= (:mode (file/stat path)) mode-before)
+                       (is (not (buffer-modified? (ed-current-buf saved))))
+                       (is (includes? (:echo saved) "as root"))))))))
+  (test "asks for the password when sudo wants one, then writes"
+    (with-stub
+      (fn (dir path)
+        (let (opened (do
+                       (file/spit (path/join dir "nopasswd") "")
+                       (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path)))
+              _ (file/rm (path/join dir "nopasswd"))
+              edited (ed-update opened "#" 80 24)
+              asked (ed-save-buf-at edited (ed-current-index edited)))
+          (do
+            (is (map/get-in asked [:minibuffer :masked]))
+            ;; nothing written before the password
+            (assert= (file/slurp path) "127.0.0.1 localhost\n")
+            (let (saved (ed-update (type-text asked "secret") :enter 80 24))
+              (do
+                (assert= (file/slurp path) "#127.0.0.1 localhost\n")
+                (is (not (buffer-modified? (ed-current-buf saved))))))))))))
+
+(describe "M-x sudo-edit"
+  (test "reopens the current file as root, keeping its unsaved text, one buffer for it"
+    (with-stub (fn (dir path)
+                 (do
+                   (file/spit (path/join dir "nopasswd") "")
+                   (let (plain (ed-update (ed-find-file (ed-init (make-buffer "")) path) "x" 80 24)
+                         buffers-before (count (:buffers plain))
+                         m (cmd-sudo-edit plain nil)
+                         b (ed-current-buf m))
+                     (do
+                       (is (= true (:sudo b)))
+                       (assert= (buffer-text b) "x127.0.0.1 localhost\n")
+                       (is (buffer-modified? b))
+                       (assert= (count (:buffers m)) buffers-before)
+                       (is (includes? (:echo (cmd-sudo-edit m nil)) "already edited as root"))))))))
+  (test "in a buffer with no file, prompts at /sudo::"
+    (let (m (cmd-sudo-edit (ed-init (make-buffer "")) nil))
+      (is (string/starts-with? (:text (map/get-in m [:minibuffer :edit])) "/sudo::")))))
+
+(describe "a sudo buffer's sidecar is private"
+  (test "it goes to the editor's state folder, the path spelled with !"
+    (with-stub (fn (dir path)
+                 (let (sidecar (ed-auto-save-path path true))
+                   (do
+                     (is (string/starts-with? sidecar (path/join dir "bedit" "state" "auto-save")))
+                     (assert= (path/basename sidecar) (str "#" (string/replace path "/" "!") "#"))
+                     (is (not (= (path/dirname sidecar) dir))))))))
+  (test "an auto-save round writes it there, owner-only, and recover-session lists it as /sudo::"
+    (with-stub
+      (fn (dir path)
+        (do
+          (file/spit (path/join dir "nopasswd") "")
+          (let (m (ed-update (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path))
+                    "#" 80 24)
+                due (ed-auto-save-due m))
+            (do
+              (assert= (:sudo due) #{path})
+              (ed-auto-save-write (:due due) (:sudo due))
+              (assert= (file/slurp (ed-auto-save-path path true)) "#127.0.0.1 localhost\n")
+              (assert= (math/mod (:mode (file/stat (ed-auto-save-path path true))) 512) 384)
+              (is (not (file/exists? (ed-auto-save-path path))))
+              (os/cmd "touch" ["-d" "1 hour ago" path])
+              (assert= (recover/ed-private-recoverable (ed-private-auto-save-dir))
+                [(str "/sudo::" path)])
+              ;; a save removes it
+              (ed-save-buf-at m (ed-current-index m))
+              (is (not (file/exists? (ed-auto-save-path path true))))))))))
+  (test "auto-revert leaves a sudo buffer alone"
+    (with-stub (fn (dir path)
+                 (do
+                   (file/spit (path/join dir "nopasswd") "")
+                   (let (m (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path)))
+                     (is (empty? (first (ed-auto-revert-candidates m (os/now)))))))))))
+
+(describe "the mode line"
+  (test "a sudo buffer shows # root; another buffer shows nothing"
+    (is (includes? (pr-str (sudo-segment {} nil {:sudo true :sudo-user "root"})) "# root"))
+    (assert= (sudo-segment {} nil (make-buffer "")) nil)))
+
+;; ---- off the loop: the job's states, folded as the live loop folds them ------------------
+;; Headless (these tests) a job runs inline; the live editor runs it in a task and folds its
+;; answer with `ed-apply-sudo` — so the fold is driven here with the answers a task gives.
+
+(defn- with-loading (m path job)
+  "`m` as a live open of `path` leaves it while its task runs: the `Loading…` buffer shown and
+the job parked."
+  (assoc (ed-open-buffer m (loading-buffer path)) :sudo-job job :sudo-proc :a-task))
+
+(describe "a sudo job off the loop"
+  (test "an open shows Loading…, read-only, until the text lands — then the file, in its place"
+    (let (path "/etc/sudoedit-test-hosts"
+          job {:kind :open :path path :user "root"}
+          loading (with-loading (ed-init (make-buffer "")) path job)
+          b (ed-current-buf loading))
+      (do
+        (assert= (buffer-text b) "Loading…\n")
+        (is (read-only? b))
+        (assert= (buffer-file b) nil)
+        (assert= (ed-sudo-live loading) [(str "sudo: opening " path " as root")])
+        (let (landed (ed-apply-sudo loading {:text "127.0.0.1 localhost\n"})
+              opened (ed-current-buf landed))
+          (do
+            (assert= (buffer-text opened) "127.0.0.1 localhost\n")
+            (is (= true (:sudo opened)))
+            (is (nil? (:sudo-proc landed)))
+            (is (not (any? (:buffers landed) :sudo-loading)))
+            (assert= (ed-sudo-live landed) []))))))
+  (test "an open that needs a password asks for it masked; C-g at the prompt drops Loading…"
+    (let (path "/etc/sudoedit-test-hosts"
+          asked (ed-apply-sudo (with-loading (ed-init (make-buffer ""))
+                                 path
+                                 {:kind :open :path path :user "root"})
+                  {:needs-password true}))
+      (do
+        (is (map/get-in asked [:minibuffer :masked]))
+        (let (cancelled (ed-update asked :ctrl-g 80 24))
+          (do
+            (is (nil? (:minibuffer cancelled)))
+            (is (not (any? (:buffers cancelled) :sudo-loading))))))))
+  (test "an open sudo refuses drops Loading… and says sudo's reason"
+    (let (path "/etc/sudoedit-test-hosts"
+          m (ed-apply-sudo (with-loading (ed-init (make-buffer ""))
+                             path
+                             {:kind :open :path path :user "root"})
+              {:text (failure "sudo/read: Sorry, try again.")}))
+      (do
+        (is (not (any? (:buffers m) :sudo-loading)))
+        (is (includes? (:echo m) "Sorry")))))
+  (test "a save stays modified until its write lands, and a failed write keeps it so"
+    (let (path "/etc/sudoedit-test-hosts"
+          m0 (ed-update (ed-init (sudo-buffer path "root" "a\n")) "x" 80 24)
+          b (ed-current-buf m0)
+          job {:kind :save :path path :user "root" :rope (buffer-rope b)}
+          out (assoc m0 :sudo-job job :sudo-proc :a-task))
+      (do
+        (is (buffer-modified? (ed-current-buf out)))
+        (let (failed (ed-apply-sudo out {:written (failure "sudo/write: Permission denied")}))
+          (do
+            (is (buffer-modified? (ed-current-buf failed)))
+            (is (includes? (:echo failed) "save failed"))
+            (is (includes? (:echo failed) "Permission denied"))))
+        (let (landed (ed-apply-sudo out {:written true}))
+          (do
+            (is (not (buffer-modified? (ed-current-buf landed))))
+            (is (includes? (:echo landed) "as root"))))
+        ;; edited again while the write was out: the newer text is still unsaved
+        (let (edited (ed-update out "y" 80 24)
+              landed (ed-apply-sudo edited {:written true}))
+          (is (buffer-modified? (ed-current-buf landed)))))))
+  (test "C-g stops a job in flight: Loading… goes, and C-g says what stopped"
+    (let (path "/etc/sudoedit-test-hosts"
+          stopped (ed-sudo-quit (dissoc (with-loading (ed-init (make-buffer ""))
+                                          path
+                                          {:kind :open :path path :user "root"})
+                                  :sudo-proc)))
+      (do
+        (is (not (any? (:buffers stopped) :sudo-loading)))
+        (is (includes? (pr-str (:quit-notes stopped)) "stopped")))))
+  (test "one job at a time"
+    (let (m (assoc (ed-init (make-buffer "")) :sudo-proc :a-task))
+      (is (includes? (:echo (ed-sudo-find-file m "/sudo::/etc/hosts")) "still running")))))
+
+(describe "C-x C-c with an unsaved file edited as root"
+  (test "asks, reads the password masked, saves through sudo, then quits"
+    (with-stub
+      (fn (dir path)
+        (do
+          (file/spit (path/join dir "nopasswd") "")
+          (let (opened (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path))
+                _ (file/rm (path/join dir "nopasswd"))
+                edited (ed-update opened "#" 80 24)
+                asked (ed-update (ed-update edited :ctrl-x 80 24) :ctrl-c 80 24))
+            (do
+              (is (includes? (map/get-in asked [:read-char :prompt]) "Save file"))
+              (let (password (ed-update asked "y" 80 24))
+                (do
+                  ;; the questions are over, the save is next: its password, masked
+                  (is (map/get-in password [:minibuffer :masked]))
+                  (is (not (:done password)))
+                  (let (quit (ed-update (type-text password "secret") :enter 80 24))
+                    (do
+                      (assert= (file/slurp path) "#127.0.0.1 localhost\n")
+                      (is (:done quit)))))))))))
+    (test "C-g at the password cancels the quit cleanly: nothing written, the buffer still modified"
+      (with-stub (fn (dir path)
+                   (do
+                     (file/spit (path/join dir "nopasswd") "")
+                     (let (opened (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path))
+                           _ (file/rm (path/join dir "nopasswd"))
+                           edited (ed-update opened "#" 80 24)
+                           asked (ed-update (ed-update (ed-update edited :ctrl-x 80 24)
+                                              :ctrl-c 80 24)
+                                   "y" 80 24)
+                           cancelled (ed-update asked :ctrl-g 80 24))
+                       (do
+                         (is (not (:done cancelled)))
+                         (is (nil? (:minibuffer cancelled)))
+                         (is (buffer-modified? (ed-current-buf cancelled)))
+                         (assert= (file/slurp path) "127.0.0.1 localhost\n"))))))))
+  (test "a wrong password stops the quit and says why"
+    (with-stub (fn (dir path)
+                 (do
+                   (file/spit (path/join dir "nopasswd") "")
+                   (let (opened (ed-find-file (ed-init (make-buffer "")) (str "/sudo::" path))
+                         _ (file/rm (path/join dir "nopasswd"))
+                         asked (ed-update (ed-update (ed-update (ed-update opened "#" 80 24)
+                                                       :ctrl-x 80 24)
+                                            :ctrl-c 80 24)
+                                 "y" 80 24)
+                         refused (ed-update (type-text asked "wrong") :enter 80 24))
+                     (do
+                       (is (not (:done refused)))
+                       (is (includes? (:echo refused) "quit canceled"))
+                       (is (buffer-modified? (ed-current-buf refused))))))))))

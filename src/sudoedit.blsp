@@ -1,0 +1,354 @@
+(defmodule sudoedit
+  "Editing a file as root — Emacs's TRAMP `/sudo::` method and `sudo-edit` — over brood's
+`sudo` (ADR-588), which reads and writes a file through `sudo` and keeps no password.
+
+  - `C-x C-f /sudo::/etc/hosts` opens the file as root ([[ed-sudo-find-file]]); `/sudo:USER@:PATH`
+    as another user. Only this machine: a remote host is refused, with the reason.
+  - `M-x sudo-edit` reopens the current file as root, its unsaved text kept ([[cmd-sudo-edit]]);
+    in a buffer with no file it prompts for one, as Emacs's does.
+  - The buffer REMEMBERS it is a sudo buffer (`:sudo`, `:sudo-user`): C-x C-s writes it
+    through sudo, in place, keeping the file's owner and mode (`pool/ed-save-buf-at` hands it
+    here), and the mode line says `# root` on it ([[sudo-segment]]).
+  - A password, when sudo wants one, is read with the masked prompt (`passwd/ed-read-passwd`)
+    and handed to sudo for one validation — never kept: sudo's own timestamp lets the next
+    open or save go without asking, as a `sudo` in a shell does.
+  - Every sudo call runs OFF the loop, one at a time (`:sudo-proc`): an open shows a
+    `Loading…` buffer at once, a save leaves the buffer modified until its write lands, C-g
+    stops either, and C-x C-c asks about one still running. C-x C-c and C-x s save the root
+    files they were told to after their questions, password and all, and quit (or report)
+    when the last has landed ([[ed-sudo-save-all]]).
+  - Its auto-save sidecar is PRIVATE (`autosave/ed-auto-save-path`): the editor's state folder,
+    never beside a root-owned file. Auto-revert leaves it alone, as Emacs's leaves a remote file.
+
+Named to dodge std's `sudo`, as formatter dodges `format`."
+  (:use editor/buffer) ; buffer-file / buffer-from-file / buffer-text / replace-region / mark-buffer-saved
+  (:use model) ; message / ed-buf-at / ed-current-buf / ed-buffer-index-by-file
+  (:use pool) ; ed-open-buffer / ed-kill-buffer-at / ed-save-buf-with / ed-find-file-prompt / ed-default-dir
+  (:use passwd) ; ed-read-passwd — the masked read
+  (:use autosave) ; ed-recovery-note — the private sidecar's
+  (:use projects) ; file-display-name
+  (:use theme) ; *red*
+  (:use interactive)) ; defcommand
+
+;; ---- the path: TRAMP's sudo method ------------------------------------------------
+
+(defn parse-sudo-path (spec)
+  "The parts of a TRAMP sudo path `spec` — `/sudo::PATH`, `/sudo:USER@:PATH`,
+`/sudo:USER@localhost:PATH` — as `{:user :host :path}` (`:user` \"root\" when none is named),
+or nil when `spec` is not one.
+
+    (sudoedit/parse-sudo-path \"/sudo::/etc/hosts\")   ;=> {:user \"root\" :host \"\" :path \"/etc/hosts\"}
+    (:user (sudoedit/parse-sudo-path \"/sudo:www@:/srv/site.conf\"))   ;=> \"www\"
+    (sudoedit/parse-sudo-path \"/etc/hosts\")   ;=> nil"
+  (when (string/starts-with? spec "/sudo:")
+    (let (rest (string/substring spec 6 (string/length spec))
+          colon (index-of rest ":"))
+      (when (>= colon 0)
+        (let (method-part (string/substring rest 0 colon)
+              at (index-of method-part "@")
+              user (if (>= at 0) (string/substring method-part 0 at) "")
+              host (if (>= at 0)
+                     (string/substring method-part (inc at) (string/length method-part))
+                     method-part))
+          {:user (if (= user "") "root" user)
+           :host host
+           :path (string/substring rest (inc colon) (string/length rest))})))))
+
+(defn local-host? (host)
+  "Whether `host` (a TRAMP path's host part) names THIS machine: empty, `localhost`, or this
+machine's name. A remote host would need TRAMP's ssh, which bedit does not have.
+
+    (sudoedit/local-host? \"\")   ;=> true
+    (sudoedit/local-host? \"elsewhere.example\")   ;=> false"
+  (or (= host "") (= host "localhost") (= host (os/hostname))))
+
+(defn sudo-spec (path &optional (user "root"))
+  "The TRAMP path that opens `path` as `user`: `/sudo::PATH` for root.
+
+    (sudoedit/sudo-spec \"/etc/hosts\")   ;=> \"/sudo::/etc/hosts\"
+    (sudoedit/sudo-spec \"/srv/a\" \"www\")   ;=> \"/sudo:www@:/srv/a\""
+  (if (= user "root") (str "/sudo::" path) (str "/sudo:" user "@:" path)))
+
+;; ---- off the loop: one sudo job at a time -----------------------------------------------
+;; Every sudo call is a process that may wait — on the disk, on PAM, on a password check that
+;; sleeps two seconds after a wrong one — so none runs on the editor's loop: an open or a save
+;; is a JOB, run in a task (`:sudo-proc`), one at a time, folded back by [[ed-apply-sudo]]. The
+;; job asks sudo first whether a password is needed (`sudo -n -v`, which never prompts); when
+;; one is, the masked prompt opens and the job runs again with it. C-g stops a job in flight
+;; ([[ed-sudo-quit]]); C-x C-c names one still running ([[ed-sudo-live]]). The password lives in
+;; the task's closure for one run, never on the model.
+
+(def *sudo-timeout-ms* 60000)
+;; How long one sudo call may take before its task is killed and the job said to have failed:
+;; a wedged PAM module must not hold the slot for ever.
+
+(defn- password-prompt ()
+  ;; sudo asks for the INVOKING user's password, whoever the file is opened as
+  (str "[sudo] password for " (or (os/env "USER") "you") ": "))
+
+(defn sudo-work (job password)
+  "What sudo `job` does, in its task: `{:needs-password true}` when sudo wants a password and
+`password` is nil; else `{:text …}` for an open (the file's text, nil when it does not exist,
+or sudo's failure) and `{:written …}` for a save (true, or the failure).
+
+    (:needs-password (sudoedit/sudo-work {:kind :open :path \"/etc/hosts\" :user \"root\"} nil))   ;~> true when sudo has no cached credential"
+  (let (opts {:user (:user job) :password password})
+    (if (and (nil? password) (sudo/password-required? {:user (:user job)}))
+      {:needs-password true}
+      (if (= (:kind job) :open)
+        {:text (sudo/read (:path job) opts)}
+        {:written (sudo/write (:path job) (:text job) opts)}))))
+
+(defn- job-doing (job)
+  (str (if (= (:kind job) :open) "opening " "saving ") (:path job) " as " (:user job)))
+
+(defn- sudo-launch (m job password)
+  "Run `job` off the loop with `password` (nil: ask sudo whether one is needed). Headless —
+the tests — it runs inline. A second job while one runs is refused, as every off-loop job is."
+  (cond
+    (:sudo-proc m) (message m "sudo: another sudo command is still running")
+    (ed-headless?) (ed-apply-sudo (assoc m :sudo-job job) (sudo-work job password))
+    else
+      (assoc (message m (str (job-doing job) "… (C-g stops)"))
+        :sudo-proc (task/task (fn () (sudo-work job password)) {:timeout *sudo-timeout-ms*})
+        :sudo-job job)))
+
+(defn- placeholder-index (m path)
+  ;; the `Loading…` buffer an open of `path` shows until its text lands, or nil
+  (let (i (seq/index-where (:buffers m) (fn (b) (= (:sudo-loading b) path))))
+    (if (< i 0) nil i)))
+
+(defn- drop-placeholder (m path)
+  (let (i (placeholder-index m path)) (if (nil? i) m (ed-kill-buffer-at m i))))
+
+(defn sudo-buffer-index (m path)
+  "The pool index of the buffer editing `path` as root, or nil."
+  (let (i (seq/index-where (:buffers m) (fn (b) (and (= true (:sudo b)) (= (buffer-file b) path)))))
+    (if (< i 0) nil i)))
+
+(defn- sudo-abandon (m job)
+  "`job` given up — its password prompt cancelled, its task stopped or failed: an open's
+`Loading…` buffer goes; a save's buffer stays as it was, modified."
+  (if (= (:kind job) :open) (drop-placeholder m (:path job)) m))
+
+(defn- sudo-failed (m job reason)
+  (message (sudo-abandon m job) (str "sudo: " reason (or (:abandon-note job) ""))))
+
+(defn- sudo-ask (m job)
+  "The masked prompt for the password `job` needs; RET runs it again with it, C-g gives it up."
+  (map/assoc-in (ed-read-passwd m
+                  (password-prompt)
+                  (fn (mm password) (sudo-launch mm job password)))
+    [:minibuffer :on-abort]
+    (fn (mm) (sudo-abandon mm job))))
+
+;; ---- opening ----------------------------------------------------------------------
+
+(defn sudo-buffer (path user text)
+  "A buffer visiting `path` as `user` (root unless named): `text` its contents as read
+through sudo — nil for a file that does not exist yet — and `:sudo` set, so a save writes it
+through sudo.
+
+    (:sudo (sudoedit/sudo-buffer \"/etc/hosts\" \"root\" \"127.0.0.1 localhost\\n\"))   ;=> true"
+  (assoc (if (nil? text) (make-buffer "" (path/basename path) path) (buffer-from-file path text))
+    :sudo true
+    :sudo-user user))
+
+(defn loading-buffer (path)
+  "The buffer an open of `path` as root shows until its text lands: `Loading…`, read-only,
+with no file of its own (so no other buffer or frame takes it for the file) — `:sudo-loading`
+names the path.
+
+    (:sudo-loading (sudoedit/loading-buffer \"/etc/hosts\"))   ;=> \"/etc/hosts\""
+  (assoc (set-read-only (make-buffer "Loading…\n" (str (path/basename path) " <sudo: loading>"))
+           true)
+    :sudo-loading path))
+
+(defn- carry-text (buf old)
+  "`buf` holding `old`'s unsaved text when `old` is modified — what `sudo-edit` keeps of the
+buffer it replaces — at `old`'s point. One edit over the file's text, so the buffer is
+modified and C-/ goes back to the file's."
+  (if (and old (buffer-modified? old))
+    (let (text (buffer-text old))
+      (goto-char (replace-region buf 0 (buffer-length buf) text)
+        (math/min (buffer-point old) (string/length text))))
+    (if old (goto-char buf (math/min (buffer-point old) (buffer-length buf))) buf)))
+
+(defn- sudo-opened (m job text)
+  "An open's text has landed: the file in a sudo buffer, shown where the `Loading…` one was
+selected, which goes — as does a buffer already visiting the file plainly, whose unsaved text
+the new one keeps. Then the job's continuation."
+  (let (path (:path job)
+        user (:user job)
+        old-index (ed-buffer-index-by-file m path)
+        old (when old-index (ed-buf-at m old-index))
+        buf (assoc (carry-text (sudo-buffer path user text) old)
+              :name (file-display-name path (:project-root m)))
+        opened (ed-open-buffer m buf)
+        without-placeholder (drop-placeholder opened path)
+        ;; one buffer per file: the plain one goes, found again (the pool moved)
+        plain (seq/index-where (:buffers without-placeholder)
+                (fn (b) (and (= (buffer-file b) path) (not (= true (:sudo b))))))
+        replaced (if (< plain 0) without-placeholder (ed-kill-buffer-at without-placeholder plain))
+        shown (let (i (sudo-buffer-index replaced path))
+                (if (nil? i) replaced (ed-select replaced i))))
+    ((or (:then job) identity) (message shown
+                                 (or (ed-recovery-note path true)
+                                   (str (if (nil? text) "new file " "opened ") path " as " user))))))
+
+;; check-allow: `then` is the caller's continuation (`identity`, or recover-session's), whose
+;; result the checker cannot see; every caller hands one that answers a model
+(check-allow :trusted
+  (defn ed-sudo-find-file (m spec &optional (then identity))
+    "Open the TRAMP sudo path `spec` (`/sudo::/etc/hosts`): the file as root (or the user it
+names), OFF the loop — a `Loading…` buffer shown at once, the file's text when sudo answers,
+the password asked for first when sudo wants one — then `(then m)` on the model with it open.
+A buffer already visiting the file as root is selected; one visiting it plainly is replaced
+([[sudo-opened]]). A remote host, or a spec that is not one, is said."
+    (let (parts (parse-sudo-path spec))
+      (cond
+        (nil? parts) (message m (str "not a sudo path: " spec " (/sudo::PATH)"))
+        (not (local-host? (:host parts)))
+          (message m
+            (str "sudo: only this machine (/sudo::PATH) — " (:host parts) " would need ssh"))
+        (string/blank? (:path parts)) (message m "sudo: which file? (/sudo::PATH)")
+        (:sudo-proc m) (message m "sudo: another sudo command is still running")
+        else
+          (let (path (path/normalize (path/absolute (:path parts)))
+                user (:user parts)
+                index (sudo-buffer-index m path))
+            (if (and index (= user (:sudo-user (ed-buf-at m index))))
+              (then (ed-select m index))
+              (sudo-launch (ed-open-buffer m (loading-buffer path))
+                {:kind :open :path path :user user :then then}
+                nil)))))))
+(sig ed-sudo-find-file (model string &optional any -> model))
+
+;; ---- saving -----------------------------------------------------------------------
+
+(defn- sudo-saved (m job)
+  "A save's write has landed: its buffer marked saved as of the text written
+(`pool/ed-save-landed` — still modified if it was edited meanwhile), then the continuation."
+  (let (index (sudo-buffer-index m (:path job))
+        saved (if (nil? index)
+                (message m (str "saved " (:path job) " as " (:user job)))
+                (ed-save-landed m index (:rope job) (str " as " (:user job)))))
+    ((or (:then job) identity) saved)))
+
+;; check-allow: `then` is a continuation (the quit's, C-x s's), whose result the checker cannot
+;; see; every caller hands one that answers a model
+(check-allow :trusted
+  (defn ed-sudo-save (m i &optional (then nil) (abandon-note nil))
+    "Save pool buffer `i`, a sudo buffer, through sudo OFF the loop — the password asked for
+first when sudo wants one. The buffer is made what its `.editorconfig` asks and its text taken
+now (`pool/ed-save-prepare`); it stays modified until the write lands, and a write that fails
+leaves it so and says why. `then` runs on the model once the write has landed (the quit
+continues there); `abandon-note` follows the reason when it does not (\" — quit canceled\")."
+    (let (b (ed-buf-at m i))
+      (cond
+        (:sudo-loading b) (message m "still loading — nothing to save yet")
+        (:sudo-proc m)
+          (message m "sudo: another sudo command is still running — save when it is done")
+        else
+          (let ([prepared-model prepared] (ed-save-prepare m i))
+            (sudo-launch prepared-model
+              {:kind :save
+               :path (buffer-file prepared)
+               :user (or (:sudo-user b) "root")
+               :text (file-text-encode (buffer-text prepared)
+                       (buffer-eol prepared)
+                       (buffer-bom? prepared))
+               :rope (buffer-rope prepared)
+               :then then
+               :abandon-note abandon-note}
+              nil))))))
+(sig ed-sudo-save (model int &optional any any -> model))
+
+;; check-allow: as above — `then` is the caller's
+(check-allow :trusted
+  (defn ed-sudo-save-all (m paths then &optional (abandon-note nil))
+    "Save every sudo buffer in `paths` (file paths) in turn — one sudo job at a time, each
+asking for the password when sudo wants one — then `(then m)`. One that fails, or whose prompt
+or task is cancelled, stops the run there, saying why with `abandon-note`: what C-x C-c and
+C-x s do with the sudo buffers they were told to save."
+    (if (empty? paths)
+      (then m)
+      (let (index (sudo-buffer-index m (first paths)))
+        (if (nil? index)
+          (ed-sudo-save-all m (rest paths) then abandon-note)
+          (ed-sudo-save m
+            index
+            (fn (mm) (ed-sudo-save-all mm (rest paths) then abandon-note))
+            abandon-note))))))
+(sig ed-sudo-save-all (model seqable any &optional any -> model))
+
+;; ---- the job's fold, its C-g, its exit question --------------------------------------
+
+(defn ed-apply-sudo (m r)
+  "Fold a finished sudo job's answer `r` ([[sudo-work]]; nil when its task failed or timed
+out): ask for the password it needs, open the file, mark the save landed — or say why not."
+  (let (job (:sudo-job m)
+        m1 (dissoc m :sudo-proc :sudo-job))
+    (cond
+      (nil? job) m1
+      (nil? r) (sudo-failed m1 job (str (job-doing job) " failed or timed out"))
+      (:needs-password r) (sudo-ask m1 job)
+      (= (:kind job) :open)
+        (if (failure? (:text r))
+          (sudo-failed m1 job (error-message (:text r)))
+          (sudo-opened m1 job (:text r)))
+      (failure? (:written r))
+        (sudo-failed m1 job (str "save failed: " (error-message (:written r))))
+      else (sudo-saved m1 job))))
+
+(defn ed-sudo-quit (m)
+  "C-g's clean-up for a sudo job (its task already killed): an open's `Loading…` buffer goes,
+a save's buffer stays modified, and C-g says what stopped."
+  (let (job (:sudo-job m))
+    (if (nil? job)
+      m
+      (ed-quit-note (sudo-abandon (dissoc m :sudo-job) job)
+        (str (job-doing job) " stopped" (or (:abandon-note job) ""))))))
+
+(defn ed-sudo-live (m)
+  "The sudo job C-x C-c would stop (`model/register-exit-query`), while one runs."
+  (if (:sudo-proc m) [(str "sudo: " (job-doing (or (:sudo-job m) {})))] []))
+
+(register-task-reply :sudo-proc
+  'sudoedit/ed-apply-sudo
+  nil
+  "sudo"
+  {:cancel-on-quit? true :on-quit 'sudoedit/ed-sudo-quit})
+(register-exit-query :sudo 'sudoedit/ed-sudo-live)
+
+;; ---- the command ------------------------------------------------------------------
+
+(defcommand cmd-sudo-edit
+  (m key)
+  "Reopen the current file as root (Emacs `sudo-edit`): read through sudo — the password
+asked for when sudo wants one, and never kept — its unsaved text carried over, and saved
+through sudo from then on. In a buffer with no file, prompt for one, starting at `/sudo::`
+and the buffer's directory. A buffer already edited as root says so."
+  (let (b (ed-current-buf m)
+        path (buffer-file b))
+    (cond
+      (= true (:sudo b)) (message m (str (buffer-name b) " is already edited as " (:sudo-user b)))
+      (nil? path)
+        (assoc m :minibuffer (ed-find-file-prompt (sudo-spec (str (ed-default-dir m) "/")) []))
+      else (ed-sudo-find-file m (sudo-spec path)))))
+
+;; ---- the mode line ----------------------------------------------------------------
+
+(defn sudo-segment (m pane buf)
+  "The `# root` chip on a sudo buffer's mode line — Emacs shows the TRAMP prefix there — red,
+as a reminder that a save writes as root; nil on any other buffer."
+  (when (= true (:sudo buf))
+    (statusbar/seg :sudo
+      (str "# " (or (:sudo-user buf) "root"))
+      {:sep "  —  "
+       :face {:fg *red* :bold true}
+       :tooltip (fn (mm)
+                  [(str "editing " (buffer-file buf) " as " (or (:sudo-user buf) "root"))
+                    "C-x C-s writes it through sudo; the password is never kept"])})))
+
+(statusbar/register-modeline-segment :sudo 30 'sudoedit/sudo-segment)

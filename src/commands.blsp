@@ -761,7 +761,9 @@ line of overlap and point's screen position. (Emacs `scroll-down-command`.)"
   (m key)
   "Scroll so point sits at the middle of the window, then the top, then the bottom on
 successive presses (Emacs `recenter-top-bottom`, C-l). Targets honour the scroll
-margin; the view moves, point does not."
+margin; the view moves, point does not. In a terminal (`bedit -nw`) it also repaints the
+whole screen, as Emacs's does — what clears whatever another program wrote over it."
+  (when (:terminal m) (term/invalidate))
   (let (rows (or (:view-rows m) 10)
         mgn (ed-margin rows)
         pos (ed-cycle-pos m 'commands/cmd-recenter :recenter-cycle)
@@ -1379,24 +1381,53 @@ A buffer whose mode refuses writing (`ed-no-write-refusal` — a hex view) is re
           (or (buffer-file (ed-current-buf m)) (str (ed-default-dir m) "/"))
           (if (:recent-files m) (recent-files) [])
           (fn (mm path)
-            (let (old-file (buffer-file (ed-current-buf mm))
-                  old-key (hosted/hosted-key (ed-current-buf mm)))
-              (try
-                (let (b (assoc (ed-current-buf mm)
-                          :file path
-                          :name (file-display-name path (ed-project-root mm))))
-                  ;; keep what save-buffer returns: it is unmodified AND stamped with the
-                  ;; new file's mtime (dropping it left a stale stamp -> a false
-                  ;; "changed on disk" on the next save)
-                  (let (b2 (save-buffer b)
-                        ;; a shared buffer is now a different document: the registry
-                        ;; entry (and every other frame's copy) follows it
-                        m2 (hosted/hosted-rekey-slot (dissoc (ed-set-buf mm b2) :status)
-                             (ed-current-index mm)
-                             old-key))
-                    (ed-remove-auto-save old-file)
-                    (message m2 (str "wrote " path))))
-                (catch e (message mm (str "write failed: " (error-message e)))))))))))
+            (if (string/starts-with? path "/sudo:")
+              (ed-write-file-as-root mm path)
+              (ed-write-file-to mm path)))))))
+
+(defn- ed-write-file-as-root (m spec)
+  "C-x C-w to a TRAMP sudo path (`/sudo::/etc/motd`): the buffer becomes a sudo buffer
+backed by that file (`sudoedit`) and is saved through sudo — the password asked for when
+sudo wants one."
+  (let (parts (sudoedit/parse-sudo-path spec))
+    (if (or (nil? parts) (not (sudoedit/local-host? (:host parts))) (string/blank? (:path parts)))
+      (message m (str "write failed: not a sudo path on this machine: " spec " (/sudo::PATH)"))
+      (let (path (path/normalize (path/absolute (:path parts)))
+            old (ed-current-buf m)
+            old-key (hosted/hosted-key old)
+            b (assoc old
+                :file path
+                :sudo true
+                :sudo-user (:user parts)
+                :name (file-display-name path (ed-project-root m)))
+            index (ed-current-index m)
+            m2 (hosted/hosted-rekey-slot (dissoc (ed-set-buf m b) :status) index old-key))
+        (do
+          (ed-remove-auto-save (buffer-file old) (= true (:sudo old)))
+          (ed-save-buf-at m2 index))))))
+
+(defn- ed-write-file-to (mm path)
+  "C-x C-w to plain `path`: the buffer written there and backed by it — no longer edited as
+root, if it was."
+  (let (old-file (buffer-file (ed-current-buf mm))
+        old-sudo? (= true (:sudo (ed-current-buf mm)))
+        old-key (hosted/hosted-key (ed-current-buf mm)))
+    (try
+      (let (b (assoc (dissoc (ed-current-buf mm) :sudo :sudo-user)
+                :file path
+                :name (file-display-name path (ed-project-root mm))))
+        ;; keep what save-buffer returns: it is unmodified AND stamped with the
+        ;; new file's mtime (dropping it left a stale stamp -> a false
+        ;; "changed on disk" on the next save)
+        (let (b2 (save-buffer b)
+              ;; a shared buffer is now a different document: the registry
+              ;; entry (and every other frame's copy) follows it
+              m2 (hosted/hosted-rekey-slot (dissoc (ed-set-buf mm b2) :status)
+                   (ed-current-index mm)
+                   old-key))
+          (ed-remove-auto-save old-file old-sudo?)
+          (message m2 (str "wrote " path))))
+      (catch e (message mm (str "write failed: " (error-message e)))))))
 
 (defcommand cmd-revert-buffer
   (m key)
@@ -2219,6 +2250,15 @@ at the spot C-y marked, Emacs-like, and point stays where the user's typing left
             (assoc m2 :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})
             m2))
       else (ed-yank-at-spot m1 spot text))))
+
+(defn ed-paste-text (m text)
+  "A terminal's bracketed paste (`[:paste text]`, brood ADR-586) into the current buffer:
+Emacs's `xterm-paste` — `text` goes onto the kill ring and is yanked, as one edit at point
+(over a region delete-selection replaces), its span kept for M-y. It arrives whole, so no
+character of it is typed: nothing is indented, paired or completed as it goes in. The
+clipboard is not written — the text came from it."
+  (let ([marked spot] (ed-yank-mark-spot (dissoc m :yank)))
+    (ed-yank-answered marked text spot)))
 
 (defn- ed-yank-spot-buffer (m spot)
   "The pool buffer C-y marked its `spot` in, or nil when that slot holds another buffer now."
@@ -3583,12 +3623,15 @@ it means and why they are not listed as answers."
       (ed-map-y-or-n m
         pending
         (fn (i) (str "Save file " (buffer-file (ed-buf-at m i)) "?"))
-        (fn (mm i) (ed-save-buf-at mm i))
+        (fn (mm i) (ed-save-or-queue mm i))
         (fn (mm n)
-          (message mm
-            (if (= n 0)
-              "(no buffers saved)"
-              (str "saved " n " buffer" (if (= n 1) "" "s")))))))))
+          (let (said (message (dissoc mm :quit-sudo-saves)
+                       (if (= n 0)
+                         "(no buffers saved)"
+                         (str "saved " n " buffer" (if (= n 1) "" "s"))))
+                queued (or (:quit-sudo-saves mm) []))
+            ;; the ones edited as root go after, one sudo job at a time
+            (if (empty? queued) said (sudoedit/ed-sudo-save-all said queued identity))))))))
 
 (defn ed-live-processes-prompt (live)
   "The question C-x C-c asks when `live` (lines from `model/ed-live-processes`) is not
@@ -3620,22 +3663,41 @@ anyway?`, then — if anything is still running — whether to kill it
 
 `save-all?` skips the asking about buffers (the `!` answer, and the caller that already
 knows); the running processes are still asked about."
-  (let (finish (fn (mm _)
-                 (if (empty? (ed-modified-file-indices mm))
-                   (ed-quit-confirm-processes mm)
-                   (ed-read-char mm
-                     "Modified buffers exist; exit anyway? (y or n)"
-                     (fn (m2 k)
-                       (if (ed-yes-key? k)
-                         (ed-quit-confirm-processes m2)
-                         (message m2 "quit canceled")))))))
+  (let (after-saves (fn (mm)
+                      (if (empty? (ed-modified-file-indices mm))
+                        (ed-quit-confirm-processes mm)
+                        (ed-read-char mm
+                          "Modified buffers exist; exit anyway? (y or n)"
+                          (fn (m2 k)
+                            (if (ed-yes-key? k)
+                              (ed-quit-confirm-processes m2)
+                              (message m2 "quit canceled"))))))
+        ;; a file edited AS ROOT is written off the loop, after its password when sudo wants
+        ;; one (sudoedit): its saves wait until every question is answered, and the quit goes
+        ;; on when the last has landed — or stops, saying why, when one fails or is cancelled
+        finish (fn (mm _)
+                 (let (queued (or (:quit-sudo-saves mm) []))
+                   (if (empty? queued)
+                     (after-saves mm)
+                     (sudoedit/ed-sudo-save-all (dissoc mm :quit-sudo-saves)
+                       queued after-saves " — quit canceled"))))
+        save (fn (mm i) (ed-save-or-queue mm i)))
     (if save-all?
-      (finish (fold pending m (fn (acc i) (ed-save-buf-at acc i))) 0)
+      (finish (fold pending m save) 0)
       (ed-map-y-or-n m
         pending
         (fn (i) (str "Save file " (buffer-file (ed-buf-at m i)) "?"))
-        (fn (mm i) (ed-save-buf-at mm i))
+        save
         finish))))
+
+(defn- ed-save-or-queue (m i)
+  "Save pool buffer `i` now — or, edited as root (sudoedit), queue it on `:quit-sudo-saves`
+for after the questions: its save asks for a password and lands later, and a masked prompt
+must not open between two y-or-n questions."
+  (let (b (ed-buf-at m i))
+    (if (= true (:sudo b))
+      (assoc m :quit-sudo-saves (conj (or (:quit-sudo-saves m) []) (buffer-file b)))
+      (ed-save-buf-at m i))))
 
 (defcommand cmd-quit
   (m key)

@@ -68,6 +68,10 @@ bedit --name ed --serve --headless notes.txt
 
 # another terminal on the SAME machine: open a window attached to the daemon
 bedit --attach ed --as alice
+
+# …or draw it in THIS terminal (emacsclient -nw): also what --attach does by itself
+# where there is no display, e.g. over ssh; kills reach your clipboard via OSC 52
+bedit --attach ed --as alice -nw
 ```
 
 - `--serve` alone → each client gets its **own** buffer (independent sessions).

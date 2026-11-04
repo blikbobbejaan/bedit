@@ -1,0 +1,126 @@
+;; bedit in the TERMINAL — `bedit -nw`, and with no display at all — run through its real
+;; `main` (tools/term-main.blsp) on a pty and read back through std/vt: the file drawn, typing
+;; and a bracketed paste reaching the buffer (the paste as ONE edit, so one undo takes it
+;; back), C-x C-s writing the disk, a `/sudo::` file opened after a masked password and saved
+;; through sudo, C-x C-c quitting; then the same editor with $DISPLAY and $WAYLAND_DISPLAY
+;; unset, which must take the terminal by itself and say so.
+;;
+;; sudo is STOOD IN FOR — a script first on the child's PATH that takes sudo's flags, answers
+;; the password `secret` and runs the command as you. This driver never runs the real sudo,
+;; and never opens a window: the first session asks for the terminal, the second has no
+;; display to open one on.
+(reflect/add-load-path (path/join (file/cwd) "tools"))
+(require-one 'drive)
+
+(defn stub-sudo (dir)
+  "A stand-in `sudo` in `dir`; its credential cache is a file there."
+  (let (stub (path/join dir "sudo"))
+    (do
+      (file/spit stub
+        (str "#!/bin/sh\n"
+          "state=" (os/shell-quote dir) "\n"
+          "noninteractive=0; from_stdin=0; ignore_cache=0; validate=0\n"
+          "while [ $# -gt 0 ]; do\n"
+          "  case \"$1\" in\n"
+          "    -n) noninteractive=1 ;; -S) from_stdin=1 ;; -k) ignore_cache=1 ;; -v) validate=1 ;;\n"
+          "    -p|-u) shift ;;\n"
+          "    --) shift; break ;;\n"
+          "    *) break ;;\n"
+          "  esac\n"
+          "  shift\n"
+          "done\n"
+          "needs_password=1\n"
+          "[ -f \"$state/cached\" ] && [ $ignore_cache = 0 ] && needs_password=0\n"
+          "if [ $needs_password = 1 ]; then\n"
+          "  if [ $from_stdin = 1 ] && [ $noninteractive = 0 ]; then\n"
+          "    IFS= read -r typed\n"
+          "    if [ \"$typed\" != secret ]; then echo 'Sorry, try again.' >&2; exit 1; fi\n"
+          "    touch \"$state/cached\"\n"
+          "  else\n"
+          "    echo 'sudo: a password is required' >&2; exit 1\n"
+          "  fi\n"
+          "fi\n"
+          "[ $validate = 1 ] && exit 0\n"
+          "exec \"$@\"\n"))
+      (os/cmd "chmod" ["+x" stub])
+      dir)))
+
+(let (dir (path/temp "bedit-drive-nw-")
+      _ (os/cmd "mkdir" ["-p" dir])
+      path (path/join dir "plain.txt")
+      rooted (path/join dir "rooted.conf")
+      _ (file/spit path "alpha\nbeta\n")
+      _ (file/spit rooted "root-owned\n")
+      stubs (path/join dir "bin")
+      s (do
+          (os/cmd "mkdir" ["-p" stubs])
+          (stub-sudo stubs)
+          (drive/start "term-main.blsp"
+            {:rows 24
+             :cols 100
+             :env {"BEDIT_DRIVE_ARGS" (str "-nw " path) "PATH" (str stubs ":" (os/env "PATH"))}})))
+  (do
+    (drive/check "-nw: the file is drawn in the terminal" (drive/wait-for s "alpha" 20000))
+    (drive/check "-nw: and its mode line" (drive/wait-for s "plain.txt" 5000))
+    (drive/send-keys s "X" 500)
+    (drive/check "typing reaches the buffer" (drive/wait-for s "Xalpha" 5000))
+    ;; a bracketed paste: two lines, whole
+    (drive/send-keys s "\e[200~one\ntwo\e[201~" 600)
+    ;; a check of an ABSENCE counts only after the presence it follows: an editor that never
+    ;; drew anything has no paste on screen and no password either
+    (let (pasted? (drive/check "a paste lands whole, newline and all" (drive/wait-for s "two" 5000)))
+      (do
+        (drive/send-keys s "\x1f" 600) ; C-/ — one undo
+        (drive/check "one undo takes the whole paste back" (and pasted? (drive/wait-gone s "two" 5000)))))
+    (drive/check "…and only the paste" (drive/wait-for s "Xalpha" 2000))
+    (drive/send-keys s "\x18\x13" 600) ; C-x C-s
+    (drive/check "C-x C-s says it saved" (drive/wait-for s (str "saved " path) 5000))
+    (let (on-disk (file/slurp path))
+      (when (not (drive/check "…and the disk has it" (string/starts-with? on-disk "Xalpha")))
+        (io/puts (str "        on disk: " (pr-str on-disk)))))
+    ;; a file opened as root: C-x C-f /sudo::PATH, the password read masked
+    (drive/send-keys s "\x18\x06" 600) ; C-x C-f
+    (drive/check "find-file prompt" (drive/wait-for s "Find file" 8000))
+    (drive/send-keys s (str "\x01\x0b/sudo::" rooted "\r") 1000)
+    ;; the open runs off the loop: its buffer is there at once, Loading…
+    (drive/check "the buffer shows Loading… while sudo runs" (drive/wait-for s "Loading…" 8000))
+    (let (asked? (drive/check "sudo asks for the password" (drive/wait-for s "password for" 8000)))
+      (do
+        (drive/send-keys s "secret" 400)
+        (drive/check "the password is masked" (and asked? (drive/gone? s "secret")))))
+    (drive/send-keys s "\r" 1500)
+    (drive/check "the file opens as root" (drive/wait-for s "root-owned" 8000))
+    (drive/check "…in place of Loading…" (drive/wait-gone s "Loading…" 5000))
+    (drive/check "the mode line says so" (drive/wait-for s "# root" 5000))
+    (drive/send-keys s "Z" 400)
+    (drive/send-keys s "\x18\x13" 1500) ; C-x C-s — sudo's cache answers, no password
+    (drive/check "the save goes through sudo" (drive/wait-for s "as root" 5000))
+    (drive/check "…and reaches the disk" (= (file/slurp rooted) "Zroot-owned\n"))
+    ;; quitting with the root file unsaved, and sudo's cache gone: C-x C-c asks, the
+    ;; password is read masked, the save runs off the loop, and the quit goes on when it lands
+    (drive/send-keys s "W" 400)
+    (os/cmd "rm" ["-f" (path/join stubs "cached")])
+    (drive/send-keys s "\x18\x03" 600) ; C-x C-c
+    (drive/check "C-x C-c asks to save the root file" (drive/wait-for s "Save file" 5000))
+    (drive/send-keys s "y" 600)
+    (drive/check "…and asks for the password it needs" (drive/wait-for s "password for" 8000))
+    (drive/send-keys s "secret\r" 300)
+    (drive/check "C-x C-c quits once the save has landed" (not (nil? (drive/wait-exit s 8000))))
+    (drive/check "…and the save reached the disk" (= (file/slurp rooted) "ZWroot-owned\n"))
+    (drive/quit s 100)
+    ;; no display at all: the editor takes the terminal by itself, and says why
+    (let (bare (drive/start "term-main.blsp"
+                 {:rows 24
+                  :cols 100
+                  :env {"BEDIT_DRIVE_ARGS" path
+                        "DISPLAY" nil
+                        "WAYLAND_DISPLAY" nil
+                        "BROOD_GUI_HEADLESS" nil}}))
+      (do
+        (drive/check "no display: the editor runs in the terminal" (drive/wait-for bare "Xalpha" 20000))
+        (drive/check "…and says why" (drive/wait-for bare "no display" 5000))
+        (drive/send-keys bare "\x18\x03" 300)
+        (drive/check "and quits" (not (nil? (drive/wait-exit bare 5000))))
+        (drive/quit bare 100)))
+    (os/cmd "rm" ["-rf" dir])
+    (drive/done "terminal (-nw) checks")))

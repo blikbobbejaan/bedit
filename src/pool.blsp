@@ -119,6 +119,23 @@ has finished loading."
     (do (require-one 'hexl) ((reflect/eval 'hexl/ed-open-binary) m path root bytes))))
 (sig ed-open-binary (model string any any -> model))
 
+;; check-allow: as above — `sudoedit` stands on this module, so it is reached late, and its
+;; entry points answer a model.
+(check-allow :trusted
+  (defn ed-open-as-root (m spec)
+    "Open the TRAMP sudo path `spec` (`/sudo::/etc/hosts`) as root
+(`sudoedit/ed-sudo-find-file`, which may ask for the password first). Loads `sudoedit` on
+first use."
+    (do (require-one 'sudoedit) ((reflect/eval 'sudoedit/ed-sudo-find-file) m spec))))
+(sig ed-open-as-root (model string -> model))
+
+(check-allow :trusted
+  (defn ed-save-as-root (m i)
+    "Save pool buffer `i`, edited as root, through sudo (`sudoedit/ed-sudo-save`, which may
+ask for the password first). Loads `sudoedit` on first use."
+    (do (require-one 'sudoedit) ((reflect/eval 'sudoedit/ed-sudo-save) m i))))
+(sig ed-save-as-root (model int -> model))
+
 (sig ed-goto-line (buffer int -> buffer))
 (defn ed-goto-line (b n)
   "Move point to the start of (1-based) line `n`, clamped to the buffer's line range."
@@ -476,9 +493,11 @@ fresh buffer backed by it (so Ctrl-S creates it). A relative or `~` path is reso
 to absolute (`path-absolute`) first, so the prompt can stay short/relative while the
 buffer's `:file`, dedup, and project-relative name all key off a canonical path. A
 directory opens in dired (Emacs `find-file` on a directory), a file that is not UTF-8 as
-a hex view (`ed-open-binary`)."
+a hex view (`ed-open-binary`). A TRAMP sudo path — `/sudo::/etc/hosts` — opens the file
+as root (`sudoedit/ed-sudo-find-file`, which may ask for the password first)."
   (cond
     (string/blank? path) (message m "(no file)")
+    (string/starts-with? path "/sudo:") (ed-open-as-root m path)
     (file/dir? (path/absolute path)) (ed-open-dired m (path/absolute path))
     else
       (let (path (path/normalize (path/absolute path)) ; `./` and `..` collapsed: one spelling per file
@@ -693,15 +712,29 @@ steady — dropping it made them blink off and back on each save.
 
 The buffer is first made what its `.editorconfig` asks (`conventions/prepare-for-save`:
 trailing whitespace trimmed, a final newline added) — edits on the buffer, so what is
-written is what is shown."
+written is what is shown.
+
+A buffer edited AS ROOT (`:sudo`, sudoedit.blsp) is written through sudo instead
+(`sudoedit/ed-sudo-save`, which may ask for the password first)."
+  (if (= true (:sudo (ed-buf-at m i)))
+    (ed-save-as-root m i)
+    (ed-save-buf-with m i save-buffer "")))
+(sig ed-save-buf-with (model int any string -> model))
+(defn ed-save-buf-with (m i write note)
+  "[[ed-save-buf-at]]'s save of pool buffer `i` with the file written by `write` — `(write
+buffer)`, answering the buffer stamped and unmodified, or raising (`editor/buffer/save-buffer`
+for a plain file; sudoedit's writer for a file edited as root) — and `note` appended to the
+`saved …` the echo area says. Everything else is the plain save's: the `.editorconfig`
+fix-ups first, the sidecar removed, a hosted slot's process told."
   (let (original (ed-buf-at m i)
-        buf (prepare-for-save original))
+        buf (prepare-for-save original)
+        sudo? (= true (:sudo original)))
     (try
       ;; `save-buffer` answers the buffer stamped with the file's new mtime, so the idle
       ;; beat's change check (`ed-revert-changed-files`) knows text and file agree again
       (let (f (buffer-file buf)
             created? (and (string? f) (not (file/exists? f)))
-            saved (dissoc (save-buffer buf) :disk-warned)
+            saved (dissoc (write buf) :disk-warned)
             m1 (dissoc (ed-set-buf-at m i saved) :status)
             ;; the save's own edits reach a hosted slot's process BEFORE it is told the
             ;; buffer is saved, below — left to the loop tail they would land after the
@@ -709,7 +742,7 @@ written is what is shown."
             m2 (ed-ship-save-edits (if created? (ed-project-files-forget m1 f) m1)
                  i original buf))
         (do
-          (ed-remove-auto-save f)
+          (ed-remove-auto-save f sudo?)
           ;; A HOSTED slot's buffer process owns the buffer's state, and it has to hear about
           ;; the save too. Only the pool copy used to be marked saved: the process went on
           ;; answering "modified", so another frame showed the buffer unsaved and the next
@@ -719,5 +752,48 @@ written is what is shown."
           (let (proc (map/get-in m [:hosted i :proc]))
             (when proc
               (buffer-edit proc (self) (fn (b) (mark-buffer-saved (buffer-stamp-file b))))))
-          (message m2 (str "saved " f))))
-      (catch e (message m (str "save failed: " (error-message e)))))))
+          (message m2 (str "saved " f note))))
+      (catch e
+        (message m
+          (str "save failed: "
+            (error-message e)
+            ;; a file the user may not write: Emacs's answer is TRAMP's sudo
+            (if (and (not sudo?) (includes? (string/lower (error-message e)) "permission denied"))
+              " — M-x sudo-edit to save it as root"
+              "")))))))
+
+;; ---- a save that lands later ----------------------------------------------------
+;; A file written OFF the loop (as root, through sudo — sudoedit.blsp) is saved in two
+;; halves: the buffer made what its `.editorconfig` asks and its text taken now
+;; ([[ed-save-prepare]]), the buffer marked saved when the write has landed
+;; ([[ed-save-landed]]). Until then it stays modified; a write that fails leaves it so.
+
+(sig ed-save-prepare (model int -> any))
+(defn ed-save-prepare (m i)
+  "`[m' buffer]` — pool buffer `i` made what its `.editorconfig` asks before a save
+(`conventions/prepare-for-save`), the edits in slot `i` and shipped to its hosted process,
+and the buffer as it will be written. Nothing is written and nothing is marked saved."
+  (let (original (ed-buf-at m i)
+        prepared (prepare-for-save original))
+    [(ed-ship-save-edits (ed-set-buf-at m i prepared) i original prepared) prepared]))
+
+(sig ed-save-landed (model int any string -> model))
+(defn ed-save-landed (m i rope note)
+  "Pool buffer `i` once a write of its text `rope` has landed: marked saved and stamped with
+its file's new time, its sidecar removed and its hosted process told — when the buffer
+still holds that text. Edited while the write was out, only the baseline moves: the buffer
+stays modified, its newer text unwritten. `note` follows the `saved …` the echo area says."
+  (let (b (ed-buf-at m i)
+        f (buffer-file b)
+        current? (= (buffer-rope b) rope)
+        stamped (dissoc (buffer-stamp-file b) :disk-warned)
+        saved (if current? (mark-buffer-saved stamped) (assoc stamped :saved-rope rope)))
+    (do
+      (when current?
+        (ed-remove-auto-save f (= true (:sudo b)))
+        ;; the process marks the text it holds — the same text, the write's edits having
+        ;; reached it first (a mailbox is FIFO)
+        (let (proc (map/get-in m [:hosted i :proc]))
+          (when proc (buffer-edit proc (self) (fn (pb) (mark-buffer-saved (buffer-stamp-file pb)))))))
+      (message (dissoc (ed-set-buf-at m i saved) :status)
+        (str "saved " f note (if current? "" " (edited since — still modified)"))))))
