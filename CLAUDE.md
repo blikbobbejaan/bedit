@@ -208,12 +208,19 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             failure CARRYING ITS REASON (brood ADR-559) said in the echo area
                             and on *Packages*' status line. An install lands in a staging dir
                             and moves into place only when it verified and enhances this bedit,
-                            so a failed or cancelled one keeps the copy there; an update reloads
-                            the plugin's sources in load order (brood's
-                            `reflect/source-load-order`). A package prompt (M-x package-install,
-                            C-h P) fetches the list itself when it has none, saying so
-                            (`package-prompt`); `package-info` is what C-h P shows. The registry
-                            calls are `*registry*` (tests stub it)
+                            so a failed or cancelled one keeps the copy there; an update RETIRES
+                            the old version first — every global its files defined removed
+                            (`plugin-definitions` by def site, brood's `reflect/undef`), its
+                            dropped themes and M-x commands with them — then reloads the
+                            sources in load order (brood's `reflect/source-load-order`); a
+                            remove retires the same way. What became of each installed package
+                            is kept (`package-status`: loaded / broken / incompatible, with the
+                            reason): startup says every one it did not load in *Messages*
+                            (`load-problems` — a bedit upgrade past a package's range is said,
+                            not dropped), *Packages* and C-h P mark it. A package prompt (M-x
+                            package-install, C-h P) fetches the list itself when it has none,
+                            saying so (`package-prompt`); `package-info` is what C-h P shows.
+                            The registry calls are `*registry*` (tests stub it)
 src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a function's *Help*
                             page: the whole docstring, keys in force, arguments, signature,
                             module and source line — brood's reflect, seeing through contract
@@ -271,7 +278,8 @@ src/passwd.blsp             a password a program asks for (Emacs read-passwd + c
                             password watch): `ed-read-passwd`, a MASKED minibuffer read (`*`s
                             via `model/mb-shown-text`, no history, no savehist, no embark, no
                             macro recording; slow-turn tags of typed keys are `:text`), and
-                            `password-prompt?`, comint's prompt regexp — the fallback for the
+                            `password-prompt?`, comint's prompt regexp (case-folded `(?i)` and
+                            `[[:alpha:]]`, brood ADR-573) — the fallback for the
                             shell's pipes and for a raw-mode program the pty cannot read
 src/saveplace.blsp          a file reopens where it was left (Emacs save-place, `:save-place`): its
                             point kept when its buffer is killed or the editor quits
@@ -662,7 +670,11 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             (the worker asks the pty on each render — echo off in line
                             mode, `os/pty-password?`, brood ADR-570 — else the prompt's
                             text) is read masked and sent, never inserted or remembered;
-                            M-x send-invisible reads one by hand. The mouse reaches a program
+                            M-x send-invisible reads one by hand. A prompt that arrived while
+                            the terminal was not shown waits for the first TYPED key there,
+                            which opens the read as its first character (input's
+                            `term-secret-overlay`), never reaching the buffer or a macro; text
+                            already typed after the prompt moves into the read. The mouse reaches a program
                             that asked for it; one that did not gets a middle click as
                             PRIMARY pasted in (Emacs's term-mouse-paste); the program's
                             cursor shape and visibility
