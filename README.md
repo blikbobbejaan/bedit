@@ -67,6 +67,12 @@ references, hover, rename, and format into any server-backed buffer. Git is
 integrated as a diff-hl change gutter plus a Magit-style status / diff / log /
 commit porcelain (`C-x g`).
 
+It runs in a terminal too: `bedit -nw` (or `--no-window`), and by itself when
+there is no display to open a window on — over ssh, on a console — with the
+mouse, bracketed paste, and kills reaching your clipboard through the terminal
+(OSC 52). A root-owned file opens as root with `C-x C-f /sudo::/etc/hosts` or
+`M-x sudo-edit`; the password is asked for, masked, and never kept.
+
 The editor is also remotely hostable: `--serve` / `--attach` give the Emacs
 daemon/emacsclient model, and `--serve --shared` turns it into real multiplayer
 editing — one document, everyone their own caret, live named presence,

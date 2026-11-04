@@ -16,16 +16,34 @@ nothing; the knowledge of \"changed since we last agreed\" lives in `std/editor/
 
 (def *auto-save-interval-ms* 30000)
 
-(defn ed-auto-save-path (path)
-  "The auto-save sidecar path: `#basename#` in the same directory as `path`."
-  (path/join (path/dirname path) (str "#" (path/basename path) "#")))
+(defn ed-private-auto-save-dir ()
+  "Where the sidecars of files edited AS ROOT go (`sudo/…`, [[ed-auto-save-path]]): the
+editor's own state folder, `…/bedit/state/auto-save` — never beside the file, where only
+root could write one and anyone who can read the directory would see the name."
+  (path/join (config/config-dir) "state" "auto-save"))
 
-(defn ed-remove-auto-save (path)
-  "Delete `path`'s `#basename#` sidecar, if there is one — what a successful write of the
-file does (`C-x C-s`, `C-x C-w`), since the sidecar's text is now on disk. A nil `path` (a
-fileless buffer) is a no-op; a sidecar that cannot be removed is logged, never raised —
-the save itself succeeded."
-  (let (sidecar (when path (ed-auto-save-path path)))
+(defn ed-auto-save-path (path &optional (sudo? false))
+  "The auto-save sidecar path: `#basename#` in the same directory as `path` — or, for a file
+edited as root (`sudo?`, a buffer's `:sudo`), `#!etc!hosts#` in [[ed-private-auto-save-dir]],
+as Emacs puts a TRAMP file's: the whole path with `/` as `!`, owner-only like every sidecar.
+
+    (autosave/ed-auto-save-path \"/home/me/notes.txt\")   ;=> \"/home/me/#notes.txt#\"
+    (path/basename (autosave/ed-auto-save-path \"/etc/hosts\" true))   ;=> \"#!etc!hosts#\""
+  (if sudo?
+    (path/join (ed-private-auto-save-dir) (str "#" (string/replace path "/" "!") "#"))
+    (path/join (path/dirname path) (str "#" (path/basename path) "#"))))
+
+(defn ed-buffer-auto-save-path (buf)
+  "The sidecar of file buffer `buf` ([[ed-auto-save-path]]), private when it is edited as
+root; nil for a buffer with no file."
+  (let (file (buffer-file buf)) (when file (ed-auto-save-path file (= true (:sudo buf))))))
+
+(defn ed-remove-auto-save (path &optional (sudo? false))
+  "Delete `path`'s `#basename#` sidecar (the private one when `sudo?`), if there is one — what
+a successful write of the file does (`C-x C-s`, `C-x C-w`), since the sidecar's text is now
+on disk. A nil `path` (a fileless buffer) is a no-op; a sidecar that cannot be removed is
+logged, never raised — the save itself succeeded."
+  (let (sidecar (when path (ed-auto-save-path path sudo?)))
     (when (and sidecar (file/exists? sidecar))
       (try
         (file/rm sidecar)
@@ -34,29 +52,39 @@ the save itself succeeded."
 (defn ed-auto-save-due (m)
   "What this auto-save round has to write: `{path rope}` for every modified file buffer —
 the `:due` ones, whose rope is not the one last written for that path (`:auto-saved`, the
-previous round's whole map), and the `:all` map the round leaves behind. A buffer nobody
-touched since the last round costs a rope-handle compare, not a rewrite of its file; one
-saved since (unmodified now) drops out, so its next edit is written again."
+previous round's whole map), and the `:all` map the round leaves behind — and `:sudo`, the
+set of those paths edited as root, whose sidecars are private ([[ed-auto-save-path]]). A
+buffer nobody touched since the last round costs a rope-handle compare, not a rewrite of
+its file; one saved since (unmodified now) drops out, so its next edit is written again."
   (let (written (or (:auto-saved m) {}))
     (fold (:buffers m)
-      {:due {} :all {}}
+      {:due {} :all {} :sudo #{}}
       (fn (acc buf)
         (let (path (buffer-file buf))
           (if (and path (buffer-modified? buf))
             (let (rope (buffer-rope buf)
-                  with-all (map/assoc-in acc [:all path] rope))
+                  with-all (map/assoc-in (if (= true (:sudo buf))
+                                           (assoc acc :sudo (conj (:sudo acc) path))
+                                           acc)
+                             [:all path]
+                             rope))
               (if (= (get written path) rope) with-all (map/assoc-in with-all [:due path] rope)))
             acc))))))
 
-(defn ed-auto-save-write (due)
-  "Write each `{path rope}` in `due` to the path's `#basename#` sidecar, the text built from
-the rope here — in the writer process `ed-auto-save!` spawns, so neither the text nor the
+(defn ed-auto-save-write (due &optional (sudo-paths #{}))
+  "Write each `{path rope}` in `due` to the path's `#basename#` sidecar — the private one for
+a path in `sudo-paths` ([[ed-auto-save-path]], its folder made first) — the text built from
+the rope here, in the writer process `ed-auto-save!` spawns, so neither the text nor the
 disk is paid for on the editor's loop. A sidecar that cannot be written is logged and the
 rest still are. Returns nil."
   (doseq (entry due)
-    (let ([path rope] entry)
+    (let ([path rope] entry
+          sudo? (contains? sudo-paths path)
+          sidecar (ed-auto-save-path path sudo?))
       (try
-        (file/spit-private (ed-auto-save-path path) (text/->string rope))
+        (do
+          (when sudo? (file/mkdir (path/dirname sidecar)))
+          (file/spit-private sidecar (text/->string rope)))
         (catch e (log/warn (str "auto-save of " path " failed: " (error-message e))))))))
 
 (defn ed-auto-save! (m)
@@ -69,9 +97,9 @@ not sent) and [[ed-auto-save-write]] builds each text there. Returns the model w
         last (or (:auto-saved-at m) 0))
     (if (< (- now-ms last) *auto-save-interval-ms*)
       m
-      (let ({:keys [due all]} (ed-auto-save-due m))
+      (let ({:keys [due all sudo]} (ed-auto-save-due m))
         (do
-          (when (not (empty? due)) (spawn (fn () (ed-auto-save-write due))))
+          (when (not (empty? due)) (spawn (fn () (ed-auto-save-write due sudo))))
           (assoc m :auto-saved-at now-ms :auto-saved all))))))
 
 (defn ed-auto-save-now! (m)
@@ -103,20 +131,21 @@ you stopped typing stayed unwritten until the next key."
 ;; The sidecars are worth something only if they come back: a file visited with a sidecar
 ;; newer than itself says so, and `recover/cmd-recover-this-file` puts the text back.
 
-(defn ed-auto-save-newer? (path)
-  "Whether `path` has an auto-save sidecar written after the file was — unsaved text the
-editor (or one that crashed) left behind. A sidecar of a file that no longer exists counts."
-  (let (sidecar-mtime (file/mtime (ed-auto-save-path path))
+(defn ed-auto-save-newer? (path &optional (sudo? false))
+  "Whether `path` has an auto-save sidecar (the private one when `sudo?`) written after the
+file was — unsaved text the editor (or one that crashed) left behind. A sidecar of a file
+that no longer exists counts."
+  (let (sidecar-mtime (file/mtime (ed-auto-save-path path sudo?))
         file-mtime (file/mtime path))
     (and (not (nil? sidecar-mtime)) (or (nil? file-mtime) (> sidecar-mtime file-mtime)))))
 
-(defn ed-recovery-note (path)
-  "What visiting `path` should say when it has newer auto-save data
+(defn ed-recovery-note (path &optional (sudo? false))
+  "What visiting `path` (as root when `sudo?`) should say when it has newer auto-save data
 ([[ed-auto-save-newer?]]), or nil. Emacs's \"has auto save data; consider M-x
 recover-this-file\".
 
     (autosave/ed-recovery-note \"/nowhere/at/all\")   ;=> nil"
-  (when (ed-auto-save-newer? path)
+  (when (ed-auto-save-newer? path sudo?)
     (str (path/basename path) " has unsaved auto-save data — M-x recover-this-file to restore it")))
 
 (def *follow-points-max-chars* 400000) ; past this, a re-read keeps the character offset
@@ -195,7 +224,9 @@ report."
 (def *auto-revert-max-per-beat* 8)
 
 (defn- ed-file-buffer? (m i)
-  (not (nil? (buffer-file (ed-buf-at m i)))))
+  ;; a file edited as root (sudoedit) is left alone, as Emacs's auto-revert leaves a remote
+  ;; file: re-reading it needs sudo, and a password nobody asked for
+  (let (b (ed-buf-at m i)) (and (not (nil? (buffer-file b))) (not (= true (:sudo b))))))
 
 (defn ed-auto-revert-candidates (m now-ms)
   "`[indices model']`: the pool indices of the file buffers this beat asks the disk about, at

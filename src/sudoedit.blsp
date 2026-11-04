@@ -1,0 +1,206 @@
+(defmodule sudoedit
+  "Editing a file as root — Emacs's TRAMP `/sudo::` method and `sudo-edit` — over brood's
+`sudo` (ADR-588), which reads and writes a file through `sudo` and keeps no password.
+
+  - `C-x C-f /sudo::/etc/hosts` opens the file as root ([[ed-sudo-find-file]]); `/sudo:USER@:PATH`
+    as another user. Only this machine: a remote host is refused, with the reason.
+  - `M-x sudo-edit` reopens the current file as root, its unsaved text kept ([[cmd-sudo-edit]]);
+    in a buffer with no file it prompts for one, as Emacs's does.
+  - The buffer REMEMBERS it is a sudo buffer (`:sudo`, `:sudo-user`): C-x C-s writes it
+    through sudo, in place, keeping the file's owner and mode (`pool/ed-save-buf-at` hands it
+    here), and the mode line says `# root` on it ([[sudo-segment]]).
+  - A password, when sudo wants one, is read with the masked prompt (`passwd/ed-read-passwd`)
+    and handed to sudo for one validation — never kept: sudo's own timestamp lets the next
+    open or save go without asking, as a `sudo` in a shell does.
+  - Its auto-save sidecar is PRIVATE (`autosave/ed-auto-save-path`): the editor's state folder,
+    never beside a root-owned file. Auto-revert leaves it alone, as Emacs's leaves a remote file.
+
+Named to dodge std's `sudo`, as formatter dodges `format`."
+  (:use editor/buffer) ; buffer-file / buffer-from-file / buffer-text / replace-region / mark-buffer-saved
+  (:use model) ; message / ed-buf-at / ed-current-buf / ed-buffer-index-by-file
+  (:use pool) ; ed-open-buffer / ed-kill-buffer-at / ed-save-buf-with / ed-find-file-prompt / ed-default-dir
+  (:use passwd) ; ed-read-passwd — the masked read
+  (:use autosave) ; ed-recovery-note — the private sidecar's
+  (:use projects) ; file-display-name
+  (:use theme) ; *red*
+  (:use interactive)) ; defcommand
+
+;; ---- the path: TRAMP's sudo method ------------------------------------------------
+
+(defn parse-sudo-path (spec)
+  "The parts of a TRAMP sudo path `spec` — `/sudo::PATH`, `/sudo:USER@:PATH`,
+`/sudo:USER@localhost:PATH` — as `{:user :host :path}` (`:user` \"root\" when none is named),
+or nil when `spec` is not one.
+
+    (sudoedit/parse-sudo-path \"/sudo::/etc/hosts\")   ;=> {:user \"root\" :host \"\" :path \"/etc/hosts\"}
+    (:user (sudoedit/parse-sudo-path \"/sudo:www@:/srv/site.conf\"))   ;=> \"www\"
+    (sudoedit/parse-sudo-path \"/etc/hosts\")   ;=> nil"
+  (when (string/starts-with? spec "/sudo:")
+    (let (rest (string/substring spec 6 (string/length spec))
+          colon (index-of rest ":"))
+      (when (>= colon 0)
+        (let (method-part (string/substring rest 0 colon)
+              at (index-of method-part "@")
+              user (if (>= at 0) (string/substring method-part 0 at) "")
+              host (if (>= at 0)
+                     (string/substring method-part (inc at) (string/length method-part))
+                     method-part))
+          {:user (if (= user "") "root" user)
+           :host host
+           :path (string/substring rest (inc colon) (string/length rest))})))))
+
+(defn local-host? (host)
+  "Whether `host` (a TRAMP path's host part) names THIS machine: empty, `localhost`, or this
+machine's name. A remote host would need TRAMP's ssh, which bedit does not have.
+
+    (sudoedit/local-host? \"\")   ;=> true
+    (sudoedit/local-host? \"elsewhere.example\")   ;=> false"
+  (or (= host "") (= host "localhost") (= host (os/hostname))))
+
+(defn sudo-spec (path &optional (user "root"))
+  "The TRAMP path that opens `path` as `user`: `/sudo::PATH` for root.
+
+    (sudoedit/sudo-spec \"/etc/hosts\")   ;=> \"/sudo::/etc/hosts\"
+    (sudoedit/sudo-spec \"/srv/a\" \"www\")   ;=> \"/sudo:www@:/srv/a\""
+  (if (= user "root") (str "/sudo::" path) (str "/sudo:" user "@:" path)))
+
+;; ---- asking for the password ------------------------------------------------------
+
+(defn- password-prompt ()
+  ;; sudo asks for the INVOKING user's password, whoever the file is opened as
+  (str "[sudo] password for " (or (os/env "USER") "you") ": "))
+
+(defn- with-password (m user then)
+  "`(then m password)` — `password` nil when sudo needs none now (`sudo/password-required?`,
+which never prompts), else read first with the masked prompt (`passwd/ed-read-passwd`), so
+`then` runs when it is answered. The password goes to `then` and nowhere else."
+  (if (sudo/password-required? {:user user})
+    (ed-read-passwd m (password-prompt) then)
+    (then m nil)))
+
+;; ---- opening ----------------------------------------------------------------------
+
+(defn sudo-buffer (path user text)
+  "A buffer visiting `path` as `user` (root unless named): `text` its contents as read
+through sudo — nil for a file that does not exist yet — and `:sudo` set, so a save writes it
+through sudo.
+
+    (:sudo (sudoedit/sudo-buffer \"/etc/hosts\" \"root\" \"127.0.0.1 localhost\\n\"))   ;=> true"
+  (assoc (if (nil? text) (make-buffer "" (path/basename path) path) (buffer-from-file path text))
+    :sudo true
+    :sudo-user user))
+
+(defn- carry-text (buf old)
+  "`buf` holding `old`'s unsaved text when `old` is modified — what `sudo-edit` keeps of the
+buffer it replaces — at `old`'s point. One edit over the file's text, so the buffer is
+modified and C-/ goes back to the file's."
+  (if (and old (buffer-modified? old))
+    (let (text (buffer-text old))
+      (goto-char (replace-region buf 0 (buffer-length buf) text)
+        (math/min (buffer-point old) (string/length text))))
+    (if old (goto-char buf (math/min (buffer-point old) (buffer-length buf))) buf)))
+
+(defn ed-sudo-open (m path user password then)
+  "Read `path` as `user` through sudo (`password` the one just typed, or nil) and open it in
+a sudo buffer ([[sudo-buffer]]) — replacing a buffer already visiting `path`, whose unsaved
+text it keeps — then `(then m)`. A refusal (a wrong password) is said and opens nothing."
+  (let (text (sudo/read path {:user user :password password}))
+    (if (failure? text)
+      (message m (str "sudo: " (error-message text)))
+      (let (old-index (ed-buffer-index-by-file m path)
+            old (when old-index (ed-buf-at m old-index))
+            buf (assoc (carry-text (sudo-buffer path user text) old)
+                  :name (file-display-name path (:project-root m)))
+            opened (ed-open-buffer m buf)
+            ;; the buffer it replaces goes: one buffer per file
+            replaced (if old-index (ed-kill-buffer-at opened old-index) opened))
+        (then (message replaced
+                (or (ed-recovery-note path true)
+                  (str (if (nil? text) "new file " "opened ") path " as " user))))))))
+
+;; check-allow: `then` is the caller's continuation (`identity`, or recover-session's), whose
+;; result the checker cannot see; every caller hands one that answers a model
+(check-allow :trusted
+  (defn ed-sudo-find-file (m spec &optional (then identity))
+    "Open the TRAMP sudo path `spec` (`/sudo::/etc/hosts`): the file as root (or the user it
+names), asking for the password first when sudo wants one, then `(then m)` on the model with
+it open. A buffer already visiting the file as root is selected; one visiting it plainly is
+replaced ([[ed-sudo-open]]). A remote host, or a spec that is not one, is said."
+    (let (parts (parse-sudo-path spec))
+      (cond
+        (nil? parts) (message m (str "not a sudo path: " spec " (/sudo::PATH)"))
+        (not (local-host? (:host parts)))
+          (message m
+            (str "sudo: only this machine (/sudo::PATH) — " (:host parts) " would need ssh"))
+        (string/blank? (:path parts)) (message m "sudo: which file? (/sudo::PATH)")
+        else
+          (let (path (path/normalize (path/absolute (:path parts)))
+                user (:user parts)
+                index (ed-buffer-index-by-file m path))
+            (if (and index
+                  (= true (:sudo (ed-buf-at m index)))
+                  (= user (:sudo-user (ed-buf-at m index))))
+              (then (ed-select m index))
+              (with-password m user (fn (mm password) (ed-sudo-open mm path user password then)))))))))
+(sig ed-sudo-find-file (model string &optional any -> model))
+
+;; ---- saving -----------------------------------------------------------------------
+
+(defn sudo-writer (user password)
+  "A writer for `pool/ed-save-buf-with`: the buffer's text written to its file as `user`
+through sudo, with its line endings and byte-order mark, then the buffer stamped and marked
+saved. Raises with sudo's reason when it refuses."
+  (fn (buf)
+    (let (written (sudo/write (buffer-file buf)
+                    (file-text-encode (buffer-text buf) (buffer-eol buf) (buffer-bom? buf))
+                    {:user user :password password}))
+      (if (failure? written)
+        (error (error-message written))
+        (mark-buffer-saved (buffer-stamp-file buf))))))
+
+(defn ed-sudo-save (m i)
+  "Save pool buffer `i`, a sudo buffer, through sudo — asking for the password first when
+sudo wants one. The buffer is found again by its file when the password is answered, since
+the pool may have changed meanwhile."
+  (let (b (ed-buf-at m i)
+        path (buffer-file b)
+        user (or (:sudo-user b) "root"))
+    (with-password m
+      user
+      (fn (mm password)
+        (let (index (ed-buffer-index-by-file mm path))
+          (if (nil? index)
+            (message mm (str "save: " path " is no longer open"))
+            (ed-save-buf-with mm index (sudo-writer user password) (str " as " user))))))))
+
+;; ---- the command ------------------------------------------------------------------
+
+(defcommand cmd-sudo-edit
+  (m key)
+  "Reopen the current file as root (Emacs `sudo-edit`): read through sudo — the password
+asked for when sudo wants one, and never kept — its unsaved text carried over, and saved
+through sudo from then on. In a buffer with no file, prompt for one, starting at `/sudo::`
+and the buffer's directory. A buffer already edited as root says so."
+  (let (b (ed-current-buf m)
+        path (buffer-file b))
+    (cond
+      (= true (:sudo b)) (message m (str (buffer-name b) " is already edited as " (:sudo-user b)))
+      (nil? path)
+        (assoc m :minibuffer (ed-find-file-prompt (sudo-spec (str (ed-default-dir m) "/")) []))
+      else (ed-sudo-find-file m (sudo-spec path)))))
+
+;; ---- the mode line ----------------------------------------------------------------
+
+(defn sudo-segment (m pane buf)
+  "The `# root` chip on a sudo buffer's mode line — Emacs shows the TRAMP prefix there — red,
+as a reminder that a save writes as root; nil on any other buffer."
+  (when (= true (:sudo buf))
+    (statusbar/seg :sudo
+      (str "# " (or (:sudo-user buf) "root"))
+      {:sep "  —  "
+       :face {:fg *red* :bold true}
+       :tooltip (fn (mm)
+                  [(str "editing " (buffer-file buf) " as " (or (:sudo-user buf) "root"))
+                    "C-x C-s writes it through sudo; the password is never kept"])})))
+
+(statusbar/register-modeline-segment :sudo 30 'sudoedit/sudo-segment)

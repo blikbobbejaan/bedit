@@ -88,12 +88,20 @@ feature work — surfacing it is half the point of this project.
 ## Layout
 
 ```
-src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop
+src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop;
+                            `-nw` / `--no-window` runs it in the TERMINAL over brood's terminal
+                            display (brood ADR-586/587), and so does no display at all (no
+                            $DISPLAY / $WAYLAND_DISPLAY, ssh), with a one-line note
 src/startup.blsp            the ONE startup path the window and `--serve` share: the runtime's
                             (grammars, slow-turn log, savehist, colours + `:theme`, packages), a
                             model's (init.blsp's model settings, recentf, save-place), a window's
                             (font, inset, text settings, window mode — an attached client's from
-                            ITS machine's init file). A `:font` that is not installed is SAID
+                            ITS machine's init file) — and the FRONTEND: `choose-frontend` (a
+                            window, or the terminal for `-nw` / no display), and the clipboard a
+                            terminal session reaches (the desktop's, else the terminal's, OSC 52).
+                            A terminal model has `:terminal` and no `:gui`: the view draws its cell
+                            fallbacks, a zoom and a second frame are refused, a bracketed paste
+                            arrives whole as `[:paste text]` (input's `ed-paste`, Emacs's xterm-paste). A `:font` that is not installed is SAID
                             (`font-warning`, from `gui/font-info`'s `:not-found`, brood ADR-442):
                             the echo area and *Messages* at startup, M-x reload-config, a served
                             window's console — never a silent DejaVu
@@ -141,7 +149,18 @@ src/scroll.blsp             keeping point on screen: the scroll-margin clamp, ho
 src/autosave.blsp           `#file#` auto-save sidecars (owner-only, on the idle beat and a timer of
                             their own) + auto-revert of files changed on disk (one undoable edit, std's
                             `revert-buffer`); the note a visit
-                            shows when a sidecar is newer than its file
+                            shows when a sidecar is newer than its file. A file edited as root
+                            (sudoedit) keeps its sidecar PRIVATE — `state/auto-save/#!etc!hosts#`,
+                            never beside the file — and auto-revert leaves it alone
+src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and `sudo-edit`) over brood's
+                            `sudo` (ADR-588): `C-x C-f /sudo::/etc/hosts` (or `/sudo:USER@:PATH`, this
+                            machine only), `M-x sudo-edit` (the current file, its unsaved text kept),
+                            `C-x C-w /sudo::PATH`. The buffer remembers (`:sudo`, `:sudo-user`, carried
+                            to other frames and a restarted loop by `hosted-meta`): C-x C-s writes it
+                            through sudo in place (`pool/ed-save-buf-with`), the mode line says
+                            `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
+                            handed to sudo once and kept nowhere — sudo's own timestamp serves the
+                            next save. Named to dodge std's `sudo`
 src/recover.blsp            M-x recover-this-file / recover-session: a sidecar's text put back as one
                             undoable edit (Emacs's), from the open and recent files
 src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `supervise`): a loop that
@@ -948,7 +967,8 @@ tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may onl
                             a new function that adds a finding declares its contract instead
 tools/drive-*.blsp          live drivers: run the real editor over a pty (std/vt reads what it
                             paints) or its own ui-run loop, and assert — the wiring the model
-                            tests can't see (`make drive`, tools/README.md)
+                            tests can't see (`make drive`, tools/README.md); `term-main.blsp` runs
+                            the REAL `main` with $BEDIT_DRIVE_ARGS, which `drive-nw` drives in -nw
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")

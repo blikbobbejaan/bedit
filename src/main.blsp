@@ -56,6 +56,7 @@ saves; C-x C-c / Esc / the window close button quits."
   (:use treewarm) ; a large tree-sitter buffer's parse, warmed off the loop
   (:use autosave) ; `#file#` sidecars + auto-revert
   (:use recover) ; M-x recover-this-file / recover-session — the sidecars put back
+  (:use sudoedit) ; /sudo::PATH and M-x sudo-edit — a file edited as root, its mode-line chip
   (:use lifeline) ; the loop under a supervisor: a dead loop auto-saves and restarts
   (:use editor/buffer-registry :only [registry-entries]) ; a restarted loop finds its buffers
   (:use lsp-commands) ; LSP autostart / text push / signature, and the `:lsp-…` events
@@ -150,37 +151,42 @@ cannot be read; nil when there is none. The file is read once."
   "The launch `file` the window could not start on, opened now there is a model: `:ask` —
 too large to read without asking (`pool/ed-visit-file`); `{:bytes}` — a binary, as a hex
 view; `{:error}` — why it could not be read, said. nil: nothing pending."
-  (let (path (path/absolute file))
-    (cond
-      (nil? pending) m
-      (= pending :ask) (pool/ed-visit-file m path)
-      (:bytes pending) (pool/ed-open-binary m path (:project-root m) (:bytes pending))
-      else (message m (str "open failed: " (error-message (:error pending)))))))
+  ;; nothing pending when there is no file (a scratch session): `path/absolute` of nil is a
+  ;; contract error under `nest run`, so the path is made only when there is one to open
+  (cond
+    (nil? pending) m
+    (= pending :ask) (pool/ed-visit-file m (path/absolute file))
+    (:bytes pending) (pool/ed-open-binary m (path/absolute file) (:project-root m) (:bytes pending))
+    else (message m (str "open failed: " (error-message (:error pending))))))
 
-(defn- live-model (buf project disp cfg)
-  "The model the live window starts from: `startup/prepare-model` (init.blsp's model-level
+(defn- live-model (buf project disp cfg frontend)
+  "The model the live editor starts from: `startup/prepare-model` (init.blsp's model-level
 settings and the live flags a served session shares — recentf, save-place) over the flags
-only a LOCAL window has, which pure-model tests (via `ed-init`) omit. The buffer conventions
-are set before `ed-init` stamps the launch buffer (`startup/prepare-buffer-settings`)."
+only a LOCAL editor has, which pure-model tests (via `ed-init`) omit. The buffer conventions
+are set before `ed-init` stamps the launch buffer (`startup/prepare-buffer-settings`).
+`frontend` is `:window` or `:terminal` ([[run-window]])."
   (startup/prepare-buffer-settings cfg)
   (startup/prepare-model
-    (assoc (ed-init buf)
-      :project-root project
-      ;; mirror kills/copies to the OS clipboard and yank from it (model/ed-clipboard-write
-      ;; + ed-clipboard-read). On only for the live editor — pure model tests build via
-      ;; `ed-init` without it, so they never touch the process-global OS clipboard (which
-      ;; would make them order-dependent); a served session has its CLIENT's instead
-      :os-clipboard true
-      ;; the kill ring every frame shares (model/ed-start-kill-agent) — a frame inherits the
-      ;; pid, so a kill in one window is yankable in all of them
-      :kill-agent (ed-start-kill-agent)
-      ;; the native GUI frontend is active (main always runs `gui-display`), so the
-      ;; view may use sub-cell `frect` rendering — rounded floating cards, etc. Pure
-      ;; tests / a `editor/ui/*term-display*` run build via `ed-init` without it, so they get
-      ;; the cell-quantised fallback (a plain `rect`) and stay frontend-agnostic.
-      :gui true
-      ;; the window id, for what asks the window itself (M-x latency)
-      :window (:window disp))
+    (merge
+      (assoc (ed-init buf)
+        :project-root project
+        ;; mirror kills/copies to the OS clipboard and yank from it (model/ed-clipboard-write
+        ;; + ed-clipboard-read). On only for the live editor — pure model tests build via
+        ;; `ed-init` without it, so they never touch the process-global OS clipboard (which
+        ;; would make them order-dependent); a served session has its CLIENT's instead. In
+        ;; the terminal it is the one [[run-loop]] binds: the desktop's, or the terminal's
+        :os-clipboard true
+        ;; the kill ring every frame shares (model/ed-start-kill-agent) — a frame inherits the
+        ;; pid, so a kill in one window is yankable in all of them
+        :kill-agent (ed-start-kill-agent))
+      (if (= frontend :terminal)
+        ;; the terminal (`bedit -nw`, or no display): no `:gui`, so the view draws its
+        ;; cell-quantised fallbacks (a plain `rect`, not a sub-cell `frect`), and no window
+        ;; for what asks one — and what only a window can do (a second frame) says so
+        {:terminal true}
+        ;; the native GUI frontend: the view may use sub-cell `frect` rendering — rounded
+        ;; floating cards, etc.; the window id, for what asks the window itself (M-x latency)
+        {:gui true :window (:window disp)}))
     cfg))
 
 (defn- start-editor-logging ()
@@ -204,7 +210,7 @@ looking at (src/appearance.blsp) instead of a guess."
    :height (:height (startup/window-font cfg))
    :line-height (config/setting cfg :line-height)})
 
-(defn- open-window (cfg)
+(defn- open-window (cfg frontend)
   "The native window (a {:enter :leave :size :draw :poll :window} map), set up from `cfg`.
 `:app-id` is how the desktop identifies it as *this* app — without it the window matches no
 installed .desktop entry and GNOME paints its generic fallback icon (config/*app-id*,
@@ -218,13 +224,23 @@ that opened it.
 Returns `[disp warnings]`: the window, and what its setup has to say — the init file's `:font`
 not installed (`startup/configure-window`), its `:theme` not existing — for [[run-loop]] to log
 into *Messages* once the logger runs (a warning logged here, before it, went to stderr) and
-for the first loop's echo area."
-  (let (disp (gui-display (assoc (config/window-options cfg) :title *app-name*))
-        font-warning (startup/configure-window cfg disp)
-        ;; the colours over the window's own background; init.blsp's `:theme` names one
-        ;; that may not exist
-        theme-warning (startup/apply-look cfg true))
-    [disp (seq/reject [font-warning theme-warning] nil?)]))
+for the first loop's echo area.
+
+In the TERMINAL (`frontend` `:terminal`) it is brood's terminal display
+(`editor/ui/*term-display*`, brood ADR-586) and only the colours are set up: a terminal's
+font is the terminal's."
+  (if (= frontend :terminal)
+    (let (theme-warning (startup/apply-look cfg false))
+      (do
+        ;; the terminal's default face follows the palette, as a window's background does
+        (theme/use-terminal-look!)
+        [editor/ui/*term-display* (seq/reject [theme-warning] nil?)]))
+    (let (disp (gui-display (assoc (config/window-options cfg) :title *app-name*))
+          font-warning (startup/configure-window cfg disp)
+          ;; the colours over the window's own background; init.blsp's `:theme` names one
+          ;; that may not exist
+          theme-warning (startup/apply-look cfg true))
+      [disp (seq/reject [font-warning theme-warning] nil?)])))
 
 (defn- run-loop (supervisor m disp warnings)
   "Run `ui-run` on `m` in `disp`, this process being the editor: the logger routed here,
@@ -242,16 +258,33 @@ its slots to the same processes (docs/frames-plan.md). Tests/headless models nev
     ;; the loop must keep answering: a native call that blocks it is reported (brood ADR-517)
     (slowlog/responsive!)
     (lifeline/announce! supervisor (:window disp) (:buffer-reg m) (frames/frames-live-of m))
-    (ui-run m ed-view ed-update disp)))
+    (if (:terminal m)
+      ;; a terminal's kills reach the desktop's clipboard when there is one, else the
+      ;; terminal's (OSC 52) — over ssh, the machine the user sits at
+      (let (clipboard (startup/terminal-clipboard-bindings (editor/ui/display-available?)))
+        ;; and the runtime has no window of its own: what reaches for one (a theme's font,
+        ;; `theme/gui-only`) is skipped rather than starting a GUI thread with no display
+        (binding (*windowless-runtime* true
+                  *clipboard-writer* (:writer clipboard)
+                  *primary-writer* (:primary-writer clipboard)
+                  *clipboard-reader* (:reader clipboard)
+                  *primary-reader* (:primary-reader clipboard))
+          (ui-run m ed-view ed-update disp)))
+      (ui-run m ed-view ed-update disp))))
 
-(defn- start-loop (supervisor init file directory? project buffer pending)
-  "The first editor loop: open the window on the launch `buffer` (a directory argument —
-`bedit .` — shows its dired listing over the scratch buffer; a launch file that is large,
-binary or unreadable is `pending`, opened once there is a model — [[open-pending]]), then
-[[run-loop]]. `init` is the init file as read for this start (`startup/read-init`)."
+(defn- start-loop (supervisor init launch buffer pending)
+  "The first editor loop: open the window (or take the terminal) on the launch `buffer` (a
+directory argument — `bedit .` — shows its dired listing over the scratch buffer; a launch
+file that is large, binary or unreadable is `pending`, opened once there is a model —
+[[open-pending]]), then [[run-loop]]. `init` is the init file as read for this start
+(`startup/read-init`); `launch` the [[run-window]] facts: `:file`, `:directory?`,
+`:project`, `:frontend` and the `:frontend-note` to say."
   (let (cfg (:config init)
-        [disp warnings] (open-window cfg)
-        started (live-model buffer project disp cfg)
+        file (:file launch)
+        directory? (:directory? launch)
+        project (:project launch)
+        [disp warnings] (open-window cfg (:frontend launch))
+        started (live-model buffer project disp cfg (:frontend launch))
         ;; dired auto-loads on the qualified call
         listed (if directory? (dired/ed-show-dired started (path/absolute file)) started)
         recovery (when (and file (not directory?) (nil? pending))
@@ -259,7 +292,7 @@ binary or unreadable is `pending`, opened once there is a model — [[open-pendi
         ;; an init file that does not read leaves every setting at its default, and a font
         ;; that is not installed leaves the bundled one: said in the echo area at once, not
         ;; only among the *Messages* lines
-        note (string/join (seq/reject (append [(:note init)]
+        note (string/join (seq/reject (append [(:frontend-note launch) (:note init)]
                                         warnings
                                         [recovery (solong/so-long-note buffer)])
                             nil?)
@@ -286,7 +319,8 @@ echo area saying what happened. Its layout, minibuffer and transient state are g
         entries (registry-entries registry)
         file-entry (seq/find (if (vector? entries) entries []) (fn (e) (:file (or (:meta e) {}))))
         show (if file-entry (:name file-entry) "*scratch*")
-        [disp warnings] (open-window cfg)
+        ;; the dead loop's frontend: a terminal session restarts in the terminal
+        [disp warnings] (open-window cfg (if (:terminal (:live state)) :terminal :window))
         seeded (frames/frames-seed-model registry show (:live state))
         m (config/apply-to-model (assoc (dissoc seeded :frame?) :window (:window disp)) cfg))
     (run-loop supervisor
@@ -307,8 +341,9 @@ whether it is being restarted — the one record a crash leaves outside the wind
                (if (:restarting? death) " — restarting" " — not restarting")))
     (do (io/puts line :to (io/stderr-port)) (log/warn line))))
 
-(defn- run-window (file)
-  "Open the local window on `file` (nil for a scratch session) and run the editor loop under
+(defn- run-window (file frontend frontend-note)
+  "Open the local window on `file` (nil for a scratch session) — or, `frontend` `:terminal`,
+take the terminal, saying `frontend-note` in the echo area — and run the editor loop under
 `lifeline/supervise`: a loop that dies has its unsaved buffers auto-saved and is restarted
 over the same buffers. Returns when the editor quits."
   (let (init (startup/read-init) ; ~/.config/bedit/init.blsp (created on first launch)
@@ -324,7 +359,14 @@ over the same buffers. Returns when the editor quits."
         [buffer pending] (launch-buffer file directory? project cfg)
         outcome (lifeline/supervise (fn (supervisor)
                                       (start-loop supervisor
-                                        init file directory? project buffer pending))
+                                        init
+                                        {:file file
+                                         :directory? directory?
+                                         :project project
+                                         :frontend frontend
+                                         :frontend-note frontend-note}
+                                        buffer
+                                        pending))
                   (fn (supervisor state) (restart-loop supervisor cfg state))
                   report-death))
     (if (= outcome :died) 1 nil)))
@@ -337,8 +379,14 @@ Applies the init file's `:font` / `:font-size` as the window's base cell font. C
 / C-x C-0) zooms ONE PANE a pixel at a time — the pane under the pointer, and only it: it is
 painted in a `cell-region` at its own size and the window's font never moves
 (`appearance/zoom-step`, brood ADR-363); `M-x preset-select` switches whole named window
-setups — what a screen share wants. Swap `(gui-display)` for `editor/ui/*term-display*` to run in
-the terminal (where a cell has one size, so a zoom is refused).
+setups — what a screen share wants.
+
+`-nw` / `--no-window` runs the editor in the TERMINAL instead (Emacs's `-nw`), over brood's
+terminal display (`editor/ui/*term-display*`, ADR-586): changed cells drawn, the mouse and a
+bracketed paste read, kills on the desktop's clipboard or — over ssh — the terminal's (OSC
+52). With no display to open a window on (no `$DISPLAY` / `$WAYLAND_DISPLAY`, an ssh
+session) it runs there by itself, and says so. A cell has one size there, so a zoom is
+refused, and there is one frame.
 
 With `--serve` (`bedit --name ed --serve [file]`) this runs as a daemon that also opens the
 host's own window (add `--headless` for a windowless background daemon; `--shared` — alias
@@ -357,4 +405,15 @@ bundle, which prints the same facts plus the build id and features."
     ;; `about/version-arg?` for why that ordering is the point, not a detail.
     (about/version-arg? args) (do (io/puts (about/version-line)) 0)
     (remote/remote-main? args) (remote/remote-main args)
-    else (run-window (remote/remote-positional args))))
+    else (run-local args)))
+
+(defn- run-local (args)
+  "The local editor for the command line `args`: in a window, or in the terminal when `-nw`
+/ `--no-window` asks or there is no display (`startup/choose-frontend`) — refused, on
+stderr, when the terminal is not one either (stdin or stdout redirected)."
+  (let ([frontend note] (startup/choose-frontend args (editor/ui/display-available?))
+        unusable (when (= frontend :terminal)
+                   (startup/terminal-unusable (os/stdin-tty?) (os/stdout-tty?))))
+    (if unusable
+      (do (io/puts unusable :to (io/stderr-port)) 1)
+      (run-window (remote/remote-positional args) frontend note))))
