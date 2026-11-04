@@ -321,8 +321,10 @@ the chord resolves (a command ran) or aborts."
   (let (chord (append (or (:chord m) []) [input]))
     (cond
       (map? binding) (assoc result :echo (str (ed-keys-label chord) "-") :chord chord)
+      ;; a chord bound to nothing fails, as Emacs's `undefined` rings the bell (and ends a
+      ;; keyboard macro)
       (and (nil? binding) (:pending m))
-        (assoc result :echo (str (ed-keys-label chord) " is undefined") :chord [])
+        (ed-ding (assoc result :chord []) (str (ed-keys-label chord) " is undefined"))
       ;; the command pressed a prefix: the step set the chord and echo to it
       (:pending result) result
       else (assoc result :chord []))))
@@ -1208,6 +1210,61 @@ else — a key."
                        typed))
         input textrows textcols)))
 
+;; ---- replaying a keyboard macro (C-x e) ---------------------------------------
+;; Each recorded key goes back through `ed-update`, the whole turn, as if typed. Emacs's
+;; rules: a run of N passes stops at the first key whose command fails — an error, or a bell
+;; (`model/ed-ding`: a failing search, a motion at the buffer's edge, a read-only refusal) —
+;; and N = 0 runs passes until one does. A pass that changes nothing (no text, no point, no
+;; buffer) would repeat forever under N = 0, so that ends the run too; and nothing can stop
+;; the loop from outside while it folds (C-g is a key behind it), so an until-failure run is
+;; also capped at `*macro-repeat-max*` passes and says so.
+
+(def *macro-repeat-max* 10000)
+;; Passes a `C-u 0 C-x e` run makes at most before it stops and says so.
+
+(defn- ed-macro-pass (m keys cols rows)
+  "Replay `keys` once through `ed-update`: `[model failed?]`, stopping at the first key whose
+command failed (`:command-failed`), which is cleared before each key so only that key's
+failure counts."
+  (letrec (step (fn (mm remaining)
+                  (if (empty? remaining)
+                    [mm false]
+                    (let (after (ed-update (dissoc mm :command-failed) (first remaining) cols rows))
+                      (if (:command-failed after)
+                        [(dissoc after :command-failed) true]
+                        (step after (rest remaining)))))))
+    (step m keys)))
+
+(defn- ed-macro-moved? (before after)
+  "Whether a macro pass changed anything a further pass could build on: the current buffer,
+its text, or point."
+  (let (buffer-before (ed-current-buf before)
+        buffer-after (ed-current-buf after))
+    (not (and (= (ed-current-index before) (ed-current-index after))
+           (= (buffer-point buffer-before) (buffer-point buffer-after))
+           (= (buffer-rope buffer-before) (buffer-rope buffer-after))))))
+
+(defn ed-run-macro (m request cols rows)
+  "Replay the last keyboard macro as `request` (`{:count N}`, from `cmd-execute-kbd-macro`)
+asks: N passes, or with N = 0 passes until one fails — each pass stopping at a key whose
+command fails, and the run with it. `:macro-executing` is on while it runs, so the macro
+cannot start itself again."
+  (let (keys (or (:macro-last m) [])
+        passes (or (:count request) 1)
+        until-failure? (= passes 0))
+    (letrec (run (fn (mm done)
+                   (cond
+                     (and (not until-failure?) (>= done passes)) mm
+                     (>= done *macro-repeat-max*)
+                       (message mm (str "Keyboard macro stopped after " done " repetitions"))
+                     else
+                       (let ([after failed?] (ed-macro-pass mm keys cols rows))
+                         (cond
+                           failed? after
+                           (and until-failure? (not (ed-macro-moved? mm after))) after
+                           else (run after (inc done)))))))
+      (dissoc (run (assoc m :macro-executing true) 0) :macro-executing))))
+
 (defn- ed-loop-tail (m0 result input cols rows)
   "After the event folded in: replay a keyboard macro if one was asked for, else propagate.
 
@@ -1223,16 +1280,15 @@ auto-share / follow / presence sync). Each is a map-lookup no-op on a model with
 hosted, which is what lets `share-session` turn a LIVE editor into a host without swapping
 update fns."
   (if (:run-macro result)
-    (fold (or (:macro-last result) '())
-      (dissoc result :run-macro)
-      (fn (mm ev) (ed-update mm ev cols rows)))
+    (ed-run-macro (dissoc result :run-macro) (:run-macro result) cols rows)
     (collab-step m0 (hosted-step m0 result input) input)))
 
 (defn- ed-recover (m0 e input)
   "A thrown error — from a command, the minibuffer, completion, or a re-check — surfaces in the
 echo area and the editor keeps running: a crash must never take down the whole editor (ui-run
 would otherwise restore the screen and re-raise, exiting). The pre-event model `m0` stands
-(the edit is undone by being abandoned — the buffer is immutable).
+(the edit is undone by being abandoned — the buffer is immutable), marked failed
+(`ed-ding`), so a keyboard macro running it stops here as Emacs's does on an error.
 
 A read-only span refusing an edit is not an error to surface as one: `ed-edit` already turns
 the common path into the buffer's hint, and this is the SAFETY NET for any command that edits
@@ -1242,10 +1298,11 @@ never a raw `error:`.
 The error echo appends to *Messages*, which is HOSTED under the flip — the append must still
 propagate or the pool cache silently diverges from the *Messages* process (its own guarded
 try: a propagate error here must not recurse into another echo)."
-  (let (me (if (and (map? e) (= (:kind e) :read-only))
-             (message m0
-               (or (ed-mode-service (ed-current-buf m0) :read-only-hint) "read-only text here"))
-             (message m0 (str "error: " (error-message e)))))
+  (let (me (ed-ding (if (and (map? e) (= (:kind e) :read-only))
+                      (message m0
+                        (or (ed-mode-service (ed-current-buf m0) :read-only-hint)
+                          "read-only text here"))
+                      (message m0 (str "error: " (error-message e))))))
     (try (hosted-step m0 me input) (catch e2 me))))
 
 (defn- ed-sync-title (result)

@@ -48,8 +48,27 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
 
 ;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e/M-f/M-b + the arrow keys) -------
 
-(defcommand cmd-forward-char (m key) (ed-apply m forward-char))
-(defcommand cmd-backward-char (m key) (ed-apply m backward-char))
+;; A motion that cannot move says so, as Emacs's signals `end-of-buffer` /
+;; `beginning-of-buffer`: the echo, and `ed-ding`'s failure, which is what ends a keyboard
+;; macro run with `C-u 0 C-x e` ("until it fails") at the last line.
+
+(defn- ed-edge-motion (m moved forward?)
+  "The model with the current buffer as `moved`, a motion's result — or, when the motion
+left point where it was, the model unmoved and failed ([[model/ed-ding]]) with `End of
+buffer` / `Beginning of buffer`."
+  (if (= (buffer-point moved) (buffer-point (ed-current-buf m)))
+    (ed-ding m (if forward? "End of buffer" "Beginning of buffer"))
+    (ed-set-buf m moved)))
+
+(defcommand cmd-forward-char
+  (m key)
+  "Move point one character forward (C-f); at the end of the buffer, say so and fail."
+  (ed-edge-motion m (forward-char (ed-current-buf m)) true))
+
+(defcommand cmd-backward-char
+  (m key)
+  "Move point one character back (C-b); at the start of the buffer, say so and fail."
+  (ed-edge-motion m (backward-char (ed-current-buf m)) false))
 ;; C-n / C-p move by SCREEN row in a wrapped buffer (Emacs `line-move-visual`) and by line
 ;; elsewhere, and both aim at a GOAL column in display cells: the column the first press
 ;; started from, kept while presses follow one another, so passing a short line or row
@@ -137,8 +156,11 @@ the lines a fold hides (`:hidden` in `extras`)."
                (:column held)
                here)
         moved (ed-row-motion buf rows goal w extras))
-    (assoc (ed-set-buf m moved)
-      :line-goal {:column goal :point (:point moved) :buffer (:name moved)})))
+    (if (= (:point moved) (:point buf))
+      ;; no row to move to (Emacs's `next-line` signalling `end-of-buffer`)
+      (ed-ding m (if (> rows 0) "End of buffer" "Beginning of buffer"))
+      (assoc (ed-set-buf m moved)
+        :line-goal {:column goal :point (:point moved) :buffer (:name moved)}))))
 
 (defcommand cmd-next-line (m key) (ed-line-move m 1))
 (defcommand cmd-previous-line (m key) (ed-line-move m -1))
@@ -1391,30 +1413,96 @@ brings back what was discarded."
 ;; ---- keyboard macros (C-x ( / C-x ) / C-x e) --------------------------------
 ;; Recording captures raw input events into `:macro-recording` (the capture happens in
 ;; `input/ed-update`, which sees every event); `:macro-last` holds the finished macro and
-;; `:run-macro` asks `ed-update` to replay it by re-feeding the events. Emacs C-x (/)/e.
+;; `:run-macro {:count N}` asks `ed-update` to replay it N times by re-feeding the events
+;; (`input/ed-run-macro`) — N = 0 meaning until a key fails. A replay stops at the first key
+;; whose command fails (`model/ed-ding`, or a thrown error), as Emacs's does. Emacs C-x (/)/e.
 
 (defcommand cmd-start-kbd-macro
   (m key)
   "Start recording a keyboard macro (C-x (): subsequent keys are captured until C-x )."
   (assoc m :macro-recording [] :echo "Recording keyboard macro…"))
 
+(def- ed-prefix-starters
+  ;; the keys that begin a prefix argument (C-u, and the negative-argument bindings)
+  #{:ctrl-u :alt-- :ctrl-- :ctrl-meta--})
+
+(defn- ed-prefix-continues-key? (key)
+  "Whether `key` can follow the start of a prefix argument: another C-u, a digit or `-`."
+  (or (= key :ctrl-u)
+    (= key "-")
+    (and (string? key) (= (string/length key) 1) (>= (index-of "0123456789" key) 0))))
+
+(defn ed-macro-prefix-start (keys)
+  "Where the prefix argument that ends `keys` begins — the index of its C-u (or negative
+argument) — or `(count keys)` when they do not end in one. The keys a `C-u 3` typed before
+`C-x )` or `C-x e` were recorded too, and belong to that command, not the macro.
+
+    (commands/ed-macro-prefix-start [\"a\" \"5\" :ctrl-u \"3\"])   ;=> 2"
+  (letrec (back (fn (index start)
+                  (if (< index 0)
+                    start
+                    (let (key (nth keys index))
+                      (cond
+                        (contains? ed-prefix-starters key) (back (dec index) index)
+                        (and (ed-prefix-continues-key? key) (= start (count keys)))
+                          (back (dec index) start)
+                        ;; a digit before the C-u that started the argument is typed text
+                        else start)))))
+    (back (dec (count keys)) (count keys))))
+
+(defn- ed-macro-finish (m)
+  "`m` with the macro being recorded made the last macro: the keys that invoked the command
+ending it — the chord (`:chord` holds its keys before the last) and a prefix argument typed
+before it — dropped, since they were recorded before dispatch."
+  (let (recorded (:macro-recording m)
+        chord (inc (count (or (:chord m) [])))
+        body (take recorded (math/max 0 (- (count recorded) chord)))
+        body (if (nil? (current-prefix-arg m)) body (take body (ed-macro-prefix-start body))))
+    (assoc (dissoc m :macro-recording) :macro-last body)))
+
+(defn- ed-macro-run (m repeats)
+  "Ask the loop to replay the last macro `repeats` times (0: until a key fails) — or say why it
+cannot: none recorded, a negative count, or a macro already running (a macro that ran
+itself would never end)."
+  (cond
+    (nil? (:macro-last m))
+      (ed-ding (message m "no keyboard macro defined (record one with C-x ( … C-x ))"))
+    (:macro-executing m) (ed-ding m "a keyboard macro cannot run itself")
+    (< repeats 0)
+      (ed-ding m "a keyboard macro runs a positive number of times, or 0: until it fails")
+    else (assoc m :run-macro {:count repeats})))
+
 (defcommand cmd-end-kbd-macro
   (m key)
-  "Finish recording the keyboard macro (C-x )); it becomes the last macro for C-x e."
-  (let (rec (:macro-recording m))
-    (if (nil? rec)
-      (message m "not currently defining a keyboard macro")
-      ;; drop the trailing `C-x )` that invoked this command (recorded before dispatch)
-      (message (assoc (dissoc m :macro-recording)
-                 :macro-last (take rec (math/max 0 (- (count rec) 2))))
-        "Keyboard macro defined"))))
+  "Finish recording the keyboard macro (C-x )); it becomes the last macro for C-x e. With a
+prefix argument N, run it N-1 more times (Emacs's `kmacro-end-macro`); `C-u 0 C-x )` runs it
+again until a key fails."
+  (cond
+    (nil? (:macro-recording m)) (ed-ding (message m "not currently defining a keyboard macro"))
+    (nil? (current-prefix-arg m)) (message (ed-macro-finish m) "Keyboard macro defined")
+    else
+      (let (repeats (current-prefix-arg m)
+            finished (message (ed-macro-finish m) "Keyboard macro defined"))
+        (cond
+          (= repeats 0) (ed-macro-run finished 0)
+          (> repeats 1) (ed-macro-run finished (dec repeats))
+          else finished))))
 
 (defcommand cmd-execute-kbd-macro
   (m key)
-  "Execute the last keyboard macro (C-x e); `ed-update` replays its events."
-  (if (nil? (:macro-last m))
-    (message m "no keyboard macro defined (record one with C-x ( … C-x ))")
-    (assoc m :run-macro true)))
+  "Execute the last keyboard macro (C-x e); `ed-update` replays its events. With a prefix
+argument N it runs N times, and `C-u 0 C-x e` runs it until a key fails — a search that
+finds nothing, a motion at the end of the buffer (Emacs's `call-last-kbd-macro`). Any run
+stops at the first key whose command fails. Pressed while recording, it ends the recording
+first and then runs the macro (Emacs's `kmacro-end-and-call-macro`)."
+  (let (repeats (or (current-prefix-arg m) 1))
+    (if (nil? (:macro-recording m))
+      (ed-macro-run m repeats)
+      (ed-macro-run (message (ed-macro-finish m) "Keyboard macro defined") repeats))))
+
+;; both read the prefix argument as their repeat count, so they run once under it
+(register-prefix-consuming 'commands/cmd-end-kbd-macro)
+(register-prefix-consuming 'commands/cmd-execute-kbd-macro)
 
 ;; ---- zap-to-char (M-z) ------------------------------------------------------
 
@@ -1434,7 +1522,7 @@ brings back what was discarded."
                       (buffer-point (ed-current-buf mm))
                       (isearch/search-fold? ch)))
           (if (nil? found)
-            (message mm (str "not found: " ch))
+            (ed-ding (message mm (str "not found: " ch)))
             (ed-kill-span mm (fn (b) (goto-char b (inc found)))))))))) ; kill [point, found] to ring
 
 ;; ---- occur (M-s o) ----------------------------------------------------------
@@ -1761,7 +1849,7 @@ when the run has nothing left."
   (let (b (ed-current-buf m)
         b1 (if (= (:last-command m) kind) b (undo-start b)))
     (if (empty? (:pending-undo b1))
-      (message m exhausted-msg)
+      (ed-ding (message m exhausted-msg))
       (assoc (ed-set-buf m (undo-next b1)) :status status))))
 
 (defcommand cmd-undo
