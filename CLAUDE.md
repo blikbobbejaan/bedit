@@ -1100,6 +1100,14 @@ pushed" *strictly* instead of racing a timeout. Only an event routed through a
 third process (the collab registry learning of a `[:down]`) needs waiting, and
 that polls (`ct-await-respawn`) rather than guessing a delay.
 
+**A test never touches the user's own config.** Every file the editor keeps lives under
+`config/config-dir`, and under the test runner (`config/under-test?`) its base is a scratch
+directory of the run's own (`bedit-test-config-…` under the temp root); `persist-write!` and
+`ensure-init!` also refuse a path under the real `~/.config/bedit` while a test runs. A new
+kind of persisted file goes under `config-dir` (or `editor-state-dir`), never `$HOME`
+directly; a test that wants its own file binds the module's dynvar (`*config-base*`,
+`bshell/*bshell-history-file*`).
+
 ## Conventions
 
 - **Write the editor in Brood.** Read `../brood/docs/brood-for-claude.md` and load
