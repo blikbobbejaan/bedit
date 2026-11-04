@@ -88,15 +88,16 @@ machine's name. A remote host would need TRAMP's ssh, which bedit does not have.
 
 (defn sudo-work (job password)
   "What sudo `job` does, in its task: `{:needs-password true}` when sudo wants a password and
-`password` is nil; else `{:text …}` for an open (the file's text, nil when it does not exist,
-or sudo's failure) and `{:written …}` for a save (true, or the failure).
+`password` is nil; else `{:bytes …}` for an open (the file's BYTES — nothing lost to a text
+decode — nil when it does not exist, or sudo's failure) and `{:written …}` for a save (true,
+or the failure).
 
     (:needs-password (sudoedit/sudo-work {:kind :open :path \"/etc/hosts\" :user \"root\"} nil))   ;~> true when sudo has no cached credential"
   (let (opts {:user (:user job) :password password})
     (if (and (nil? password) (sudo/password-required? {:user (:user job)}))
       {:needs-password true}
       (if (= (:kind job) :open)
-        {:text (sudo/read (:path job) opts)}
+        {:bytes (sudo/read-bytes (:path job) opts)}
         {:written (sudo/write (:path job) (:text job) opts)}))))
 
 (defn- job-doing (job)
@@ -121,9 +122,15 @@ the tests — it runs inline. A second job while one runs is refused, as every o
 (defn- drop-placeholder (m path)
   (let (i (placeholder-index m path)) (if (nil? i) m (ed-kill-buffer-at m i))))
 
-(defn sudo-buffer-index (m path)
-  "The pool index of the buffer editing `path` as root, or nil."
-  (let (i (seq/index-where (:buffers m) (fn (b) (and (= true (:sudo b)) (= (buffer-file b) path)))))
+(defn sudo-buffer-index (m path &optional (user nil))
+  "The pool index of the buffer editing `path` through sudo — as `user` when one is named, as
+anyone otherwise — or nil. A file is one buffer per user it is edited as: `/sudo::/x` and
+`/sudo:www@:/x` are two."
+  (let (i (seq/index-where (:buffers m)
+            (fn (b)
+              (and (= true (:sudo b))
+                (= (buffer-file b) path)
+                (or (nil? user) (= user (or (:sudo-user b) "root")))))))
     (if (< i 0) nil i)))
 
 (defn- sudo-abandon (m job)
@@ -180,7 +187,10 @@ selected, which goes — as does a buffer already visiting the file plainly, who
 the new one keeps. Then the job's continuation."
   (let (path (:path job)
         user (:user job)
-        old-index (ed-buffer-index-by-file m path)
+        ;; the PLAIN buffer visiting the file, whose unsaved text the new one keeps
+        old-index (let (i (seq/index-where (:buffers m)
+                            (fn (b) (and (= (buffer-file b) path) (not (= true (:sudo b)))))))
+                    (if (< i 0) nil i))
         old (when old-index (ed-buf-at m old-index))
         buf (assoc (carry-text (sudo-buffer path user text) old)
               :name (file-display-name path (:project-root m)))
@@ -190,11 +200,31 @@ the new one keeps. Then the job's continuation."
         plain (seq/index-where (:buffers without-placeholder)
                 (fn (b) (and (= (buffer-file b) path) (not (= true (:sudo b))))))
         replaced (if (< plain 0) without-placeholder (ed-kill-buffer-at without-placeholder plain))
-        shown (let (i (sudo-buffer-index replaced path))
+        shown (let (i (sudo-buffer-index replaced path user))
                 (if (nil? i) replaced (ed-select replaced i))))
     ((or (:then job) identity) (message shown
                                  (or (ed-recovery-note path true)
                                    (str (if (nil? text) "new file " "opened ") path " as " user))))))
+
+(defn- sudo-open-bytes (m job bytes)
+  "An open's bytes have landed: nil (no file yet) or UTF-8 text opens as an editable sudo
+buffer ([[sudo-opened]]); anything else opens as the read-only hex view a plain find-file
+gives a binary (`pool/ed-open-binary`) — never as text with its undecodable bytes replaced,
+which a save would write back over the file. A refusal is said."
+  (if (failure? bytes)
+    (sudo-failed m job (error-message bytes))
+    (let (text (when bytes
+                 (check-allow :discarded-catch (try (string/bytes-> bytes) (catch _ :not-text)))))
+      (if (= text :not-text)
+        (let (shown (ed-open-binary (drop-placeholder m (:path job))
+                      (:path job)
+                      (:project-root m)
+                      bytes))
+          ((or (:then job) identity) (message shown
+                                       (str "opened "
+                                         (:path job)
+                                         " as hex — not UTF-8 text, so read-only"))))
+        (sudo-opened m job text)))))
 
 ;; check-allow: `then` is the caller's continuation (`identity`, or recover-session's), whose
 ;; result the checker cannot see; every caller hands one that answers a model
@@ -216,8 +246,8 @@ A buffer already visiting the file as root is selected; one visiting it plainly 
         else
           (let (path (path/normalize (path/absolute (:path parts)))
                 user (:user parts)
-                index (sudo-buffer-index m path))
-            (if (and index (= user (:sudo-user (ed-buf-at m index))))
+                index (sudo-buffer-index m path user))
+            (if index
               (then (ed-select m index))
               (sudo-launch (ed-open-buffer m (loading-buffer path))
                 {:kind :open :path path :user user :then then}
@@ -229,7 +259,7 @@ A buffer already visiting the file as root is selected; one visiting it plainly 
 (defn- sudo-saved (m job)
   "A save's write has landed: its buffer marked saved as of the text written
 (`pool/ed-save-landed` — still modified if it was edited meanwhile), then the continuation."
-  (let (index (sudo-buffer-index m (:path job))
+  (let (index (sudo-buffer-index m (:path job) (:user job))
         saved (if (nil? index)
                 (message m (str "saved " (:path job) " as " (:user job)))
                 (ed-save-landed m index (:rope job) (str " as " (:user job)))))
@@ -267,13 +297,14 @@ continues there); `abandon-note` follows the reason when it does not (\" — qui
 ;; check-allow: as above — `then` is the caller's
 (check-allow :trusted
   (defn ed-sudo-save-all (m paths then &optional (abandon-note nil))
-    "Save every sudo buffer in `paths` (file paths) in turn — one sudo job at a time, each
+    "Save every sudo buffer in `paths` (`[file user]` pairs) in turn — one sudo job at a time, each
 asking for the password when sudo wants one — then `(then m)`. One that fails, or whose prompt
 or task is cancelled, stops the run there, saying why with `abandon-note`: what C-x C-c and
 C-x s do with the sudo buffers they were told to save."
     (if (empty? paths)
       (then m)
-      (let (index (sudo-buffer-index m (first paths)))
+      (let ([path user] (first paths)
+            index (sudo-buffer-index m path user))
         (if (nil? index)
           (ed-sudo-save-all m (rest paths) then abandon-note)
           (ed-sudo-save m
@@ -291,12 +322,12 @@ out): ask for the password it needs, open the file, mark the save landed — or 
         m1 (dissoc m :sudo-proc :sudo-job))
     (cond
       (nil? job) m1
+      ;; the `Loading…` buffer was killed while sudo ran: the open is cancelled
+      (and (= (:kind job) :open) (nil? (placeholder-index m1 (:path job))))
+        (message m1 (str "opening " (:path job) " as " (:user job) " cancelled"))
       (nil? r) (sudo-failed m1 job (str (job-doing job) " failed or timed out"))
       (:needs-password r) (sudo-ask m1 job)
-      (= (:kind job) :open)
-        (if (failure? (:text r))
-          (sudo-failed m1 job (error-message (:text r)))
-          (sudo-opened m1 job (:text r)))
+      (= (:kind job) :open) (sudo-open-bytes m1 job (:bytes r))
       (failure? (:written r))
         (sudo-failed m1 job (str "save failed: " (error-message (:written r))))
       else (sudo-saved m1 job))))

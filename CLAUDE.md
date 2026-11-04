@@ -164,7 +164,13 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             stops it): an open shows `Loading…` at once, a save stays modified
                             until its write lands (`pool/ed-save-prepare` / `ed-save-landed`), and
                             C-x C-c / C-x s save root files after their questions and go on when
-                            the last lands. Named to dodge std's `sudo`
+                            the last lands. A file is read as BYTES (`sudo/read-bytes`): not
+                            UTF-8, it opens as the read-only hex view; a large one is asked about
+                            first (`pool/ed-file-of-spec`); one buffer per file AND user (the
+                            registry `:key` names the user); killing `Loading…` cancels the open.
+                            Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
+                            and SIGHUP / SIGTERM auto-save every unsaved buffer before the
+                            terminal is restored (`main/terminal-hangup`). Named to dodge std's `sudo`
 src/recover.blsp            M-x recover-this-file / recover-session: a sidecar's text put back as one
                             undoable edit (Emacs's), from the open and recent files
 src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `supervise`): a loop that
