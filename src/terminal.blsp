@@ -43,7 +43,8 @@ program, the buffer's tail is its screen, everything above it is scrollback."
   (:use model)
   (:use pool) ; ed-open-buffer / ed-select / ed-project-root — the terminal buffer and where it runs
   (:use editor/buffer)
-  (:use interactive))
+  (:use interactive)
+  (:use passwd)) ; ed-read-passwd / password-prompt? — a password the program asks for, read masked
 
 ;; ---- the buffer ---------------------------------------------------------------------
 
@@ -102,14 +103,27 @@ until the next render."
       (fold (:replies v) nil (fn (_ r) (term-write state r)))
       (assoc state :vt v :evicted (into (:evicted state) (:evicted v))))))
 
+(defn- term-password (state)
+  "Whether the program is reading a password right now — its terminal's echo off in line
+mode (`os/pty-password?`, brood ADR-570) — or nil when that cannot be known (no child, a
+closed one, a runtime without the primitive), which leaves the editor to guess from the
+prompt's text. Asked once per render, which is once per burst of output: a prompt arriving
+is output, so this is when the answer can change."
+  (let (proc (:proc state))
+    (when proc
+      (check-allow :discarded-catch (try (os/pty-password? proc) (catch _ nil))))))
+
 (defn- term-render (state)
-  "Send the editor the screen as it stands, the rows evicted since the last render read
-through the palette ahead of it, and start a fresh eviction list."
+  "Send the editor the screen as it stands — with `:password`, whether the program is
+reading one (`term-password`) — the rows evicted since the last render read through the
+palette ahead of it, and start a fresh eviction list."
   (let (pal (:palette state)
         lines (into [] (map (:evicted state) (fn (row) (vt/line row pal)))))
     (do
       (send (:reply state)
-        (terminal/term-screen-event (:buffer state) lines (vt/screen (:vt state) pal)))
+        (terminal/term-screen-event (:buffer state)
+          lines
+          (assoc (vt/screen (:vt state) pal) :password (term-password state))))
       (assoc state :evicted []))))
 
 (defn- term-drain (state)
@@ -319,10 +333,83 @@ size since tells its program."
     (if (nil? idx)
       m
       (let (before (ed-buf-at m idx)
-            after (term-apply-screen before
-                    (term-screen-event-lines event)
-                    (term-screen-event-screen event)))
-        (term-sync-sizes (term-follow (ed-set-buf-at m idx after) idx before after))))))
+            screen (term-screen-event-screen event)
+            after (term-apply-screen before (term-screen-event-lines event) screen))
+        (term-watch-password (term-sync-sizes (term-follow (ed-set-buf-at m idx after)
+                                                idx before after))
+          idx screen)))))
+
+;; ---- a password the program asks for -------------------------------------------------------
+;; In line mode the buffer is the line editor, so what is typed SHOWS and RET remembers it —
+;; right for `1 + 1`, wrong for the password `sudo` or `mix hex.user auth` asks for. Emacs's
+;; comint watches for that prompt and reads the answer in the minibuffer, masked
+;; (`comint-watch-for-password-prompt`, `send-invisible`); this does the same, on the better
+;; of two signals: the worker asks the pty whether the program turned echo off for a line
+;; read (`:password` on the screen, brood ADR-570), and the prompt's text is matched as
+;; comint matches it (`passwd/password-prompt?`) — for a program that reads its password
+;; through its own raw-mode editor, which the pty cannot tell from any other read.
+;;
+;; On the buffer: `:term-secret` (the program is waiting for one now), `:term-prompt-mark`
+;; (where its prompt is: the screen cursor and the prompt line) and `:term-secret-answered`
+;; (that mark when a password was sent). A screen that shows the SAME prompt after the
+;; answer — a resize or a theme redraw before the program has read it — is the old request,
+;; not a new one; a re-asked prompt (`Sorry, try again.`) is on another line, so it asks.
+;; A char-mode terminal is the program's own screen, and is left alone.
+
+(defn- screen-prompt (screen)
+  "The line the program's cursor is on, up to the cursor: its prompt."
+  (passwd/prompt-line (string/substring (:text screen)
+                        0
+                        (math/min (:cursor screen)
+                          (string/length (:text screen))))))
+
+(defn- term-open-password (m name)
+  "Read the password terminal `name`'s program asks for, masked; RET sends it."
+  (let (b (ed-buf-at m (ed-buffer-index-by-name! m name))
+        line (string/trim (or (second (:term-prompt-mark b)) ""))
+        prompt (if (= line "") "Password: " (str line " ")))
+    (passwd/ed-read-passwd m prompt (fn (m1 password) (term-send-secret m1 name password)) name)))
+
+(defn- term-send-secret (m name password)
+  "Send `password` to terminal `name`'s program as a line — to the program only: not into
+the buffer, not into its history — and mark the request answered."
+  (let (idx (ed-buffer-index-by-name m name)
+        gone "the program has exited; nothing sent")
+    (if (nil? idx)
+      (message m gone)
+      (let (b (ed-buf-at m idx)
+            pid (live-program b))
+        (if (nil? pid)
+          (message m gone)
+          (do
+            (send pid [:term-line password])
+            (ed-set-buf-at m
+              idx
+              (assoc b :term-secret false :term-secret-answered (:term-prompt-mark b)))))))))
+
+(defn- term-watch-password (m idx screen)
+  "After screen `screen` folded into terminal `idx`: in line mode, note whether its program
+is waiting for a password, and when it has just started to — and you are looking at it,
+with no other prompt open — read it (`term-open-password`). Elsewhere RET asks."
+  (let (b (ed-buf-at m idx))
+    (if (not (:term-line-mode b))
+      m
+      (let (line (screen-prompt screen)
+            mark [(:cursor screen) line]
+            answered (:term-secret-answered b)
+            stale? (= answered mark)
+            secret? (and (not stale?)
+                      (or (= true (:password screen)) (passwd/password-prompt? line)))
+            asked? (and secret? (not (:term-secret b)))
+            noted (ed-set-buf-at m
+                    idx
+                    (assoc b
+                      :term-secret secret?
+                      :term-prompt-mark mark
+                      :term-secret-answered (if stale? answered nil))))
+        (if (and asked? (= idx (ed-current-index noted)) (passwd/ed-prompt-free? noted))
+          (term-open-password noted (buffer-name b))
+          noted)))))
 
 (defn ed-ev-term-exit (m event textrows cols rows)
   "A `term-exit-event` → say so on the buffer's tail; the buffer stays to be read, `C-x k`
@@ -331,11 +418,11 @@ closes it."
         note (str "\n[process exited"
                (if (nil? code) "" (str " with code " code))
                " — C-x k to close]\n"))
-    (ed-update-named m
+    (ed-update-named (passwd/ed-withdraw-read m (term-exit-event-buffer event))
       (term-exit-event-buffer event)
       (fn (b)
         (let (noted (insert (end-of-buffer (set-read-only b false)) note))
-          (set-read-only (assoc noted :term-exited true) true))))))
+          (set-read-only (assoc noted :term-exited true :term-secret false) true))))))
 
 ;; ---- sizing: the vt is the size of the smallest pane that shows it ------------------------
 
@@ -489,18 +576,41 @@ edited here with the shell's history and boundary keys, and RET sends it whole."
   "RET in a line-mode terminal: send the input region to the program as one line and
 remember it in the buffer's history — in memory, this terminal's own: a line typed at iex
 or `nest repl` is not a shell command, so it stays out of the shell's history file. The
-program's echo replaces it."
+program's echo replaces it.
+
+While the program waits for a PASSWORD (`term-watch-password`), RET reads it masked
+instead; a line already typed is sent as the answer but never remembered."
   (let (b (ed-current-buf m)
         [start end] (bshell/input-region b)
         line (string/substring (buffer-text b) start end)
         pid (live-program b))
-    (if (nil? pid)
-      m
-      (do
-        (send pid [:term-line line])
-        (let (remembered (if (string/blank? line) m (bshell/remember-input m line))
-              cleared (replace-region (ed-current-buf remembered) start end ""))
-          (ed-set-buf remembered cleared))))))
+    (cond
+      (nil? pid) m
+      (and (:term-secret b) (= line "")) (term-open-password m (buffer-name b))
+      (:term-secret b)
+        (let (sent (term-send-secret m (buffer-name b) line))
+          (ed-set-buf sent (replace-region (ed-current-buf sent) start end "")))
+      else
+        (do
+          (send pid [:term-line line])
+          (let (remembered (if (string/blank? line) m (bshell/remember-input m line))
+                cleared (replace-region (ed-current-buf remembered) start end ""))
+            (ed-set-buf remembered cleared))))))
+
+(defcommand cmd-send-invisible
+  (m key)
+  "M-x send-invisible (Emacs's `comint-send-invisible`): read a line masked and send it to
+the program in this buffer — a line-mode terminal's, or the command a shell is running —
+without showing it or remembering it. For a password prompt bedit did not recognise; one
+it recognises opens this read by itself."
+  (let (b (ed-current-buf m))
+    (cond
+      (and (term-buffer? b) (:term-line-mode b) (live-program b))
+        (term-open-password m (buffer-name b))
+      (and (term-buffer? b) (live-program b))
+        (message m "char mode: the program reads its own keys (C-c C-j for line mode)")
+      (bshell/bshell-buffer? b) (bshell/bshell-read-secret m (buffer-name b))
+      else (message m "no program here to send to"))))
 
 (defcommand cmd-project-repl
   (m key)
