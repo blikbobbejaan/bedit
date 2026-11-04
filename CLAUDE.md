@@ -364,17 +364,28 @@ src/electric.blsp           electric pairs (Emacs electric-pair-mode) as POLICY:
                             Python's triple quotes), else `()` `[]` `{}` `""`; `<>` nowhere — the
                             user's `:electric-pair` per mode (a bool or the mode's pairs), Emacs's
                             inhibit rules (not before a word or the same character; a Lisp's
-                            `:electric-pair-inhibit :never` always pairs, as paredit), a closer
-                            skipped past spaces on the line, and M-x electric-pair-mode /
-                            electric-pair-local-mode. The bracket keys stay in `commands`, and any
-                            character a mode pairs is electric through `cmd-self-insert`; an opener
-                            or closer over a region wraps it, mode on or off
+                            `:electric-pair-inhibit :never` always pairs, as paredit),
+                            electric-pair-preserve-balance (an opener a waiting closer balances is
+                            typed alone; a closer is stepped over — past spaces, tabs and newlines —
+                            only while the brackets stay balanced), a quote's open / close / skip
+                            read from the STRING STATE at point (`stringstate`), and M-x
+                            electric-pair-mode / electric-pair-local-mode. The bracket keys stay in
+                            `commands`, and any character a mode pairs is electric through
+                            `cmd-self-insert`; an opener or closer over a region wraps it, mode on
+                            or off
+src/stringstate.blsp        where a buffer's strings and comments are (Emacs's syntax-ppss, for
+                            strings), from the mode's `:string-syntax` as DATA (a `deflanguage`'s
+                            `:strings`: delimiters, which span lines, which are raw, line and block
+                            comments; else its quote pairs as one-line strings) — one native
+                            `regex/rope-spans` pass, no grammar. Electric pairs ask it whether a
+                            quote opens or closes and which brackets count for balance (`balance`,
+                            the whole buffer under 200 KB); M-q asks it for the docstring to fill
 src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string/fill-prefixes`
                             (brood ADR-589, Emacs's adaptive fill): the first line keeps its
                             prefix, the rest the paragraph's continuation — a list item HANGS under
                             its text, a comment / quote keeps its marker. The paragraph is
                             narrowed to point's comment, list item, or (in code) string
-                            (`string-extent`, off the mode's fontify); a mode's `:fill-separate`
+                            (`stringstate/string-extent`, no grammar needed); a mode's `:fill-separate`
                             lines (an Org heading, a Markdown fence) stand alone and its
                             `:fill-prefixes` answers for it (a Lisp docstring continues at column
                             0). M-x auto-fill-mode per buffer, `:auto-fill` per mode — in code only

@@ -1,0 +1,211 @@
+(defmodule stringstate
+  "Where a buffer's strings and comments are — the question Emacs answers with `syntax-ppss` —
+from the MODE's string syntax as data, with no grammar and no highlighter: electric pairs ask
+it whether a quote opens or closes a string and which brackets count for balance, and M-q in
+code asks it which string point is in.
+
+A mode declares `:string-syntax` (a `deflanguage`'s `:strings`):
+
+    {:strings [{:open \"\\\"\\\"\\\"\" :multiline true} {:open \"'\"}]
+     :comments [\"#\"]
+     :block-comments [[\"/*\" \"*/\"]]}
+
+— each string's delimiter, whether it may span lines, and `:raw` when a backslash does not
+escape (Go's backtick); line comments; block comments. A mode with none gets one from its
+electric pairs (`pairs-syntax`): every quote pair a one-line string, which is what prose
+wants — a `\"` closes the one the line opened.
+
+The scan is one native regex pass (`regex/rope-spans`) over the rope, a lexer's leftmost
+tokens: strings and comments as spans, so a `#` in a string is not a comment and a quote in
+a comment opens nothing. It reads from the buffer's start when the syntax has anything that
+spans lines (a triple quote, a block comment), else from point's line; past `*scan-window*`
+characters before point it starts there instead, which can misread a string open across
+that boundary — a 1 MB file costs ~20 ms a scan, and only the quote and bracket keys and
+M-q scan."
+  (:use editor/buffer) ; buffer-rope / buffer-point
+  (:use model)) ; ed-mode-service
+
+(def *scan-window*
+  ;; how far back from point a scan reads at most (characters)
+  1000000)
+
+(def- *default-quote-pairs* [["\"" "\""]])
+
+(defn pairs-syntax (pairs)
+  "The string syntax a mode with none declared has: every one-character quote pair of
+`pairs` (opener = closer) a one-line string, no comments.
+
+    (stringstate/pairs-syntax [[\"(\" \")\"] [\"'\" \"'\"]])   ;=> {:strings [{:open \"'\"}]}"
+  {:strings (into []
+              (map (seq/filter pairs
+                     (fn (pair)
+                       (and (= (first pair) (second pair)) (= 1 (string/length (first pair))))))
+                (fn (pair) {:open (first pair)})))})
+
+(defn syntax-of (buf)
+  "`buf`'s string syntax: its mode's `:string-syntax`, else `pairs-syntax` of its mode's
+electric pairs (or of the double quote)."
+  (or (ed-mode-service buf :string-syntax)
+    (pairs-syntax (or (ed-mode-service buf :electric-pairs) *default-quote-pairs*))))
+
+;; ---- the token pattern ------------------------------------------------------------------
+
+(defn- string-alternative (entry)
+  ;; one string: its opener, a lazy body (escapes skipped unless raw; no newline unless it
+  ;; spans lines), then its closer — or, unterminated, the line's or the text's end
+  (let (open (regex/escape (:open entry))
+        multiline? (= true (:multiline entry))
+        body (cond
+               (:raw entry) (if multiline? "." "[^\n]")
+               multiline? "(?:\\\\.|[^\\\\])"
+               else "(?:\\\\.|[^\\\\\n])"))
+    (str open body "*?(?:" open (if multiline? "" "|\n") "|$)")))
+
+(defn token-pattern (syntax)
+  "The regex whose leftmost matches are `syntax`'s strings and comments, in the order a lexer
+takes them: block comments, then strings (longest delimiter first), then line comments."
+  (let (strings (seq/sort-by (or (:strings syntax) [])
+                  (fn (entry) (- 0 (string/length (:open entry)))))
+        blocks (map (or (:block-comments syntax) [])
+                 (fn (pair)
+                   (str (regex/escape (first pair)) ".*?(?:" (regex/escape (second pair)) "|$)")))
+        lines (map (or (:comments syntax) []) (fn (token) (str (regex/escape token) "[^\n]*"))))
+    (string/join (append blocks (map strings string-alternative) lines) "|")))
+
+(defn spans-across? (syntax)
+  "Whether `syntax` has a token that may span lines — a multi-line string or a block comment —
+so a scan must start before point's line."
+  (or (not (empty? (or (:block-comments syntax) [])))
+    (any? (or (:strings syntax) []) (fn (entry) (= true (:multiline entry))))))
+
+(defn spans (rope syntax from to)
+  "Every string and comment token of `syntax` in `rope` that starts in `[from, to)`, as
+`[start end]` in order — an unterminated one running to its line's or the text's end."
+  (let (pattern (token-pattern syntax))
+    (if (= pattern "")
+      []
+      (letrec (more (fn (at acc)
+                      (let (found (regex/rope-spans pattern rope at to {:lines? false})
+                            all (into acc found))
+                        ;; `rope-spans` answers at most 4096 at a time
+                        (if (< (count found) 4096) all (more (second (last found)) all)))))
+        (more from [])))))
+
+(defn scan-start (rope syntax point)
+  "Where a scan for `point`'s state starts: the text's start (at most `*scan-window*` back)
+when `syntax` spans lines, else point's line."
+  (if (spans-across? syntax)
+    (math/max 0 (- point *scan-window*))
+    (text/line->char rope (text/char->line rope point))))
+
+;; ---- the state at a position -------------------------------------------------------------
+
+(defn- opener-of (syntax text)
+  ;; the string delimiter or comment token `text` (a token's text) starts with, and its kind
+  (let (strings (seq/sort-by (or (:strings syntax) [])
+                  (fn (entry) (- 0 (string/length (:open entry)))))
+        string (seq/find strings (fn (entry) (string/starts-with? text (:open entry)))))
+    (if string
+      [:string (:open string)]
+      (let (block (seq/find (or (:block-comments syntax) [])
+                    (fn (pair) (string/starts-with? text (first pair)))))
+        (if block [:comment (second block)] [:comment nil])))))
+
+(defn token-state (rope syntax token)
+  "The `{:kind :open :start :end :closed?}` of the token `[start end]`: `:kind` `:string` or
+`:comment`, `:open` the string's delimiter (or a block comment's closer), `:closed?` whether
+its closer is there."
+  (let ([start end] token
+        text (text/slice rope start end)
+        [kind open] (opener-of syntax text)
+        n (if (string? open) (string/length open) 0)
+        closed? (and (string? open)
+                  (>= (string/length text) (* 2 n))
+                  (string/ends-with? text open)))
+    {:kind kind :open open :start start :end end :closed? closed?}))
+
+(defn state-at (buf syntax point)
+  "The string or comment `point` of `buf` is inside — `token-state`'s map — or nil in code.
+Inside means after its opener and before its closer (an unterminated one, up to its end)."
+  (let (rope (buffer-rope buf)
+        found (spans rope syntax (scan-start rope syntax point) point))
+    (when (not (empty? found))
+      (let (state (token-state rope syntax (last found))
+            {:keys [start end closed? kind]} state)
+        (when (and (> point start)
+                (or (< point end)
+                  (and (not closed?) (= point end) (not (= kind :comment)))
+                  ;; a line comment runs to its line's end, point there included
+                  (and (= kind :comment) (= point end) (nil? (:open state)))))
+          state)))))
+
+(defn string-extent (buf)
+  "The `[start end]` of the string point of `buf` is in, by its mode's string syntax, or nil."
+  (let (state (state-at buf (syntax-of buf) (buffer-point buf)))
+    (when (and state (= (:kind state) :string)) [(:start state) (:end state)])))
+
+;; ---- bracket balance (Emacs's `electric-pair-preserve-balance`) -----------------------------
+
+(defn- outside? (tokens offset)
+  ;; whether `offset` lies in none of the sorted `[start end]` `tokens`
+  (not (any? tokens (fn (token) (and (>= offset (first token)) (< offset (second token)))))))
+
+(sig blank-line-at? (any int -> bool))
+(defn- blank-line-at? (rope line)
+  ;; whether line `line` of `rope` holds only whitespace
+  (= "" (string/trim (text/line rope line))))
+
+(sig char-at (any int -> string))
+(defn- char-at (rope offset)
+  ;; the character at `offset` of `rope`
+  (text/slice rope offset (inc offset)))
+
+(def *balance-whole-below*
+  ;; a buffer this short (characters) is balanced as a whole, as Emacs's `syntax-ppss` reads it
+  200000)
+
+(defn balance-region (buf)
+  "The `[lo hi)` bracket balance is counted over in `buf`: the whole buffer when it is under
+`*balance-whole-below*` characters, else the run of non-blank lines around point (at most 400
+lines each way) — a larger file's brackets rarely pair across a blank line."
+  (let (rope (buffer-rope buf)
+        n (text/length rope))
+    (if (< n *balance-whole-below*)
+      [0 n]
+      (let (lines (text/line-count rope)
+            here (text/char->line rope (buffer-point buf))
+            top (letrec (up (fn (line steps)
+                              (if (or (<= line 0) (>= steps 400) (blank-line-at? rope (dec line)))
+                                line
+                                (up (dec line) (inc steps)))))
+                  (up here 0))
+            bottom (letrec (down (fn (line steps)
+                                   (if (or (>= (inc line) lines)
+                                         (>= steps 400)
+                                         (blank-line-at? rope (inc line)))
+                                     line
+                                     (down (inc line) (inc steps)))))
+                     (down here 0)))
+        [(text/line->char rope top)
+          (if (< (inc bottom) lines) (text/line->char rope (inc bottom)) n)]))))
+
+(defn balance (buf syntax pair lo hi)
+  "How `pair`'s brackets stand in `[lo, hi)` of `buf`, strings and comments skipped:
+`{:open n :closers [offset …]}` — the openers left unclosed, and where the closers that close
+nothing are. What electric-pair asks before pairing an opener or stepping over a closer."
+  (let (rope (buffer-rope buf)
+        [open close] pair
+        tokens (seq/filter (spans rope syntax (scan-start rope syntax lo) hi)
+                 (fn (token) (and (> (second token) lo) (< (first token) hi))))
+        pattern (str (regex/escape open) "|" (regex/escape close))
+        hits (seq/filter (regex/rope-spans pattern rope lo hi {:lines? false})
+               (fn (hit) (outside? tokens (first hit)))))
+    (let (result (fold hits
+                   {:open 0 :closers []}
+                   (fn (acc hit)
+                     (let (offset (first hit))
+                       (cond
+                         (= (char-at rope offset) open) (assoc acc :open (inc (:open acc)))
+                         (> (:open acc) 0) (assoc acc :open (dec (:open acc)))
+                         else (assoc acc :closers (conj (:closers acc) offset)))))))
+      result)))

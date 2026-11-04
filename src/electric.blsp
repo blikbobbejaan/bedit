@@ -24,17 +24,22 @@ entry may be a vector of pairs, which REPLACES the mode's (`{:markdown [[\"(\" \
 **When it pairs** — after Emacs's `electric-pair-default-inhibit`: not before a word character
 (`(` typed before `foo` is a `(`), not before the same character, not as the third of a run
 (`((` + `(`) — except in a Lisp, whose `:electric-pair-inhibit :never` always pairs, as paredit
-keeps its parens balanced. A quote opens only where a string plausibly STARTS — after whitespace, an opener
-or the buffer's edge — so the `\"` that ends a string you typed is typed (`self-pair-opens?`).
-A closer at point is stepped over, and so is one past only spaces and tabs on the line
-(`electric-pair-skip-whitespace`, kept to the line: without Emacs's balance check a `}` must
-not jump to the next line's).
+keeps its parens balanced. And `electric-pair-preserve-balance`, Emacs's default: an opener a
+waiting closer already balances is typed alone (`helps-balance?`), and a closer is stepped over
+only while the brackets stay balanced — `((a|)` + `)` types it (`skip-target`). The balance is
+counted with strings and comments skipped (`stringstate`), over the whole buffer below 200 KB.
+A quote's meaning comes from the STRING STATE at point (`stringstate/state-at`, Emacs's
+`syntax-ppss`), not the character before it: in code it opens a pair, in a string it closes it
+(or steps over the closer at point), in a comment it pairs as prose on the line
+(`quote-action`). A closer at point is stepped over, and so is one past only whitespace —
+spaces, tabs and newlines, Emacs's `electric-pair-skip-whitespace-chars`.
 
 An active region is wrapped by any opener or closer of the table, mode on or off — a selection
 plus a bracket has one meaning."
   (:use editor/buffer) ; buffer-char-before / -after, buffer-rope, buffer-point
   (:use interactive) ; defcommand — the two mode toggles
   (:use scroll :only [ed-mode-setting])
+  (:use stringstate :only [syntax-of]) ; string state and bracket balance, from the mode's syntax
   (:use model)) ; ed-current-buf, ed-mode-service, message
 
 (def *default-pairs*
@@ -91,7 +96,7 @@ and the setting's entry for its mode."
 
 (defn triple-pair (pairs buf key)
   "The multi-character pair `key` completes at point in `buf` — `\"\"\"` when `key` is `\"` and
-`\"\"` is just before point — or nil."
+`\"\"` is just before point, in code (not inside a string, `stringstate/state-at`) — or nil."
   (let (point (buffer-point buf))
     (seq/find pairs
       (fn (pair)
@@ -101,7 +106,8 @@ and the setting's entry for its mode."
             (string/ends-with? open key)
             (>= point (dec n))
             (= (text/slice (buffer-rope buf) (- point (dec n)) point)
-              (string/substring open 0 (dec n)))))))))
+              (string/substring open 0 (dec n)))
+            (nil? (stringstate/state-at buf (syntax-of buf) point))))))))
 
 ;; ---- when an opener pairs -------------------------------------------------------------
 
@@ -127,40 +133,85 @@ language's syntax table."
         (= after key)
         (and (= (char-at buf (dec point)) key) (= (char-at buf (- point 2)) key))))))
 
-(defn self-pair-opens? (pairs buf key)
-  "For a quote (a pair whose opener is its closer): whether one typed at point OPENS a pair. It
-does at the buffer's edge and after anything but what ENDS a string or a word — a word
-character, a quote, a closer of `pairs`, or sentence punctuation (`.` `!` `?`). There it is
-typed alone, which is how a string typed by hand is closed (`\"hello|` + `\"`). So `x=` + `\"`
-opens, as after a space or an opener."
-  (let (before (buffer-char-before buf))
-    (or (nil? before)
-      (not (or (word-char? before)
-             (any? pairs (fn (pair) (= (second pair) before)))
-             (includes? ["." "!" "?"] before))))))
+(defn helps-balance? (buf pair)
+  "Whether typing `pair`'s opener at point should stand ALONE because a closer after point
+already waits for it — Emacs's `electric-pair-inhibit-if-helps-balance`: `foo|)` + `(` is
+`(foo)`, not `(()foo)`. Strings and comments are not counted (`stringstate/balance`)."
+  (let (point (buffer-point buf)
+        [lo hi] (stringstate/balance-region buf)
+        result (stringstate/balance buf (stringstate/syntax-of buf) pair lo hi))
+    (any? (:closers result) (fn (offset) (>= offset point)))))
+
+(defn quote-action (m buf key)
+  "What a typed quote `key` (a pair whose opener is its closer) does at point — `:skip` over the
+quote there, `:pair`, or `:insert` it alone — from the string state at point
+(`stringstate/state-at`), as Emacs reads it from `syntax-ppss`:
+  - in a string this quote opened, at its closer, it steps over it (`\"abc|\"`); elsewhere in a
+    string it is typed — it closes the string, or is a character of another quote's
+  - in a comment it pairs when it opens one of its own on the line (an even count before it)
+  - in code it pairs, unless the inhibit rules say not (`inhibit?`)."
+  (let (syntax (stringstate/syntax-of buf)
+        point (buffer-point buf)
+        state (stringstate/state-at buf syntax point)
+        after (buffer-char-after buf)
+        on? (electric-pair-in? m buf))
+    (cond
+      (and state (= (:kind state) :string))
+        (if (and on?
+              (= after key)
+              (string/ends-with? (or (:open state) "") key)
+              (:closed? state)
+              (>= point (- (:end state) (string/length (:open state)))))
+          :skip :insert)
+      (and state (= (:kind state) :comment))
+        (let (before (text/slice (buffer-rope buf) (:start state) point)
+              count-before (count (seq/filter (string/->list before) (fn (c) (= c key)))))
+          (cond
+            (not on?) :insert
+            (and (math/odd? count-before) (= after key)) :skip
+            (math/odd? count-before) :insert
+            (inhibit? buf key) :insert
+            else :pair))
+      (not on?) :insert
+      (inhibit? buf key) :insert
+      else :pair)))
 
 (defn should-pair? (m buf pair key)
-  "Whether opener `key` of `pair` types its pair at point: the buffer pairs, nothing inhibits
-it, and a quote is where one opens."
+  "Whether bracket opener `key` of `pair` types its pair at point: the buffer pairs, nothing
+inhibits it (`inhibit?`), and no closer after point already waits for it (`helps-balance?`,
+Emacs's `electric-pair-preserve-balance`). A Lisp (`:electric-pair-inhibit :never`) always
+pairs."
   (and (electric-pair-in? m buf)
     (not (inhibit? buf key))
-    (or (not (= (first pair) (second pair))) (self-pair-opens? (pairs-for m buf) buf key))))
+    (or (= :never (ed-mode-service buf :electric-pair-inhibit)) (not (helps-balance? buf pair)))))
 
 ;; ---- closers --------------------------------------------------------------------------
 
 (defn closer-ahead (buf key)
-  "Where the closer `key` at point ends when only spaces and tabs on this line separate it
-from point — the offset just past it — or nil. Emacs's `electric-pair-skip-whitespace`, kept
-to the line."
+  "Where the closer `key` ends when only whitespace — spaces, tabs and newlines, Emacs's
+`electric-pair-skip-whitespace-chars` — separates it from point: the offset just past it, or
+nil."
   (let (rope (buffer-rope buf)
         n (buffer-length buf))
     (letrec (scan (fn (i)
                     (let (c (when (< i n) (text/slice rope i (inc i))))
                       (cond
                         (= c key) (inc i)
-                        (or (= c " ") (= c "\t")) (scan (inc i))
+                        (or (= c " ") (= c "\t") (= c "\n")) (scan (inc i))
                         else nil))))
       (scan (buffer-point buf)))))
+
+(defn skip-target (m buf pair key)
+  "Where a typed closer `key` of `pair` steps to — past the closer at point or past whitespace
+to it (`closer-ahead`) — or nil to type it: Emacs's `electric-pair-skip-self` under
+`electric-pair-preserve-balance`, which steps over only when that keeps the brackets
+balanced. With an opener left unclosed (`((a|)` + `)`) the closer is typed."
+  (when (electric-pair-in? m buf)
+    (let (ahead (closer-ahead buf key))
+      (when ahead
+        (let ([lo hi] (stringstate/balance-region buf)
+              result (stringstate/balance buf (stringstate/syntax-of buf) pair lo hi))
+          (when (= 0 (:open result)) ahead))))))
 
 (defn empty-pair-at (m buf)
   "The `[open close]` of `buf`'s pairs point sits inside with nothing between — `(|)` — or nil:
