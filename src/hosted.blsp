@@ -27,10 +27,12 @@ module is content only."
   (:use model) ; ed-buf-at / ed-stamp
   (:use editor/buffer-registry)) ; registry-share / -remove / -rekey — one process per document across frames
 (defn- hosted-proj (b)
-  "The subscription projection: `[text markers participants]` — the document, every
-marker (pid → offset; presence cursors ride these), and the pid → name registry.
-Sent on the seed and on closure edits; structured ops push O(change) deltas instead."
-  [(buffer-text b) (buffer-markers b) (:participants b {})])
+  "The subscription projection: std's `content-view` — `[text markers participants
+properties]`: the document, every marker (pid → offset; presence cursors ride these), the
+pid → name registry and the text properties (a program's colours, brood ADR-579), so a
+frame that joins late gets the colours too. Sent on the seed and on closure edits;
+structured ops push O(change) deltas instead, each splice with its properties."
+  (content-view b))
 
 (defn ed-hosted? (m &optional i)
   "Whether pool slot `i` (default the current buffer's) is backed by a buffer process."
@@ -123,12 +125,16 @@ registry-hosted or its identity did not change."
   "Host pool slot `i` — through the model's `:buffer-reg` when it has one (the registry's
 process for the buffer's document — `hosted-key` — shared with every other frame), else locally
 (`ed-host-slot`). A registry that does not answer falls back to a local host, so the
-editor never wedges on it."
+editor never wedges on it. The registry starts the process from the buffer's text AND its text
+properties, so a log coloured before it was shared stays coloured in every frame."
   (let (reg (:buffer-reg m)
         b (ed-buf-at m i))
     (if (nil? reg)
       (ed-host-slot m i)
-      (let (bp (registry-share reg (buffer-name b) (buffer-text b) (hosted-meta b)))
+      (let (bp (registry-share reg
+                 (buffer-name b)
+                 {:text (buffer-text b) :properties (buffer-property-map b)}
+                 (hosted-meta b)))
         (if (pid? bp)
           (map/update-in (ed-host-slot m i bp)
             [:hosted i]
@@ -233,7 +239,8 @@ with it. Echoes the casualty by name."
 with its `before` document by NAME (`ed-buffer-index-by-name` — pool names are the
 standard identity), because the indices shifted and a positional diff would compare
 different documents. A slot with no same-named `before` buffer (freshly created
-this event) is skipped — its process seeds from current text."
+this event) is skipped — its process seeds from current text. The rest send the splices
+their edits made, with the text properties they carried (`link-propagate-buffers`)."
   (fold (%map-pairs (or (:hosted after) {}))
     after
     (fn (acc kv)
@@ -249,9 +256,7 @@ this event) is skipped — its process seeds from current text."
                   acc
                   (map/assoc-in acc
                     [:hosted i]
-                    (link-propagate (map/get-in acc [:hosted i])
-                      (buffer-text ob)
-                      (buffer-text nb))))))))))))
+                    (link-propagate-buffers (map/get-in acc [:hosted i]) ob nb)))))))))))
 
 (defn hosted-step (before after input)
   "The loop-tail content hook: host any new pool slot (`hosted-reconcile` — the
@@ -282,37 +287,43 @@ nothing."
             (hosted-slot-for-proc m (nth input 1))
             nil)))))
 
-(defn- hosted-rebuilt (old text)
-  "`old` with its text replaced by `text`, KEEPING every non-content field. A hosted
+(defn- hosted-rebuilt (old text properties)
+  "`old` with its text replaced by `text` and its text properties by `properties` (the
+process's, `{key spans}` — a program's colours), KEEPING every non-content field. A hosted
 resync used to `make-buffer` from scratch, which silently dropped the buffer's
 `:type`/`:layers` (so its whole mode — keymap, fontify, indent — vanished) along with
 every mode-local field: `:git-status`/`:line-links` on a report buffer,
 `:input-start` on a shell, and `:read-only-spans` on the tutorial, whose loss
 would unfreeze the read-only prose (the spans are the buffer's own protection now —
-ADR-219). The rope is the only thing that should change."
-  (let (fresh (make-buffer text (buffer-name old) (buffer-file old)))
-    (merge old
-      {:rope (get fresh :rope)
-       ;; the content changed under us, so point/mark/undo can't be trusted
-       :point (math/min (get old :point 0) (buffer-length fresh))
-       :mark nil
-       :undo nil
-       :pending-undo nil})))
+ADR-219). The rope and what belongs to its text are the only things that should change."
+  (let (fresh (make-buffer text (buffer-name old) (buffer-file old))
+        rebuilt (merge (dissoc old :properties)
+                  {:rope (get fresh :rope)
+                   ;; the content changed under us, so point/mark/undo can't be trusted
+                   :point (math/min (get old :point 0) (buffer-length fresh))
+                   :mark nil
+                   :undo nil
+                   :pending-undo nil}))
+    (if (or (nil? properties) (empty? properties))
+      rebuilt
+      (assoc rebuilt :properties properties))))
 
 (defn- hosted-resync (m i link old)
   "Resync slot `i` from its process after a genuinely ambiguous collision (the same span
 touched on both sides inside one round-trip) — always correct. `buffer-sync` pairs text
-+ version ATOMICALLY: edits applied between the ambiguous push and our snapshot are
-inside the returned text, and advancing the link to the snapshot version makes their
-queued pushes drop as stale instead of replaying onto the rebuilt copy (doubling)."
-  (let (snap (buffer-sync (:proc link) buffer-text))
+(and its text properties) + version ATOMICALLY: edits applied between the ambiguous push
+and our snapshot are inside the returned text, and advancing the link to the snapshot
+version makes their queued pushes drop as stale instead of replaying onto the rebuilt copy
+(doubling)."
+  (let (snap (buffer-sync (:proc link) content-view))
     (if (= snap :no-reply)
       m ; process died mid-resync — the [:down] rehost will recover
-      (let ([version text] snap)
+      (let ([version view] snap
+            [text _ _ properties] view)
         (hosted-carried (assoc m :hosted (assoc (:hosted m) i (assoc link :version version)))
           i
           old
-          (ed-stamp (hosted-rebuilt old text))
+          (ed-stamp (hosted-rebuilt old text properties))
           (text-splice (buffer-text old) text))))))
 
 (defn- hosted-carried (m i old new splice)
@@ -398,8 +409,8 @@ version just before this push. `link` unchanged when nothing was skipped."
   "Fold one push's CONTENT into hosted slot `i`: `link-fold` (std protocol client)
 decides — stale drop, own-echo version bump, foreign splice transformed over our
 in-flight edits, ambiguous resync, or full-text rebuild — and the action is applied
-to the pool cache here (the pool-buffer twin of std's plain-string
-`text-apply-action`). The link first catches up on the own echoes the loop skipped
+to the pool cache here (std's `buffer-apply-action`, with the carrying a pool needs — the twin of
+std's plain-string `text-apply-action`). The link first catches up on the own echoes the loop skipped
 (`hosted-absorb-echoes`). Returns `[m' status]`, status `:stale` (push ignored — the
 caller should skip its own layers too) or `:applied`. Every window on the slot, the
 buffer's point and mark and its off-text positions are carried through the change
@@ -413,22 +424,33 @@ buffer's point and mark and its off-text positions are carried through the chang
         [(match action
            (:resync (hosted-resync m1 i link old))
            ;; a foreign DELTA that merges: already transformed over our in-flight
-           ;; splices by link-fold — apply in place (O(change), the rope survives), and
-           ;; everything pointing into the text carried through it (`hosted-carried`)
-           ([:splice [lo hi replacement]] (hosted-carried m1
-                                            i
-                                            old
-                                            (replace-region old lo hi replacement)
-                                            [lo hi replacement]))
+           ;; splices by link-fold — apply in place (O(change), the rope survives), with
+           ;; the text properties it came with, whatever this copy's read-only state (the
+           ;; text already changed in the process: std's `apply-splice`), and everything
+           ;; pointing into the text carried through it (`hosted-carried`)
+           ([:splice [lo hi replacement] properties]
+             (hosted-carried m1
+               i
+               old
+               ;; a redaction (a secret moved out of a shell's input) leaves this copy no trace
+               ;; either: std's `buffer-apply-action` reads `:redact` the same way
+               (buffer-apply-action old [:splice [lo hi replacement] properties])
+               [lo hi replacement]))
            ;; a full-text view (closure edits / the seed): rebuild only on real
-           ;; change (cheap no-op churn, and local undo state survives)
-           ([:text text] (if (= text (buffer-text old))
-                           m1
-                           (hosted-carried m1
-                             i
-                             old
-                             (ed-stamp (hosted-rebuilt old text))
-                             (text-splice (buffer-text old) text))))
+           ;; change (cheap no-op churn, and local undo state survives); the same text
+           ;; with other properties (a frame seeded after the colours changed) takes the
+           ;; properties alone
+           ([:text text properties] (cond
+                                      (not (= text (buffer-text old)))
+                                        (hosted-carried m1
+                                          i
+                                          old
+                                          (ed-stamp (hosted-rebuilt old text properties))
+                                          (text-splice (buffer-text old) text))
+                                      (= (or properties {}) (buffer-property-map old)) m1
+                                      (empty? (or properties {}))
+                                        (ed-set-buf-at m1 i (dissoc old :properties))
+                                      else (ed-set-buf-at m1 i (assoc old :properties properties))))
            ;; `:noop` (our own echo / a cursor-only delta) falls through untouched
            (_ m1))
           :applied]))))
