@@ -32,13 +32,13 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | paths: home, temp, absolute, `~` (brood ADR-592) | ✅ | ✅ — `C:/…` roots; the home is `%USERPROFILE%` when no `HOME` |
 | CRLF and BOM kept through find-file / save | ✅ | ✅ |
 | names with spaces and non-ASCII | ✅ | ✅ |
-| shell commands (M-!, M-\|, compile, the project shell) | ✅ | ⚠️ only where an `sh` is on PATH (Git for Windows, MSYS2) — brood KI-364 |
+| shell commands (M-!, M-\|, compile, the project shell) | ✅ `sh -c` | ✅ `cmd.exe /d /s /c`, the line passed raw (brood `os/shell-cmd`, KI-364 fixed) — written in cmd's language there |
 | clipboard seam | ✅ | ✅ |
 | key mapping (Option-as-Meta, AltGr) | ✅ brood unit tests | ✅ brood unit tests |
 | missing-font warning | ✅ (names Font Book) | ✅ (names the Fonts settings) |
 | auto-save sidecars: location, recovery | ✅ | ✅ |
-| auto-save sidecars: owner-only | ✅ | ❌ not private beyond the directory's ACL — brood KI-365 |
-| terminal buffers (C-x p t, M-x claude) | not in the set | ❌ no pty on Windows (brood's `spawn_pty` is Unix only) |
+| auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; brood's smoke test reads the ACL back) |
+| terminal buffers (C-x p t, M-x claude) | not in the set | ❌ no pty on Windows (brood KI-369, ConPTY); the command says so instead of failing |
 | a real window, font discovery, file watching (auto-revert) | not run — headless | not run — headless |
 
 ## Fixed on the way
@@ -57,8 +57,11 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 - Tests aged files with GNU `touch -d "1 hour ago"`, which macOS's `touch` does not read;
   they use `touch -t`.
 
-## Not fixed
+- M-x mur-browse opened URLs with `open` / `xdg-open` through `sh`; it uses brood's `os/open`
+  now (on Windows the URL protocol handler), started detached.
+- M-!, M-|, compile and the project shell named `sh`; they run through brood's platform shell
+  now (`cmd.exe` on Windows, the line passed raw).
 
-- M-x mur-browse opens a URL with `open` (macOS) or `xdg-open` — through `sh`, so not on
-  Windows (KI-364's shell question, and no Windows opener named).
-- Terminal buffers and the line-mode REPL need a pty; Windows has none in brood.
+## Not fixed
+- Terminal buffers and the line-mode REPL need a pty; Windows has none in brood (KI-369: ConPTY
+  needs a second child type in brood's subprocess registry). bedit says so when one is asked for.
