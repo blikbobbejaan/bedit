@@ -1152,8 +1152,9 @@ commands (transpose-lines, occur)."
 (defn ed-read-char (m prompt then)
   "Show `prompt` in the echo area and route the *next* key to `then` (a `(model key) ->
 model` continuation), via the read-char transient (`input`). Esc/C-g aborts. The shared
-one-key reader behind zap-to-char and the register / bookmark commands."
-  (assoc (message m prompt) :read-char {:then then}))
+one-key reader behind zap-to-char, the register / bookmark commands and every y/n question.
+The prompt stands until the key comes: a [[message]] meanwhile shows beside it, not over it."
+  (assoc (message (dissoc m :read-char) prompt) :read-char {:then then :prompt prompt}))
 
 (defn ed-yes-key? (key)
   "Whether `key` — what an `ed-read-char` continuation was handed for a `(y or n)`
@@ -1443,6 +1444,14 @@ the reply to land) gets none and keeps ranking inline."
 closes (`input/mb-close`), so a session never outlives the prompt that owns it."
   (let (session (map/get-in m [:minibuffer :ranker]))
     (do (when session (fuzzy/ranker-stop session)) m)))
+
+(defn ed-minibuffer-closed (m)
+  "`m` with the open prompt gone — its ranking session stopped ([[ed-mb-stop-ranker]]) — and a
+[[message]] that was showing beside it, said since the last key, moved to the echo area,
+where it would have gone with no prompt open."
+  (let (said (map/get-in m [:minibuffer :message])
+        closed (assoc (ed-mb-stop-ranker m) :minibuffer nil))
+    (if (nil? said) closed (assoc closed :echo said))))
 
 (defn ed-apply-ranked (m session query hits)
   "Fold a ranking session's reply into the open minibuffer's `:cand-cache`. Dropped unless
@@ -2040,17 +2049,37 @@ A report about a slow `:ui-slow` turn is not sent: when every turn is slow, logg
 slow too, and reporting that would keep the loop busy logging its own reports."
   (when (not (= (:tag report) :ui-slow)) (send (self) [:ui-slow report])))
 
-(defn message (m s)
-  "Log `s` to the editor's default sink: append it as a line to `*Messages*`
+;; check-allow: the message kept beside a standing question is written by `map/assoc-in`, whose
+;; answer the checker reads as a bare `map`; every branch hands back the model it was given
+;; with one field set
+(sig message (model any -> model))
+(check-allow :trusted
+  (defn message (m s)
+    "Log `s` to the editor's default sink: append it as a line to `*Messages*`
 (`ed-append-named`, creating it if needed) *and* show it (flattened to one line) in
 the echo area. Never disturbs the current buffer's point. The editor's primary output
 — commands print here, never the console; categorised logs route elsewhere (see
 `ed-append-named` + the log routes). `*Messages*` keeps its newest
-[[*message-log-max*]] lines."
-  (let (logged (ed-append-named m "*Messages*" s)
-        i (or (ed-buffer-index-by-name logged "*Messages*") (error "message: no *Messages* buffer"))
-        cut (ed-head-cut-lines (ed-buf-at logged i) *message-log-max*))
-    (assoc (if (nil? cut) logged (ed-cut-head-at logged i cut)) :echo (one-line s))))
+[[*message-log-max*]] lines.
+
+While a QUESTION stands — a minibuffer prompt, a y/n read ([[ed-read-char]]), a
+query-replace's y/n/!/./q — the message does not take its place: it is kept beside the
+question ([[ed-standing-question]]) and shown after it in brackets, `Delete foo? (y/n)
+[pushed main]`, until the next key (Emacs's `set-minibuffer-message`). A task reply, a timer
+or a language server speaking up can no longer leave the user answering a question they
+cannot see."
+    (let (logged (ed-append-named m "*Messages*" s)
+          i (or (ed-buffer-index-by-name logged "*Messages*")
+              (error "message: no *Messages* buffer"))
+          cut (ed-head-cut-lines (ed-buf-at logged i) *message-log-max*)
+          kept (if (nil? cut) logged (ed-cut-head-at logged i cut))
+          line (one-line s))
+      ;; each path spelled literally, so the model keeps its shape through the update
+      (case (ed-standing-question-key m)
+        :read-char (map/assoc-in kept [:read-char :message] line)
+        :query-replace (map/assoc-in kept [:query-replace :message] line)
+        :minibuffer (map/assoc-in kept [:minibuffer :message] line)
+        (assoc kept :echo line)))))
 
 (sig ed-ding (model &optional (or nil string) -> model))
 (defn ed-ding (m &optional text)
@@ -2062,6 +2091,31 @@ echo area when given — only shown, not logged, so a held C-n at the end of the
 not fill *Messages*. A command that also wants the line logged passes it `(message m …)`.
 The flag is read only by the macro replay, which clears it before each key."
   (let (failed (assoc m :command-failed true)) (if (nil? text) failed (assoc failed :echo text))))
+
+(defn- ed-standing-question-key (m)
+  "The model field holding the question the user is being asked, or nil: `:read-char` when
+its reader shows a `:prompt`, `:query-replace` at a match, `:minibuffer` when a prompt is
+open — in that order, the overlay that has the keyboard first."
+  (cond
+    (map/get-in m [:read-char :prompt]) :read-char
+    (map/get-in m [:query-replace :prompt]) :query-replace
+    (:minibuffer m) :minibuffer
+    else nil))
+
+(defn ed-standing-question (m)
+  "`{:prompt :message}` for a one-key question the user is being asked — a y/n read or a
+query-replace — or nil (a minibuffer prompt draws its own line, `view/ed-echo-line`).
+`:message` is the latest [[message]] since it was asked, nil when none came."
+  (let (key (ed-standing-question-key m))
+    (when (and key (not (= key :minibuffer))) (get m key))))
+
+(defn ed-with-question-message (prompt message)
+  "The echo line for a question with a `message` that arrived while it stood: the prompt,
+then the message in brackets.
+
+    (model/ed-with-question-message \"Delete foo? (y/n) \" \"pushed\")   ;=> \"Delete foo? (y/n) [pushed]\"
+    (model/ed-with-question-message \"Delete foo? (y/n) \" nil)          ;=> \"Delete foo? (y/n) \""
+  (if (nil? message) prompt (str (string/trimr prompt) " [" message "]")))
 
 ;; ---- applying buffer ops to the current buffer ------------------------------
 ;; The editing core: every command that changes the text goes through `ed-try-edit`
@@ -2279,10 +2333,22 @@ supervised logger, so routes survive a restart."
 ;; idle beat reads it again: a program run from the editor (`xclip` in a terminal buffer)
 ;; can copy without the focus ever moving.
 
-(defn- ed-read-clipboard-with (reader)
-  "What `reader` finds on the OS clipboard, or `:clipboard-unread` when the read failed — a
-read already waiting on a wedged owner (brood ADR-536), no display. Never nil for a
-failure: nil is an empty clipboard."
+(defdyn *clipboard-writer* os/clipboard-set)
+;; What puts a text on the OS clipboard — every kill's mirror ([[ed-clipboard-write]]); a test
+;; binds a stand-in, so it never replaces what the user copied.
+
+(defdyn *primary-reader* os/primary-get)
+;; What reads the PRIMARY selection (X11 / Wayland: what is highlighted anywhere, brood
+;; ADR-553) — the middle click's text; a test binds a stand-in.
+
+(defdyn *primary-writer* os/primary-set)
+;; What owns the PRIMARY selection with a text — a drag-select's region; a test binds a
+;; stand-in that records what it was handed.
+
+(defn ed-read-clipboard-with (reader)
+  "What `reader` finds on the OS clipboard (or the PRIMARY selection, for a primary reader),
+or `:clipboard-unread` when the read failed — a read already waiting on a wedged owner
+(brood ADR-536), no display. Never nil for a failure: nil is an empty clipboard."
   (try
     (reader)
     (catch e (do (log/warn (str "clipboard read failed: " (error-message e))) :clipboard-unread))))
@@ -2470,7 +2536,7 @@ for a model with neither. Returns nil; [[ed-push-kill]] records the OS write on 
   (cond
     ;; `os/clipboard-set` is itself a no-op without a clipboard, so nothing here is guarded:
     ;; a stale name must raise, not leave every kill un-mirrored.
-    (:os-clipboard m) (do (os/clipboard-set text) nil)
+    (:os-clipboard m) (do (*clipboard-writer* text) nil)
     (:client-clipboard m) (do (editor/serve/client-clipboard-set text) nil)
     else nil))
 
@@ -2628,15 +2694,31 @@ reports no focus would then never read another app's copy again."
   (let (moved (assoc m :clipboard-epoch (inc (:clipboard-epoch m 0))))
     (if (:clipboard-known? m) (assoc moved :clipboard-text text) moved)))
 
-(defn ed-drag-copy (m)
-  "Emacs `mouse-drag-copy-region`: when a mouse drag-select ends with a real region,
-copy it to the kill ring — and thus the OS clipboard (`ed-push-kill`) — WITHOUT clearing
-it, so releasing a highlight makes it immediately paste-able in any buffer, read-only or
-not. Silent (no echo — a drag shouldn't spam the echo area). A plain click selects
-nothing, so it's a no-op. Coalescing is suppressed (`:last-command` cleared) so the
-selection is its own entry, never appended to a prior kill."
+(defn ed-primary-write (m text)
+  "Own the PRIMARY selection with `text` — what a middle click in any app then pastes —
+leaving the CLIPBOARD alone: the local window's (`:os-clipboard`). Nothing for a served
+session, whose link carries its client's clipboard but no PRIMARY (brood ADR-539, ADR-553),
+nor for a model with no OS clipboard. Returns nil."
+  (when (:os-clipboard m) (*primary-writer* text))
+  nil)
+
+(defn ed-drag-select (m)
+  "A mouse drag-select ended with a real region: the region stays highlighted and its text
+becomes the PRIMARY selection ([[ed-primary-write]]) — and that is all. The kill ring and
+the OS CLIPBOARD are not touched, as in Emacs (`select-enable-clipboard` t,
+`mouse-drag-copy-region` nil, `select-active-regions` t): highlighting text never throws
+away what was copied in another app. M-w copies it as any region.
+
+With the `:mouse-drag-copy-region` setting on (Emacs's variable of that name), the region is
+also copied to the kill ring — and so the clipboard, [[ed-push-kill]] — as its own entry
+(`:last-command` cleared: never appended to a prior kill). Silent either way, and a no-op
+when the press selected nothing."
   (let (text (buffer-region (ed-current-buf m)))
-    (if (nil? text) m (ed-push-kill (assoc m :last-command nil) text true))))
+    (cond
+      (nil? text) m
+      (:mouse-drag-copy-region m)
+        (do (ed-primary-write m text) (ed-push-kill (assoc m :last-command nil) text true))
+      else (do (ed-primary-write m text) m))))
 
 ;; ---- OS window title --------------------------------------------------------
 

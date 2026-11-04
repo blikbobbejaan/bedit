@@ -111,7 +111,13 @@ src/model.blsp              the ui-run model: buffer pool, panes, kill ring, min
                             cursor and scroll moving with the text — Emacs's
                             comint-buffer-maximum-size), and `ed-ding`: a command's FAILURE
                             (a motion at the edge, a failing search, a read-only refusal),
-                            which is what stops a keyboard macro
+                            which is what stops a keyboard macro. `message` never covers a
+                            STANDING QUESTION (a y/n read, a query-replace, a minibuffer prompt):
+                            it shows beside it in brackets until the next key, as Emacs's
+                            minibuffer message, and lands in *Messages* as always. The
+                            clipboard seam: kills mirror to the OS CLIPBOARD; a mouse drag
+                            sets only PRIMARY (`ed-drag-select`, brood ADR-553 — the clipboard
+                            and kill ring stay put unless `:mouse-drag-copy-region`)
 src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
                             over the live keymap, `\[command]` substitution, docstrings
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
@@ -207,7 +213,9 @@ src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a fun
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model); the
                             row table every row↔line question reads (`ed-pane-rows`), from the
                             pane's start row; `ed-visible-windows`, the char ranges a per-window
-                            highlight reads (a long line only over what the pane shows of it)
+                            highlight reads (a long line only over what the pane shows of it).
+                            A middle click places point (`ed-mouse-set-point`) and commands
+                            yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`)
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
                             feature: a pane body's layers share ONE geometry map, and the
                             mode line's feature chips come from the statusbar registry
@@ -492,7 +500,10 @@ src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) mod
                             (C-M-s / C-M-r, M-r) and word (M-s w) search, M-c case toggle, C-M-%
                             with `\1` groups; the `3/17` match count (a timer of its own, a slice of
                             the rope per turn, never on a key) and every visible match lit
-                            (`lazy-ranges`), over std regex's rope search (brood ADR-540)
+                            (`lazy-ranges`), over std regex's rope search (brood ADR-540). With
+                            the region active, M-% / C-M-% stay inside it (`Query replace in
+                            region:`): its end moves with each replacement, and a regexp is
+                            searched with it as the bound (brood ADR-554)
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/eval-commands.blsp      the C-x C-e family as commands (eval-last-sexp / -region / -buffer):
                             off the loop as a std/task, C-g cancels; loaded with the image (main)
