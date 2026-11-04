@@ -18,7 +18,16 @@ and the command clones and compiles it. Fetching and compiling needs the network
 toolchain, and an editor that quietly shells out to both is doing something the user
 should have asked for — so nothing fetches unasked. Opening a file whose grammar is
 missing only says so, naming the command; `M-x grammar-list` still prints the recipe for
-a language nobody declared."
+a language nobody declared.
+
+Every declared grammar is PINNED to the revision bedit's tables for it were written against
+(`:grammar {:url … :revision …}`), because a grammar's repository moves on its own and a newer
+one may rename the very nodes a face table names. `grammar-install` fetches exactly that
+revision and records what it built beside the library (brood ADR-583); `M-x grammar-list`
+shows each grammar's installed revision against its pin, and `M-x grammar-update` moves one
+that differs back to it. Whatever is installed is also CHECKED for the names bedit uses
+(`grammarcheck`): a grammar lacking one is reported in *Messages* once and its language stands
+in with its line lexer, rather than colouring wrongly."
   (:use model) ; message / ed-current-buf
   (:use pool) ; ed-show-named
   (:use task) ; task — a grammar builds off the loop
@@ -73,7 +82,8 @@ outside the image belongs on the startup path, where it runs every launch.
 
 Scanning the directory rather than consulting a list is what makes adding a language one
 edit: drop the library in, add the mode's three definitions, and nothing has to name it
-twice."
+twice. Every grammar's check against bedit's tables (`grammarcheck`) is asked afresh."
+  (grammarcheck/forget)
   (let (dir (ts-grammar-dir))
     (if (not (file/dir? dir))
       '()
@@ -91,7 +101,9 @@ for a frame that shows at most one; loading them a moment later left a file of a
 language opened in between with no colours. A declaration costs a table entry, and the
 runtime loads a language exactly when a buffer first needs it. On the startup path for the
 same reason as [[load-user-grammars]]: a declaration lives in the runtime, which an image
-does not restore."
+does not restore. A declaration may name a library of another revision, so every grammar's
+check against bedit's tables (`grammarcheck`) is asked afresh at its first use."
+  (grammarcheck/forget)
   (let (dir (ts-grammar-dir))
     (if (not (file/dir? dir))
       '()
@@ -121,6 +133,98 @@ you ask — a grammar's ABI lives in the library, and `tree-sitter-load-grammar`
   (check-allow :discarded-catch
     (try (%tree-sitter-load-grammar path (keyword lang)) (catch e (error-message e)))))
 
+;; ---- where a grammar lives, which revision, and fetching it when asked ---------------
+;; A language declares where its grammar lives AND the revision its tables were written
+;; against (`deflanguage`'s `:grammar {:url … :revision …}`), so getting one is a command:
+;; `M-x grammar-install go` fetches exactly that revision and compiles it off the loop (std's
+;; `editor/treesit/grammar-install`), writes a manifest beside the library saying what it
+;; built (brood ADR-583), and loads it — the next frame colours. A grammar is a separate
+;; repository that moves on its own schedule, and a newer one may rename the nodes a face
+;; table names; pinning is how "works today" stays true tomorrow. It needs git and a C
+;; compiler, and it only runs when asked; opening a file whose grammar is missing just SAYS
+;; so, with the command.
+
+(defn declare-grammar (lang source)
+  "Record that `lang`'s grammar lives at `source`: a git URL, or `{:url :revision :subdir}` —
+the revision (a commit hash or tag) bedit's tables for it were written against, and the
+grammar's directory in a repository holding several."
+  (ownership/claim! :grammars/sources lang source))
+
+(defn grammar-source (lang)
+  "Where `lang`'s grammar lives, as declared — nil for a language that declared none."
+  (registry/lookup :grammars/sources lang))
+
+(defn grammar-pin (lang)
+  "The revision `lang`'s grammar is pinned to — a commit hash or tag — or nil when its
+declaration names none (or there is no declaration)."
+  (let (source (grammar-source lang)) (when (map? source) (get source :revision))))
+
+(defn installed-manifest (lang)
+  "What the install of `lang`'s grammar in the user's directory recorded
+(`editor/treesit/grammar-manifest`), or nil — none installed, or built by hand."
+  (editor/treesit/grammar-manifest (ts-grammar-path lang)))
+
+(defn at-pin? (manifest pin)
+  "Whether the install `manifest` describes is the pinned revision `pin`: it asked for `pin`,
+or the commit it resolved to begins with it (a hash pin).
+
+    (grammars/at-pin? {:revision nil :commit \"5842537f734d\"} \"5842537f\")   ;=> true
+    (grammars/at-pin? {:revision \"v1.0\" :commit \"abc\"} \"v1.1\")   ;=> false"
+  (and (not (nil? manifest))
+    (not (nil? pin))
+    (or (= (get manifest :revision) pin)
+      (let (commit (get manifest :commit))
+        (and (string? commit) (string/starts-with? commit pin))))))
+
+(defn pin-state (lang)
+  "Where the installed `lang` grammar stands against its pin: `:pinned` (installed at it),
+`:other` (installed at another revision — `:installed` names it), `:unknown` (installed with
+no manifest, so its revision is not known), `:replaced` (the library is no longer the one its
+manifest describes), `:missing` (none installed in the user's directory) or `:unpinned` (no
+revision declared). As `{:state :pin :installed}`."
+  (let (pin (grammar-pin lang)
+        path (ts-grammar-path lang)
+        manifest (installed-manifest lang)
+        installed (or (get manifest :commit) (get manifest :revision)))
+    {:pin pin
+     :installed installed
+     :state (cond
+              (nil? pin) :unpinned
+              (not (file/exists? path)) :missing
+              (nil? manifest) :unknown
+              (not (= (get manifest :sha256) (editor/treesit/grammar-file-hash path))) :replaced
+              (at-pin? manifest pin) :pinned
+              else :other)}))
+
+(defn- short-revision (revision)
+  ;; a commit hash cut to twelve; a tag as it is
+  (cond
+    (nil? revision) "-"
+    (and (> (string/length revision) 12) (regex/matches? "[0-9a-f]+" revision))
+      (string/substring revision 0 12)
+    else revision))
+
+(defn- pin-cell (lang)
+  ;; what the grammar list says about the pin, in a few words
+  (let ({:keys [state pin installed]} (pin-state lang))
+    (case state
+      :pinned (str "pinned " (short-revision pin))
+      :other (str "MISMATCH installed " (short-revision installed) ", pinned " (short-revision pin))
+      :unknown (str "revision unknown (built by hand), pinned " (short-revision pin))
+      :replaced (str "replaced since its install, pinned " (short-revision pin))
+      :missing (str "pinned " (short-revision pin))
+      "unpinned")))
+
+(defn- check-cell (lang)
+  ;; the grammar's check against bedit's tables: the names it lacks, or nothing
+  (let (problems (grammarcheck/verdict lang))
+    (if (empty? problems)
+      ""
+      (str "\n      CONTRACT: "
+        (string/join (take problems 4) "; ")
+        (if (> (count problems) 4) (str " (and " (- (count problems) 4) " more)") "")
+        " — not the revision bedit expects: M-x grammar-update"))))
+
 (defn- grammar-row (pair)
   (let ([lang path] pair
         abi (grammar-abi lang path)
@@ -131,11 +235,16 @@ you ask — a grammar's ABI lives in the library, and `tree-sitter-load-grammar`
       (string/pad-right (->string abi) 6)
       " "
       (if size (str (humanize/byte-size-short size) " ") "")
-      path)))
+      (pin-cell (keyword lang))
+      "  "
+      path
+      ;; a library that did not load has no contract to check; its ABI cell says why
+      (if (int? abi) (check-cell (keyword lang)) ""))))
 
 (defn grammar-report ()
-  "The *Grammars* buffer's text: what is installed, what the runtime has built in, and how
-to build another."
+  "The *Grammars* buffer's text: what is installed — each grammar's ABI, its revision against
+the pinned one, and the names bedit's tables use that it lacks — what the runtime has built in,
+and how to build another."
   (let (files (grammar-files)
         dir (ts-grammar-dir))
     (string/join (append (list "-*- tree-sitter grammars -*-" "" (str "loaded from " dir) "")
@@ -144,7 +253,13 @@ to build another."
                      (append (into [] (map files grammar-row)) (list "")))
                    (list "built into this runtime: elixir, ruby (nest --features treesit-grammars)"
                      ""
-                     "To upgrade one, replace the library and reload — no restart:"
+                     "M-x grammar-install fetches a missing grammar at its pinned revision;"
+                     "M-x grammar-update moves an installed one to its pin. A grammar of another"
+                     "revision may have renamed the nodes bedit colours and indents by — the"
+                     "CONTRACT line names them, and its language is coloured by its line lexer"
+                     "meanwhile where it has one."
+                     ""
+                     "To build one by hand, replace the library and reload — no restart:"
                      ""
                      "    git clone --depth=1 https://github.com/tree-sitter/tree-sitter-<lang>"
                      "    cd tree-sitter-<lang>"
@@ -160,8 +275,9 @@ to build another."
 
 (defcommand cmd-grammar-list
   (m key)
-  "Show the installed tree-sitter grammars, their ABI versions, and how to build one
-(M-x grammar-list)."
+  "Show the installed tree-sitter grammars — ABI, installed revision against the pinned one,
+and whether each still has the names bedit's tables use — and how to build one (M-x
+grammar-list)."
   (ed-show-named m *grammar-buffer* (grammar-report)))
 
 (defcommand cmd-grammar-reload
@@ -172,39 +288,35 @@ upgrade path: replace the `.so` and run this, without restarting.
 Safe because the runtime treats a re-load as a swap: it overrides the registration, drops
 the pooled parsers bound to the old library, and clears the cached trees, which were
 shaped by it. Anything that survived would be holding pointers into a library the next
-parse no longer uses."
+parse no longer uses. Each reloaded grammar is checked against bedit's tables afresh."
   (let (loaded (load-user-grammars))
     (message (ed-grammars-arrived m)
       (if (empty? loaded)
         (str "no grammars in " (ts-grammar-dir))
         (str "reloaded " (string/join (map loaded ->string) ", "))))))
 
-;; ---- where a grammar lives, and fetching it when asked ---------------------------
-;; A language declares where its grammar lives (`deflanguage`'s `:grammar`), so getting one
-;; is a command rather than the recipe above: `M-x grammar-install go` clones and compiles it
-;; off the loop (std's `editor/treesit/grammar-install`), drops the library where the
-;; startup scan finds it, and loads it — the next frame colours. It needs git and a C
-;; compiler, and it only runs when asked; opening a file whose grammar is missing just SAYS
-;; so, with the command.
-
-(defn declare-grammar (lang source)
-  "Record that `lang`'s grammar lives at `source`: a git URL, or `{:url … :subdir …}` for a
-repository holding several grammars."
-  (ownership/claim! :grammars/sources lang source))
-
-(defn grammar-source (lang)
-  "Where `lang`'s grammar lives, as declared — nil for a language that declared none."
-  (registry/lookup :grammars/sources lang))
-
 (defn grammar-loaded? (lang)
   "Whether the runtime can parse `lang` right now (loaded or built in)."
   (includes? (editor/treesit/languages) lang))
 
 (defn missing-grammars ()
-  "The declared languages whose grammar is not ready (`model/grammar-ready?`), sorted by
-name."
+  "The declared languages whose grammar is not ready (`model/grammar-ready?`: none, or one
+failing its check), sorted by name."
   (seq/sort-by (seq/filter (keys (registry/entries :grammars/sources))
                  (fn (lang) (not (*grammar-ready?* lang))))
+    ->string))
+
+(defn outdated-grammars ()
+  "The declared languages whose installed grammar is not at its pinned revision — another
+one, an unknown one (built by hand), or a library replaced since — or that fails its check
+against bedit's tables, sorted by name. What `M-x grammar-update` offers."
+  (seq/sort-by
+    (seq/filter (keys (registry/entries :grammars/sources))
+      (fn (lang)
+        (let (state (:state (pin-state lang)))
+          (or (contains? #{:other :unknown :replaced} state)
+            ;; a built-in grammar too: installing the pinned one overrides it
+            (and (grammar-loadable? lang) (not (empty? (grammarcheck/verdict lang))))))))
     ->string))
 
 (defn buffer-grammar (buf)
@@ -215,79 +327,128 @@ name."
 (defn missing-note (buf)
   "What to add to the message that opened `buf` when its mode is a tree-sitter language
 with no grammar ready — how to get one — else \"\". A stand-in buffer is coloured by its line
-lexer meanwhile, and says so rather than claiming no colours."
-  (let (lang (buffer-grammar buf))
-    (if (or (nil? lang) (*grammar-ready?* lang))
-      ""
-      (str " — no "
-        (->string lang)
-        (if (ed-mode-service buf :wants-grammar)
-          " grammar, so coloured line by line with no structure: "
-          " grammar, so no colours or structure: ")
-        (if (nil? (grammar-source lang))
-          "M-x grammar-list says how to build one"
-          "M-x grammar-install")))))
+lexer meanwhile, and says so rather than claiming no colours. A grammar that is installed but
+fails its check (another revision than bedit's tables were written for) is named as that,
+with the command that installs the pinned one."
+  (let (lang (buffer-grammar buf)
+        stand-in? (ed-mode-service buf :wants-grammar))
+    (cond
+      (or (nil? lang) (*grammar-ready?* lang)) ""
+      (and (grammar-loadable? lang) (not (empty? (grammarcheck/verdict lang))))
+        (str " — the installed "
+          (->string lang)
+          " grammar is not the revision bedit expects ("
+          (first (grammarcheck/verdict lang))
+          (if stand-in? "), so coloured line by line: " "): ")
+          "M-x grammar-update")
+      else
+        (str " — no "
+          (->string lang)
+          (if stand-in?
+            " grammar, so coloured line by line with no structure: "
+            " grammar, so no colours or structure: ")
+          (if (nil? (grammar-source lang))
+            "M-x grammar-list says how to build one"
+            "M-x grammar-install")))))
 
 (defn- grammar-work-dir ()
-  "Where grammar checkouts are cloned: beside the libraries, which the startup scan ignores."
+  "Where grammar checkouts are fetched: beside the libraries, which the startup scan ignores."
   (path/join (ts-grammar-dir) "src"))
 
-(defn- grammar-install-run (lang source)
-  "Fetch and compile `lang`'s grammar into the grammar directory: `{:ok path}` or `{:error
-text}`. Runs off the loop — a clone and a compile take seconds."
-  (let (url (if (map? source) (get source :url) source)
-        subdir (if (map? source) (get source :subdir) nil))
-    (editor/treesit/grammar-install url lang (ts-grammar-dir) (grammar-work-dir) subdir)))
+(defdyn *grammar-installer*
+  ;; `(fn (url lang out-dir work-dir options) -> {:ok path} | {:error text})` — std's fetch and
+  ;; build; a dynvar so a test can stand in for the network and the compiler
+  editor/treesit/grammar-install)
 
-(defn- grammar-install-land (m lang result)
-  "Load a freshly built grammar and say what happened."
+(defn grammar-install-run (lang source)
+  "Fetch `lang`'s grammar at its pinned revision and compile it into the grammar directory,
+writing its manifest: `{:ok path :commit sha}` or `{:error text}`. Runs off the loop — a fetch
+and a compile take seconds."
+  (let (url (if (map? source) (get source :url) source)
+        options (if (map? source)
+                  {:subdir (get source :subdir) :revision (get source :revision)}
+                  {}))
+    (*grammar-installer* url lang (ts-grammar-dir) (grammar-work-dir) options)))
+
+(defn- install-outcome (lang result)
+  ;; one language's install, loaded and checked: the line that says how it went, and whether
+  ;; a grammar arrived
   (cond
-    (nil? result) (message m (str "grammar-install " (->string lang) ": failed or timed out"))
-    (contains? result :error)
-      (message m (str "grammar-install " (->string lang) ": " (get result :error)))
+    (nil? result) [(str (->string lang) ": failed or timed out") false]
+    (contains? result :error) [(str (->string lang) ": " (get result :error)) false]
     else
-      (let (abi (ts-load-grammar lang))
-        (message (if (nil? abi) m (ed-grammars-arrived m))
-          (if (nil? abi)
-            (str "built " (get result :ok) " but it did not load — see *Messages*")
-            (str "installed the " (->string lang) " grammar (ABI " abi ") — " (get result :ok)))))))
+      (do
+        (grammarcheck/forget lang)
+        (let (abi (ts-load-grammar lang)
+              problems (if (nil? abi) '() (grammarcheck/verdict lang))
+              at (short-revision (or (get result :commit) (grammar-pin lang))))
+          (cond
+            (nil? abi)
+              [(str "built " (get result :ok) " but it did not load — see *Messages*") false]
+            (not (empty? problems))
+              [(str (->string lang) " " at " (ABI " abi ") still lacks " (first problems)) true]
+            else [(str (->string lang) " " at " (ABI " abi ")") true])))))
+
+(defn- grammar-install-land (m results)
+  "Load each freshly built grammar of `results` (`[lang result]` pairs) and say what happened."
+  (let (outcomes (map results (fn ([lang result]) (install-outcome lang result)))
+        arrived? (any? outcomes (fn ([_ ok?]) ok?))
+        lines (map outcomes first))
+    (message (if arrived? (ed-grammars-arrived m) m)
+      (str (if arrived? "installed " "grammar-install ") (string/join lines "; ")))))
 
 (register-task-reply :grammar-proc 'grammars/grammar-install-apply nil "building a grammar")
-(defn grammar-install-apply (m result)
-  "The `:grammar-proc` task's reply, folded: the build's result, or nil when the task
+(defn grammar-install-apply (m results)
+  "The `:grammar-proc` task's reply, folded: each build's `[lang result]`, or nil when the task
 errored or timed out."
-  (let (lang (:grammar-pending m))
-    (grammar-install-land (dissoc m :grammar-proc :grammar-pending) lang result)))
+  (let (langs (:grammar-pending m)
+        cleared (dissoc m :grammar-proc :grammar-pending))
+    (grammar-install-land cleared
+      (if (nil? results) (map langs (fn (lang) [lang nil])) results))))
 
-(defn grammar-install-start (m lang)
-  "Fetch, build and load `lang`'s declared grammar — off the loop, or inline when there is
-no loop to reply to (a test, a batch run)."
-  (let (source (grammar-source lang))
+(defn- install-all (langs)
+  ;; each language fetched and built in turn, `[lang result]` pairs
+  (map langs (fn (lang) [lang (grammar-install-run lang (grammar-source lang))])))
+
+(defn grammar-install-start (m lang-or-langs)
+  "Fetch, build and load the declared grammar of a language — or of each of a list of them,
+in turn — at its pinned revision: off the loop, or inline when there is no loop to reply to
+(a test, a batch run)."
+  (let (langs (if (keyword? lang-or-langs) [lang-or-langs] (vec lang-or-langs))
+        unknown (seq/filter langs (fn (lang) (nil? (grammar-source lang)))))
     (cond
-      (nil? source)
+      (not (empty? unknown))
         (message m
           (str "no known source for a "
-            (->string lang)
+            (->string (first unknown))
             " grammar — M-x grammar-list says how to build one"))
       (:grammar-proc m) (message m "a grammar is already being built")
-      (ed-headless?) (grammar-install-land m lang (grammar-install-run lang source))
+      (ed-headless?) (grammar-install-land m (install-all langs))
       else
         (message (assoc m
-                   :grammar-proc (task (fn () (grammar-install-run lang source)) {:timeout 300000})
-                   :grammar-pending lang)
-          (str "fetching and building the " (->string lang) " grammar…")))))
+                   :grammar-proc
+                     (task (fn () (install-all langs)) {:timeout (* 300000 (count langs))})
+                   :grammar-pending langs)
+          (str "fetching and building the "
+            (string/join (map langs ->string) ", ")
+            (if (= 1 (count langs)) " grammar" " grammars")
+            " at the pinned revision…")))))
+
+(defn- ordered-names (langs m)
+  ;; `langs` as names for a prompt, the current buffer's language first
+  (let (names (map langs ->string)
+        here (buffer-grammar (ed-current-buf m)))
+    (if (and here (includes? names (->string here)))
+      (cons (->string here) (seq/filter names (fn (name) (not (= name (->string here))))))
+      names)))
 
 (defcommand cmd-grammar-install
   (m key)
   "Fetch, compile and load a language's tree-sitter grammar (M-x grammar-install): from
-where its mode declares it lives, into the grammar directory, with git and the C
-compiler. Offers the languages with no grammar loaded, the current buffer's first."
-  (let (missing (map (missing-grammars) ->string)
-        here (buffer-grammar (ed-current-buf m))
-        names (if (and here (includes? missing (->string here)))
-                (cons (->string here)
-                  (seq/filter missing (fn (name) (not (= name (->string here))))))
-                missing))
+where its mode declares it lives, at the revision it pins, into the grammar directory, with
+git and the C compiler. Offers the languages with no grammar ready, the current buffer's
+first."
+  (let (names (ordered-names (missing-grammars) m))
     (if (empty? names)
       (message m "every declared language already has its grammar")
       (assoc m
@@ -299,3 +460,25 @@ compiler. Offers the languages with no grammar loaded, the current buffer's firs
                 (if (= chosen "")
                   (message m2 "no language given")
                   (grammar-install-start m2 (keyword chosen))))))))))
+
+(defcommand cmd-grammar-update
+  (m key)
+  "Move installed tree-sitter grammars to the revisions bedit pins (M-x grammar-update):
+offers each grammar installed at another revision, at an unknown one (built by hand), or that
+lacks names bedit's tables use — the current buffer's first — and `all` for every one of them.
+Each is fetched at its pin, rebuilt, recorded and reloaded, and open buffers of its language
+are parsed by it from the next frame."
+  (let (outdated (outdated-grammars)
+        names (ordered-names outdated m))
+    (if (empty? names)
+      (message m "every installed grammar is at its pinned revision")
+      (assoc m
+        :minibuffer
+          (ed-name-prompt "Update grammar: "
+            (if (> (count names) 1) (append names ["all"]) names)
+            (fn (m2 text)
+              (let (chosen (string/trim text))
+                (cond
+                  (= chosen "") (message m2 "no language given")
+                  (= chosen "all") (grammar-install-start m2 outdated)
+                  else (grammar-install-start m2 (keyword chosen))))))))))

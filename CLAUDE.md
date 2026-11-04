@@ -412,7 +412,10 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             Go / C / Terraform + HCL (two modes over one `:hcl` grammar,
                             told apart by `:type`; only Terraform's files take `terraform
                             fmt`), shell (bash), JSON, TOML, YAML and Dockerfile, each naming
-                            where its grammar lives (`:grammar`, for M-x grammar-install) — a
+                            where its grammar lives AND the commit its tables were written
+                            against (`:grammar {:url :revision}`, for M-x grammar-install —
+                            each pin the commit the installed library was rebuilt
+                            byte-identical from), its names registered for `grammarcheck` — a
                             spec may extend another's (TypeScript is JavaScript's, Terraform
                             HCL's). A language that had a line lexer first keeps it as its
                             `:fallback`: a buffer opened while the grammar is missing is typed
@@ -459,11 +462,24 @@ src/gutter.blsp             the line-number gutter text-mode names as its `:gutt
                             paints and resolves a click
 src/grammars.blsp           tree-sitter grammars the runtime was not built with: where they
                             live (~/.config/bedit/grammars), declaring them at startup, and
-                            M-x grammar-list / grammar-reload / grammar-install: what is
-                            installed (ABI, path), fetching and building a declared one off
-                            the loop, and a live swap — drop a new .so in and reload, no
-                            restart. An install or reload retypes every open line-lexer
-                            stand-in as its parsed mode (`model/ed-grammars-arrived`)
+                            M-x grammar-list / grammar-reload / grammar-install / grammar-update:
+                            what is installed (ABI, path, its revision against the PIN, and the
+                            names bedit's tables use that it lacks), fetching and building a
+                            declared one off the loop at exactly its pinned revision (std's
+                            `grammar-install`, which writes a manifest beside the .so: revision,
+                            commit, hash — brood ADR-583), moving one back to its pin, and a
+                            live swap — drop a new .so in and reload, no restart. An install or
+                            reload retypes every open line-lexer stand-in as its parsed mode
+                            (`model/ed-grammars-arrived`)
+src/grammarcheck.blsp       does the installed grammar still have every node kind and field a
+                            mode names? Each `deflanguage` registers the names its face table,
+                            indent spec, injections and definitions use (std's
+                            `editor/treesit/language-names`); the first use of a grammar checks
+                            them against what it contains (`grammar-problems`), kept per language
+                            until an install / reload. A failing grammar is reported once in
+                            *Messages* (M-x grammar-update) and is not `model/grammar-ready?`, so
+                            a language with a line lexer stands in with it rather than
+                            mis-colouring. Below `model`, which asks it
 src/conventions.blsp        a buffer's INDENT WIDTH, TAB WIDTH, tabs-or-spaces and FILL COLUMN,
                             resolved per buffer: its own (M-x set-fill-column) > its
                             .editorconfig > the user's init.blsp entry for its mode > the mode's

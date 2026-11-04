@@ -1,0 +1,247 @@
+;; Grammar pinning (src/grammars.blsp) and the grammar check (src/grammarcheck.blsp): every
+;; declared grammar names the revision bedit's tables were written against, an install
+;; fetches exactly that revision, the grammar list says where each installed one stands, and
+;; an installed grammar lacking a name the tables use is reported and stood in for. Nothing
+;; here touches the network or a compiler — the fetch and build are stood in for — and the
+;; grammar directory is a temporary one. The check against the REAL installed grammars runs
+;; per language when its library is there, and skips otherwise.
+(defmodule grammarpin-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use config) ; *config-base* — a scratch config dir, never the user's grammars
+  (:use grammars) ; *grammar-installer* — the fetch and build, stood in for
+  (:use grammarcheck)) ; *grammar-problems* — a grammar of another revision, stood in for
+
+;; loaded here, at file load, so the `when`s below see what is installed
+(grammars/load-user-grammars)
+
+(defn- file-model (text file) (ed-init (make-buffer text file file)))
+(defn- file-buffer (text file) (ed-current-buf (file-model text file)))
+
+(defn- declared-languages () (keys (registry/entries :grammars/sources)))
+
+(purge-stale-temp "bedit-grammarpin-")
+
+(defn- with-config (thunk)
+  ;; `thunk` called with a fresh config base, whose bedit/grammars directory it may fill
+  (let (base (temp-dir "bedit-grammarpin-"))
+    (file/mkdir (path/join base "bedit" "grammars"))
+    (let (result (binding (*config-base* base) (thunk base)))
+      (file/rmdir base)
+      result)))
+
+(defn- write-library (lang text)
+  ;; a stand-in library file for `lang` in the current grammar directory
+  (let (path (grammars/ts-grammar-path lang)) (file/spit path text) path))
+
+(defn- write-manifest (lang manifest)
+  (file/spit (editor/treesit/grammar-manifest-path (grammars/ts-grammar-path lang))
+    (pr-str manifest)))
+
+(def pin-test-revision "0123456789abcdef0123456789abcdef01234567")
+
+(grammars/declare-grammar :pintest
+  {:url "https://example.invalid/tree-sitter-pintest"
+   :revision pin-test-revision})
+
+(describe "every declared grammar is pinned"
+  (test "each names its repository and a full commit hash"
+    (let (unpinned (seq/filter (declared-languages)
+                     (fn (lang)
+                       (let (source (grammars/grammar-source lang))
+                         (not (and (map? source)
+                                (string? (get source :url))
+                                (regex/matches? "[0-9a-f]{40}" (or (get source :revision) "")))))))
+          ;; languages a test declared for itself
+          real-unpinned (seq/filter unpinned
+                          (fn (lang) (not (contains? #{:bedit-test-language :pkgsreg} lang)))))
+      (assert= real-unpinned '())))
+
+  (test "the languages bedit ships each have one"
+    (doseq (lang [:python
+                   :rust :go :c :javascript :typescript :tsx :gomod :hcl :bash :json :toml :yaml
+                   :dockerfile :css :html :c-sharp :heex :elixir])
+      (is (string? (grammars/grammar-pin lang)))))
+
+  (test "TypeScript and TSX share one repository, one revision, two directories"
+    (let (typescript (grammars/grammar-source :typescript)
+          tsx (grammars/grammar-source :tsx))
+      (assert= (:url typescript) (:url tsx))
+      (assert= (:revision typescript) (:revision tsx))
+      (assert= [(:subdir typescript) (:subdir tsx)] ["typescript" "tsx"]))))
+
+(describe "at-pin?: is an install the pinned revision"
+  (test "by the revision it asked for, or the commit it resolved to"
+    (is (grammars/at-pin? {:revision "v1.0" :commit "aaa"} "v1.0"))
+    (is (grammars/at-pin? {:revision nil :commit pin-test-revision} pin-test-revision))
+    (is (grammars/at-pin? {:revision nil :commit pin-test-revision} "0123456789ab"))
+    (refute (grammars/at-pin? {:revision nil :commit "fedcba"} pin-test-revision))
+    (refute (grammars/at-pin? nil pin-test-revision))
+    (refute (grammars/at-pin? {:commit pin-test-revision} nil))))
+
+(describe "pin-state: the installed grammar against its pin"
+  (test "missing, unknown, pinned, other and replaced"
+    (with-config
+      (fn (base)
+        (assert= (:state (grammars/pin-state :pintest)) :missing)
+        (let (library (write-library :pintest "not really a library"))
+          ;; built by hand: no manifest, so no revision to compare
+          (assert= (:state (grammars/pin-state :pintest)) :unknown)
+          (write-manifest :pintest
+            {:revision pin-test-revision
+             :commit pin-test-revision
+             :sha256 (editor/treesit/grammar-file-hash library)})
+          (assert= (grammars/pin-state :pintest)
+            {:state :pinned :pin pin-test-revision :installed pin-test-revision})
+          (write-manifest :pintest
+            {:revision nil
+             :commit "fedcba9876543210"
+             :sha256 (editor/treesit/grammar-file-hash library)})
+          (assert= (grammars/pin-state :pintest)
+            {:state :other :pin pin-test-revision :installed "fedcba9876543210"})
+          ;; the library swapped under its manifest: the manifest no longer describes it
+          (write-library :pintest "another library")
+          (assert= (:state (grammars/pin-state :pintest)) :replaced)))))
+
+  (test "a language that declared no revision is unpinned"
+    (grammars/declare-grammar :pintest-loose "https://example.invalid/tree-sitter-loose")
+    (assert= (:state (grammars/pin-state :pintest-loose)) :unpinned)))
+
+(describe "grammar-install fetches the pinned revision"
+  (test "the installer is asked for the url, the subdir and the revision"
+    (let (asked (with-config (fn (base)
+                               (binding (*grammar-installer* (fn (url lang out-dir work-dir options)
+                                                               {:error (pr-str [url
+                                                                                 lang
+                                                                                 (path/basename out-dir)
+                                                                                 options])}))
+                                 (:echo (grammars/grammar-install-start (ed-init (make-buffer ""
+                                                                                   "x"))
+                                          :tsx))))))
+      (is (includes? asked "https://github.com/tree-sitter/tree-sitter-typescript"))
+      (is (includes? asked ":tsx"))
+      (is (includes? asked ":subdir \"tsx\""))
+      (is (includes? asked (str ":revision \"" (grammars/grammar-pin :tsx) "\"")))))
+
+  (test "a failed build says which language and why, and nothing arrives"
+    (let (echo (with-config (fn (base)
+                              (binding (*grammar-installer* (fn (& _) {:error "cc failed: boom"}))
+                                (:echo (grammars/grammar-install-start (ed-init (make-buffer "" "x"))
+                                         :pintest))))))
+      (assert= echo "grammar-install pintest: cc failed: boom")))
+
+  (test "several languages are installed in turn, each reported"
+    (let (asked (with-config (fn (base)
+                               (binding (*grammar-installer* (fn (url lang & _)
+                                                               {:error (str "no " (->string lang))}))
+                                 (:echo (grammars/grammar-install-start (ed-init (make-buffer ""
+                                                                                   "x"))
+                                          [:pintest :tsx]))))))
+      (assert= asked "grammar-install pintest: no pintest; tsx: no tsx"))))
+
+(describe "grammar-update offers what is not at its pin"
+  (test "an install at another revision is outdated; one at the pin is not"
+    (with-config (fn (base)
+                   (let (library (write-library :pintest "x"))
+                     (write-manifest :pintest
+                       {:revision nil
+                        :commit "fedcba"
+                        :sha256 (editor/treesit/grammar-file-hash library)})
+                     (is (includes? (grammars/outdated-grammars) :pintest))
+                     (write-manifest :pintest
+                       {:revision pin-test-revision
+                        :commit pin-test-revision
+                        :sha256 (editor/treesit/grammar-file-hash library)})
+                     (refute (includes? (grammars/outdated-grammars) :pintest))))))
+
+  (test "the grammar list says pinned, or the mismatch"
+    (with-config
+      (fn (base)
+        (let (library (write-library :pintest "x"))
+          (write-manifest :pintest
+            {:revision nil
+             :commit "fedcba9876543210"
+             :sha256 (editor/treesit/grammar-file-hash library)})
+          ;; the stand-in library does not load, so its row stops at the ABI's message
+          (is (includes? (grammars/grammar-report)
+                "MISMATCH installed fedcba987654, pinned 0123456789ab")))))))
+
+;; ---- the check: names the tables use against the grammar installed ----------------------
+
+(describe "grammarcheck: a verdict per grammar, asked once"
+  (test "the problems are asked once and kept until forgotten"
+    (let (calls (table/new)
+          stub (fn (lang names)
+                 (table/incr calls :n)
+                 (list (str "node kind `gone` is not in the :" (->string lang) " grammar"))))
+      (grammarcheck/forget :pinverdict)
+      (binding (*grammar-problems* stub)
+        (assert= (grammarcheck/verdict :pinverdict)
+          '("node kind `gone` is not in the :pinverdict grammar"))
+        (grammarcheck/verdict :pinverdict)
+        (refute (grammarcheck/sound? :pinverdict))
+        (assert= (table/get calls :n) 1)
+        (grammarcheck/forget :pinverdict)
+        (grammarcheck/verdict :pinverdict)
+        (assert= (table/get calls :n) 2))
+      (grammarcheck/forget :pinverdict)))
+
+  (test "the names of every mode over a grammar are checked together"
+    (grammarcheck/expect-names :pinunion :a {:kinds #{:x} :fields #{:f}})
+    (grammarcheck/expect-names :pinunion :b {:kinds #{:y} :fields #{}})
+    (assert= (grammarcheck/expected-names :pinunion) {:kinds #{:x :y} :fields #{:f}}))
+
+  (test "a language's names come from its whole spec"
+    (let (names (grammarcheck/expected-names :hcl))
+      ;; the face table, the indent spec (a heredoc is verbatim), and Terraform's own table
+      (is (contains? (:kinds names) :heredoc_template))
+      (is (contains? (:kinds names) :block))))
+
+  (test "the report names the language, the missing names and the remedy"
+    (let (line (grammarcheck/report-line :hcl
+                 '("node kind `a` is not in the :hcl grammar" "b" "c" "d" "e")))
+      (is (includes? line "node kind `a`"))
+      (is (includes? line "(and 2 more)"))
+      (is (includes? line "M-x grammar-update")))))
+
+;; The pins are the revisions the specs were written against, so the grammars installed at
+;; them must have every name the specs use. Per language, where its library is installed.
+(describe "the installed grammars have every name bedit's tables use"
+  (test "no installed grammar lacks a kind or field its modes name"
+    (let (checked (seq/filter (declared-languages)
+                    (fn (lang)
+                      (and (grammar-loadable? lang)
+                        (not (contains? #{:pintest :pintest-loose} lang)))))
+          failing (into {}
+                    (seq/keep checked
+                      (fn (lang)
+                        (grammarcheck/forget lang)
+                        (let (problems (grammarcheck/verdict lang))
+                          (when (not (empty? problems)) [lang problems]))))))
+      (assert= failing {}))))
+
+;; A grammar of another revision, made by asking the installed one for a name it never had:
+;; the same verdict a renamed node gives, with no second library.
+(when (grammar-loadable? :json)
+  (describe "a grammar lacking a name the tables use stands in with its line lexer"
+    (test "the JSON buffer is the lexer mode, and its note says why and what to run"
+      (let (_ (grammarcheck/expect-names :json
+                :pin-test-drift {:kinds #{:no_such_json_node} :fields #{}})
+            _ (grammarcheck/forget :json)
+            ready? (grammar-ready? :json)
+            buf (file-buffer "{\"a\": 1}\n" "/p/x.json")
+            note (grammars/missing-note buf)
+            outdated (grammars/outdated-grammars)
+            ;; put the language back as it was before asserting anything
+            _ (registry/put! :grammarcheck/expected
+                :json (dissoc (registry/lookup :grammarcheck/expected :json) :pin-test-drift))
+            _ (grammarcheck/forget :json))
+        (refute ready?)
+        (assert= (:grammar-wanted buf) :json)
+        (is (includes? note "not the revision bedit expects"))
+        (is (includes? note "no_such_json_node"))
+        (is (includes? note "M-x grammar-update"))
+        (is (includes? outdated :json))
+        ;; and sound again once the name is gone
+        (is (grammar-ready? :json))))))
