@@ -7,35 +7,173 @@ A producer keeps ONE decoder per stream (stdout and stderr are two) and threads 
 every chunk, so an escape split across two reads (`ESC[1` then `mERROR`) is finished by
 the second instead of leaking `1mERROR` into the text. Off the loop the worker [[decode]]s
 a chunk into its plain text and its attribute spans; on the loop the append lays the text
-in and [[add-faces]] stamps the spans as `:output-spans` on the buffer. They stay SGR
-attributes (`{:fg 1 :bold true}`): the view resolves them through the theme's sixteen ANSI
+in WITH them, as the buffer's `:ansi` text property ([[faces]], brood ADR-579) — so they
+belong to the characters: an edit, an undo, a head cut and another frame's copy all keep
+them on the text they colour, with no carrying here. They stay SGR attributes
+(`{:fg 1 :bold true}`): the view resolves them through the theme's sixteen ANSI
 colours (`theme/ansi-palette`) as it paints, UNDER the mode's own colouring
 (`view/ed-span-layers`) — as font-lock lays over ansi-color's faces, and as those faces
 follow a theme switch.
 
-A carriage return is dropped, as `ansi/strip` drops it: these buffers are logs, and a
-`\\r\\n` line end is the common case. A buffer that only wants the text (*Tests*) takes the
-decoded text and leaves the spans.")
+A carriage return is done as a terminal does it (Emacs's `comint-carriage-motion`, in
+[[insert-output]]): `\\r\\n` is a line end, and a lone `\\r` — a progress counter's `10%\\r20%` —
+rewrites its line rather than joining the two. A buffer that only wants the text (*Tests*)
+takes the decoded text and leaves the spans."
+  (:use editor/buffer))
 
-(defn- without-returns (segments)
-  "Decoded `segments` with their carriage returns dropped and any segment left empty gone."
-  (into []
-    (seq/reject (map segments
-                  (fn (segment) [(string/replace (first segment) "\r" "") (second segment)]))
-      (fn (segment) (= (first segment) "")))))
+(defn decoder ()
+  "A fresh decoder for one output stream: std's (`ansi/decoder`), and whether the last chunk
+ended in a carriage return [[decode]] is holding until it knows whether a newline follows.
+
+    (:return? (ansicolor/decoder))   ;=> false"
+  {:ansi (ansi/decoder) :return? false})
 
 (defn decode (decoder chunk)
-  "Decode the next `chunk` of a stream: `[decoder' text spans]` — the chunk's text with its
-escapes (and carriage returns) gone, and its SGR attributes as `[start end attr]` ranges
+  "Decode the next `chunk` of a stream with `decoder` ([[decoder]]): `[decoder' text spans]` —
+the chunk's text with its escapes gone, and its SGR attributes as `[start end attr]` ranges
 from offset 0 of `text` (`ansi/segments-spans`). An escape the chunk ends inside waits in
 `decoder'` for the next chunk.
 
-    (rest (ansicolor/decode (ansi/decoder) (str (string/int->char 27) \"[1mok\\r\\n\")))   ;=> (\"ok\\n\" [[0 3 {:bold true}]])
+A `\\r\\n` line end becomes `\\n`; a LONE carriage return stays in the text — progress
+output (`10%\\r20%`) rewrites its line, which the append does ([[carriage]]). One that ends
+the chunk is held for the next: until then it cannot be told from the start of a `\\r\\n`.
+
+    (rest (ansicolor/decode (ansicolor/decoder) (str (string/int->char 27) \"[1mok\\r\\n\")))   ;=> (\"ok\\n\" [[0 3 {:bold true}]])
+    (second (ansicolor/decode (ansicolor/decoder) \"10%\\r20%\"))   ;=> \"10%\\r20%\"
 
 The newline is bold too: no reset came before it, and a line's end carries its colour."
-  (let ([next-decoder segments] (ansi/feed decoder chunk)
-        clean (if (includes? chunk "\r") (without-returns segments) segments))
-    [next-decoder (ansi/segments-text clean) (ansi/segments-spans clean 0)]))
+  (let ([next-ansi segments] (ansi/feed (:ansi decoder) chunk)
+        text (ansi/segments-text segments)
+        spans (ansi/segments-spans segments 0)
+        ;; a return held from the last chunk goes in front, uncoloured
+        [held-text held-spans] (if (:return? decoder)
+                                 [(str "\r" text) (append-spans [] spans 1)]
+                                 [text spans])
+        holds? (string/ends-with? held-text "\r")
+        kept (if holds? (string/substring held-text 0 (dec (string/length held-text))) held-text)
+        [crlf-text crlf-spans] (if (includes? kept "\r\n")
+                                 (keep-ranges kept
+                                   held-spans
+                                   (crlf-ranges kept))
+                                 [kept held-spans]))
+    [{:ansi next-ansi :return? holds?} crlf-text (clip-spans crlf-spans (string/length crlf-text))]))
+
+(defn- clip-spans (spans length)
+  "`spans` cut to a text of `length` chars, one left empty dropped."
+  (into []
+    (seq/keep spans
+      (fn (span)
+        (let ([from to attr] span
+              end (math/min to length))
+          (when (< from end) [from end attr]))))))
+
+(defn- crlf-ranges (text)
+  "The `[from to]` ranges of `text` to keep so every `\\r\\n` reads as `\\n`."
+  (let (parts (into [] (string/split text "\r\n")))
+    (letrec (walk (fn (k start out)
+                    (let (end (+ start (string/length (nth parts k ""))))
+                      (if (= k (dec (count parts)))
+                        (conj out [start end])
+                        ;; keep the part and its newline, skip the return before it
+                        (walk (inc k) (+ end 2) (conj (conj out [start end]) [(inc end) (+ end 2)]))))))
+      (walk 0 0 []))))
+
+(defn- keep-ranges (text spans ranges)
+  "`[text' spans']`: `text` reduced to the ascending, disjoint `ranges` (`[from to]`), and
+`spans` mapped onto what is kept — the parts of each span inside a kept range, moved to where
+that range now starts, joined where they meet in the same attribute. One merge walk over
+both, so a chunk of many lines and many colours costs their sum."
+  (letrec (walk (fn (ranges spans offset pieces out)
+                  (cond
+                    (empty? ranges) [(string/join (reverse pieces) "") out]
+                    (empty? spans)
+                      (let ([from to] (first ranges))
+                        (walk (rest ranges)
+                          spans
+                          (+ offset (- to from))
+                          (cons (string/substring text from to) pieces)
+                          out))
+                    else
+                      (let ([from to] (first ranges)
+                            [span-from span-to attr] (first spans))
+                        (cond
+                          ;; the span ends before this range: no later range can use it
+                          (<= span-to from) (walk ranges (rest spans) offset pieces out)
+                          ;; the span starts after this range: on to the next range
+                          (>= span-from to)
+                            (walk (rest ranges)
+                              spans
+                              (+ offset (- to from))
+                              (cons (string/substring text from to) pieces)
+                              out)
+                          else
+                            (let (piece [(+ offset (- (math/max from span-from) from))
+                                          (+ offset (- (math/min to span-to) from))
+                                          attr]
+                                  joined (append-spans out [piece] 0))
+                              ;; the rest of the span may reach the next range
+                              (if (> span-to to)
+                                (walk (rest ranges)
+                                  spans
+                                  (+ offset (- to from))
+                                  (cons (string/substring text from to) pieces)
+                                  joined)
+                                (walk ranges (rest spans) offset pieces joined))))))))
+    (walk ranges (apply list spans) 0 () [])))
+
+(defn carriage (text spans)
+  "`[erase? text' spans']`: decoded output `text` (its `spans` from offset 0) with its lone
+carriage returns done as a terminal does them, Emacs's `comint-carriage-motion`: a return
+goes back to the start of the line, so what came before it on that line is gone and what
+follows writes the line anew. `erase?` says the FIRST line had one — the start of that line
+is in the buffer already (the line the output is continuing), and the append erases it too.
+Text with no return comes back as it is.
+
+    (ansicolor/carriage \"10%\\r20%\\r30%\\ndone\" [])   ;=> [true \"30%\\ndone\" []]
+    (ansicolor/carriage \"a\\nb\\rc\" [[0 4 :x]])   ;=> [false \"a\\nc\" [[0 2 :x]]]"
+  (if (not (includes? text "\r"))
+    [false text spans]
+    (let (parts (into [] (string/split text "\n"))
+          last-index (dec (count parts))
+          ;; a part's body: a return just before its newline is the CRLF line end, no motion
+          body-of (fn (k part)
+                    (if (and (< k last-index) (string/ends-with? part "\r"))
+                      (string/substring part 0 (dec (string/length part)))
+                      part))
+          ranges (letrec (walk (fn (k start out)
+                                 (let (part (nth parts k "")
+                                       body (body-of k part)
+                                       end (+ start (string/length part))
+                                       return-at (string/last-index-of body "\r")
+                                       from (if (>= return-at 0) (+ start return-at 1) start)
+                                       line (conj out [from (+ start (string/length body))])
+                                       ;; the line's newline is kept with it
+                                       kept (if (= k last-index) line (conj line [end (inc end)])))
+                                   (if (= k last-index) kept (walk (inc k) (inc end) kept)))))
+                   (walk 0 0 []))
+          erase? (>= (string/last-index-of (body-of 0 (first parts)) "\r") 0)
+          [kept-text kept-spans] (keep-ranges text
+                                   spans
+                                   (seq/reject ranges (fn (range) (= (first range) (second range))))))
+      [erase? kept-text kept-spans])))
+
+(defn insert-output (buf at text spans)
+  "`[buf' end]`: decoded output `text` inserted into `buf` at `at` (the end, or a shell's
+process mark) with its colours ([[faces]]) and its carriage returns done ([[carriage]]) — a
+return in its first line erases the output line `at` is on, back to that line's start —
+in ONE edit, and `end` the offset just past what was inserted. A read-only buffer is unlocked
+for it and re-locked: the stream owns its text. Point lands at `end`.
+
+    (first (ansicolor/insert-output (editor/buffer/make-buffer \"$ x\\n10%\") 8 \"\\r20%\" []))   ;~> a buffer holding \"$ x\\n20%\""
+  (let ([erase? kept kept-spans] (carriage text spans)
+        start (if erase?
+                (text/line->char (buffer-rope buf) (text/char->line (buffer-rope buf) at))
+                at)
+        locked? (read-only? buf)
+        open (if locked? (set-read-only buf false) buf)
+        inserted (replace-region open start at kept (faces kept-spans))
+        end (+ start (string/length kept)))
+    [(if locked? (set-read-only inserted true) inserted) end]))
 
 (defn- append-spans (before spans shift)
   "The ascending span vector `before` followed by `spans` moved by `shift` — and a run that
@@ -52,15 +190,47 @@ same attribute) joined again, so where a read happened to end never shows in the
         (rest shifted))
       (into before shifted))))
 
-(defn add-faces (buf spans offset)
-  "`buf` with attribute `spans` (from offset 0 of text just appended at `offset`) added to
-its `:output-spans`, moved to `offset` — joined to the last one when they continue it.
-Appends keep them ascending; no spans, no change.
+(def ansi-property :ansi)
+;; The text property a program's colours live under (brood ADR-579): SGR attribute maps,
+;; carried with the characters by every edit, undo and splice — so they colour the same
+;; text after the user edits the buffer, and in every frame showing it.
 
-    (:output-spans (ansicolor/add-faces {} [[0 2 {:fg 1}]] 5))   ;=> [[5 7 {:fg 1}]]"
+(defn faces (spans)
+  "The text properties an append of decoded text carries — `{:ansi spans}` — or nil when
+`spans` (`[start end attr]` from the text's start, [[decode]]'s) colour nothing. Hand it to
+the insert that lays the text in (`editor/buffer/insert`'s `properties`), so the colours
+arrive in the same edit as their text.
+
+    (ansicolor/faces [[0 2 {:fg 1}]])   ;=> {:ansi [[0 2 {:fg 1}]]}
+    (ansicolor/faces [])   ;=> nil"
+  (when (and spans (not (empty? spans))) {ansi-property spans}))
+
+(defn colour-spans (buf)
+  "`buf`'s program colours: its `:ansi` text property's spans, ascending — where the text
+they were laid on is now.
+
+    (ansicolor/colour-spans (editor/buffer/make-buffer \"x\"))   ;=> []"
+  (buffer-properties buf ansi-property))
+
+(defn add-faces (buf spans offset)
+  "`buf` with attribute `spans` (from offset 0 of text ALREADY in it at `offset`) laid on
+that text as its `:ansi` text property ([[faces]]) — for text a producer wrote whole before
+it knew the colours (a command's output shown at once). A read-only buffer is unlocked for
+it and re-locked: the producer owns its text. An append should pass [[faces]] to its insert
+instead. No spans, no change.
+
+    (ansicolor/colour-spans (ansicolor/add-faces (editor/buffer/make-buffer \"hello\") [[0 2 {:fg 1}]] 3))   ;=> [[3 5 {:fg 1}]]"
   (if (or (nil? spans) (empty? spans))
     buf
-    (assoc buf :output-spans (append-spans (or (:output-spans buf) []) spans offset))))
+    (let (length (buffer-length buf)
+          start (if (< offset length) offset length)
+          reach (+ offset (second (last spans)))
+          end (if (< reach length) reach length)
+          placed (map spans (fn ([from to attr]) [(+ from offset) (+ to offset) attr]))
+          locked? (read-only? buf)
+          open (if locked? (set-read-only buf false) buf)
+          put (put-properties open ansi-property start end placed))
+      (if locked? (set-read-only put true) put))))
 
 ;; ---- line-buffered output ------------------------------------------------------
 ;; A line-oriented consumer (procstream) splits decoded text at newlines. Attributes carry

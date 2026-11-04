@@ -506,29 +506,39 @@ src/brood-test.blsp         C-c t in a Brood project without the project load: a
                             (project/reload-changed), so it is never stale
 src/apprun.blsp             run the project (C-c r): nest run in a subprocess with debug taps —
                             app output + spy/trace traffic into *Run*; live stats on a statusbar chip
-src/hosted.blsp             THE FLIP: every pool buffer backed by its own process (hosted-reconcile)
+src/hosted.blsp             THE FLIP: every pool buffer backed by its own process (hosted-reconcile);
+                            the seed and resync carry the text properties (std's `content-view`)
 src/frames.blsp             frames (C-x 5 2 / o / 0): a second OS window is a PROCESS with its own
                             ui-run whose pool slots link to the same buffer processes, named by
                             std/editor/buffer-registry — a buffer opened, edited or killed in one
                             frame is in every frame (docs/frames-plan.md); a change another frame
                             made carries this frame's windows, points and `:input-start` with the
-                            text (`hosted/hosted-carried`)
+                            text (`hosted/hosted-carried`), and its text properties (a log's
+                            colours) ride the splice, so every frame shows them; a foreign splice
+                            lands on a read-only copy too (std's `buffer-apply-action`), and a
+                            redaction (brood ADR-581) redacts every copy, history and all
 src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
                             apprun's :apprun ride it): line-buffered stdout -> handler fns,
-                            each line ANSI-decoded (a decoder per stream) with its colour spans;
+                            each line ANSI-decoded (a decoder per stream) with its colour spans
+                            and its carriage returns done (the partial line too, so a counter
+                            that never ends its line keeps one count);
                             a partial line past `*procstream-line-max*` is delivered as it
                             stands, so the worker's buffer is bounded (an escape cut there
                             waits in the decoder)
 src/ansicolor.blsp          a program's ANSI colours on the buffer its output streams into (Emacs
                             ansi-color), over std's streaming decoder (`ansi/feed`, brood ADR-567):
                             a decoder per stream, so an escape split across two reads never leaks
-                            (`1mERROR`, issue #24); the SGR attributes kept as `:output-spans` and
+                            (`1mERROR`, issue #24); the SGR attributes laid on the text in the
+                            same edit as its `:ansi` TEXT PROPERTY (`faces`, brood ADR-579) and
                             resolved through `theme/ansi-palette` as the view paints them, UNDER the
                             mode's colouring (`view/ed-span-layers`) — so a theme switch recolours
                             them. *compilation*, the shell buffer, *Run* and M-!'s output colour;
-                            *Tests* keeps the text; the vcs log is `ansi/render`ed. The spans are
-                            positions like markers: the output cap's head cut and a foreign splice
-                            carry them (`model/ed-carry-spans`)
+                            *Tests* keeps the text; the vcs log is `ansi/render`ed. The colours
+                            belong to the characters: the user's edits, undo, the output cap's head
+                            cut and another frame's copy (the splice carries them, the seed of a
+                            frame opened later too) keep them on the text — nothing carries them here.
+                            A lone `\r` rewrites its output line (`carriage` / `insert-output`,
+                            Emacs's comint-carriage-motion): a progress counter shows one count
 src/wrap.blsp              where a line falls on screen rows: the pure break rule (a line →
                             `[from to]` row segments, word-wrapped at the pane width) and the
                             ONE row of a truncated line (`one-row`: cut before the cells its
