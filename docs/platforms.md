@@ -48,3 +48,14 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 - A projectless eval child started in `/tmp`, which Windows lacks; it starts in
   `path/temp-root`.
 - The missing-font warning told every user to run `fc-list`, which exists on Linux only.
+- On Windows, C-g on a running M-! killed only the shell; the command it started kept
+  running and kept the output pipe open, so the task waited it out. Brood's `os/cmd` now runs
+  the child in a Job Object (brood ADR-592).
+- On Windows, `$HOME` is `C:\Users\…` while the editor names the home `C:/Users/…`; a typed
+  `/x/C:/y` now starts over at the drive, as Emacs reads it there (brood ADR-592).
+
+## Not fixed
+
+- M-x mur-browse opens a URL with `open` (macOS) or `xdg-open` — through `sh`, so not on
+  Windows (KI-364's shell question, and no Windows opener named).
+- Terminal buffers and the line-mode REPL need a pty; Windows has none in brood.
