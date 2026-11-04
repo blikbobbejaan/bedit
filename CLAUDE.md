@@ -719,7 +719,9 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             which opens the read as its first character (input's
                             `secret-overlay`), never reaching the buffer or a macro; text
                             already typed after the prompt moves into the read, leaving no
-                            undo step (`passwd/take-typed`). The mouse reaches a program
+                            undo step (`passwd/take-typed`). An answered prompt redrawn is not
+                            asked again; one re-asked is, told apart by the rows scrolled off
+                            (`:term-scrolled`) and the pty's echo coming back on. The mouse reaches a program
                             that asked for it; one that did not gets a middle click as
                             PRIMARY pasted in (Emacs's term-mouse-paste); the program's
                             cursor shape and visibility
