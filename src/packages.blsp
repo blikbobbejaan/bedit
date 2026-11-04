@@ -143,37 +143,51 @@ strings. A file that does not open with one declares none."
   (let (parts (string/split (->string global) "/"))
     (when (> (count parts) 1) (string/join (take parts (dec (count parts))) "/"))))
 
+(defn- sited-under? (global prefix)
+  ;; whether `global`'s definition was last loaded from a file under `prefix`
+  (let (site (reflect/source-location global))
+    (and (vector? site) (string/starts-with? (str (first site)) prefix))))
+
+(defn- global-value (global)
+  (check-allow :discarded-catch (try (reflect/eval global) (catch _ nil))))
+
+(defn- define-global (global value)
+  ;; `global` bound to `value` again — the root escape names it whatever module asks
+  (reflect/eval (list 'def (symbol (str "/" global)) (list 'quote value))))
+
 (defn plugin-definitions (name)
-  "Every global package `name`'s code defined in this image: the names IN ITS OWN MODULES
-([[package-modules]]) whose definition was loaded from a file under its directory
-(`reflect/source-location`) — private ones and ones a macro generated included, which no
-reading of its source could list. A core name the package redefined is not among them: its
-file is the package's, its module is not, and taking it away would break the editor."
+  "Every global package `name`'s code FIRST defined in this image: the names its load left
+sited in its files that were unbound before it ([[note-loaded]] keeps them — a file without
+a `defmodule` included, whose names are root names), and any name in its own modules
+([[package-modules]]) sited there. A core name the package REDEFINED is not among them: it
+was bound before, and retiring the package restores it ([[restore-redefinitions]])."
   (let (prefix (str (pkg-dir name) "/")
-        modules (package-modules name))
-    (vec (seq/filter (reflect/global-names)
-           (fn (global)
-             (let (site (reflect/source-location global))
-               (and (vector? site)
-                 (string/starts-with? (str (first site)) prefix)
-                 (contains? modules (global-namespace global)))))))))
+        modules (package-modules name)
+        noted (seq/filter (registry/lookup :packages/defined name []) (fn (global) (bound? global))))
+    (vec (seq/distinct (append noted
+                         (seq/filter (reflect/global-names)
+                           (fn (global)
+                             (and (contains? modules (global-namespace global))
+                               (sited-under? global prefix)))))))))
 
 ;; ---- core names a package redefined ----------------------------------------
 ;; A package's file may redefine a name the editor already had — a core function it patches
-;; (`(defn /bedit/keyhelp/ed-key-label …)`). Retiring that by source location undefined it:
+;; (`(defn bedit/keyhelp/ed-key-label …)`). Retiring that by source location undefined it:
 ;; the core function was gone until a restart. So a package's load is compared with the
 ;; globals as they were before it ([[global-values]]): a name sited in its files afterwards,
-;; outside its own modules, that was bound before with another value is a REDEFINITION,
-;; kept with the value it replaced (`:packages/redefined`), and removing or updating the
-;; package puts that value back (Emacs's `unload-feature` restores a function the same way).
+;; outside its own modules, that was bound before with another value is a REDEFINITION.
+;;
+;; Two packages may patch the same function, so each redefined global keeps a STACK, as a
+;; registry row does (`ownership`): `:packages/redefinitions` global -> `{:base :stack [{:package
+;; :value} …]}`, the value from before any package and each package's on top, the live one
+;; last. Retiring a package splices its layer out: the top one restores the layer below it
+;; (or the base), a lower one leaves the live patch alone — so removing A while B's patch is
+;; live keeps B's, and removing B then gives back the core function, never A's (whose helpers
+;; went with A). Emacs's `unload-feature` restores a function the same way.
 
 (defn- global-values ()
   "Every global's value now, by name — what a package's load is compared against."
-  (fold (reflect/global-names)
-    {}
-    (fn (acc global)
-      (assoc acc
-        global (check-allow :discarded-catch (try (reflect/eval global) (catch _ nil)))))))
+  (fold (reflect/global-names) {} (fn (acc global) (assoc acc global (global-value global)))))
 
 (defn plugin-redefinitions (name before)
   "The globals package `name`'s files REDEFINED, as `{global value-before}`: sited under its
@@ -184,52 +198,77 @@ directory now, outside its own modules ([[package-modules]]), bound in `before` 
     (into {}
       (seq/keep (reflect/global-names)
         (fn (global)
-          (let (site (reflect/source-location global))
-            (when (and (contains? before global)
-                    (vector? site)
-                    (string/starts-with? (str (first site)) prefix)
-                    (not (contains? modules (global-namespace global)))
-                    (not (= (get before global)
-                           (check-allow :discarded-catch
-                             (try (reflect/eval global) (catch _ nil))))))
-              [global (get before global)])))))))
+          (when (and (contains? before global)
+                  (sited-under? global prefix)
+                  (not (contains? modules (global-namespace global)))
+                  (not (= (get before global) (global-value global))))
+            [global (get before global)]))))))
 
 (defn- note-redefinitions (name before)
-  ;; the earliest value wins: a name already noted keeps the value from before the package
-  (let (noted (registry/lookup :packages/redefined name {}))
-    (registry/put! :packages/redefined name (merge (plugin-redefinitions name before) noted))))
+  ;; each redefined global's stack gets this package's layer on top (its earlier one gone)
+  (doseq ([global value-before] (plugin-redefinitions name before))
+    (let (record (registry/lookup :packages/redefinitions global {:base value-before :stack []})
+          others (into [] (seq/reject (:stack record) (fn (layer) (= (:package layer) name)))))
+      (registry/put! :packages/redefinitions
+        global
+        (assoc record :stack (conj others {:package name :value (global-value global)}))))))
 
-(defn- restore-redefinitions (name)
-  "Put back every core global package `name` redefined, with the value it had before, and
-answer how many."
-  (let (noted (registry/lookup :packages/redefined name {}))
-    (doseq ([global value] noted)
-      (reflect/eval (list 'def (symbol (str "/" global)) (list 'quote value))))
-    (registry/remove! :packages/redefined name)
-    (count noted)))
+(defn restore-redefinitions (name)
+  "Take package `name`'s layer out of every redefined global's stack: where it was the live
+patch the layer below it is bound again (another package's, or the value from before any
+package), where it was not the live patch is left alone. Answers how many globals it had
+patched."
+  (fold (registry/entries :packages/redefinitions)
+    0
+    (fn (patched [global record])
+      (let (stack (:stack record)
+            kept (into [] (seq/reject stack (fn (layer) (= (:package layer) name)))))
+        (cond
+          (= (count kept) (count stack)) patched
+          (empty? kept)
+            (do
+              (registry/remove! :packages/redefinitions global)
+              (define-global global (:base record))
+              (inc patched))
+          (= (:package (last stack)) name)
+            (do
+              (registry/put! :packages/redefinitions global (assoc record :stack kept))
+              (define-global global (:value (last kept)))
+              (inc patched))
+          else
+            (do
+              (registry/put! :packages/redefinitions global (assoc record :stack kept))
+              (inc patched)))))))
 
 (defn- retire-definitions (name)
-  "Remove every global package `name`'s code defined (`reflect/undef`, brood ADR-391) and answer
-how many went. What an update does BEFORE loading the new version, so a function the new
-version dropped is gone rather than callable with the old body, and what a remove does so the
-removed package's code stops running. A caller still holding one raises `unbound symbol
-(removed by reflect/undef …)` — said, not silently old. Its registrations are taken back
-first ([[release-registrations]]), so nothing the editor runs still names one."
-  (count (seq/filter (plugin-definitions name)
-           (fn (global)
-             (check-allow :discarded-catch (try (reflect/undef global) (catch _ false)))))))
+  "Remove every global package `name`'s code first defined (`reflect/undef`, brood ADR-391)
+and answer how many went. What an update does BEFORE loading the new version, so a function
+the new version dropped is gone rather than callable with the old body, and what a remove
+does so the removed package's code stops running. A caller still holding one raises `unbound
+symbol (removed by reflect/undef …)` — said, not silently old. Its registrations are taken
+back first, so nothing the editor runs still names one."
+  (let (retired (count (seq/filter (plugin-definitions name)
+                         (fn (global)
+                           (check-allow :discarded-catch
+                             (try (reflect/undef global) (catch _ false)))))))
+    (registry/remove! :packages/defined name)
+    retired))
+
+;; ---- registrations the package made ----------------------------------------------
 
 (defn- claimant-file (name)
   ;; what a registration made while package `name` is applied, outside a load of one of its
   ;; files, is claimed for (`ownership/*claimant*`): a file under its directory
   (path/join (pkg-dir name) "project.blsp"))
 
+(defn- module-symbols (name) (into #{} (map (package-modules name) symbol)))
+
 (defn release-registrations (name)
-  "Take back every registry entry package `name` made — its idle jobs, task replies, event,
-down and timer handlers, exit queries, post-steps, mode line chips, commands, modes, file
-types, settings and themes, whatever registered them (`ownership/release-under!`) — and
-answer the `[kind key]`s released. An entry it replaced comes back. What removing and
-updating the package do before its globals go."
+  "Take back every registry entry package `name` made through bedit's registries — its idle
+jobs, task replies, event, down and timer handlers, exit queries, post-steps, mode line chips,
+commands, modes, file types, settings and themes, at load or as its code ran
+(`ownership/release-under!`) — and answer the `[kind key]`s released. An entry it replaced
+comes back."
   (ownership/release-under! (pkg-dir name)))
 
 (defn- adopt-settings (name before)
@@ -244,16 +283,183 @@ load wrote — `settings/define` writes std's registry directly — over what th
         (contains? before setting)
         (get before setting)))))
 
+;; A package may write std's registries DIRECTLY — `editor/layers/register-type-layers`,
+;; `register-system-layer`, a `registry/put!` of its own — past bedit's claims. The kernel
+;; records the module whose load made each registry write (`registry/written-by`), so what the
+;; package's modules wrote is known; what each map entry held BEFORE the load is kept beside it
+;; (`:packages/std-writes`), and retiring the package puts that back, or takes the write back
+;; (`registry/retract`) where there was nothing.
+
+(defn- path-present? (table path)
+  (let (head (first path)
+        more (rest path))
+    (and (map? table)
+      (contains? table head)
+      (or (empty? more) (and (map? (get table head)) (contains? (get table head) (first more)))))))
+
+(defn- note-std-writes (name before)
+  ;; each map entry the package's modules' loads wrote, with what it held in `before`
+  (registry/put! :packages/std-writes
+    name
+    (vec (seq/keep (registry/written-by (module-symbols name))
+           (fn (write)
+             (when (:path write)
+               (let (prior (get before (:global write))
+                     present? (path-present? prior (:path write)))
+                 {:global (:global write)
+                  :path (:path write)
+                  :present? present?
+                  :before (when present? (map/get-in prior (:path write)))})))))))
+
+(defn- retract-std-writes (name)
+  "Take back every std registry write package `name`'s modules' loads made that is still
+there — a map entry gets back what it held before the load, or goes; a list member goes —
+and answer the writes."
+  (let (recorded (registry/lookup :packages/std-writes name [])
+        writes (registry/written-by (module-symbols name)))
+    (registry/remove! :packages/std-writes name)
+    (doseq (write writes)
+      (let (prior (seq/find recorded
+                    (fn (entry)
+                      (and (= (:global entry) (:global write)) (= (:path entry) (:path write))))))
+        (if (and prior (:present? prior))
+          (%registry-update! (:global write) :assoc (:path write) (:before prior))
+          (registry/retract write))))
+    writes))
+
+;; ---- the backstop: rows that still name the package ------------------------------
+;; A row registered where neither a load nor a dispatch could attribute it (a hook called
+;; straight through `reflect/call-if-bound`, a timer) is found by what it NAMES: a hook symbol
+;; in one of the package's namespaces, a function defined there, a name its files first
+;; defined. Retiring the package drops every such row from bedit's registries and std's.
+
+(defn- function-name (value)
+  ;; the qualified name a named function prints with (`#<fn pkg/f>`), else nil
+  (let (printed (pr-str value))
+    (when (and (string/starts-with? printed "#<fn ") (string/ends-with? printed ">"))
+      (symbol (string/substring printed 5 (dec (string/length printed)))))))
+
+(defn- names-package? (value namespaces defined)
+  "Whether `value` mentions, at any depth, a symbol or a named function of the package:
+in one of `namespaces` (strings) or among the globals it first `defined` (a set)."
+  (let (ours? (fn (sym)
+                (or (contains? defined sym)
+                  (contains? namespaces (ownership/symbol-namespace sym)))))
+    (letrec (walk (fn (stack)
+                    (if (empty? stack)
+                      false
+                      (let (item (first stack)
+                            more (rest stack))
+                        (cond
+                          (symbol? item) (or (ours? item) (walk more))
+                          (fn? item)
+                            (let (named (function-name item))
+                              (or (and named (ours? named)) (walk more)))
+                          (map? item) (walk (append (keys item) (vals item) more))
+                          (or (vector? item) (list? item) (set? item))
+                            (walk (append (vec item) more))
+                          else (walk more))))))
+      (walk (list value)))))
+
+(defn- drop-references (name)
+  "Drop every registry row — bedit's and `editor/layers`' — that still names package `name`,
+and answer the buffer types it took away."
+  (let (namespaces (package-modules name)
+        defined (into #{} (registry/lookup :packages/defined name []))
+        ours? (fn (value) (names-package? value namespaces defined))
+        bookkeeping #{"ownership" "packages"})
+    (doseq ([id table] registry/*registries*)
+      (when (not (and (keyword? id) (contains? bookkeeping (ownership/symbol-namespace id))))
+        (doseq ([key entry] table) (when (ours? entry) (ownership/drop-entry! id key)))))
+    (doseq (ref editor/layers/*system-layers*)
+      (when (ours? ref) (editor/layers/unregister-system-layer ref)))
+    (doseq (rule editor/layers/*auto-type-by-file*)
+      (when (ours? (:match rule)) (editor/layers/unregister-file-type (:match rule) (:type rule))))
+    (into #{}
+      (seq/keep editor/layers/*type-layers*
+        (fn ([type refs])
+          (when (ours? refs) (ownership/drop-entry! :modes/type-layers type) type))))))
+
+;; ---- retiring a package -----------------------------------------------------------
+
+(defn- note-loaded (name globals-before settings-before)
+  "Record what package `name`'s load did, against the image `globals-before` it: the globals
+it first defined (`:packages/defined`), the core ones it redefined, the std registry entries
+it wrote with what they held, its settings — and its namespaces, so its commands and hooks
+register for it as they run (`ownership/own-namespace!`)."
+  (let (prefix (str (pkg-dir name) "/"))
+    (registry/put! :packages/defined
+      name
+      (vec (seq/filter (reflect/global-names)
+             (fn (global)
+               (and (not (contains? globals-before global)) (sited-under? global prefix))))))
+    (note-redefinitions name globals-before)
+    (note-std-writes name globals-before)
+    (adopt-settings name settings-before)
+    (doseq (module (package-modules name)) (ownership/own-namespace! module (claimant-file name)))))
+
 (defn retire-package (name)
   "Take package `name` out of the live editor, in the one order that leaves nothing pointing
-at a name about to go: its registrations back ([[release-registrations]]), the core names it
-redefined restored ([[restore-redefinitions]]), then the globals its own modules defined
-removed ([[retire-definitions]]). What removing it does, and what updating it does before
-the new version loads. Answers `{:released :restored :retired}`, how many of each."
+at a name about to go: its bedit registrations back ([[release-registrations]]), the std
+registry entries its modules wrote directly back ([[retract-std-writes]]), any row still
+naming it dropped ([[drop-references]]), the core names it redefined restored
+([[restore-redefinitions]]), then the globals it first defined removed
+([[retire-definitions]]). What removing it does, and what updating it does before the new
+version loads. The buffer types it took away are kept for [[ed-settle-package-buffers]].
+Answers `{:released :restored :retired :types}`."
   (let (released (release-registrations name)
+        std-writes (retract-std-writes name)
+        dropped-types (drop-references name)
         restored (restore-redefinitions name)
-        retired (retire-definitions name))
-    {:released (count released) :restored restored :retired retired}))
+        retired (retire-definitions name)
+        types (into dropped-types
+                (append (seq/keep released (fn ([kind key]) (when (= kind :modes/type-layers) key)))
+                  (seq/keep std-writes
+                    (fn (write)
+                      (when (= (:global write) 'editor/layers/*type-layers*)
+                        (first (:path write))))))))
+    (doseq (module (package-modules name)) (ownership/disown-namespace! module))
+    (registry/put! :packages/settle
+      name
+      (into (registry/lookup :packages/settle name #{}) types))
+    {:released (count released) :restored restored :retired retired :types types}))
+
+(defn ed-settle-package-buffers (m name)
+  "`m` with every buffer in a mode package `name`'s retirement took away seeded again: in the
+mode its type has now (the new version's, or the core mode the package had replaced), else
+in fundamental mode — and *Messages* says which went to fundamental mode, as Emacs's
+`unload-feature` puts a removed major mode's buffers in `fundamental-mode`."
+  (let (types (registry/lookup :packages/settle name #{}))
+    (registry/remove! :packages/settle name)
+    (if (empty? types)
+      m
+      (let ([settled orphaned] (fold (range (count (:buffers m)))
+                                 [m []]
+                                 (fn (acc index)
+                                   (let ([model names] acc
+                                         buf (ed-buf-at model index))
+                                     (cond
+                                       (not (contains? types (:type buf))) acc
+                                       (empty? (editor/layers/layers-for-type (:type buf)))
+                                         [(ed-set-buf-at model
+                                            index
+                                            (editor/layers/init-buffer-layers (editor/layers/set-buffer-type buf
+                                                                                :fundamental)))
+                                           (conj names (buffer-name buf))]
+                                       else
+                                         [(ed-set-buf-at model
+                                            index
+                                            (editor/layers/init-buffer-layers buf))
+                                           names])))))
+        (if (empty? orphaned)
+          settled
+          (message settled
+            (str "removed "
+              name
+              ": "
+              (string/join orphaned ", ")
+              (if (= (count orphaned) 1) " is" " are")
+              " in fundamental mode now")))))))
 
 (defn plugin-entry (name &optional (reload? false))
   "Load package `name` (its src must be on the load-path) — again, from its files, when
@@ -304,8 +510,7 @@ either — the package reads as broken, with the reason."
                            (when (not (failure? loaded))
                              (doseq (theme (or (:themes loaded) [])) (register-theme! theme)))
                            loaded))))
-    (adopt-settings name settings-before)
-    (note-redefinitions name globals-before)
+    (note-loaded name globals-before settings-before)
     (if (failure? contribution)
       (do (note-status name :broken (error-message contribution)) contribution)
       (do (note-status name :loaded nil) true))))
@@ -559,8 +764,11 @@ died or timed out, said as such."
                                                        :package-list (:available outcome)
                                                        :package-status nil))))
         else
-          (let (note (outcome-note outcome))
-            (settle-package-prompt (refresh-packages (message (assoc m1 :package-status note) note))))))))
+          (let (note (outcome-note outcome)
+                ;; an update retired the old version: its mode's buffers take the new one's
+                noted (message (assoc m1 :package-status note) note))
+            (settle-package-prompt (refresh-packages (ed-settle-package-buffers noted
+                                                       (:name outcome)))))))))
 
 (defn settle-package-prompt (m)
   "After a job that was not the list's ends, a package prompt opened while it ran (saying the
@@ -911,7 +1119,8 @@ plugin contributes as loaded now. An installed package this image could not load
 an install or update of it landing afterwards would put it straight back."
   (cond
     (:package-job m) (busy-message m)
-    (remove! name) (refresh-packages (message m (str "removed " name)))
+    (remove! name)
+      (refresh-packages (ed-settle-package-buffers (message m (str "removed " name)) name))
     else (message m (str name " is not installed"))))
 
 (defcommand cmd-package-remove

@@ -191,3 +191,149 @@
 (describe "a package's registrations go with it"
   :isolated (test "removed: every row goes and every core row it replaced comes back; updated: the new rows once"
     (plugin-registry-round-trip)))
+
+;; ---- the second round: std registries, run-time rows, stacked patches, open buffers -------
+
+(defn- write-files (dir name files)
+  "Package `name` 1.0.0 under packages `dir`, its src/ holding `files` (file name -> text)."
+  (let (root (path/join dir name))
+    (os/cmd "mkdir" ["-p" (path/join root "src")])
+    (file/spit (path/join root "project.blsp")
+      (str "(project :name \"" name "\" :version \"1.0.0\" :enhances {bedit \">= 0.1\"})\n"))
+    (doseq ([file text] files) (file/spit (path/join root "src" file) text))))
+
+(defn- apply-from-files (base name)
+  ;; from its files (the reload path): the isolate's restore rolls the load back
+  (run-with base (stub-registry "") (fn () (packages/apply-plugin! name true))))
+
+(defn- remove-package (base name)
+  (run-with base (stub-registry "") (fn () (packages/remove! name))))
+
+(describe "two packages patching the same core function"
+  :isolated (test "removing either keeps the live patch right, and the last one gives back the core function"
+    (let (base (temp-dir "bedit-plugreg-")
+          dir (path/join base "bedit" "packages")
+          patch (fn (name answer)
+                  (write-files dir
+                    name
+                    {(str name ".blsp") (str "(defmodule "
+                                          name ")\n(defn bedit-plugin () {})\n(defn answer () \""
+                                          answer
+                                          "\")\n(defn bedit/keyhelp/ed-key-label (k) (answer))\n")}))
+          core (keyhelp/ed-key-label "a"))
+      (patch "pkgpatcha" "A")
+      (patch "pkgpatchb" "B")
+      ;; A then B; A removed first: B's patch stays live, then B's removal is the core again
+      (apply-from-files base "pkgpatcha")
+      (apply-from-files base "pkgpatchb")
+      (assert= (keyhelp/ed-key-label "a") "B")
+      (remove-package base "pkgpatcha")
+      (assert= (keyhelp/ed-key-label "a") "B")
+      (remove-package base "pkgpatchb")
+      (assert= (keyhelp/ed-key-label "a") core)
+      ;; A then B again; B removed first: A's patch is live again, then the core
+      (patch "pkgpatcha" "A")
+      (patch "pkgpatchb" "B")
+      (apply-from-files base "pkgpatcha")
+      (apply-from-files base "pkgpatchb")
+      (remove-package base "pkgpatchb")
+      (assert= (keyhelp/ed-key-label "a") "A")
+      (remove-package base "pkgpatcha")
+      (assert= (keyhelp/ed-key-label "a") core)
+      (assert= (registry/lookup :packages/redefinitions 'bedit/keyhelp/ed-key-label) nil))))
+
+(describe "a package that writes std's registries directly"
+  :isolated (test "its editor/layers rows and its own registry go, and the core row it replaced comes back"
+    (let (base (temp-dir "bedit-plugreg-")
+          dir (path/join base "bedit" "packages")
+          bash-before (get editor/layers/*auto-type-by-interpreter* "bash")
+          _ (write-files dir
+              "pkgstd"
+              {"pkgstd.blsp" (string/join ["(defmodule pkgstd)"
+                                            "(defn bedit-plugin () {})"
+                                            "(def pkgstd-layer {:name 'pkgstd :keymap {}})"
+                                            "(editor/layers/register-type-layers :pkgstd (list 'pkgstd/pkgstd-layer))"
+                                            "(editor/layers/register-file-type \".pkgstd\" :pkgstd)"
+                                            "(editor/layers/register-system-layer 'pkgstd/pkgstd-layer)"
+                                            "(editor/layers/register-interpreter-type \"bash\" :pkgstd)"
+                                            "(registry/put! :pkgstd/own :row 1)"]
+                               "\n")})
+          _ (apply-from-files base "pkgstd")
+          loaded {:type (editor/layers/layers-for-type :pkgstd)
+                  :file (editor/layers/buffer-type-for {:file "/tmp/a.pkgstd"})
+                  :system (includes? editor/layers/*system-layers* 'pkgstd/pkgstd-layer)
+                  :bash (get editor/layers/*auto-type-by-interpreter* "bash")
+                  :own (registry/lookup :pkgstd/own :row)}
+          _ (remove-package base "pkgstd"))
+      (assert= loaded
+        {:type '(pkgstd/pkgstd-layer) :file :pkgstd :system true :bash :pkgstd :own 1})
+      (assert= (editor/layers/layers-for-type :pkgstd) ())
+      (assert= (editor/layers/buffer-type-for {:file "/tmp/a.pkgstd"}) :fundamental)
+      (refute (includes? editor/layers/*system-layers* 'pkgstd/pkgstd-layer))
+      (assert= (get editor/layers/*auto-type-by-interpreter* "bash") bash-before)
+      (assert= (registry/lookup :pkgstd/own :row) nil)
+      (assert= (registry/written-by #{'pkgstd}) []))))
+
+(describe "rows a package registers as it runs"
+  :isolated (test "a command's registration is claimed for the package; one nothing attributes is dropped by what it names"
+    (let (base (temp-dir "bedit-plugreg-")
+          dir (path/join base "bedit" "packages")
+          _ (write-files dir
+              "pkgrun"
+              {"pkgrun.blsp" (string/join ["(defmodule pkgrun)"
+                                            "(defn bedit-plugin () {})" "(defn late-run (m) m)"
+                                            "(defn spec (m) nil)" "(defn fire (m) m)"
+                                            "(interactive/defcommand cmd-pkgrun-register (m key) \"Registers a job.\" (do (model/register-idle-job :pkgrun-late {:order 998 :run 'pkgrun/late-run}) m))"
+                                            "(defn register-orphan () (model/register-timer-client :pkgrun-orphan 'pkgrun/spec 'pkgrun/fire))"]
+                               "\n")})
+          _ (apply-from-files base "pkgrun")
+          package-dir (run-with base (stub-registry "") (fn () (packages/pkg-dir "pkgrun")))
+          _ (interactive/run-command (ed-init (make-buffer "")) "pkgrun-register" (fn (m name) m))
+          _ ((reflect/eval 'pkgrun/register-orphan))
+          claimed (includes? (ownership/claims-under package-dir) [:model/idle-jobs :pkgrun-late])
+          registered [(contains? (idle-names) :pkgrun-late)
+                       (not (nil? (get (ed-timer-clients) :pkgrun-orphan)))]
+          _ (remove-package base "pkgrun"))
+      (is claimed)
+      (assert= registered [true true])
+      (refute (contains? (idle-names) :pkgrun-late))
+      (assert= (get (ed-timer-clients) :pkgrun-orphan) nil))))
+
+(describe "buffers in a removed package's mode"
+  :isolated (test "go to fundamental mode, and *Messages* says so"
+    (let (base (temp-dir "bedit-plugreg-")
+          dir (path/join base "bedit" "packages")
+          _ (write-files dir
+              "pkgmode"
+              {"pkgmode.blsp" (string/join ["(defmodule pkgmode)"
+                                             "(defn bedit-plugin () {})"
+                                             "(def pkgmode-layer {:name 'pkgmode :keymap {} :file-pattern \"[.]pkgmode$\"})"
+                                             "(modes/register-language-mode 'pkgmode/pkgmode-layer :pkgmode)"]
+                                "\n")})
+          _ (apply-from-files base "pkgmode")
+          model (ed-init (editor/layers/init-buffer-layers (make-buffer "text"
+                                                             "a.pkgmode" "/tmp/a.pkgmode")))
+          typed (:type (ed-buf-at model 0))
+          removed (run-with base
+                    (stub-registry "")
+                    (fn () (packages/remove-package model "pkgmode")))
+          buf (ed-buf-at removed 0)
+          messages (buffer-text (ed-buf-at removed (ed-buffer-index-by-name! removed "*Messages*"))))
+      (assert= typed :pkgmode)
+      (assert= (:type buf) :fundamental)
+      (refute (any? (editor/layers/active-layers buf) (fn (layer) (= (:name layer) 'pkgmode))))
+      (is (includes? messages "removed pkgmode: a.pkgmode is in fundamental mode now")))))
+
+(describe "a package file without a defmodule"
+  :isolated (test "its root names are first defined by the package, and go with it"
+    (let (base (temp-dir "bedit-plugreg-")
+          dir (path/join base "bedit" "packages")
+          _ (write-files dir
+              "pkgloose"
+              {"pkgloose.blsp" "(defmodule pkgloose)\n(defn bedit-plugin () {})\n"
+               "helpers.blsp" "(defn pkgloose-helper () :helped)\n"})
+          _ (apply-from-files base "pkgloose")
+          had ((reflect/eval 'pkgloose-helper))
+          _ (remove-package base "pkgloose"))
+      (assert= had :helped)
+      (refute (bound? 'pkgloose-helper)))))
