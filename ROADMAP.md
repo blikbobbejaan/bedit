@@ -311,8 +311,10 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
   (`view/ed-which-key-ops` over the keymap data + shared `model/ed-key-label` /
   `ed-cmd-label`).
 - ✅ **Help** — `describe-key` (`C-h k`, resolves a key sequence through the keymap and
-  shows the command + docstring) and `describe-function` (`C-h f`, completes the M-x
-  registry); docstrings via the `doc` primitive (`model/ed-doc`).
+  shows the command + docstring), `describe-function` (`C-h f`, completes the M-x
+  registry or takes any qualified global: a *Help* page with the whole docstring, the keys
+  in force, arguments, signature, module and source line) and `describe-setting` (`C-h v`,
+  an init.blsp setting: doc, type, default, the value in effect and where it came from).
 - ✅ **Registers** (`C-x r SPC`/`j`/`s`/`i`) and **persistent bookmarks** (`C-x r m`/`b`,
   in `~/.cache/brood/bookmarks.blsp`) — both on a reusable one-key reader
   (`model/ed-read-char` + a read-char transient).

@@ -17,13 +17,15 @@
   "The help system: `C-h b` every binding grouped by the layer that owns it (shadowed ones
 shown, and marked), `C-h m` the active modes, `C-h w` where a command is bound, `C-h a`
 apropos over the command registry, `C-h l` the keys you last pressed, `C-h ?` the help map
-itself, `C-h k` / `C-h f` what one key or one command does. Reports bindings through
-`editor/layers/scope-bindings`, so what help says is what dispatch does."
+itself, `C-h k` what one key does, `C-h f` a function's whole *Help* page (doc, keys,
+signature, module), `C-h v` an init.blsp setting's (doc, type, default, the value in effect and
+where it came from). Reports bindings through `editor/layers/scope-bindings`, so what help
+says is what dispatch does."
   (:use keyhelp) ; key / command labels, where-is, docstrings
   (:use model) ; message
   (:use pool) ; ed-show-named — the report buffer
   (:use interactive) ; defcommand / command-names / command-sym
-  (:use editor/layers)) ; scope-bindings / active-layers — the layer stack with provenance
+  (:use editor/layers)) ; scope-bindings / active-layers / scope-keymap — the layer stack with provenance
 (def *lossage-max* 100)
 ;; How many recent keys `C-h l` remembers (Emacs keeps 300 in a C ring). The model carries
 ;; them as a plain vector, so the cap is what stops a long session growing a field without
@@ -224,21 +226,218 @@ area, the command it runs and the first line of its docstring. Handled by the de
 transient (`input`); Esc/C-g aborts."
   (assoc (message m "Describe key: ") :describe-key {:pending nil :keys []}))
 
+;; ---- describe-function (C-h f) --------------------------------------------------
+;; Emacs's *Help* page for a function: what it is, where it lives, the keys that run it, how
+;; it is called, and the WHOLE docstring. It used to be the docstring's first line in the
+;; echo area, which for a command whose doc is three paragraphs of why was the least useful
+;; line of it. Everything here is asked of the image (`reflect/*`) and of the dispatcher's
+;; own binding report, so it describes what will run, not what a table says should.
+
+(defn- help-row (label value)
+  "One `  Label      value` line of a *Help* page's summary block, or nil when `value` is."
+  (when (and (not (nil? value)) (not (= value "")))
+    (str "  " label (string/repeat " " (math/max 1 (- 11 (string/length label)))) value)))
+
+(defn- help-function-symbol (name)
+  "The symbol `name` (typed at C-h f) describes: the command registered under it, else the
+global it names when that is bound (a qualified `string/join`, loading its module as a
+qualified reference would) — nil when it names neither."
+  (or (command-sym name)
+    (let (sym (symbol name))
+      ;; check-allow: a name that does not resolve — a typo, a module that does not load — is
+      ;; the answer `nil`, said by the caller as "no function"
+      (check-allow :discarded-catch
+        (when (try (reflect/resolves? sym) (catch _ false)) sym)))))
+
+(defn- help-module-of (sym)
+  "The module a qualified global belongs to — everything before its last `/` — or nil for a
+bare (prelude / builtin) name."
+  (let (text (->string sym)
+        parts (string/split text "/"))
+    (if (< (count parts) 2) nil (string/join (seq/drop-last parts 1) "/"))))
+
+(defn- help-location (sym)
+  "`file:line` where `sym` was defined (the home as `~`), or nil (a builtin, or a module loaded from the
+startup image rather than its source)."
+  (let (location (reflect/source-location sym))
+    (when (and (vector? location) (>= (count location) 2))
+      (str (path/abbreviate (first location)) ":" (second location)))))
+
+(defn- help-arglist (sym)
+  "The parameter list `sym` was defined with, printed — nil when it has none to report."
+  ;; check-allow: `reflect/arglist` is a special form over a symbol, so it is built and
+  ;; evaluated; a global that is not a function (a value, a macro) has no arglist to show
+  (check-allow :discarded-catch
+    (let (arglist (try (reflect/eval (list 'reflect/arglist sym)) (catch _ nil)))
+      (if (nil? arglist) nil (pr-str arglist)))))
+
+(defn- help-signature (sym)
+  "`[text declared?]` — the contract a `sig` declared for `sym`, else the checker's inferred
+type for it, else nil."
+  (let (declared (reflect/declared-signature sym))
+    (if (string? declared)
+      [declared true]
+      (let (inferred (reflect/type-signature sym)) (if (string? inferred) [inferred false] nil)))))
+
+(defn- help-kind (name sym)
+  "What `sym` is, as the page's heading says it: an interactive command (with its M-x name)
+or a function."
+  (if (= (command-sym name) sym)
+    (str name " is an interactive command")
+    (str (->string sym) " is a function")))
+
+(defn describe-function-text (m name sym)
+  "The *Help* page for the function `sym`, reached as `name` (its M-x name for a command):
+what it is, its module and where it was defined, the keys in force that run it (the
+dispatcher's own report), its parameters, its signature — declared, or the checker's
+inference, marked so — and its FULL docstring, with `\\[command]` holes showing the live key."
+  (let (entries (scope-bindings (help-scope m))
+        keys (help-keys-for entries name)
+        command? (= (command-sym name) sym)
+        signature (help-signature sym)
+        doc (ed-doc sym)
+        keymap (scope-keymap (help-scope m))
+        summary (seq/keep [(help-row "Module" (help-module-of sym))
+                            (help-row "Defined" (help-location sym))
+                            (help-row "Keys"
+                              (cond
+                                (not command?) nil
+                                (empty? keys) (str "none — M-x " name)
+                                else (string/join keys ", ")))
+                            (help-row "Arguments" (help-arglist sym))
+                            (help-row "Signature"
+                              (if (nil? signature)
+                                nil
+                                (let ([text declared?] signature)
+                                  (if declared? text (str text "   (inferred)")))))
+                            (help-row "Symbol" (if command? (->string sym) nil))]
+                  (fn (row) row)))
+    (str (help-kind name sym)
+      ".\n\n"
+      (string/join summary "\n")
+      "\n\n"
+      (if (string? doc) (ed-substitute-command-keys keymap doc) "Not documented.")
+      "\n")))
+
 (defcommand cmd-describe-function
   (m key)
-  "Describe a command by name (C-h f): prompt with completion over the M-x registry,
-then show the first line of its docstring in the echo area."
-  (let (names (command-names))
-    (assoc m
-      :minibuffer
-        (ed-name-prompt "Describe command: "
-          names
-          (fn (mm t)
-            (let (sym (command-sym t))
-              (if (nil? sym)
-                (message mm (str "no command: " t))
-                (let (d (ed-doc sym))
-                  (message mm (if d (str t " — " (ed-first-line d)) (str t " (no docstring)")))))))))))
+  "Describe a function (C-h f): prompt with completion over the M-x registry — or type any
+qualified global (`string/join`, `pool/ed-show-named`) — then show its *Help* page: what it
+is, its module and source location, the keys that run it, its parameters and signature, and
+the whole docstring. Emacs's `describe-function`."
+  (assoc m
+    :minibuffer
+      (ed-name-prompt "Describe function: "
+        (command-names)
+        (fn (mm name)
+          (let (sym (help-function-symbol (string/trim name)))
+            (if (nil? sym)
+              (message mm (str "no function: " name))
+              (ed-show-named mm "*Help*" (describe-function-text mm (string/trim name) sym) :help)))))))
+
+;; ---- describe-setting (C-h v) ---------------------------------------------------
+;; Emacs's `describe-variable` has nothing to describe here — bedit's state is a model, not
+;; a sea of globals — but what a user DOES set is init.blsp, and every key of it is one
+;; `settings/define` (config.blsp, and a package's own under `:bedit/settings`): its type,
+;; default and doc. C-h v is the page for one of those, with the value it has now and where
+;; that value came from.
+
+(defn setting-names ()
+  "Every declared init.blsp setting's name (no colon), in the order the default file lists them
+— bedit's own and every loaded package's."
+  (map (settings/specs config/*settings*) (fn (spec) (->string (:name spec)))))
+
+(defn- help-value-text (value)
+  "A setting value as init.blsp would spell it."
+  (pr-str value))
+
+(defn- help-per-mode-lines (value)
+  "A per-mode map's entries, one `  key   value` line each, sorted — the `:line-numbers` /
+`:long-lines` / `:indent-width` shape — or empty when `value` is not a map."
+  (if (not (map? value))
+    []
+    (let (rows (seq/sort-by (vec value) (fn ([key _]) (->string key)))
+          width (fold rows
+                  8
+                  (fn (widest [key _]) (math/max widest (+ 2 (string/length (pr-str key)))))))
+      (map rows
+        (fn ([key setting])
+          (str "    "
+            (pr-str key)
+            (string/repeat " " (- width (string/length (pr-str key))))
+            (pr-str setting)))))))
+
+(defn describe-setting-text (m spec loaded on-disk)
+  "The *Help* page for setting `spec` (a `settings/define` spec): its doc, type, default, the
+value in effect and WHERE it came from — init.blsp, or the default (and why: unset, or a value
+its type rejects) — the live value on the model when a command changed it this session, each
+mode's value when it is a per-mode map, and a note when init.blsp on disk (`on-disk`) no longer
+says what was loaded (`loaded`)."
+  (let (name (:name spec)
+        set? (contains? loaded name)
+        written (get loaded name)
+        valid? (settings/valid? spec written)
+        in-effect (config/setting loaded name)
+        model-key (:model-key spec)
+        live (when model-key (get m model-key))
+        source (cond
+                 (not set?) "the default (init.blsp does not set it)"
+                 valid? (str "init.blsp (" (config/init-file) ")")
+                 else
+                   (str "the default — init.blsp's "
+                     (help-value-text written)
+                     " is rejected: it wants "
+                     (settings/want-text spec)))
+        summary (seq/keep [(help-row "Type" (settings/want-text spec))
+                            (help-row "Default" (help-value-text (:default spec)))
+                            (help-row "Value" (help-value-text in-effect))
+                            (help-row "Set by" source)
+                            (help-row "Live"
+                              (if (and model-key (contains? m model-key) (not (= live in-effect)))
+                                (str (help-value-text live) "   (changed in this session)")
+                                nil))
+                            (help-row "Example"
+                              (if (and (contains? spec :example)
+                                    (not (= (:example spec) (:default spec))))
+                                (help-value-text (:example spec))
+                                nil))]
+                  (fn (row) row))
+        per-mode (help-per-mode-lines in-effect)
+        stale? (not (= (get on-disk name) written)))
+    (str (pr-str name)
+      " is an init.blsp setting.\n\n"
+      (string/join summary "\n")
+      (if (empty? per-mode)
+        ""
+        (str "\n\n  Per mode (a mode's name, a line kind, :default):\n" (string/join per-mode "\n")))
+      (if stale?
+        (str "\n\n  init.blsp now says "
+          (if (contains? on-disk name) (help-value-text (get on-disk name)) "nothing")
+          " — M-x reload-config applies it.")
+        "")
+      "\n\n"
+      (if (string? (:doc spec)) (:doc spec) "Not documented.")
+      "\n")))
+
+(defcommand cmd-describe-setting
+  (m key)
+  "Describe an init.blsp setting (C-h v): prompt with completion over every declared setting —
+bedit's and each loaded package's — then show its *Help* page: doc, type, default, the value in
+effect and whether init.blsp or the default gave it, each mode's value for a per-mode setting,
+and the live value when a command changed it this session. Emacs's `describe-variable`, for
+the variables bedit has."
+  (assoc m
+    :minibuffer
+      (ed-name-prompt "Describe setting: "
+        (setting-names)
+        (fn (mm typed)
+          (let (name (keyword (string/drop-prefix (string/trim typed) ":"))
+                spec (settings/spec-of config/*settings* name))
+            (if (nil? spec)
+              (message mm (str "no setting: " typed))
+              (let (on-disk (config/peek-init)
+                    loaded (or (:init-config mm) on-disk))
+                (ed-show-named mm "*Help*" (describe-setting-text mm spec loaded on-disk) :help))))))))
 
 ;; ---- where-is / apropos ----------------------------------------------------
 
@@ -384,7 +583,8 @@ swallowed is in this list, which is the only place it is visible."
     ["C-h b" "describe-bindings — every key in force, by layer"]
     ["C-h m" "describe-mode — the layers active in this buffer"]
     ["C-h k" "describe-key — what one key runs, and where it is bound"]
-    ["C-h f" "describe-function — a command's docstring"]
+    ["C-h f" "describe-function — a function's doc, keys, signature and module"]
+    ["C-h v" "describe-setting — an init.blsp setting: doc, type, default, value"]
     ["C-h w" "where-is — the keys that run a command"]
     ["C-h a" "apropos-command — commands matching a pattern"]
     ["C-h l" "view-lossage — the keys you last pressed"]

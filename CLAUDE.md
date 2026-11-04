@@ -178,7 +178,20 @@ src/themes.blsp             the theme registry (M-x theme-select): a live picker
                             adding one is data (theme.blsp is the palette; this is the registry)
 src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
                             hive packages that `:enhances bedit` at RUNTIME, into
-                            ~/.config/bedit/packages (the elpa model) — never the build's _deps
+                            ~/.config/bedit/packages (the elpa model) — never the build's _deps.
+                            The list fetch, an install and an update run OFF the loop (a task in
+                            `:package-job`: one at a time, C-g stops it, C-x C-c asks), each a
+                            failure CARRYING ITS REASON (brood ADR-559) said in the echo area
+                            and on *Packages*' status line. An install lands in a staging dir
+                            and moves into place only when it verified and enhances this bedit,
+                            so a failed or cancelled one keeps the copy there; an update reloads
+                            the plugin's sources. The registry calls are `*registry*` (tests stub it)
+src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a function's *Help*
+                            page: the whole docstring, keys in force, arguments, signature,
+                            module and source line — brood's reflect, seeing through contract
+                            shims, ADR-560) and C-h v (an init.blsp setting's page: doc, type,
+                            default, the value in effect and whether init.blsp or the default
+                            gave it, per-mode values, a session change, an unloaded edit)
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model); the
                             row table every row↔line question reads (`ed-pane-rows`), from the
                             pane's start row
