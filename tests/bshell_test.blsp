@@ -1,7 +1,7 @@
 ;; The project shell (`C-x p e`) — `src/bshell.blsp`. A bshell is **per project**: each gets
 ;; its own `*bshell: <root>*` buffer carrying its own state (`:bshell-proc`/`-running`/
 ;; `-input-start`/history) on the buffer, plus the generic `:dir` (= its project root). These
-;; cover the GUI-free pieces: ANSI stripping, the input-region/prompt bookkeeping, RET, history,
+;; cover the GUI-free pieces: ANSI colour, the input-region/prompt bookkeeping, RET, history,
 ;; fontify, completion. The shell process is a thin IO shell around `proc-spawn` (the `:cwd`
 ;; path is in brood's proc_test.blsp), so it isn't re-tested here.
 
@@ -64,19 +64,85 @@
 (describe "ed-ev-bshell-output"
   (test "appends the chunk verbatim (no forced newline)"
     (let (m (bshell/ed-ev-bshell-output (bshell-model)
-              (bshell/bshell-output-event bshell-name "hi")
+              (bshell/bshell-output-event bshell-name "hi" [])
               24
               80
               24))
       (is (string/ends-with? (bshell-text m) "tmp $ hi"))))
   (test "consecutive chunks concatenate without a line break between them"
     (let (m1 (bshell/ed-ev-bshell-output (bshell-model)
-               (bshell/bshell-output-event bshell-name "ab")
+               (bshell/bshell-output-event bshell-name "ab" [])
                24
                80
                24)
-          m2 (bshell/ed-ev-bshell-output m1 (bshell/bshell-output-event bshell-name "cd") 24 80 24))
+          m2 (bshell/ed-ev-bshell-output m1
+               (bshell/bshell-output-event bshell-name "cd" [])
+               24
+               80
+               24))
       (is (string/ends-with? (bshell-text m2) "abcd")))))
+
+;; ---- ANSI colour, split across reads (issue #24) -------------------------------
+
+(defn- bshell-stream-into (m chunks)
+  "`m` with `chunks` — the command's stdout reads, in order — run through the worker's
+decode step (`bshell-forward`, its decoder in the worker state, the events sent here) and
+folded as the loop folds them."
+  (do
+    (fold chunks
+      {:buffer bshell-name :reply (self) :out (ansi/decoder) :err (ansi/decoder)}
+      (fn (state chunk) (bshell/bshell-forward state :out chunk)))
+    (letrec (drain (fn (model)
+                     (receive
+                       (event (drain (bshell/ed-ev-bshell-output model event 24 80 24)))
+                       (after 0 model))))
+      (drain m))))
+
+(describe "bshell: a command's ANSI colours"
+  (test "an escape split across two reads never leaks into the shell buffer"
+    (let (m (bshell-stream-into (bshell-model) ["\e[01;3" "4mdir\e[0m  file\n"]))
+      (is (string/ends-with? (bshell-text m) "tmp $ dir  file\n"))))
+  (test "the colours land as faces on the output, after the prompt"
+    (let (m0 (bshell-model)
+          start (string/length (bshell-text m0))
+          m (bshell-stream-into m0 ["\e[01;3" "4mdir\e[0m  file\n"])
+          spans (:output-spans (ed-buf-at m (ed-buffer-index-by-name! m bshell-name))))
+      (assert= (into [] (map spans (fn (s) [(first s) (second s)]))) [[start (+ start 3)]])
+      (is (:bold (nth (first spans) 2)))
+      (assert= (:fg (nth (first spans) 2)) 4)))
+  (test "stdout and stderr keep separate decoders"
+    (let (state (bshell/bshell-forward {:buffer bshell-name
+                                        :reply (self)
+                                        :out (ansi/decoder)
+                                        :err (ansi/decoder)}
+                  :out "\e[3")
+          state2 (bshell/bshell-forward state :err "plain\n")
+          _ (bshell/bshell-forward state2 :out "1mred\n")
+          m (letrec (drain (fn (model)
+                             (receive
+                               (event (drain (bshell/ed-ev-bshell-output model event 24 80 24)))
+                               (after 0 model))))
+              (drain (bshell-model))))
+      (is (string/ends-with? (bshell-text m) "tmp $ plain\nred\n")))))
+
+(describe "bshell: input typed ahead while a command runs"
+  ;; the output lands at the process mark (comint's), before what was typed ahead — so no
+  ;; later edit of that input can shift the output's colour spans off their text
+  (test "output goes before it, coloured where it lands; the new prompt keeps it as input"
+    (let (running (set-field (set-field (bshell-model) :bshell-running true)
+                    :bshell-output-at (string/length (bshell-text (bshell-model))))
+          mark (string/length (bshell-text running))
+          typed (type-into running "next")
+          m1 (bshell-stream-into typed ["\e[31mre" "d\e[0m\n"])
+          spans (:output-spans (bshell-buf m1))
+          m2 (bshell/ed-ev-bshell-done m1 (bshell/bshell-done-event bshell-name 0) 24 80 24))
+      (is (string/ends-with? (bshell-text m1) "tmp $ red\nnext"))
+      (assert= (into [] (map spans (fn (s) [(first s) (second s)]))) [[mark (+ mark 3)]])
+      (assert= (string/substring (bshell-text m1) mark (+ mark 3)) "red")
+      ;; the command ends: the prompt follows its output, and `next` waits after it
+      (is (string/ends-with? (bshell-text m2) "red\n/tmp $ next"))
+      (assert= (bshell-input m2) "next")
+      (refute (bshell-running m2)))))
 
 (describe "ed-ev-bshell-done"
   (test "a clean exit (0) is silent — no [exit] line, but a fresh prompt and idle shell"
@@ -338,7 +404,7 @@
           m1 (ed-update m0 "s" 80 24)
           m2 (cmd-bshell-send m1 :enter)
           m3 (bshell/ed-ev-bshell-output m2
-               (bshell/bshell-output-event bshell-name "a.txt\n")
+               (bshell/bshell-output-event bshell-name "a.txt\n" [])
                24
                80
                24)
@@ -349,7 +415,7 @@
     (let (m0 (ed-update (bshell-model) "x" 80 24)
           m1 (at-point m0 0) ; up in the output (the prompt line's start)
           m2 (bshell/ed-ev-bshell-output m1
-               (bshell/bshell-output-event bshell-name "more\n")
+               (bshell/bshell-output-event bshell-name "more\n" [])
                24
                80
                24))

@@ -3,42 +3,77 @@
 (defmodule procstream-test
   (:use test)
   (:use-internals procstream))
-
 ;; A run as the worker holds it: handlers that BUILD events, delivered to `reply`.
 (defn- run-to (reply on-line on-err)
   {:handlers {:on-line on-line :on-err-line on-err :on-done (fn (code tok) [:done code tok])}
    :token :g1
    :reply reply})
 
+(defn- feed-all (run deliver chunks)
+  "The stream state after `chunks` are fed, in order, from a fresh stream."
+  (fold chunks
+    (procstream/procstream-stream)
+    (fn (stream chunk) (procstream/procstream-feed run stream chunk deliver))))
+
+(defn- received-lines ()
+  "Every `[:line text spans tok]` event already in the mailbox, in order."
+  (letrec (go (fn (acc)
+                (receive
+                  ([:line l s t] (go (conj acc [l s t])))
+                  (after 0 acc))))
+    (go [])))
+
 (describe "procstream — line buffering (pure)"
-  (test "complete lines are delivered; the trailing partial is returned, token threaded"
-    (let (run (run-to (self) (fn (line tok) [:line line tok]) (fn (l t) nil))
-          rest (procstream/procstream-feed run "" "a\nb\nc" procstream/procstream-out-line))
-      (assert= "c" rest) ; the partial carries over
-      (assert= ["a" :g1] (receive ([:line l t] [l t]) (after 500 :timeout)))
-      (assert= ["b" :g1] (receive ([:line l t] [l t]) (after 500 :timeout)))))
+  (test "complete lines are delivered; the trailing partial is kept, token threaded"
+    (let (run (run-to (self) (fn (line spans tok) [:line line spans tok]) (fn (l s t) nil))
+          stream (feed-all run procstream/procstream-out-line ["a\nb\nc"]))
+      (assert= ["c" []] (:partial stream)) ; the partial carries over
+      (assert= [["a" [] :g1] ["b" [] :g1]] (received-lines))))
   (test "a handler that builds nothing delivers nothing"
-    (let (run (run-to (self) (fn (line tok) nil) (fn (l t) nil)))
-      (procstream/procstream-feed run "" "quiet\n" procstream/procstream-out-line)
+    (let (run (run-to (self) (fn (line spans tok) nil) (fn (l s t) nil)))
+      (feed-all run procstream/procstream-out-line ["quiet\n"])
       (is (nil? (receive (anything anything) (after 100 nil))))))
   (test "a handler throw is caught and routed to on-err, not fatal"
-    (let (run (run-to (self) (fn (line tok) (throw "boom")) (fn (line tok) [:err line])))
-      (procstream/procstream-feed run "" "x\n" procstream/procstream-out-line)
+    (let (run (run-to (self) (fn (line spans tok) (throw "boom")) (fn (line spans tok) [:err line])))
+      (feed-all run procstream/procstream-out-line ["x\n"])
       (is (includes? (receive ([:err l] l) (after 500 :timeout)) "boom"))))
   (test "stderr rides the same splitter, its blank lines dropped"
-    (let (run (run-to (self) (fn (line tok) nil) (fn (line tok) [:err line]))
-          rest (procstream/procstream-feed run
-                 "tra" "ce\n\n  \nnext" procstream/procstream-err-line))
-      (assert= "next" rest)
+    (let (run (run-to (self) (fn (line spans tok) nil) (fn (line spans tok) [:err line]))
+          stream (feed-all run procstream/procstream-err-line ["tra" "ce\n\n  \nnext"]))
+      (assert= ["next" []] (:partial stream))
       (assert= "trace" (receive ([:err l] l) (after 500 :timeout)))
       (is (nil? (receive (anything anything) (after 100 nil)))))))
+
+(describe "procstream — ANSI escapes split across reads (issue #24)"
+  (test "a line arrives with no escape in it, its colours beside it"
+    (let (run (run-to (self) (fn (line spans tok) [:line line spans tok]) (fn (l s t) nil)))
+      (feed-all run procstream/procstream-out-line ["\e[1" "mERROR\e[0m done\n"])
+      (assert= [["ERROR done" [[0 5 {:bold true}]] :g1]] (received-lines))))
+  (test "every cut of a coloured stream delivers the same lines and colours"
+    (let (stream-text "\e[32mok\e[0m one\r\n\e[31mred\nstill red\e[0m\n\e]0;title\x07plain\n"
+          n (string/length stream-text)
+          run (run-to (self) (fn (line spans tok) [:line line spans tok]) (fn (l s t) nil))
+          expected (do
+                     (feed-all run procstream/procstream-out-line [stream-text])
+                     (received-lines)))
+      (assert= (into [] (map expected first)) ["ok one" "red" "still red" "plain"])
+      (assert= (second (nth expected 2)) [[0 9 {:fg 1}]]) ; the colour carried over a line
+      (doseq (i (range 1 n))
+        (feed-all run
+          procstream/procstream-out-line
+          [(string/substring stream-text 0 i) (string/substring stream-text i n)])
+        (assert= [i (received-lines)] [i expected]))))
+  (test "the partial line keeps its colours for the line it completes"
+    (let (run (run-to (self) (fn (line spans tok) [:line line spans tok]) (fn (l s t) nil)))
+      (feed-all run procstream/procstream-out-line ["ab\e[4mcd" "ef\e[0m\n"])
+      (assert= [["abcdef" [[2 6 {:underline true}]] :g1]] (received-lines)))))
 
 (describe "procstream — end to end (a real nest run child)"
   :isolated (test "stdout lines and the exit code reach the run's reply address, tagged with its token"
     (let (script "/tmp/bedit-procstream-probe.blsp")
       (file/spit script "(io/puts \"line-one\")\n(io/puts \"line-two\")\n")
-      (let (handlers {:on-line (fn (line tok) [:line line tok])
-                      :on-err-line (fn (line tok) nil)
+      (let (handlers {:on-line (fn (line spans tok) [:line line tok])
+                      :on-err-line (fn (line spans tok) nil)
                       :on-done (fn (code tok) [:done code tok])}
             w (spawn (procstream/procstream-loop handlers)))
         ;; the address is per RUN: the worker is shared, the loop that asked is not
@@ -61,8 +96,8 @@
           other-loop (spawn (letrec (relay (fn ()
                                              (receive (msg (do (send me [:other msg]) (relay))))))
                               (relay)))
-          handlers {:on-line (fn (line tok) nil)
-                    :on-err-line (fn (line tok) nil)
+          handlers {:on-line (fn (line spans tok) nil)
+                    :on-err-line (fn (line spans tok) nil)
                     :on-done (fn (code tok) [:done tok])}
           w (spawn (procstream/procstream-loop handlers)))
       (file/spit script "(io/puts \"x\")\n")
