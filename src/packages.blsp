@@ -169,8 +169,11 @@ strings. A file that does not open with one declares none."
   (check-allow :discarded-catch (try (reflect/eval (exact global)) (catch _ nil))))
 
 (defn- define-global (global value)
-  ;; `global` bound to `value` again — the root escape names it whatever module asks
-  (reflect/eval (list 'def (exact global) (list 'quote value))))
+  ;; `global` bound to `value` again, by exactly that name: its module apart from bedit's of
+  ;; the same short name (brood ADR-604), so a package's `org/f` is never bedit's `bedit/org/f`
+  (let (namespace (global-namespace global))
+    (reflect/with-modules-apart (if namespace [namespace] [])
+      (fn () (reflect/eval (list 'def (exact global) (list 'quote value)))))))
 
 (defn- undefine-global (global)
   ;; `global` removed (`reflect/undef`, brood ADR-391); false when it cannot be
@@ -190,7 +193,7 @@ strings. A file that does not open with one declares none."
 ;; (A's is gone) — never A's old body. Emacs's `unload-feature` restores a function the same
 ;; way.
 ;;
-;; What a load bound is read from the runtime (`reflect/rebound-since`, brood ADR-597), not from
+;; What a load bound is read from the runtime (`reflect/rebound-since`, brood ADR-603), not from
 ;; every global's value: the value a name had BEFORE the load is kept only for the names the
 ;; package's sources spell ([[source-names]]) and the registries — what it can rebind.
 
@@ -300,10 +303,12 @@ removed package's code stops running."
                          (fn ([global record])
                            (and (any? (:stack record) (fn (layer) (= (:package layer) name)))
                              (retire-layer name global record)))))
-        own (seq/filter (reflect/global-names)
+        ;; only what was bound since the package loaded (brood ADR-603), not every global
+        own (seq/filter (reflect/rebound-since (registry/lookup :packages/loaded-at name 0))
               (fn (global)
                 (let (spelled (->string global))
                   (and (any? module-prefixes (fn (module) (string/starts-with? spelled module)))
+                    (bound? global)
                     (contains? modules (global-namespace global))
                     (nil? (registry/lookup :packages/definitions global))
                     (sited-under? global prefix)
@@ -472,9 +477,20 @@ and answer the buffer types it took away."
   (let (namespaces (into (package-modules name) (registry/lookup :packages/modules name #{}))
         defined (first-defined name)
         ours? (fn (value) (names-package? value namespaces defined))
+        ;; A table is walked entry by entry only when its printed form could name the
+        ;; package at all — one of its namespaces, a name it defined, or a function, which
+        ;; prints `#<fn>` and is told by its module — so the backstop costs a print of each
+        ;; table, not a walk of every entry of every registry
+        needles (append (map (seq namespaces) (fn (namespace) (str namespace "/")))
+                  (map (seq defined) ->string)
+                  ["#<fn"])
+        worth-walking? (fn (value)
+                         (let (text (pr-str value))
+                           (any? needles (fn (needle) (includes? text needle)))))
         bookkeeping #{"ownership" "packages"})
     (doseq ([id table] registry/*registries*)
-      (when (not (and (keyword? id) (contains? bookkeeping (ownership/symbol-namespace id))))
+      (when (and (not (and (keyword? id) (contains? bookkeeping (ownership/symbol-namespace id))))
+              (worth-walking? table))
         (doseq ([key entry] table) (when (ours? entry) (ownership/drop-entry! id key)))))
     (doseq (ref editor/layers/*system-layers*)
       (when (ours? ref) (editor/layers/unregister-system-layer ref)))
@@ -503,6 +519,9 @@ settings, its modules — and its namespaces, so its commands and hooks register
 run (`ownership/own-namespace!`)."
   (let (modules (package-modules name))
     (note-definitions name before)
+    ;; the generation it first loaded at: what it binds later is found from there
+    (when (nil? (registry/lookup :packages/loaded-at name))
+      (registry/put! :packages/loaded-at name (:generation before)))
     (registry/put! :packages/writers name (package-writers name))
     (registry/put! :packages/modules
       name
@@ -513,7 +532,7 @@ run (`ownership/own-namespace!`)."
 
 (defn- retract-impls (name)
   ;; the ability impls package `name`'s modules registered, taken back — the tier below each
-  ;; winning again (brood ADR-597); `reflect/undef` retires only the impls of a type it removes
+  ;; winning again (brood ADR-603); `reflect/undef` retires only the impls of a type it removes
   (count (seq/filter (registry/impls-by (into #{}
                                           (map (seq (registry/lookup :packages/modules
                                                       name
@@ -547,6 +566,7 @@ Answers `{:released :restored :retired :types}` — `:restored` the impls taken 
     (doseq (module (into (package-modules name) (registry/lookup :packages/modules name #{})))
       (ownership/disown-namespace! module))
     (registry/remove! :packages/modules name)
+    (registry/remove! :packages/loaded-at name)
     (registry/remove! :packages/contributions name)
     {:released (count released) :restored restored :retired retired :types types}))
 
@@ -625,7 +645,10 @@ update needs after [[update-plugin!]] retired the old version."
         before (values-before name)
         contribution (ownership/with-claimant (claimant-file name)
                        (fn ()
-                         (let (loaded (plugin-entry name reload?))
+                         ;; its modules load as ITS, apart from bedit's of the same short name
+                         ;; (brood ADR-604): a package module `org` never loads into `bedit/org`
+                         (let (loaded (reflect/with-modules-apart (package-modules name)
+                                        (fn () (plugin-entry name reload?))))
                            (when (not (failure? loaded))
                              (doseq (theme (or (:themes loaded) [])) (register-theme! theme)))
                            loaded))))
