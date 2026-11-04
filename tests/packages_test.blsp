@@ -298,7 +298,7 @@ asks rather than assumes."
       (is (includes? (nth (string/split (pk-buffer-text done "*Packages*") "\n") 1)
             "installed pkgsnet"))
       ;; the row says installed now, read from the disk without fetching the list again
-      (is (includes? (pk-buffer-text done "*Packages*") "installed  pkgsnet"))
+      (is (includes? (pk-buffer-text done "*Packages*") "installed    pkgsnet"))
       (is (nil? (:package-job done)))))
   :isolated (test "a failed install says the registry's reason, and installs nothing"
     (let (base (temp-dir "bedit-pkgs-")
@@ -462,3 +462,118 @@ asks rather than assumes."
       (is (includes? fetching "fetching the package list…"))
       (is (nil? (:package-job landed)))
       (is (includes? (pk-buffer-text landed "*Packages*") "pkgsnet")))))
+
+;; ---- an upgrade makes a package incompatible, or an update drops something (issue #21) -------
+;; package.el marks a package it will not activate and says so; it reloads an upgraded one. bedit
+;; does both, and retires what the old version defined before the new one loads.
+
+(describe "an installed package bedit does not load is said, not dropped"
+  :isolated (test "one for a newer bedit, or another editor, is incompatible with the reason"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-package dir "pkgsnewer" "{bedit \">= 99.0\"}")
+          _ (pk-package dir "pkgsforeign" "{waggle \">= 0.1\"}")
+          problems (binding (*config-base* base)
+                     (packages/load-installed!)
+                     (packages/load-problems))
+          rows (binding (*config-base* base) (packages/package-rows [])))
+      (assert= (:status (packages/package-status "pkgsnewer")) :incompatible)
+      (is (includes? (:reason (packages/package-status "pkgsnewer")) "it needs bedit >= 99.0"))
+      (is (includes? (:reason (packages/package-status "pkgsforeign")) "does not declare"))
+      (is (any? problems (fn (line) (includes? line "pkgsnewer was not loaded — it needs bedit"))))
+      (assert= (:status (seq/find rows (fn (row) (= (:name row) "pkgsnewer")))) :incompatible)
+      (is (includes? (:text (packages/render-packages rows)) "incompatible"))))
+  :isolated (test "one whose code no longer loads is broken, with the load's own error"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir "pkgsbroke" "1.0.0" "{bedit \">= 0.1\"}" "(no-such-function-anywhere 1)")
+          problems (binding (*config-base* base)
+                     (packages/load-installed!)
+                     (packages/load-problems))
+          info (binding (*config-base* base)
+                 (packages/package-info (ed-init (make-buffer "")) "pkgsbroke")))
+      (assert= (:status (packages/package-status "pkgsbroke")) :broken)
+      (is (any? problems
+            (fn (line) (includes? line "pkgsbroke is broken — its module did not load"))))
+      (assert= (:status info) :broken)
+      (is (includes? (help/describe-package-text info) "BROKEN")))))
+
+(describe "an update retires what the old version defined"
+  :isolated (test "a function the new version dropped is gone, the kept one is the new body"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir
+              "pkgsret" "1.0.0" "{bedit \">= 0.1\"}"
+              "(defn bedit-plugin () {})\n(defn generation () 1)\n(defn old-only () :old)")
+          registry (pk-registry {:latest-version (fn (_name) "1.1.0")
+                                 :install (fn (name dest-dir)
+                                            (do
+                                              (pk-write dest-dir
+                                                name "1.1.0" "{bedit \">= 0.1\"}"
+                                                "(defn bedit-plugin () {})\n(defn generation () 2)")
+                                              {:name name :version "1.1.0"}))})
+          _ (pk-run base registry (fn () (packages/apply-plugin! "pkgsret")))
+          had-old (bound? 'pkgsret/old-only)
+          done (pk-launch base registry {:kind :update :name "pkgsret"}))
+      (is had-old)
+      (is (includes? (:echo done) "updated pkgsret → 1.1.0"))
+      (refute (bound? 'pkgsret/old-only))
+      (assert= ((reflect/eval 'pkgsret/generation)) 2)
+      (assert= (:status (packages/package-status "pkgsret")) :loaded)))
+  :isolated (test "a theme the new version no longer contributes leaves the picker"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir
+              "pkgsthm" "1.0.0" "{bedit \">= 0.1\"}"
+              "(defn bedit-plugin () {:themes [{:name \"pkgsthm-old\" :colors {}} {:name \"pkgsthm-kept\" :colors {}}]})")
+          registry (pk-registry {:latest-version (fn (_name) "1.1.0")
+                                 :install (fn (name dest-dir)
+                                            (do
+                                              (pk-write dest-dir
+                                                name "1.1.0" "{bedit \">= 0.1\"}"
+                                                "(defn bedit-plugin () {:themes [{:name \"pkgsthm-kept\" :colors {}}]})")
+                                              {:name name :version "1.1.0"}))})
+          _ (pk-run base registry (fn () (packages/apply-plugin! "pkgsthm")))
+          before (themes/themes-names)
+          _ (pk-launch base registry {:kind :update :name "pkgsthm"}))
+      (is (includes? before "pkgsthm-old"))
+      (refute (includes? (themes/themes-names) "pkgsthm-old"))
+      (is (includes? (themes/themes-names) "pkgsthm-kept"))
+      (themes/unregister-theme! "pkgsthm-kept")))
+  :isolated (test "a removed package's code stops running, and installing it again loads it"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir
+              "pkgsrm" "1.0.0" "{bedit \">= 0.1\"}" "(defn bedit-plugin () {})\n(defn hello () :hi)")
+          _ (pk-run base (pk-registry {}) (fn () (packages/apply-plugin! "pkgsrm")))
+          had (bound? 'pkgsrm/hello)
+          _ (pk-run base (pk-registry {}) (fn () (packages/remove! "pkgsrm")))
+          gone (not (bound? 'pkgsrm/hello))
+          _ (pk-write dir
+              "pkgsrm" "1.0.0" "{bedit \">= 0.1\"}" "(defn bedit-plugin () {})\n(defn hello () :hi)")
+          again (pk-run base (pk-registry {}) (fn () (packages/apply-plugin! "pkgsrm"))))
+      (is had)
+      (is gone)
+      (assert= again true)
+      (assert= ((reflect/eval 'pkgsrm/hello)) :hi))))
+
+(describe "a retired command leaves M-x"
+  :isolated (test "a command the new version dropped is no longer offered"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir
+              "pkgscmd" "1.0.0" "{bedit \">= 0.1\"}"
+              "(defn bedit-plugin () {})\n(interactive/defcommand cmd-pkgscmd-old (m key) \"Old.\" m)")
+          registry (pk-registry {:latest-version (fn (_name) "1.1.0")
+                                 :install (fn (name dest-dir)
+                                            (do
+                                              (pk-write dest-dir
+                                                name "1.1.0" "{bedit \">= 0.1\"}"
+                                                "(defn bedit-plugin () {})\n(interactive/defcommand cmd-pkgscmd-new (m key) \"New.\" m)")
+                                              {:name name :version "1.1.0"}))})
+          _ (pk-run base registry (fn () (packages/apply-plugin! "pkgscmd")))
+          before (interactive/command-names)
+          _ (pk-launch base registry {:kind :update :name "pkgscmd"}))
+      (is (includes? before "pkgscmd-old"))
+      (refute (includes? (interactive/command-names) "pkgscmd-old"))
+      (is (includes? (interactive/command-names) "pkgscmd-new")))))

@@ -108,50 +108,140 @@ it, and one reload is enough."
                                             (fn (path) (string/ends-with? path ".blsp")))))
     (reflect/load file)))
 
+(defn- entry-symbol (name) (symbol (str name "/bedit-plugin")))
+
+(defn- loaded-contribution (name)
+  "What package `name`'s plugin contributes in the image AS IT IS — its entry called if it is
+bound, loading nothing — or nil: a package never loaded, or one whose entry fails, contributed
+nothing that is still registered."
+  (let (entry (entry-symbol name))
+    (when (bound? entry)
+      (let (contribution (check-allow :discarded-catch
+                           (try ((reflect/eval entry)) (catch _ nil))))
+        (when (map? contribution) contribution)))))
+
+(defn plugin-definitions (name)
+  "Every global package `name`'s code defined in this image: the names whose definition was
+loaded from a file under its directory (`reflect/source-location`) — private ones and ones a
+macro generated included, which no reading of its source could list."
+  (let (prefix (str (pkg-dir name) "/"))
+    (vec (seq/filter (reflect/global-names)
+           (fn (global)
+             (let (site (reflect/source-location global))
+               (and (vector? site) (string/starts-with? (str (first site)) prefix))))))))
+
+(defn- retire-definitions (name)
+  "Remove every global package `name`'s code defined (`reflect/undef`, brood ADR-391) and answer
+how many went. What an update does BEFORE loading the new version, so a function the new
+version dropped is gone rather than callable with the old body, and what a remove does so the
+removed package's code stops running. A caller still holding one raises `unbound symbol
+(removed by reflect/undef …)` — said, not silently old. Its commands leave `M-x` with them
+(`interactive/unregister-commands`); the new version's `defcommand`s register theirs again."
+  (let (retired (seq/filter (plugin-definitions name)
+                  (fn (global)
+                    (check-allow :discarded-catch (try (reflect/undef global) (catch _ false))))))
+    (unregister-commands (into #{} retired))
+    (count retired)))
+
 (defn plugin-entry (name &optional (reload? false))
   "Load package `name` (its src must be on the load-path) — again, from its files, when
 `reload?` — and return its `(bedit-plugin)` contribution map, or a failure saying why not:
 its module did not load (the load's own error), it has no `bedit-plugin` entry, or the entry
-threw."
+threw. A module the image loaded once and whose definitions were since retired (a removed
+package installed again) is loaded from its files too: `require-one` would take it as loaded."
   (let (module (symbol name)
+        entry-name (entry-symbol name)
         loaded (try
-                 (do (if reload? (reload-sources name) (require-one module)) true)
+                 (do
+                   (if reload? (reload-sources name) (require-one module))
+                   (when (not (bound? entry-name)) (reload-sources name))
+                   true)
                  (catch e (failure "its module did not load: " (error-message e)))))
-    (if (failure? loaded)
-      loaded
-      (let (entry-name (symbol (str name "/bedit-plugin")))
-        (if (not (bound? entry-name))
-          (failure "it has no `" name "/bedit-plugin` entry")
-          (try
-            (let (contribution ((reflect/eval entry-name)))
-              (if (map? contribution)
-                contribution
-                (failure "its `bedit-plugin` answered " (pr-str contribution) ", not a map")))
-            (catch e (failure "its `bedit-plugin` threw: " (error-message e)))))))))
+    (cond
+      (failure? loaded) loaded
+      (not (bound? entry-name)) (failure "it has no `" name "/bedit-plugin` entry")
+      else
+        (try
+          (let (contribution ((reflect/eval entry-name)))
+            (if (map? contribution)
+              contribution
+              (failure "its `bedit-plugin` answered " (pr-str contribution) ", not a map")))
+          (catch e (failure "its `bedit-plugin` threw: " (error-message e)))))))
+
+(defn- theme-names (contribution)
+  (if (map? contribution) (into #{} (map (or (:themes contribution) []) :name)) #{}))
 
 (defn apply-plugin! (name &optional (reload? false))
-  "Load package `name`'s contribution into the LIVE editor: put it on the load-path, load it
-(again from its files when `reload?` — an update), register its themes. Answers true, or the
-failure [[plugin-entry]] gave — which says why. Realtime: the theme appears in
-`M-x theme-select` immediately."
+  "Load package `name`'s contribution into the LIVE editor: put it on the load-path, load it,
+register its themes. Answers true, or the failure [[plugin-entry]] gave — which says why —
+and records which it was ([[package-status]]). Realtime: the theme appears in
+`M-x theme-select` immediately.
+
+With `reload?` (an update) the old version is RETIRED first, as package.el reloads an upgraded
+package and better: every global its code defined is removed ([[retire-definitions]]) before
+the new files load, so nothing the new version dropped stays callable, and a theme the old
+version contributed and the new one does not leaves the picker. An update that fails to load
+leaves none of the old version behind either — the package reads as broken, with the reason."
   (add-to-load-path! name)
-  (let (contribution (plugin-entry name reload?))
+  (let (old (when reload? (loaded-contribution name))
+        _ (when reload? (retire-definitions name))
+        contribution (plugin-entry name reload?)
+        kept (theme-names contribution))
+    (doseq (theme (theme-names old)) (when (not (contains? kept theme)) (unregister-theme! theme)))
     (if (failure? contribution)
-      (do
-        (log/warn (str "packages: " name " not applied: " (error-message contribution)))
-        contribution)
+      (do (note-status name :broken (error-message contribution)) contribution)
       (do
         (doseq (theme (or (:themes contribution) [])) (register-theme! theme))
+        (note-status name :loaded nil)
         true))))
 
 (defn unapply-plugin! (name)
   "Remove package `name`'s contribution from the live editor: unregister the themes it added, so
-they leave `M-x theme-select`. The module stays in memory until restart (Brood has no
-`unrequire`), but its contribution is gone. A plugin whose entry does not load contributed
-nothing, so there is nothing to take back."
-  (let (contribution (plugin-entry name))
-    (when (map? contribution)
-      (doseq (theme (or (:themes contribution) [])) (unregister-theme! (:name theme))))))
+they leave `M-x theme-select`, and retire the globals its code defined ([[retire-definitions]]),
+so a removed package's code stops running without a restart. A package that never loaded
+contributed nothing, and nothing of it is loaded to take back."
+  (doseq (theme (theme-names (loaded-contribution name))) (unregister-theme! theme))
+  (retire-definitions name)
+  (registry/remove! :packages/status name))
+
+;; ---- what became of each installed package -----------------------------------------
+;; Emacs's package.el marks a package it will not activate (`incompat`, `disabled`) and says so;
+;; one bedit does not load is never dropped in silence. Kept in a process-global registry
+;; (`:packages/status`), since startup loads packages in a process of its own.
+
+(defn- note-status (name status reason)
+  (registry/put! :packages/status name {:status status :reason reason}))
+
+(defn package-status (name)
+  "What became of installed package `name` in this image: `{:status :reason}` — `:loaded`,
+`:broken` (it did not load or its plugin failed; `:reason` says how) or `:incompatible` (it
+does not declare it enhances this bedit; `:reason` says what it asks for) — or nil when it was
+never looked at."
+  (registry/lookup :packages/status name))
+
+(defn incompatible-reason (name)
+  "Why installed package `name` is not for this bedit: it asks for another bedit version, or it
+does not say it enhances bedit at all (an upgrade of bedit past the range it declared, or a
+package put there by hand)."
+  (let (enhances (manifest-value name :enhances)
+        wanted (when (map? enhances) (get enhances (symbol *bedit-name*))))
+    (if (nil? wanted)
+      "it does not declare that it enhances bedit"
+      (str "it needs bedit "
+        (if (string? wanted) wanted (pr-str wanted))
+        ", and this is bedit "
+        (about/bedit-version)))))
+
+(defn load-problems ()
+  "What startup says about the installed packages it did not load: one line per incompatible or
+broken package, with the reason. `[]` when every one loaded."
+  (vec (seq/keep (sort (installed-packages))
+         (fn (name)
+           (let (status (package-status name))
+             (case (:status status)
+               :incompatible (str "packages: " name " was not loaded — " (:reason status))
+               :broken (str "packages: " name " is broken — " (:reason status))
+               nil))))))
 
 ;; ---- startup: discover + load what's installed -----------------------------
 
@@ -163,10 +253,15 @@ one test startup and an install share (std's `project/enhancers-in`)."
 (defn load-installed! ()
   "At startup: put every installed package that `:enhances` this bedit on the load-path, and
 apply it. Returns the vector of names applied. Safe with no packages dir (⇒ []). A refused
-package (another editor's, or for another bedit version) is not put on the load path at
-all: its `src/` would otherwise shadow modules for code that never asked for it."
-  (vec (seq/keep (compatible-in (user-package-dir))
-         (fn (name) (when (= true (apply-plugin! name)) name)))))
+package (another editor's, or for another bedit version — a bedit upgrade can make one so) is
+not put on the load path at all: its `src/` would otherwise shadow modules for code that never
+asked for it. It is not dropped in silence either: each installed package's fate is recorded
+([[package-status]]) for the *Packages* buffer and [[load-problems]]."
+  (let (compatible (compatible-in (user-package-dir)))
+    (doseq (name (installed-packages))
+      (when (not (includes? compatible name))
+        (note-status name :incompatible (incompatible-reason name))))
+    (vec (seq/keep compatible (fn (name) (when (= true (apply-plugin! name)) name))))))
 
 ;; ---- the network work: what a package job does (in its task) -------------------
 ;; Each answers an OUTCOME map — never raises, so a reason never turns into a bare \"the task
@@ -396,12 +491,22 @@ left its staging directory."
     (and latest (version/newer? latest installed)) :update
     else :installed))
 
+(defn- with-load-status (row)
+  "`row` as this image left its package: an installed one that did not load reads `broken` or
+`incompatible`, the reason in place of its description — what package.el's list shows for a
+package it will not activate."
+  (let (status (when (:installed row) (package-status (:name row))))
+    (if (includes? [:broken :incompatible] (:status status))
+      (assoc row :status (:status status) :description (str "(" (:reason status) ")"))
+      row)))
+
 (defn package-rows (available)
   "The merged package list for the browser: every hive bedit package in `available` (the
 registry's `{:name :latest_version :description}` maps, as last fetched) annotated with its
 install status as the DISK has it now, plus any installed package not among them (a local/dev
 one, or every installed one before the list has arrived). Each row is
-`{:name :installed :latest :status :description}`."
+`{:name :installed :latest :status :description}`; an installed package this image could not
+load is `:broken` or `:incompatible`, its description the reason ([[package-status]])."
   (let (available-names (map available :name)
         from-hive (map available
                     (fn (entry)
@@ -421,18 +526,23 @@ one, or every installed one before the list has arrived). Each row is
                        :latest nil
                        :description "(installed — not on the registry)"
                        :status :installed}))))
-    (append from-hive orphans)))
+    (map (append from-hive orphans) with-load-status)))
 
 (defn- pad (s width)
   (let (text (str (or s "-")))
     (if (>= (count text) width) text (str text (string/repeat " " (- width (count text)))))))
 
 (defn- status-label (status)
-  (cond (= status :update) "update" (= status :installed) "installed" else "available"))
+  (case status
+    :update "update"
+    :installed "installed"
+    :broken "broken"
+    :incompatible "incompatible"
+    "available"))
 
 (defn- render-package-row (row)
   (str "  "
-    (pad (status-label (:status row)) 11)
+    (pad (status-label (:status row)) 13)
     (pad (:name row) 30)
     (pad (:installed row) 11)
     (pad (:latest row) 10)
@@ -443,7 +553,7 @@ one, or every installed one before the list has arrived). Each row is
 
 (def *packages-columns*
   (str "  "
-    (pad "Status" 11)
+    (pad "Status" 13)
     (pad "Package" 30)
     (pad "Installed" 11)
     (pad "Latest" 10)
@@ -654,20 +764,23 @@ too. `[]` when it declares none or is not installed."
 
 (defn package-info (m name)
   "Everything bedit knows about package `name`, or nil when nothing does: `{:name :installed
-:latest :status :description :enhances :settings :themes}` — the installed copy's manifest
-(its version, description, what it `:enhances`), the hive's row as last fetched (the newest
-version), the settings its sources declare ([[package-settings]]) and the themes its plugin
-contributes, for an installed package this bedit loads."
+:latest :status :reason :description :enhances :settings :themes}` — the installed copy's
+manifest (its version, description, what it `:enhances`), the hive's row as last fetched (the
+newest version), the settings its sources declare ([[package-settings]]) and the themes its
+plugin contributes as loaded now. An installed package this image could not load is `:status`
+`:broken` or `:incompatible`, with the `:reason` ([[package-status]])."
   (let (row (seq/find (or (:package-list m) []) (fn (entry) (= (:name entry) name)))
         installed (installed-version name)
         latest (:latest_version row)
-        loaded? (and installed (includes? (compatible-in (user-package-dir)) name))
-        contribution (when loaded? (plugin-entry name)))
+        load-status (when installed (package-status name))
+        failed? (includes? [:broken :incompatible] (:status load-status))
+        contribution (when (and installed (not failed?)) (loaded-contribution name)))
     (when (or row installed)
       {:name name
        :installed installed
        :latest latest
-       :status (row-status installed latest)
+       :status (if failed? (:status load-status) (row-status installed latest))
+       :reason (when failed? (:reason load-status))
        :description (or (when installed (manifest-value name :description)) (:description row))
        :enhances (or (when installed (manifest-value name :enhances)) (:enhances row))
        :settings (if installed (package-settings name) [])
