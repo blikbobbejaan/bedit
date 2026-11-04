@@ -179,7 +179,8 @@ src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `sup
                             closed, and a fresh loop started over the registry's buffers — given up
                             after `*restart-max*` restarts a minute, so a fault on every start
                             cannot spin — and never once a -nw loop's terminal hung up
-                            (`no-restart!`): a loop restarted on a dead terminal only dies again
+                            (`no-restart!`): a loop restarted on a dead terminal only dies again.
+                            Its `emergency-save!` is a served session's crash hook too (remote)
 src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the idle beat — in
                             the sandbox child for a brood buffer (its own session client), an
                             in-image task otherwise; folds into the model's diagnostics cache
@@ -1041,8 +1042,15 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             PRIMARY is the client's the same way (brood ADR-562): a drag sets it,
                             a middle click asks for it (`model/ed-primary-ask`). A guest
                             keeps the host's config and loses recentf and save-place; a `--listen`
-                            daemon keeps savehist off. A session whose loop dies loses its
-                            buffers — no lifeline or hosting there yet (brood KI-334)
+                            daemon keeps savehist off. A private session's buffers are hosted
+                            as the window's are, in a registry the SESSION owns (`ed-served-host`,
+                            brood ADR-593 — no runtime-wide name, gone with the session), and
+                            std's `serve` supervises its loop: one that dies has its unsaved
+                            files' sidecars written from the buffer processes
+                            (`lifeline/emergency-save!`) and restarts over the same registry for
+                            the same client (`ed-served-restart`, a guest still a guest), within
+                            3 a minute; a shared session saves from and restarts over its collab
+                            registry
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
