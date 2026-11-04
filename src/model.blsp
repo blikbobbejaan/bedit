@@ -2515,7 +2515,8 @@ The local window needs no ask: its clipboard is read off the loop on focus and t
         (assoc m :clipboard-asks (assoc (or (:clipboard-asks m) {}) asked {:then then :data data}))))))
 
 (defn ed-ev-clipboard (m input textrows cols rows)
-  "`[:clipboard ref text]`: the answer to an [[ed-clipboard-ask]] — its continuation run
+  "`[:clipboard ref text]` (or `[:primary ref text]`): the answer to an [[ed-clipboard-ask]]
+(or a served [[ed-primary-ask]]) — its continuation run
 with `text`. Only the first answer to an ask counts: the client's real answer arriving after
 brood answered for it at the timeout (or the reverse) finds no ask and changes nothing."
   (let (asked (nth input 1)
@@ -2528,6 +2529,8 @@ brood answered for it at the timeout (or the reverse) finds no ask and changes n
         (:data pending)))))
 
 (register-event-handler :clipboard 'model/ed-ev-clipboard)
+;; a served session's PRIMARY answers the same way (`ed-primary-ask`, brood ADR-562)
+(register-event-handler :primary 'model/ed-ev-clipboard)
 
 (defn ed-clipboard-asking? (m then)
   "Whether an [[ed-clipboard-ask]] that goes on with `then` is still waiting for its answer —
@@ -2702,11 +2705,83 @@ reports no focus would then never read another app's copy again."
 
 (defn ed-primary-write (m text)
   "Own the PRIMARY selection with `text` — what a middle click in any app then pastes —
-leaving the CLIPBOARD alone: the local window's (`:os-clipboard`). Nothing for a served
-session, whose link carries its client's clipboard but no PRIMARY (brood ADR-539, ADR-553),
-nor for a model with no OS clipboard. Returns nil."
-  (when (:os-clipboard m) (*primary-writer* text))
+leaving the CLIPBOARD alone: the local window's (`:os-clipboard`), or for a served session
+the client machine's, a cast over the link (`editor/serve/client-primary-set`, brood
+ADR-562). Nothing for a model with neither. Returns nil."
+  (cond
+    (:os-clipboard m) (*primary-writer* text)
+    (:client-clipboard m) (editor/serve/client-primary-set text))
   nil)
+
+;; ---- reading the PRIMARY selection, off the loop ----------------------------------
+;; A middle click pastes PRIMARY — into a buffer (`commands/ed-mouse-yank-primary`) or into a
+;; terminal's program (`terminal/term-mouse`). Reading it waits on the app that owns it (brood
+;; ADR-536, ADR-553), and a served session's is on the client's machine (ADR-562), so it is
+;; ASKED, the clipboard's way ([[ed-clipboard-ask]]): the asker goes on with a continuation
+;; when the text is known, and the loop draws and takes keys meanwhile.
+
+(register-task-reply :primary-proc
+  'model/ed-primary-landed
+  :clipboard-unread nil
+  {:cancel-on-quit? true :on-quit 'model/ed-primary-quit})
+
+;; check-allow: the continuation is resolved late (`reflect/eval`), so its result is unknown
+;; to the checker; every `then` is a fold, and answers a model
+(sig ed-primary-ask (model symbol any &optional (or nil symbol) -> model))
+(check-allow :trusted
+  (defn ed-primary-ask (m then data &optional quit)
+    "Ask for the PRIMARY selection model `m` shares and go on with `(then m' text data)` once
+it is known — `text` nil when the selection is empty, unreadable or there is none to read.
+`quit`, a `(model data) -> model` symbol, runs instead when C-g cancels the read.
+
+The local window (`:os-clipboard`) reads it in a task on `:primary-proc` (inline when there
+is no loop to answer, a test); while one read is out a second ask is dropped — `m` comes back
+as it was. A served session (`:client-clipboard`) asks its client
+(`editor/serve/client-primary-ask`, brood ADR-562); the `[:primary ref text]` answer runs
+`then` through the clipboard's table ([[ed-ev-clipboard]]). A model with neither has no
+PRIMARY: `then` runs now with nil."
+    (cond
+      (:client-clipboard m)
+        (let (asked (editor/serve/client-primary-ask))
+          (if (nil? asked)
+            ((reflect/eval then) m nil data)
+            (assoc m
+              :clipboard-asks (assoc (or (:clipboard-asks m) {}) asked {:then then :data data}))))
+      (not (:os-clipboard m)) ((reflect/eval then) m nil data)
+      (:primary-proc m) m
+      (ed-headless?)
+        (let (text (ed-read-clipboard-with *primary-reader*))
+          ((reflect/eval then) m (if (string? text) text nil) data))
+      else
+        (let (reader *primary-reader*)
+          (assoc m
+            :primary-proc
+              (task/task (fn () (ed-read-clipboard-with reader))
+                {:timeout *clipboard-read-timeout-ms*})
+            :primary-then {:then then :data data :quit quit})))))
+
+(defn ed-primary-asking? (m)
+  "Whether a read of the local PRIMARY selection is still out ([[ed-primary-ask]])."
+  (not (nil? (:primary-proc m))))
+
+;; check-allow: the continuation is resolved late, as in `ed-primary-ask`
+(check-allow :trusted
+  (defn ed-primary-landed (m text)
+    "The local PRIMARY read's answer: its asker's continuation run with `text` (nil for an
+empty or unreadable selection)."
+    (let (pending (:primary-then m)
+          landed (dissoc m :primary-proc :primary-then))
+      (if (nil? pending)
+        landed
+        ((reflect/eval (:then pending)) landed (if (string? text) text nil) (:data pending))))))
+
+(defn ed-primary-quit (m)
+  "C-g while a PRIMARY read is out: the task is already killed; the asker's `quit` runs."
+  (let (pending (:primary-then m)
+        cleared (dissoc m :primary-then))
+    (if (and pending (:quit pending))
+      ((reflect/eval (:quit pending)) cleared (:data pending))
+      cleared)))
 
 (defn ed-drag-select (m)
   "A mouse drag-select ended with a real region: the region stays highlighted and its text
