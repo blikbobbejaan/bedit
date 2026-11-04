@@ -160,7 +160,11 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             through sudo in place (`pool/ed-save-buf-with`), the mode line says
                             `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
                             handed to sudo once and kept nowhere — sudo's own timestamp serves the
-                            next save. Named to dodge std's `sudo`
+                            next save. Every sudo call is a task (`:sudo-proc`, one at a time, C-g
+                            stops it): an open shows `Loading…` at once, a save stays modified
+                            until its write lands (`pool/ed-save-prepare` / `ed-save-landed`), and
+                            C-x C-c / C-x s save root files after their questions and go on when
+                            the last lands. Named to dodge std's `sudo`
 src/recover.blsp            M-x recover-this-file / recover-session: a sidecar's text put back as one
                             undoable edit (Emacs's), from the open and recent files
 src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `supervise`): a loop that
