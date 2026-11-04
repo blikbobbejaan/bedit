@@ -1018,7 +1018,7 @@ block, closing the gap. Yank it back with C-x r y."
 ;; `input`) so a kill knows whether the *previous* command was also a kill (then it
 ;; appends to the head entry rather than starting a new one), and so M-y
 ;; (`cmd-yank-pop`) only fires right after a yank. The ring itself — `ed-push-kill`, the
-;; coalescing rule and `ed-drag-copy` — lives in `model`, beside the kill-ring state.
+;; coalescing rule and `ed-drag-select` — lives in `model`, beside the kill-ring state.
 (def- ed-yank-commands '(commands/cmd-yank commands/cmd-yank-pop))
 (defn- ed-yank-command? (sym) (includes? ed-yank-commands sym))
 
@@ -1719,36 +1719,43 @@ line's ends and `.` short of a newline. M-r inside any search toggles between th
 spaces or line breaks lie between them in the buffer."
   (isearch-start m :forward :word))
 
+(defn ed-active-region (m)
+  "The current buffer's region as `[low high]` when one is active and not empty, else nil —
+Emacs's `use-region-p`, what decides whether a replace is confined to the region."
+  (let (bounds (buffer-region-bounds (ed-current-buf m)))
+    (when (and bounds (< (first bounds) (second bounds))) bounds)))
+
+(defn- ed-query-replace-prompts (m regexp?)
+  "Ask what to replace and with what, then start the y/n/!/./q loop (`isearch/qr-start`).
+The region is read NOW, before either prompt, as Emacs's interactive spec reads it: with one
+active the replace is confined to it, and both prompts say so — `Query replace in region:`."
+  (let (region (ed-active-region m)
+        kind (str "Query replace" (if regexp? " regexp" "") (if region " in region" ""))
+        options (merge {:regexp? regexp?} (if region {:region region} {})))
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit (str kind ": ") "")
+         :on-complete (fn (mm from)
+                        (if (= from "")
+                          (message mm "(nothing to replace)")
+                          (assoc mm
+                            :minibuffer
+                              {:edit (ed-mb-edit (str kind " " from " with: ") "")
+                               :on-complete (fn (m2 to) (qr-start m2 from to options))})))})))
+
 (defcommand cmd-query-replace
   (m key)
-  "Replace occurrences of one string with another from point, asking at each (M-%).
-Prompts for the search string, then the replacement, then enters the y/n/!/./q loop
-(see `isearch`)."
-  (assoc m
-    :minibuffer
-      {:edit (ed-mb-edit "Query replace: " "")
-       :on-complete (fn (mm from)
-                      (if (= from "")
-                        (message mm "(nothing to replace)")
-                        (assoc mm
-                          :minibuffer
-                            {:edit (ed-mb-edit (str "Query replace " from " with: ") "")
-                             :on-complete (fn (m2 to) (qr-start m2 from to))})))}))
+  "Replace occurrences of one string with another from point — or within the region when one
+is active — asking at each (M-%). Prompts for the search string, then the replacement, then
+enters the y/n/!/./q loop (see `isearch`)."
+  (ed-query-replace-prompts m false))
 
 (defcommand cmd-query-replace-regexp
   (m key)
-  "Replace matches of a regexp from point, asking at each (C-M-%). The replacement may refer
-to what matched: `\\&` the whole match, `\\1`…`\\9` its groups, `\\\\` a backslash."
-  (assoc m
-    :minibuffer
-      {:edit (ed-mb-edit "Query replace regexp: " "")
-       :on-complete (fn (mm from)
-                      (if (= from "")
-                        (message mm "(nothing to replace)")
-                        (assoc mm
-                          :minibuffer
-                            {:edit (ed-mb-edit (str "Query replace regexp " from " with: ") "")
-                             :on-complete (fn (m2 to) (qr-start m2 from to {:regexp? true}))})))}))
+  "Replace matches of a regexp from point — or within the region when one is active — asking
+at each (C-M-%). The replacement may refer to what matched: `\\&` the whole match, `\\1`…`\\9`
+its groups, `\\\\` a backslash."
+  (ed-query-replace-prompts m true))
 
 ;; ---- undo / redo ------------------------------------------------------------
 
@@ -2022,6 +2029,14 @@ adopts the user's clipboard if another app copied something newer — ASKED for
 (`ed-clipboard-ask`), so a served session's yank does not stop the loop for the round trip
 to its client: the spot is marked now and the text goes in when the answer comes
 ([[ed-yank-answered]]). A read-only buffer says so and records no span."
+  (let ([marked spot] (ed-yank-mark-spot m))
+    ;; the previous yank's span is not this one's: M-y must never reach it from here on
+    (ed-clipboard-ask (dissoc marked :yank) 'commands/ed-yank-answered spot)))
+
+(defn ed-yank-mark-spot (m)
+  "`[m' spot]` — where a yank whose text is not known yet will go: a marker at point in the
+current buffer, so text typed meanwhile cannot move it off its spot, and the `spot` that
+names it (the pool index, the buffer's name, text and point as they are now)."
   (let (b (ed-current-buf m)
         index (ed-current-index m)
         spot-id (ref)
@@ -2030,12 +2045,62 @@ to its client: the spot is marked now and the text goes in when the answer comes
               :name (buffer-name b)
               :rope (buffer-rope b)
               :point (buffer-point b)}
-        ;; a marker where the yank goes, so text typed meanwhile cannot move it off its spot
         marked (ed-set-buf-at m
                  index
                  (buffer-marker-set (ed-buf-at m index) spot-id (buffer-point b))))
-    ;; the previous yank's span is not this one's: M-y must never reach it from here on
-    (ed-clipboard-ask (dissoc marked :yank) 'commands/ed-yank-answered spot)))
+    [marked spot]))
+
+;; ---- the middle click: yank the PRIMARY selection (Emacs `mouse-yank-primary`) ----
+;; PRIMARY is what is highlighted anywhere — a drag-select here sets it (`model/ed-drag-select`)
+;; — and a middle click inserts it at the click, never touching the kill ring. Reading it waits
+;; on the app that owns it (brood ADR-536, ADR-553), so it is read OFF the loop, the spot
+;; marked as C-y marks one, and the text goes in when the read lands ([[ed-primary-answered]]).
+
+(register-task-reply :primary-proc
+  'commands/ed-primary-answered
+  :clipboard-unread nil
+  {:cancel-on-quit? true :on-quit 'commands/ed-primary-quit})
+
+(defn ed-mouse-yank-primary (m)
+  "A middle click, point already moved to it ([[panes/ed-mouse-set-point]]): insert the
+PRIMARY selection there (Emacs `mouse-yank-primary`). The read runs in a task (inline when
+there is no loop to answer, a test); a click while one is still out does nothing more. A
+served session has no PRIMARY of its client's to read — said, nothing inserted."
+  (cond
+    (not (:os-clipboard m)) (message m "mouse-yank-primary: no primary selection here")
+    (:primary-proc m) m
+    else
+      (let ([marked spot] (ed-yank-mark-spot m)
+            asked (assoc (dissoc marked :yank) :primary-spot spot)
+            reader *primary-reader*)
+        (if (ed-headless?)
+          (ed-primary-answered asked (ed-read-clipboard-with reader))
+          (assoc asked
+            :primary-proc
+              (task/task (fn () (ed-read-clipboard-with reader))
+                {:timeout *clipboard-read-timeout-ms*}))))))
+
+(defn ed-primary-answered (m text)
+  "The rest of a middle click once the PRIMARY selection's `text` is known: inserted at point
+when nothing moved since the click, else at the spot it marked ([[ed-yank-at-spot]]). Not
+on the kill ring — a middle click is not a kill. An empty or unreadable selection
+(`:clipboard-unread`) is said and inserts nothing."
+  ;; a reply always finds its spot: C-g forgets the spot and frees the slot together
+  ;; ([[ed-primary-quit]]), so a cancelled read's answer is dropped before it gets here
+  (let (spot (:primary-spot m)
+        landed (dissoc m :primary-proc :primary-spot))
+    (cond
+      (or (not (string? text)) (= text ""))
+        (message (ed-yank-unmark landed spot) "mouse-yank-primary: no primary selection")
+      (ed-yank-spot-unchanged? landed spot)
+        (first (ed-try-edit (ed-yank-unmark landed spot) (fn (b) (insert b text))))
+      else (ed-yank-at-spot landed spot text))))
+
+(defn ed-primary-quit (m)
+  "C-g while a middle click's read is out: the read is cancelled (its task killed by the
+registry) and the spot it marked forgotten."
+  (let (spot (:primary-spot m))
+    (dissoc (if spot (ed-yank-unmark m spot) m) :primary-spot)))
 
 (defn ed-yank-answered (m clip spot)
   "The rest of C-y once the clipboard's text `clip` is known ([[cmd-yank]]): the kill ring's
@@ -2918,9 +2983,13 @@ how many are modified up front is the same consent, informed, in one key."
 (defn ed-replace-span (m)
   "`[from to]` — what the replace commands act on: the active region, else point to the
 end of the buffer."
-  (let (buf (ed-current-buf m)
-        rb (buffer-region-bounds buf))
-    (if rb rb [(buffer-point buf) (buffer-length buf)])))
+  (let (buf (ed-current-buf m))
+    (or (ed-active-region m) [(buffer-point buf) (buffer-length buf)])))
+
+(defn- ed-in-region-label (m)
+  "` in region` when the replace about to be asked for is confined to the region, else `\"\"`
+— what Emacs's prompts say (`Replace string in region: `)."
+  (if (ed-active-region m) " in region" ""))
 
 (defn ed-replace-in-span (m from to regexp? verb)
   "Replace throughout `ed-replace-span` and report the count — the body `replace-string`
@@ -2962,21 +3031,25 @@ re-nest the minibuffer by hand."
 
 (defcommand cmd-replace-string
   (m key)
-  "Replace every occurrence of a string, from point (M-x replace-string). LITERAL — the
-text you type is the text it looks for, brackets and dots and all."
-  (ed-two-part-prompt m
-    "Replace string: "
-    (fn (from) (str "Replace `" from "` with: "))
-    (fn (mm from to) (ed-replace-in-span mm from to false "replaced"))))
+  "Replace every occurrence of a string, from point — or within the region when one is active,
+which the prompt says (M-x replace-string). LITERAL — the text you type is the text it looks
+for, brackets and dots and all."
+  (let (where (ed-in-region-label m))
+    (ed-two-part-prompt m
+      (str "Replace string" where ": ")
+      (fn (from) (str "Replace string" where " `" from "` with: "))
+      (fn (mm from to) (ed-replace-in-span mm from to false "replaced")))))
 
 (defcommand cmd-replace-regexp
   (m key)
-  "Replace every match of a regexp, from point (M-x replace-regexp). `$1`…`$9` in the
-replacement stand for the pattern's groups."
-  (ed-two-part-prompt m
-    "Replace regexp: "
-    (fn (from) (str "Replace regexp `" from "` with: "))
-    (fn (mm from to) (ed-replace-in-span mm from to true "replaced"))))
+  "Replace every match of a regexp, from point — or within the region when one is active,
+which the prompt says (M-x replace-regexp). `$1`…`$9` in the replacement stand for the
+pattern's groups."
+  (let (where (ed-in-region-label m))
+    (ed-two-part-prompt m
+      (str "Replace regexp" where ": ")
+      (fn (from) (str "Replace regexp" where " `" from "` with: "))
+      (fn (mm from to) (ed-replace-in-span mm from to true "replaced")))))
 
 (defcommand cmd-flush-lines
   (m key)

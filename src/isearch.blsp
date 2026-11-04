@@ -501,11 +501,15 @@ once (the next turn) while it is going; nil otherwise."
 (check-allow :trusted
   (defmemo lazy-ranges-at 4 (rope windows lazy face)
     "[[lazy-ranges]] over each char range `[from to]` of `windows`, remembered on what it
-reads (the face too, so a theme switch recomputes)."
-    (mapcat windows
-      (fn ([from to])
-        (map (regex/rope-spans (:pattern lazy) rope from to {:fold? (:fold? lazy)})
-          (fn (span) [(first span) (second span) face]))))))
+reads (the face too, so a theme switch recomputes). A replace confined to the region names
+it as the description's `:within [low high]`: only the matches inside it are lit."
+    (let ([low high] (or (:within lazy) [0 nil]))
+      (mapcat windows
+        (fn ([from to])
+          (let (spans (regex/rope-spans (:pattern lazy) rope from to {:fold? (:fold? lazy)}))
+            (for (span spans
+                   :when (and (>= (first span) low) (or (nil? high) (<= (second span) high))))
+              [(first span) (second span) face])))))))
 
 (sig lazy-windows (any int int any -> list))
 (defn- lazy-windows (rope top rows clip)
@@ -676,17 +680,31 @@ word search, `Backspace` steps back, `Enter`/`Esc` exit, `C-g` aborts."
     (:to qr)
     ": (y/n/!/./q)"))
 
+(defn- qr-limit (qr buf)
+  "Where the replace's matches must end by: its region's end (`:limit`, carried along as
+replacements change the text's length) when it was started over a region, else the end of
+the buffer."
+  (or (:limit qr) (buffer-length buf)))
+
 (defn- qr-find (qr buf pos)
   "The next match of the replace at or after `pos`, as `regex/find`'s map
-(`{:start :end :text :groups}`), or nil."
+(`{:start :end :text :groups}`), or nil — one that ENDS by [[qr-limit]], so a replace over
+the region never reaches past it. A regexp is searched with that limit as its bound (brood
+ADR-554: a greedy match stops at the region's end, as Emacs's `re-search-forward` BOUND
+does, while `$` and `\\b` there still read the text beyond); a literal match cannot be
+shortened, so one ending past the limit is simply none."
   (let (fold? (qr-fold? qr)
-        from (:from qr))
-    (if (:regexp? qr)
-      (regex/rope-find from (buffer-rope buf) pos {:fold? fold? :empty? true})
-      (let (start (buffer-search-forward buf from pos fold?))
-        (when start
+        from (:from qr)
+        limit (qr-limit qr buf))
+    (cond
+      (> pos limit) nil
+      (:regexp? qr)
+        (regex/rope-find from (buffer-rope buf) pos {:fold? fold? :empty? true :bound limit})
+      else
+        (when-let (start (buffer-search-forward buf from pos fold?))
           (let (end (+ start (string/length from)))
-            {:start start :end end :text (text/slice (buffer-rope buf) start end) :groups []}))))))
+            (when (<= end limit)
+              {:start start :end end :text (text/slice (buffer-rope buf) start end) :groups []}))))))
 
 (defn expand-replacement (to found)
   "The replacement template `to` with its references filled in from `found` (a match map,
@@ -744,19 +762,21 @@ non-empty too (`perform-replace`'s `match-again`)."
       (let (next (regex/rope-find (:from qr)
                    (buffer-rope buf)
                    (:end found)
-                   {:fold? (qr-fold? qr) :empty? true}))
+                   {:fold? (qr-fold? qr) :empty? true :bound (qr-limit qr buf)}))
         (and next (= (:start next) (:end found)) (not (= (:start next) (:end next))))))))
 
-(sig qr-next (any any int -> (or nil int)))
-(defn- qr-next (buf adjacent? pos)
+(sig qr-next (any any any int -> (or nil int)))
+(defn- qr-next (qr buf adjacent? pos)
   "Where the next search starts, in `buf` (as it is now), from `pos` just past the last match
 or its replacement: `pos` itself when the next match may be adjacent ([[qr-adjacent?]]),
-else a character on — nil at the end of the buffer, or when the step would reach it."
-  (let (length (buffer-length buf))
+else a character on — nil at the end of the buffer (or of the region the replace is confined
+to, [[qr-limit]]), or when the step would reach it: `perform-replace`'s loop runs while
+point is short of its limit."
+  (let (limit (qr-limit qr buf))
     (cond
-      (>= pos length) nil
+      (>= pos limit) nil
       adjacent? pos
-      (< (inc pos) length) (inc pos)
+      (< (inc pos) limit) (inc pos)
       else nil)))
 
 (sig qr-goto (model (or nil int) -> model))
@@ -772,9 +792,14 @@ empty match at the buffer's end ([[qr-next]])."
       (assoc (ed-set-buf m (goto-char buf (:start found)))
         :overlays [{:start (:start found) :end (:end found) :face face-isearch}]
         :isearch-lazy
-          {:pattern (if (:regexp? qr) (:from qr) (regex/escape (:from qr))) :fold? (qr-fold? qr)}
+          (merge {:pattern (if (:regexp? qr) (:from qr) (regex/escape (:from qr)))
+                  :fold? (qr-fold? qr)}
+            ;; over a region, only the matches the replace will reach are lit
+            (if (:limit qr) {:within [(:region-start qr) (:limit qr)]} {}))
         :echo (qr-prompt qr)
-        :query-replace (assoc qr :match (:start found) :found found)))))
+        ;; the question stands until answered: a `message` meanwhile shows beside it
+        :query-replace
+          (assoc (dissoc qr :message) :match (:start found) :found found :prompt (qr-prompt qr))))))
 
 (defn replacement-for (matched to fold?)
   "The text to put in place of `matched`, given the replacement `to`.
@@ -808,17 +833,21 @@ a name, not a sentence."
 (defn- qr-replace (m)
   "Replace the current match with its replacement ([[qr-replacement]]) and return
 `[model' next-search-pos]` (the model with its count bumped, point just past the inserted
-text). A buffer that refuses the edit (read-only) ends the replace there."
+text — and a region's end moved by what the replacement added or removed, so the replace
+stays confined to the text the region held). A buffer that refuses the edit (read-only) ends
+the replace there."
   (let (qr (qr-state m)
         start (qr-match qr)
         found (:found qr)
         end (:end found)
         to (qr-replacement qr found)
         adjacent? (qr-adjacent? qr (ed-current-buf m) found)
-        [m2 replaced?] (ed-try-edit m (fn (b) (replace-region b start end to))))
+        [m2 replaced?] (ed-try-edit m (fn (b) (replace-region b start end to)))
+        grown (- (string/length to) (- end start))
+        moved (if (:limit qr) (assoc qr :limit (+ (:limit qr) grown)) qr))
     (if replaced?
-      [(assoc m2 :query-replace (assoc qr :count (inc (:count qr))))
-        (qr-next (ed-current-buf m2) adjacent? (+ start (string/length to)))]
+      [(assoc m2 :query-replace (assoc moved :count (inc (:count qr))))
+        (qr-next moved (ed-current-buf m2) adjacent? (+ start (string/length to)))]
       [(assoc m2 :query-replace (assoc qr :match nil)) (buffer-length (ed-current-buf m2))])))
 
 (defn- qr-matches (qr buf pos acc)
@@ -830,7 +859,7 @@ them is."
       acc
       (qr-matches qr
         buf
-        (qr-next buf (qr-adjacent? qr buf found) (:end found))
+        (qr-next qr buf (qr-adjacent? qr buf found) (:end found))
         (cons [(:start found) (:end found) (qr-replacement qr found)] acc)))))
 
 (sig qr-replace-at (buffer (list (tuple int int string)) -> buffer))
@@ -872,16 +901,24 @@ or Enter/Esc/C-g/Delete. Any other key finishes the replace and is dispatched no
 
 (defn qr-start (m from to &optional (options {}))
   "Begin query-replace of `from` → `to` from point; jump to the first match. `options`:
-`:regexp?` makes `from` a regexp and lets `to` refer to its groups (C-M-%)."
-  (cond
-    (= from "") (message m "(nothing to replace)")
-    (and (:regexp? options) (regex/incomplete? from))
-      (message m (str "Invalid regexp: " from " [incomplete input]"))
-    else
-      (qr-goto (assoc m
-                 :query-replace
-                   {:from from :to to :regexp? (= true (:regexp? options)) :match nil :count 0})
-        (buffer-point (ed-current-buf m)))))
+`:regexp?` makes `from` a regexp and lets `to` refer to its groups (C-M-%); `:region [low
+high]` confines it to that span of the text (Emacs's query-replace with the region active):
+it starts at `low` rather than point, the region is deactivated so the matches show, and no
+match may end past `high` — which moves as replacements change the text's length
+([[qr-limit]])."
+  (let (region (:region options)
+        buf (ed-current-buf m)
+        state {:from from :to to :regexp? (= true (:regexp? options)) :match nil :count 0})
+    (cond
+      (= from "") (message m "(nothing to replace)")
+      (and (:regexp? options) (regex/incomplete? from))
+        (message m (str "Invalid regexp: " from " [incomplete input]"))
+      (nil? region) (qr-goto (assoc m :query-replace state) (buffer-point buf))
+      else
+        (let ([low high] region)
+          (qr-goto (assoc (ed-set-buf m (clear-mark (goto-char buf low)))
+                     :query-replace (assoc state :region-start low :limit high))
+            low)))))
 
 (defn qr-handle (m input)
   "Fold one query-replace answer key: y/space replace+advance, n/Delete skip, ! all,
@@ -892,7 +929,7 @@ or Enter/Esc/C-g/Delete. Any other key finishes the replace and is dispatched no
       (or (= input "n") (= input :delete))
         (let (buf (ed-current-buf m)
               found (:found qr))
-          (qr-goto m (qr-next buf (qr-adjacent? qr buf found) (:end found))))
+          (qr-goto m (qr-next qr buf (qr-adjacent? qr buf found) (:end found))))
       (= input "!") (qr-all m)
       (= input ".") (let ([m2 _] (qr-replace m)) (qr-finish m2))
       else (qr-finish m)))) ; q / Enter / Esc / C-g
