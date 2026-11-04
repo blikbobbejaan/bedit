@@ -266,10 +266,15 @@
             jumped (cmd-visit-location on-row nil))
         (assert= (buffer-name (cur jumped)) "*scratch*")
         (assert= (buffer-current-line (cur jumped)) 2))))) ; line 3 → 0-based index 2
+(defn- macro-out (m)
+  ;; what the loop does while a macro runs: fire its ticker until the run ends
+  (if (nil? (:macro-run m)) m (macro-out (ed-update m [:timer :macro-continue] 80 24))))
+(defn- run (m keys) (macro-out (press m keys)))
+
 (describe "editor keyboard macros (C-x ( / ) / e)"
   (test "record a macro and execute it replays the keys"
     ;; C-x ( type "ab" C-x ) then C-x e → "ab" typed twice = "abab"
-    (let (m (press (m-of "") [:ctrl-x "(" "a" "b" :ctrl-x ")" :ctrl-x "e"]))
+    (let (m (run (m-of "") [:ctrl-x "(" "a" "b" :ctrl-x ")" :ctrl-x "e"]))
       (assert= (buffer-text (cur m)) "abab")))
   (test "the macro body excludes the C-x ) that ended it"
     (let (m (press (m-of "") [:ctrl-x "(" "x" :ctrl-x ")"]))
@@ -277,42 +282,81 @@
   (test "C-x e with no macro reports it"
     (is (includes? (get (press (m-of "") [:ctrl-x "e"]) :echo) "no keyboard macro")))
   (test "C-u N C-x e runs the macro N times"
-    (let (m (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u "3" :ctrl-x "e"]))
+    (let (m (run (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u "3" :ctrl-x "e"]))
       (assert= (buffer-text (cur m)) "aaaa")))
   (test "a bare C-u C-x e runs it four times"
-    (let (m (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u :ctrl-x "e"]))
+    (let (m (run (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u :ctrl-x "e"]))
       (assert= (buffer-text (cur m)) "aaaaa")))
   (test "a run stops at the first key that fails: a search with no next match"
     ;; the macro: search for `x`, leave the search, type `!`. Two x's: the third pass's
     ;; search fails, so its `!` is never typed
     (let (m (press (m-of "x x x") [:ctrl-x "(" :ctrl-s "x" :enter "!" :ctrl-x ")"])
-          ran (press (ed-set-buf m (goto-char (cur m) 0)) [:ctrl-u "9" :ctrl-x "e"]))
+          ran (run (ed-set-buf m (goto-char (cur m) 0)) [:ctrl-u "9" :ctrl-x "e"]))
       (assert= (buffer-text (cur m)) "x! x x")
       (assert= (buffer-text (cur ran)) "x!! x! x!")))
   (test "C-u 0 C-x e runs until a key fails: C-n at the last line"
     (let (m (press (m-of "a\nb\nc\nd") [:ctrl-x "(" :ctrl-a "-" :ctrl-n :ctrl-x ")"])
-          ran (press m [:ctrl-u "0" :ctrl-x "e"]))
+          ran (run m [:ctrl-u "0" :ctrl-x "e"]))
       (assert= (buffer-text (cur ran)) "-a\n-b\n-c\n-d")
-      (assert= (:echo ran) "End of buffer")))
-  (test "C-u 0 C-x e stops when a pass changes nothing, rather than spinning"
-    (let (m (press (m-of "abc") [:ctrl-x "(" :ctrl-a :ctrl-x ")"])
-          ran (press m [:ctrl-u "0" :ctrl-x "e"]))
-      (assert= (buffer-point (cur ran)) 0)
+      (assert= (:echo ran) "End of buffer")
       (is (nil? (:macro-executing ran)))))
+  (test "a run is sliced: it yields to the loop and its ticker resumes it"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u "3" :ctrl-x "e"]))
+        ;; a slice of one key: the recorded `a` and the run's first
+        (assert= (buffer-text (cur m)) "aa")
+        (is (:macro-executing m))
+        (is (contains? (:timers m) :macro-continue))
+        (let (done (macro-out m))
+          (assert= (buffer-text (cur done)) "aaaa")
+          (is (nil? (:macro-executing done)))
+          (is (not (contains? (:timers done) :macro-continue)))))))
+  (test "C-g ends a run that would never fail, keeping what it did"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "x" :ctrl-x ")" :ctrl-u "0" :ctrl-x "e"])
+            ticked (press m [[:timer :macro-continue] [:timer :macro-continue]])
+            quit (press ticked [:ctrl-g]))
+        ;; past the recorded `x` and the first slice's: the ticks typed more
+        (is (string/starts-with? (buffer-text (cur ticked)) "xxx"))
+        (assert= (buffer-text (cur quit)) (buffer-text (cur ticked)))
+        (is (nil? (:macro-run quit)))
+        (is (nil? (:macro-executing quit)))
+        (is (not (contains? (:timers quit) :macro-continue)))
+        ;; and the editor takes keys again at once
+        (assert= (buffer-text (cur (press quit ["!"]))) (str (buffer-text (cur quit)) "!")))))
+  (test "C-g drops what was typed while the run went"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "x" :ctrl-x ")" :ctrl-u "0" :ctrl-x "e" "z" :ctrl-g]))
+        (assert= (buffer-text (cur m)) "xx")
+        (is (nil? (:macro-typeahead m))))))
+  (test "keys typed during a run wait for it, then fold in order"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u "3" :ctrl-x "e" "y" "z"]))
+        (assert= (buffer-text (cur m)) "aa")
+        (assert= (:macro-typeahead m) ["y" "z"])
+        (assert= (buffer-text (cur (macro-out m))) "aaaayz"))))
+  (test "a run undoes as one typing run, however it is sliced"
+    ;; the recording's own `ab` is a group of its own (C-x ) came between)
+    (let (recorded (press (m-of "") [:ctrl-x "(" "a" "b" :ctrl-x ")"])
+          whole (press (run recorded [:ctrl-u "2" :ctrl-x "e"]) [:ctrl-/])
+          sliced (binding (*macro-slice-ms* 0)
+                   (press (run recorded [:ctrl-u "2" :ctrl-x "e"]) [:ctrl-/])))
+      (assert= (buffer-text (cur whole)) "ab")
+      (assert= (buffer-text (cur sliced)) "ab")))
   (test "a chord bound to nothing stops the macro too"
     (let (m (assoc (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")"])
               :macro-last ["a" :ctrl-x "4" "z" "b"])
-          ran (press m [:ctrl-u "3" :ctrl-x "e"]))
+          ran (run m [:ctrl-u "3" :ctrl-x "e"]))
       ;; `C-x 4 z` is bound to nothing: the first pass types `a` (after the one recording
       ;; typed), fails there, and stops — no `b`, no second pass
       (assert= (buffer-text (cur ran)) "aa")))
   (test "the macro excludes the prefix argument typed before C-x ) and the chord"
-    (let (m (press (m-of "") [:ctrl-x "(" "5" "a" :ctrl-u "2" :ctrl-x ")"]))
+    (let (m (macro-out (press (m-of "") [:ctrl-x "(" "5" "a" :ctrl-u "2" :ctrl-x ")"])))
       (assert= (vec (:macro-last m)) ["5" "a"])
       ;; C-u 2 C-x ) ends the macro and runs it once more
       (assert= (buffer-text (cur m)) "5a5a")))
   (test "C-x e while recording ends the macro and runs it"
-    (let (m (press (m-of "") [:ctrl-x "(" "a" :ctrl-x "e"]))
+    (let (m (run (m-of "") [:ctrl-x "(" "a" :ctrl-x "e"]))
       (assert= (vec (:macro-last m)) ["a"])
       (is (nil? (:macro-recording m)))
       (assert= (buffer-text (cur m)) "aa")))

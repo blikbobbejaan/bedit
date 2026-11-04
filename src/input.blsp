@@ -1228,59 +1228,97 @@ else — a key."
         input textrows textcols)))
 
 ;; ---- replaying a keyboard macro (C-x e) ---------------------------------------
-;; Each recorded key goes back through `ed-update`, the whole turn, as if typed. Emacs's
-;; rules: a run of N passes stops at the first key whose command fails — an error, or a bell
-;; (`model/ed-ding`: a failing search, a motion at the buffer's edge, a read-only refusal) —
-;; and N = 0 runs passes until one does. A pass that changes nothing (no text, no point, no
-;; buffer) would repeat forever under N = 0, so that ends the run too; and nothing can stop
-;; the loop from outside while it folds (C-g is a key behind it), so an until-failure run is
-;; also capped at `*macro-repeat-max*` passes and says so.
+;; Each recorded key goes back through the whole turn (`ed-update-direct`), as if typed.
+;; Emacs's rules: a run of N passes stops at the first key whose command fails — an error,
+;; or a bell (`model/ed-ding`: a failing search, a motion at the buffer's edge, a read-only
+;; refusal) — and N = 0 runs passes until one does, or until C-g.
+;;
+;; C-g has to reach a run, so a run is not one turn: it replays keys for at most
+;; `*macro-slice-ms*` and then yields to the loop, which takes queued input before it fires
+;; the `:macro-continue` ticker that resumes the run (the idle beat's slicing). Between
+;; slices a C-g ends the run, keeping what it did, and runs as the quit it is; any other
+;; input the user types meanwhile waits in `:macro-typeahead` and is folded, in order, when
+;; the run ends — Emacs reads the macro's keys before the keyboard's. The run's state is
+;; `:macro-run` (`{:keys :passes :done :index}`); `:macro-executing` is on while it lasts,
+;; so the macro cannot start itself again.
 
-(def *macro-repeat-max* 10000)
-;; Passes a `C-u 0 C-x e` run makes at most before it stops and says so.
+(defdyn *macro-slice-ms* 8)
+;; How long one slice of a macro run may replay keys before it yields to the loop, which
+;; then takes the input queued behind it (C-g above all). Half a 60 Hz frame, as the loop's
+;; own fold budget: a long run shows its progress every frame or two.
 
-(defn- ed-macro-pass (m keys cols rows)
-  "Replay `keys` once through `ed-update`: `[model failed?]`, stopping at the first key whose
-command failed (`:command-failed`), which is cleared before each key so only that key's
-failure counts."
-  (letrec (step (fn (mm remaining)
-                  (if (empty? remaining)
-                    [mm false]
-                    (let (after (ed-update (dissoc mm :command-failed) (first remaining) cols rows))
-                      (if (:command-failed after)
-                        [(dissoc after :command-failed) true]
-                        (step after (rest remaining)))))))
-    (step m keys)))
+(def- *macro-continue-timer* :macro-continue)
 
-(defn- ed-macro-moved? (before after)
-  "Whether a macro pass changed anything a further pass could build on: the current buffer,
-its text, or point."
-  (let (buffer-before (ed-current-buf before)
-        buffer-after (ed-current-buf after))
-    (not (and (= (ed-current-index before) (ed-current-index after))
-           (= (buffer-point buffer-before) (buffer-point buffer-after))
-           (= (buffer-rope buffer-before) (buffer-rope buffer-after))))))
+(defn- ed-macro-end (m cols rows)
+  "End the macro run in `m`: its state and ticker gone, then the input typed while it ran
+folded in the order it came (`:macro-typeahead`)."
+  (let (typeahead (or (:macro-typeahead m) [])
+        ended (ed-drop-timer (dissoc m :macro-run :macro-executing :macro-typeahead)
+                *macro-continue-timer*))
+    (fold typeahead ended (fn (acc input) (ed-update acc input cols rows)))))
+
+(defn- ed-macro-slice (m cols rows)
+  "Replay the run in `m` (`:macro-run`) from where it stands for up to `*macro-slice-ms*` —
+at least one step, so a run always progresses. Ends the run at the first key whose command
+failed (`:command-failed`, cleared before each key so only that key's failure counts) or
+after its last pass; otherwise keeps the position and arms `:macro-continue`."
+  (let (deadline (+ (os/now) *macro-slice-ms*))
+    (letrec (step (fn (mm run stepped)
+                    (let (keys (:keys run)
+                          index (:index run))
+                      (cond
+                        (and (> stepped 0) (>= (os/now) deadline))
+                          (ed-set-timer (assoc mm :macro-run run) *macro-continue-timer* {:every 1})
+                        (>= index (count keys))
+                          (let (done (inc (:done run)))
+                            (if (and (> (:passes run) 0) (>= done (:passes run)))
+                              (ed-macro-end mm cols rows)
+                              (step mm (assoc run :done done :index 0) (inc stepped))))
+                        else
+                          (let (after (ed-update-direct (dissoc mm :command-failed)
+                                        (nth keys index)
+                                        cols
+                                        rows))
+                            (if (:command-failed after)
+                              (ed-macro-end (dissoc after :command-failed) cols rows)
+                              (step after (assoc run :index (inc index)) (inc stepped))))))))
+      (step m (:macro-run m) 0))))
 
 (defn ed-run-macro (m request cols rows)
-  "Replay the last keyboard macro as `request` (`{:count N}`, from `cmd-execute-kbd-macro`)
-asks: N passes, or with N = 0 passes until one fails — each pass stopping at a key whose
-command fails, and the run with it. `:macro-executing` is on while it runs, so the macro
-cannot start itself again."
-  (let (keys (or (:macro-last m) [])
-        passes (or (:count request) 1)
-        until-failure? (= passes 0))
-    (letrec (run (fn (mm done)
-                   (cond
-                     (and (not until-failure?) (>= done passes)) mm
-                     (>= done *macro-repeat-max*)
-                       (message mm (str "Keyboard macro stopped after " done " repetitions"))
-                     else
-                       (let ([after failed?] (ed-macro-pass mm keys cols rows))
-                         (cond
-                           failed? after
-                           (and until-failure? (not (ed-macro-moved? mm after))) after
-                           else (run after (inc done)))))))
-      (dissoc (run (assoc m :macro-executing true) 0) :macro-executing))))
+  "Start replaying the last keyboard macro as `request` (`{:count N}`, from
+`cmd-execute-kbd-macro`) asks — N passes, or with N = 0 passes until one fails — and run its
+first slice ([[ed-macro-slice]]); the loop runs the rest, between the user's input."
+  (ed-macro-slice (assoc m
+                    :macro-executing true
+                    :macro-run
+                      {:keys (vec (or (:macro-last m) []))
+                       :passes (or (:count request) 1)
+                       :done 0
+                       :index 0})
+    cols rows))
+
+(defn- ed-macro-typeahead? (input)
+  "Whether `input` is the user's — a key, typed or committed text, the mouse, the close
+button — which a running macro makes wait, rather than a timer, a reply or a window event
+that folds as usual."
+  (and (not (record? input))
+    (not (= input :blur))
+    (not (= input :focus-in))
+    (or (not (vector? input)) (contains? #{:text :mouse :preedit} (first input)))))
+
+(sig ed-macro-input (model any int int -> model))
+(defn- ed-macro-input (m input cols rows)
+  "Fold `input` into `m` while a macro runs: its ticker resumes the run, C-g ends it — the
+work done so far kept, the typeahead dropped, and C-g then run as the quit it is — and
+other user input waits for the run to end."
+  (cond
+    (= input [:timer *macro-continue-timer*]) (ed-macro-slice m cols rows)
+    (= input :ctrl-g)
+      (ed-update-direct (ed-drop-timer (dissoc m :macro-run :macro-executing :macro-typeahead)
+                          *macro-continue-timer*)
+        input cols rows)
+    (ed-macro-typeahead? input) (assoc m :macro-typeahead (conj (or (:macro-typeahead m) []) input))
+    else (ed-update-direct m input cols rows)))
 
 (defn- ed-loop-tail (m0 result input cols rows)
   "After the event folded in: replay a keyboard macro if one was asked for, else propagate.
@@ -1377,8 +1415,17 @@ a large file. They run debounced on the idle beat instead (`ed-timer-fire :idle-
                        (catch e (ed-recover m0 e input)))))))
 
 (defn ed-update (m input cols rows)
-  "ui-run update: fold one input into the next model — the whole pipeline
-([[ed-update-turn]]) unless the input can change nothing it would act on. Three can't:
+  "ui-run update: fold one input into the next model. While a keyboard macro runs
+(`:macro-run`) the input is [[ed-macro-input]]'s — the run's ticker, C-g, or typeahead that
+waits for it; otherwise [[ed-update-direct]]."
+  (if (nil? (:macro-run m))
+    (ed-update-direct m input cols rows)
+    (ed-macro-input m input cols rows)))
+
+(sig ed-update-direct (model any int int -> model))
+(defn- ed-update-direct (m input cols rows)
+  "Fold one input into the next model — the whole pipeline ([[ed-update-turn]]) unless the
+input can change nothing it would act on. Three can't:
 
 - a key's release (`[:key-up k]`): bedit keeps no state about a held key (the desktop
   repeats it, brood ADR-441, and `ui-run` holds the idle timers while one is down), so `m`
