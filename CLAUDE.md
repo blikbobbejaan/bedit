@@ -150,7 +150,7 @@ src/autosave.blsp           `#file#` auto-save sidecars (owner-only, on the idle
                             their own) + auto-revert of files changed on disk (one undoable edit, std's
                             `revert-buffer`); the note a visit
                             shows when a sidecar is newer than its file. A file edited as root
-                            (sudoedit) keeps its sidecar PRIVATE — `state/auto-save/#!etc!hosts#`,
+                            (sudoedit) keeps its sidecar PRIVATE — `state/auto-save/#%2Fetc%2Fhosts#`,
                             never beside the file — and auto-revert leaves it alone
 src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and `sudo-edit`) over brood's
                             `sudo` (ADR-588): `C-x C-f /sudo::/etc/hosts` (or `/sudo:USER@:PATH`, this
@@ -178,7 +178,8 @@ src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `sup
                             auto-saved from the buffer PROCESSES (they outlive it), its window
                             closed, and a fresh loop started over the registry's buffers — given up
                             after `*restart-max*` restarts a minute, so a fault on every start
-                            cannot spin
+                            cannot spin — and never once a -nw loop's terminal hung up
+                            (`no-restart!`): a loop restarted on a dead terminal only dies again
 src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the idle beat — in
                             the sandbox child for a brood buffer (its own session client), an
                             in-image task otherwise; folds into the model's diagnostics cache
