@@ -24,29 +24,33 @@ what prose wants — a `\"` closes the one the line opened.
 **Incremental, as `syntax-ppss`'s cache is.** The syntax becomes a LINE LEXER whose state is
 what a line starts in — inside which string or block comment, and the stack of open brackets —
 kept per pool buffer in the model's `:string-caches` by std's line cache
-(`editor/highlight/line-cache-state`, brood ADR-591): a key reads its line's state from the
-cache (a checkpoint at most a few dozen lines up, or the line an edit touched) and lexes only
-its own line. Balance looks FORWARD from point only as far as the brackets around point close,
-as Emacs's `electric-pair--balance-info` does, at most `*balance-lines*` lines.
+(`editor/highlight/line-cache-state`, brood ADR-591): a key reads its line's state, brackets
+included, from the cache (a checkpoint at most a few dozen lines up, or the line an edit
+touched) and lexes only its own line. A line in code that begins a top-level form starts with
+no bracket open (`start-state`), so a bracket left open while you type moves the states below
+it only to the next top-level form, where the cache comes back in step. Balance looks FORWARD
+from point only as far as the brackets around point close, as Emacs's
+`electric-pair--balance-info` does — at most `*key-lines*` lines, and never past a top-level
+form.
 
 **Never a cold walk on a key.** A key lexes at most `*key-lines*` lines to bring the cache to its
 line (`editor/highlight/line-cache-state-within`); past that it GUESSES the line's state from
-the nearest top-level form above it (`guess-line-state`, bounded like the balance) and takes
-that answer for that key. The cache itself is built off the loop: at once when a large buffer
-is visited or a key had to guess (a post-step, `ed-warm-now`), and on the idle beat when it
-fell behind its text (`ed-launch-string-warm`); the reply installs it."
+the nearest top-level form above it (`guess-line-state`, at most `*key-lines*` lines more) and
+takes that answer for that key. The cache itself is built off the loop: at once when a large
+buffer is visited or a key had to guess (a post-step, `ed-warm-now`), and on the idle beat when
+it fell behind its text (`ed-launch-string-warm`); the reply installs it."
   (:use editor/buffer) ; buffer-rope / buffer-point
   (:use task) ; task — the cache warmed off the loop
   (:use model)) ; ed-mode-service / ed-current-buf / ed-current-index / the registries
 
 (def *balance-lines*
-  ;; how many lines a balance check reads forward from point at most; past it, balanced — and
-  ;; how far up a guessed line state looks for a top-level form (`guess-line-state`)
+  ;; how many lines M-q follows a string down to its closer (`string-end`)
   2000)
 
 (def *key-lines*
-  ;; how many lines a key may lex to bring the cache to its line; past it the line's state is
-  ;; guessed (`guess-line-state`) and the background build (`ed-launch-string-warm`) catches up
+  ;; how many lines a key may lex: to bring the cache to its line (past it the line's state is
+  ;; guessed by `guess-line-state`, at most as many again, and the background build —
+  ;; `ed-launch-string-warm` — catches up), and forward from point for a balance check
   200)
 
 (def- *default-quote-pairs* [["\"" "\""]])
@@ -102,6 +106,9 @@ string openers longest first, line comments, the char-literal quote, the bracket
                  (map brackets second)))
     {:pattern (string/join (map tokens regex/escape) "|")
      :fast (fast-pattern syntax)
+     :bracket-pattern (string/join (map (append (map brackets first) (map brackets second))
+                                     regex/escape)
+                        "|")
      :strings strings
      :blocks blocks
      :comments comments
@@ -305,11 +312,48 @@ line comments (only at a word's start under `:comment-word-start`)."
           [:block (second block)])
       else nil)))
 
-(defn inside-after (data line inside)
-  "What the line after `line` starts inside, given what `line` starts inside — the line cache's
-question, answered with one native pass (`fast-pattern`) after the closer of a string or block
-comment the line opens inside of."
-  (let (n (string/length line)
+(sig bracket-step (any string string -> string))
+(defn- bracket-step (data stack text)
+  ;; `stack` after the brackets of `text`, a stretch of code: an opener pushes, a closer pops
+  ;; the innermost, a closer with nothing open closes nothing — as `lex-line` counts them
+  (if (or (= (:bracket-pattern data) "") (= text ""))
+    stack
+    (fold (regex/find-all (:bracket-pattern data) text)
+      stack
+      (fn (acc found)
+        (let (bracket (:text found))
+          (cond
+            (contains? (:openers data) bracket) (str acc bracket)
+            (= acc "") acc
+            else (string/substring acc 0 (dec (string/length acc)))))))))
+
+(sig code-prefix (any string -> string))
+(defn- code-prefix (data text)
+  ;; the code a fast-pattern match begins with: the character before a word-start line
+  ;; comment (`(?:^|[ \t;|&(`])#` matches the `(` of `$(# x`), else nothing
+  (if (and (:word-start? data)
+        (> (string/length text) 1)
+        (not (any? (:comments data) (fn (token) (string/starts-with? text token))))
+        (any? (:comments data) (fn (token) (string/starts-with? (string/substring text 1) token))))
+    (string/substring text 0 1)
+    ""))
+
+(defn start-state (data text state)
+  "The state a line whose text is `text` starts in, from `state` — what the line above left
+it: a line in code that begins a top-level form by its look (`top-level-line?`) starts with no
+bracket open, as Emacs's `open-paren-in-column-0-is-defun-start` reads one. So a bracket left
+open while you type counts only to the next top-level form, never to the end of the file."
+  (let ([inside _] state) (if (and (nil? inside) (top-level-line? data text)) [nil ""] state)))
+
+(defn state-after (data line state)
+  "The state the line after `line` starts in, given the `state` (`[inside stack]`) `line`
+starts in — the line cache's question: what the line ends INSIDE, answered with one native pass
+(`fast-pattern`) after the closer of a string or block comment it opens inside of, and the
+brackets its code leaves open, counted in the stretches of code between that pass's matches.
+
+    (stringstate/state-after (stringstate/lexer-data {:strings [{:open \"'\"}]} [[\"(\" \")\"]]) \"  f(a, ')'\" [nil \"\"])   ;=> [nil \"(\"]"
+  (let ([inside stack] (start-state data line state)
+        n (string/length line)
         from (cond
                (nil? inside) 0
                (= (first inside) :string)
@@ -319,22 +363,40 @@ comment the line opens inside of."
                else
                  (let (at (index-of line (second inside) 0))
                    (if (< at 0) nil (+ at (string/length (second inside)))))))
-    (cond
-      (nil? from) inside
-      (= (:fast data) "") nil
-      else
-        (let (rest (string/substring line from n)
-              found (regex/find-all (:fast data) rest))
-          (if (empty? found) nil (open-match data rest (last found)))))))
+    (if (nil? from)
+      [inside stack]
+      (let (rest (string/substring line from n)
+            found (if (= (:fast data) "") [] (regex/find-all (:fast data) rest))
+            [cursor carried] (fold found
+                               [0 stack]
+                               (fn (acc match)
+                                 (let ([at open-brackets] acc
+                                       start (:start match)
+                                       end (:end match)
+                                       text (:text match))
+                                   (if (and (int? start) (int? end) (string? text))
+                                     [end
+                                       (bracket-step data
+                                         open-brackets
+                                         (str (string/substring rest at start)
+                                           (code-prefix data text)))]
+                                     acc)))))
+        [(if (empty? found) nil (open-match data rest (last found)))
+          (bracket-step data carried (string/substring rest cursor (string/length rest)))]))))
+
+(defn inside-after (data line inside)
+  "What the line after `line` starts inside, given what `line` starts inside — the inside half
+of [[state-after]]."
+  (first (state-after data line [inside ""])))
 
 (defn line-lexer-of (data)
-  "`data`'s lexer as an `editor/highlight` line lexer whose state is only what a line starts
-INSIDE — nil, a string, a block comment — never its brackets: a bracket typed near the top of a
-file then changes no line's state below it, and the cache keeps them all (`stack-at` counts
-the brackets around point from where its top-level form begins). A line's spans are none: the
-cache serves states (`editor/highlight/line-cache-state`), and the tokens of point's line come
-from `lex-line`."
-  (editor/highlight/line-lexer (fn (line inside) [[] (inside-after data line inside)]) nil))
+  "`data`'s lexer as an `editor/highlight` line lexer whose state is what a line starts in,
+`[inside stack]` ([[state-after]]): inside which string or block comment, and the brackets open.
+A bracket left open changes the states below it only to the next top-level form
+([[start-state]]), where the cache comes back in step. A line's spans are none: the cache
+serves states (`editor/highlight/line-cache-state`), and the tokens of point's line come from
+`lex-line`."
+  (editor/highlight/line-lexer (fn (line state) [[] (state-after data line state)]) [nil ""]))
 
 ;; ---- the cache: what each line starts inside, per pool buffer ----------------------------
 
@@ -378,34 +440,49 @@ from `lex-line`."
                   change))
           next]))))
 
+(defn- start-state-at (rope data line state)
+  ;; [[start-state]] for line `line` of `rope`, which may be past its end
+  (if (< line (text/line-count rope)) (start-state data (line-text rope line) state) state))
+
 (defn guess-line-state (rope data line &optional (known nil))
-  "What line `line` of `rope` starts inside, within bounds — what a key answers with while no
-cache reaches its line (a large file whose cache is still being built). `known`, `[line state]`,
-is where the cache's walk stopped and the exact state it starts in: within `*balance-lines*`
-above, the state is lexed on from there — exact. Otherwise it is GUESSED from the nearest line
-above that begins a top-level form by its look (`top-level-line?`), taken to start in code, at
-most `*balance-lines*` up — a column-0 line inside a docstring can mislead it, until the
-background build replaces it."
-  (let ([known-line known-state] (or known [nil nil]))
-    (if (and (int? known-line) (<= known-line line) (< (- line known-line) *balance-lines*))
-      (fold (range known-line line)
-        known-state
-        (fn (inside i) (inside-after data (line-text rope i) inside)))
-      (let (from (letrec (up (fn (at)
-                               (if (or (<= at 0)
-                                     (>= (- line at) *balance-lines*)
-                                     (top-level-line? data (line-text rope at)))
-                                 at
-                                 (up (dec at)))))
-                   (up line)))
-        (fold (range from line) nil (fn (inside i) (inside-after data (line-text rope i) inside)))))))
+  "The state, `[inside stack]`, line `line` of `rope` starts in, within bounds — what a key
+answers with while no cache reaches its line (a large file whose cache is still being built).
+`known`, `[line state]`, is where the cache's walk stopped and the exact state it starts in:
+within `*key-lines*` above, the state is lexed on from there — exact. Otherwise it is GUESSED
+from the nearest line above that begins a top-level form by its look (`top-level-line?`), taken
+to start in code with no bracket open, at most `*key-lines*` up — a column-0 line inside a
+docstring can mislead it, until the background build replaces it. Either way a key lexes at
+most `*key-lines*` lines here."
+  (let ([known-line known-state] (or known [nil nil])
+        state (if (and (int? known-line) (<= known-line line) (< (- line known-line) *key-lines*))
+                (fold (range known-line line)
+                  known-state
+                  (fn (state i) (state-after data (line-text rope i) state)))
+                (let (from (letrec (up (fn (at)
+                                         (if (or (<= at 0)
+                                               (>= (- line at) *key-lines*)
+                                               (top-level-line? data (line-text rope at)))
+                                           at
+                                           (up (dec at)))))
+                             (up (math/min line (dec (text/line-count rope))))))
+                  (fold (range from line)
+                    [nil ""]
+                    (fn (state i) (state-after data (line-text rope i) state))))))
+    (start-state-at rope data line state)))
 
 (defn ed-line-state (m idx buf line)
   "`[m' inside]`: what line `line` of `buf` (pool buffer `idx`) starts inside — nil, a
-`[:string open multiline? raw?]` or a `[:block close]` — read from the buffer's entry in the
-model's `:string-caches` (std's line cache, `editor/highlight/line-cache-state`: from the
-nearest checkpoint, or the first line an edit touched), and the model keeping the entry it left.
-The edits since the cache last looked come from the buffer's splice log, taken one by one."
+`[:string open multiline? raw?]` or a `[:block close]` — the inside half of [[ed-line-start]]."
+  (let ([m2 state] (ed-line-start m idx buf line)) [m2 (first state)]))
+
+(defn ed-line-start (m idx buf line)
+  "`[m' state]`: the state line `line` of `buf` (pool buffer `idx`) starts in, `[inside stack]`
+— what it is inside (nil, a `[:string open multiline? raw?]` or a `[:block close]`) and the
+brackets open at its start — read from the buffer's entry in the model's `:string-caches`
+(std's line cache, `editor/highlight/line-cache-state`: from the nearest checkpoint, or the
+first line an edit touched, at most `*key-lines*` lines lexed), and the model keeping the entry
+it left. The edits since the cache last looked come from the buffer's splice log, taken one by
+one."
   (let (entry (cache-entry m idx buf)
         prior (:cache entry)
         old (:rope prior)
@@ -418,16 +495,19 @@ The edits since the cache last looked come from the buffer's splice log, taken o
                            (let ([c _] (through-splices prior (:lexer entry) old splices)
                                  [lo hi replacement] (last splices))
                              [c [lo hi (+ lo (string/length replacement))]]))
-        [cache known? inside] (editor/highlight/line-cache-state-within moved
-                                (:lexer entry)
-                                (buffer-rope buf)
-                                line
-                                *key-lines*
-                                change))
+        rope (buffer-rope buf)
+        [cache known? state] (editor/highlight/line-cache-state-within moved
+                               (:lexer entry)
+                               rope
+                               line
+                               *key-lines*
+                               change))
     [(assoc m
        :string-caches
          (assoc (or (:string-caches m) {}) idx (assoc entry :cache cache :guessed (not known?))))
-      (if known? inside (guess-line-state (buffer-rope buf) (:data entry) line inside))]))
+      (if known?
+        (start-state-at rope (:data entry) line state)
+        (guess-line-state rope (:data entry) line state))]))
 
 (defn ed-drop-string-cache-slot (m killed)
   "Drop pool slot `killed`'s string cache ahead of its removal from the pool, shifting the
@@ -491,30 +571,6 @@ nothing (its index cleared: the reply is folded and dropped)."
     (let (c (string/char-at text 0))
       (and (not (string/blank? c)) (not (contains? (:closers data) c))))))
 
-(defn- top-level-start (m idx buf data line)
-  ;; `[m' line inside]`: the nearest line at or above `line` that begins a top-level form in
-  ;; code, at most `*balance-lines*` up (else the furthest it looked)
-  (let (rope (buffer-rope buf))
-    (letrec (up (fn (mm at)
-                  (let (candidate? (top-level-line? data (line-text rope at)))
-                    (if (and (not candidate?) (> at 0) (< (- line at) *balance-lines*))
-                      (up mm (dec at))
-                      (let ([mm2 inside] (ed-line-state mm idx buf at))
-                        (if (and inside (> at 0) (< (- line at) *balance-lines*))
-                          (up mm2 (dec at))
-                          [mm2 at inside]))))))
-      (up m line))))
-
-(defn- stack-at (m idx buf data line column)
-  ;; `[m' [inside stack]]`: the state at `column` of `line` — what it is inside, and the open
-  ;; brackets, counted from where its top-level form begins
-  (let (rope (buffer-rope buf)
-        [m2 from inside-from] (top-level-start m idx buf data line)
-        at-line (fold (range from line)
-                  [inside-from ""]
-                  (fn (state i) (:end (lex-line data (line-text rope i) state)))))
-    [m2 (:open (lex-line data (string/substring (line-text rope line) 0 column) at-line))]))
-
 ;; ---- the state at point ---------------------------------------------------------------
 
 (defn ed-point-state (m)
@@ -551,12 +607,14 @@ also means the brackets are balanced; `:state-in` what point's line starts insid
       (let (idx (ed-current-index m)
             line (text/char->line rope point)
             bol (text/line->char rope line)
-            [m2 state-in] (ed-line-state m idx buf line)
-            data (:data (get (:string-caches m2) idx))
+            [m3 line-state] (ed-line-start m idx buf line)
+            state-in (first line-state)
+            data (:data (get (:string-caches m3) idx))
             text (line-text rope line)
             column (- point bol)
-            whole (lex-line data text [state-in ""])
-            [m3 [inside stack]] (stack-at m2 idx buf data line column)
+            whole (lex-line data text line-state)
+            ;; the brackets open at point: those its line starts with (the cache's), and its own
+            [inside stack] (:open (lex-line data (string/substring text 0 column) line-state))
             token (seq/find (:tokens whole)
                     (fn (token)
                       (let ([start end kind] token)
@@ -582,24 +640,30 @@ also means the brackets are balanced; `:state-in` what point's line starts insid
 
 ;; ---- balance, looking forward from point ---------------------------------------------------
 
-(sig scan-forward (any any int any fn -> any))
-(defn- scan-forward (data rope from state step)
+(sig scan-forward (any any int any int fn -> any))
+(defn- scan-forward (data rope from state limit step)
   ;; lex from char `from` on, line by line in `state`, calling `(step lexed base)` on each —
   ;; `base` the offset its text starts at — which answers `:continue` or a final answer; nil
-  ;; after `*balance-lines*` lines or at the end
+  ;; after `limit` lines, at the end, or at a line in code that begins a top-level form (no
+  ;; bracket open before it stays open past it — `start-state`)
   (let (first-line (text/char->line rope from)
         lines (text/line-count rope))
     (letrec (walk (fn (line state)
-                    (if (or (>= line lines) (>= (- line first-line) *balance-lines*))
+                    (if (or (>= line lines) (>= (- line first-line) limit))
                       nil
                       (let (text (line-text rope line)
-                            bol (text/line->char rope line)
-                            start (if (= line first-line) (- from bol) 0)
-                            lexed (lex-line data
-                                    (string/substring text start (string/length text))
-                                    state)
-                            answer (step lexed (+ bol start)))
-                        (if (= answer :continue) (walk (inc line) (:end lexed)) answer)))))
+                            top-level? (and (> line first-line)
+                                         (nil? (first state))
+                                         (top-level-line? data text)))
+                        (if top-level?
+                          nil
+                          (let (bol (text/line->char rope line)
+                                start (if (= line first-line) (- from bol) 0)
+                                lexed (lex-line data
+                                        (string/substring text start (string/length text))
+                                        state)
+                                answer (step lexed (+ bol start)))
+                            (if (= answer :continue) (walk (inc line) (:end lexed)) answer)))))))
       (walk first-line state))))
 
 (defn closer-waits? (buf info pair)
@@ -613,6 +677,7 @@ forward from point until the brackets around it close; a held parse with no erro
         (buffer-rope buf)
         (buffer-point buf)
         [(:inside info) (:stack info)]
+        *key-lines*
         (fn (lexed base)
           (cond
             (and (:excess lexed) (= (second (:excess lexed)) (second pair))) true
@@ -636,6 +701,7 @@ typed instead."
                          (buffer-rope buf)
                          target
                          [nil rest-stack]
+                         *key-lines*
                          (fn (lexed base) (if (= 0 (:low lexed)) true :continue)))))))))))
 
 ;; ---- the string M-q fills -------------------------------------------------------------------
@@ -674,6 +740,7 @@ typed instead."
               rope
               (text/line->char rope next-line)
               [inside-at-end ""]
+              *balance-lines*
               (fn (lexed base)
                 (let (closed (seq/find (:tokens lexed)
                                (fn (token) (and (vector? (nth token 2)) (nth (nth token 2) 2)))))
