@@ -101,7 +101,14 @@ src/model.blsp              the ui-run model: buffer pool, panes, kill ring, min
                             (`register-down-handler`), and what is still running when
                             C-x C-c asks (`register-exit-query`: a compile, a test run,
                             the app, a terminal, a push). The core names no feature: a
-                            module registers its rows when it loads
+                            module registers its rows when it loads. Also the OUTPUT CAP
+                            every streaming sink shares (`ed-cap-output-at`: past
+                            `:output-buffer-max-lines` a buffer's oldest lines are cut,
+                            point / mark / `:input-start` / `:line-links` and every pane's
+                            cursor and scroll moving with the text — Emacs's
+                            comint-buffer-maximum-size), and `ed-ding`: a command's FAILURE
+                            (a motion at the edge, a failing search, a read-only refusal),
+                            which is what stops a keyboard macro
 src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
                             over the live keymap, `\[command]` substitution, docstrings
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
@@ -154,7 +161,9 @@ src/config.blsp             ~/.config/bedit/init.blsp — the declarative user c
                             Every key is ONE `settings/define` (std `settings`, brood ADR-428):
                             its default, type and doc give the check, the fallback
                             (`config/setting`) and the generated default file. A package
-                            declares its own under `:bedit/settings`
+                            declares its own under `:bedit/settings`. `:undo-limit` /
+                            `:undo-strong-limit` are std/editor/buffer's undo cap (brood
+                            ADR-550), `def`'d image-wide so buffer processes trim by them too
 src/userkeys.blsp           init.blsp's `:keys` (global-set-key) and `:mode-keys` (define-key in a
                             mode's map): each key read by std's `key-parse` (brood ADR-535), each
                             command by its M-x name, compiled onto the model as `:user-keys` by
@@ -243,7 +252,10 @@ src/statusbar.blsp          the mode line as extensible segments (render ops + c
 src/ui-kit.blsp             the widget kit over editor/display: a widget is `(area ctx) ->
                             {:ops :zones}` — paint and hit-test in ONE pass, styled by semantic
                             role. The shared shape behind the context menu, popup, plume, which-key
-src/input.blsp              dispatch: fold a key/mouse/tick event into the next model
+src/input.blsp              dispatch: fold a key/mouse/tick event into the next model; and the
+                            keyboard-macro REPLAY (`ed-run-macro`): N passes (C-u N C-x e), or
+                            until one fails (C-u 0), each stopping at the first key whose
+                            command fails (`model/ed-ding` or a throw), as Emacs's does
 src/commands.blsp           the GENERAL editing commands, each a (model key) -> model — motion,
                             editing, kill ring, panes, buffers, prompts. A feature's commands
                             live in its own module (dired, help, vim, registers, hexl,
@@ -448,7 +460,9 @@ src/frames.blsp             frames (C-x 5 2 / o / 0): a second OS window is a PR
                             std/editor/buffer-registry — a buffer opened, edited or killed in one
                             frame is in every frame (docs/frames-plan.md)
 src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
-                            apprun's :apprun ride it): line-buffered stdout -> handler fns
+                            apprun's :apprun ride it): line-buffered stdout -> handler fns;
+                            a partial line past `*procstream-line-max*` is delivered as it
+                            stands, so the worker's buffer is bounded
 src/wrap.blsp              where a line falls on screen rows: the pure break rule (a line →
                             `[from to]` row segments, word-wrapped at the pane width) and the
                             ONE row of a truncated line (`one-row`: cut before the cells its
@@ -547,7 +561,8 @@ src/results.blsp            the results-buffer abstraction behind *Tests* / *Run
                             *Occur* / *git-status*: the `file:line[:col]` location vocabulary, the
                             `location-jump-layer` that makes every such row navigable, and
                             `ed-append-follow` — the streaming append that follows the tail
-                            only in a pane already at the bottom
+                            only in a pane already at the bottom, then caps the buffer
+                            (`model/ed-cap-output-at`)
 src/testadapter.blsp        one result vocabulary, two runners: Brood's structured
                             test/*report-sink* lines and ExUnit's `mix test --trace` text
                             both decode into the same {:group :name :passed :where …}, so
@@ -609,8 +624,8 @@ src/vcscore.blsp            the VCS layer, whichever system the project uses (Em
                             backend: a row's hooks are symbols called late
 src/vcsproc.blsp            what every VCS's command line shares: the PROCESS LOG (`$`,
                             *vcs-process*, magit's `magit-process-buffer`) — git and mur
-                            commands in the order they ran, exit code, duration, output,
-                            credentials redacted, `\r` progress applied — `vcs-launch` (OFF the loop,
+                            commands in the order they ran, exit code, duration, output
+                            (its last 500 lines), credentials redacted, `\r` progress applied — `vcs-launch` (OFF the loop,
                             for the network), the working-tree QUEUE (`vcs-run-queued`, and
                             `vcs-gather` for a read a key waits on: refs, is anything staged —
                             in a task, in order, C-g cancels a read), `vcs-report-cmd`,

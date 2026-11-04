@@ -1,0 +1,136 @@
+;; Unbounded growth (review #18): a streaming output buffer keeps only its newest lines —
+;; cut from the top, whole lines, every position into it kept — and the undo limits reach
+;; std/editor/buffer from the user's settings.
+(defmodule output-cap-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use-internals results) ; ed-append-follow
+  (:use-internals testrun) ; testrun-append-link — the *Tests* row and its off-text link
+  (:use-internals compile) ; compile-append — *compilation*'s raw-chunk stream
+  (:use-internals procstream) ; procstream-feed — the worker's line buffer
+  (:use-internals vcsproc) ; vcs-entry-tail — a journal entry's output
+  (:use-internals config)) ; apply-to-model / setting — the settings reaching the model
+
+(defn- lines-text (from to)
+  "`line FROM` … `line TO-1`, each ending in a newline."
+  (string/join (map (range from to) (fn (i) (str "line " i "\n"))) ""))
+
+(defn- output-index (m name)
+  (or (ed-buffer-index-by-name m name) (error "no buffer " name)))
+
+(defn- show-at (m idx top point)
+  "`m` with its selected pane on pool buffer `idx`, scrolled to `top`, its cursor at `point`."
+  (ed-map-panes m (fn (pane) (assoc pane :buffer idx :top top :point point :mark nil))))
+
+(describe "cutting an output buffer's head keeps every position"
+  (test "point, mark and a shell's input start move back with the text"
+    (let (b (assoc (set-mark (goto-char (make-buffer (lines-text 0 4)) 20)) :input-start 25)
+          cut (ed-cut-head b 14))
+      (assert= (buffer-text cut) (lines-text 2 4))
+      (assert= (buffer-point cut) 6)
+      (assert= (buffer-mark cut) 6)
+      (assert= (:input-start cut) 11)))
+  (test "a position inside the deleted text lands at the start"
+    (assert= (buffer-point (ed-cut-head (goto-char (make-buffer (lines-text 0 4)) 3) 14)) 0))
+  (test "the off-text line links move up with their rows, the deleted rows' dropped"
+    (let (b (assoc (make-buffer (lines-text 0 4)) :line-links {0 :zero 2 :two 3 :three})
+          cut (ed-cut-head b 14))
+      (assert= (:line-links cut) {0 :two 1 :three})))
+  (test "a read-only buffer is cut and stays read-only"
+    (let (b (set-read-only (make-buffer (lines-text 0 4)) true))
+      (is (read-only? (ed-cut-head b 7)))
+      (assert= (buffer-text (ed-cut-head b 7)) (lines-text 1 4)))))
+
+(describe "a streaming sink keeps its newest lines"
+  (test "past :output-max-lines the oldest go, back to nine tenths of it"
+    (let (m (fold (range 25)
+              (assoc (ed-init (make-buffer "")) :output-max-lines 10)
+              (fn (acc i) (ed-append-named acc "*out*" (str "line " i))))
+          out (ed-buf-at m (output-index m "*out*")))
+      (is (<= (ed-complete-lines out) 10))
+      (is (string/ends-with? (buffer-text out) "line 24\n"))
+      (is (string/starts-with? (buffer-text out) (str "line " (- 25 (ed-complete-lines out)) "\n")))))
+  (test "a model with no setting keeps *output-max-lines*"
+    (assert= (ed-output-max-lines (ed-init (make-buffer ""))) *output-max-lines*)
+    (assert= (ed-output-max-lines (assoc (ed-init (make-buffer "")) :output-max-lines 7)) 7))
+  (test "a pane reading the scrollback keeps reading the same lines"
+    (let (m0 (ed-append-named (assoc (ed-init (make-buffer "")) :output-max-lines 10)
+               "*out*"
+               (string/trimr (lines-text 0 9)))
+          idx (output-index m0 "*out*")
+          ;; scrolled to `line 5`, the cursor on `line 6`
+          reading (show-at m0 idx 5 (index-of (buffer-text (ed-buf-at m0 idx)) "line 6"))
+          m (fold (range 9 14) reading (fn (acc i) (ed-append-named acc "*out*" (str "line " i))))
+          out (ed-buf-at m idx)
+          pane (ed-current-pane m))
+      (assert= (buffer-line-at out (:top pane)) "line 5\n")
+      (assert= (:point pane) (index-of (buffer-text out) "line 6"))))
+  (test "a pane following the tail is still at the tail after the cut"
+    (let (m0 (assoc (ed-init (make-buffer "")) :output-max-lines 10 :scroll-output true)
+          m1 (ed-append-follow m0 "*out*" "line 0" 80 8)
+          idx (output-index m1 "*out*")
+          following (show-at m1 idx 0 0)
+          m (fold (range 1 30)
+              following
+              (fn (acc i) (ed-append-follow acc "*out*" (str "line " i) 80 8)))
+          out (ed-buf-at m idx))
+      (is (<= (ed-complete-lines out) 10))
+      ;; the pane shows the last line
+      (is (>= (+ (:top (ed-current-pane m)) 4) (dec (ed-complete-lines out))))))
+  (test "*compilation*'s raw chunks are capped too"
+    (let (m (fold (range 30)
+              (assoc (ed-init (make-buffer "")) :output-max-lines 10)
+              (fn (acc i) (compile/compile-append acc (str "chunk " i "\n"))))
+          out (ed-buf-at m (output-index m compile/*compile-buf*)))
+      (is (<= (ed-complete-lines out) 10))
+      (is (string/ends-with? (buffer-text out) "chunk 29\n")))))
+
+(describe "a *Tests* row's link survives the cut"
+  (test "the link is recorded on the row it landed on, after the oldest lines went"
+    (let (m (fold (range 30)
+              (assoc (ed-init (make-buffer "")) :output-max-lines 10)
+              (fn (acc i)
+                (testrun/testrun-append-link acc (str "row " i) {:file "a.blsp" :line i} 80 24)))
+          out (ed-buf-at m (output-index m testrun/*tests-buffer*))
+          links (:line-links out))
+      ;; every kept link points at the row that names it
+      (is (every? links
+            (fn ([line loc])
+              (= (buffer-line-at out line) (str "row " (:line loc) "\n")))))
+      (assert= (get links (dec (ed-complete-lines out))) {:file "a.blsp" :line 29}))))
+
+(describe "a child's endless partial line is bounded"
+  (test "past *procstream-line-max* the partial is delivered as a line and starts again"
+    (let (run {:handlers {:on-line (fn (line token) [:line (string/length line)])
+                          :on-err-line (fn (line token) nil)
+                          :on-done (fn (code token) nil)}
+               :token :t
+               :reply (self)}
+          rest (binding (*procstream-line-max* 10)
+                 (procstream/procstream-feed run "abcdefgh" "ijklmn" procstream/procstream-out-line)))
+      (assert= rest "")
+      (assert= (receive ([:line n] n) (after 500 :timeout)) 14))))
+
+(describe "a VCS journal entry keeps its last lines"
+  (test "older lines are dropped and counted"
+    (assert= (binding (*vcs-entry-output-max-lines* 2) (vcs-entry-tail "a\nb\nc\nd"))
+      "[2 earlier lines dropped]\nc\nd")
+    (assert= (binding (*vcs-entry-output-max-lines* 5) (vcs-entry-tail "a\nb")) "a\nb")))
+
+(describe "the limits come from the settings"
+  (test "the undo limits reach std/editor/buffer and the output cap reaches the model"
+    (let (before-limit editor/buffer/*undo-limit*
+          before-strong editor/buffer/*undo-strong-limit*
+          m (apply-to-model (ed-init (make-buffer ""))
+              {:undo-limit 1234 :undo-strong-limit 5678 :output-buffer-max-lines 42}))
+      (assert= editor/buffer/*undo-limit* 1234)
+      (assert= editor/buffer/*undo-strong-limit* 5678)
+      (assert= (ed-output-max-lines m) 42)
+      ;; put the image back as it was for the rest of the run
+      (def editor/buffer/*undo-limit* before-limit)
+      (def editor/buffer/*undo-strong-limit* before-strong)))
+  (test "an unset file means the defaults"
+    (assert= (setting {} :undo-limit) 2000000)
+    (assert= (setting {} :undo-strong-limit) 3000000)
+    (assert= (setting {} :output-buffer-max-lines) 10000)))
