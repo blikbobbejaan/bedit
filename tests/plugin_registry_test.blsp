@@ -1,0 +1,193 @@
+;; A package's registrations go with it (src/ownership.blsp, `packages/retire-package`).
+;; A fake package registers one row of every registry a feature fills at load — and replaces
+;; a core row, a core command and a core function besides. Removing it must leave none of
+;; its rows, give the core ones back, and leave an editor that still runs; updating it must
+;; leave the new version's rows exactly once.
+
+(defmodule plugin-registry-test
+  (:use test)
+  (:use-internals packages)
+  (:use config) ; *config-base* — a scratch config dir, never the user's own packages
+  (:use model) ; ed-init
+  (:use input :only [ed-update]) ; one event folded, the idle beat fired
+  (:use view :only [ed-view]) ; one frame drawn
+  (:use editor/buffer)) ; make-buffer
+
+(purge-stale-temp "bedit-plugreg-")
+
+(defn- write-package (dir version body)
+  "Package `pkgsreg`@`version` under packages `dir`, its module's body `body`."
+  (let (root (path/join dir "pkgsreg"))
+    (os/cmd "mkdir" ["-p" (path/join root "src")])
+    (file/spit (path/join root "project.blsp")
+      (str "(project :name \"pkgsreg\" :version \"" version "\" :enhances {bedit \">= 0.1\"})\n"))
+    (file/spit (path/join root "src" "pkgsreg.blsp") (str "(defmodule pkgsreg)\n" body "\n"))))
+
+;; Version 1: one row of each kind, plus a core idle job, a core chip, a core M-x name and a
+;; core function replaced.
+(def- version-one
+  (string/join ["(defn bedit-plugin () {:themes [{:name \"pkgsreg-theme\" :palette {}}]})"
+                 "(defn idle-run (m) (assoc m :pkgsreg-idle-ran true))" "(defn idle-stale (m) true)"
+                 "(defn on-event (m input textrows cols rows) (assoc m :pkgsreg-event-seen true))"
+                 "(defn step (m) m)" "(defn chip (m pane buf) nil)"
+                 "(defn running (m) [\"pkgsreg: busy\"])" "(defn timer-spec (m) nil)"
+                 "(defn timer-fire (m) m)" "(defn on-down (m pid reason) m)"
+                 "(defn keep (m name f) m)" "(defn fold-reply (m value) m)"
+                 "(model/register-idle-job :pkgsreg-idle {:order 999 :run 'pkgsreg/idle-run :stale? 'pkgsreg/idle-stale})"
+                 "(model/register-idle-job :auto-save {:order 110 :run 'pkgsreg/idle-run})"
+                 "(model/register-task-reply :pkgsreg-slot 'pkgsreg/fold-reply nil \"pkgsreg\")"
+                 "(model/register-event-handler :pkgsreg-event 'pkgsreg/on-event)"
+                 "(model/register-down-handler :pkgsreg-down 'pkgsreg/on-down)"
+                 "(model/register-exit-query :pkgsreg-exit 'pkgsreg/running)"
+                 "(model/register-timer-client :pkgsreg-timer 'pkgsreg/timer-spec 'pkgsreg/timer-fire)"
+                 "(model/register-post-step :pkgsreg-step {:order 999 :run 'pkgsreg/step})"
+                 "(model/register-layout-keeper :pkgsreg-keeper 'pkgsreg/keep)"
+                 "(statusbar/register-modeline-segment :pkgsreg-chip 99 'pkgsreg/chip)"
+                 "(statusbar/register-modeline-segment :apprun 50 'pkgsreg/chip)"
+                 "(interactive/defcommand cmd-pkgsreg-hello (m key) \"Hello.\" m)"
+                 "(interactive/defcommand cmd-goto-line (m key) \"Shadows the core one.\" m)"
+                 "(interactive/register-prefix-consuming 'pkgsreg/cmd-pkgsreg-hello)"
+                 "(keymaps/register-profile :pkgsreg-profile (list 'pkgsreg/profile-layer))"
+                 "(def pkgsreg-mode-layer {:name 'pkgsreg :keymap {} :file-pattern \"[.]pkgsreg$\"})"
+                 "(modes/register-language-mode 'pkgsreg/pkgsreg-mode-layer :pkgsreg)"
+                 "(modes/register-interpreter \"pkgsreg-sh\" :pkgsreg)"
+                 "(settings/define :bedit/settings :pkgsreg-setting {:default 1 :type 'int :doc \"a package's setting\"})"
+                 "(theme/defchrome pkgsreg-face {:fg \"#ffffff\"})"
+                 "(grammars/declare-grammar :pkgsreg \"https://example.invalid/grammar\")"
+                 "(defn bedit/keyhelp/ed-key-label (k) \"patched\")"]
+    "\n"))
+
+;; Version 2: the idle job and the command again, under the same keys; everything else
+;; dropped.
+(def- version-two
+  (string/join ["(defn bedit-plugin () {})"
+                 "(defn idle-run (m) (assoc m :pkgsreg-idle-ran 2))"
+                 "(model/register-idle-job :pkgsreg-idle {:order 999 :run 'pkgsreg/idle-run})"
+                 "(interactive/defcommand cmd-pkgsreg-hello (m key) \"Hello again.\" m)"]
+    "\n"))
+
+(defn- run-with (base registry thunk)
+  (binding (*config-base* base *registry* registry) (thunk)))
+
+(defn- stub-registry (body)
+  ;; the hive offers pkgsreg 2.0.0, whose install writes `body`
+  {:enhancers (fn (_app) [])
+   :latest-version (fn (_name) "2.0.0")
+   :install (fn (name dest-dir)
+              (do (write-package dest-dir "2.0.0" body) {:name name :version "2.0.0"}))})
+
+(defn- idle-names () (into #{} (map (ed-idle-jobs) :name)))
+
+(defn- core-rows ()
+  ;; the core rows the package replaces, as the registries hold them (a command by its
+  ;; symbol: a function value read back from a registry is a copy, never `=` to the first)
+  {:auto-save (registry/lookup :model/idle-jobs :auto-save)
+   :apprun (registry/lookup :statusbar/segments :apprun)
+   :goto-line (registry/lookup :interactive/command-syms "goto-line")
+   :key-label (keyhelp/ed-key-label "a")})
+
+(defn- beat (m) (ed-update m [:timer :idle-recompute] 80 24))
+
+;; The package is loaded from its FILES (`apply-plugin!`'s reload path, `reflect/load`), never
+;; through `require-one`. An `:isolated` test's restore REPLAYS what a `require-one` load
+;; inside it defined and registered (KI-134: a module other processes may be using is kept),
+;; but not a removal made after it — so the package's rows, its globals and its replacements
+;; of core rows came back after the test and leaked into every later test in the run (an
+;; auto-save idle job running the package's function). A file load is rolled back with the
+;; rest, so the restore leaves the editor as the test found it.
+(defn- plugin-registry-round-trip ()
+  (let (base (temp-dir "bedit-plugreg-")
+        dir (path/join base "bedit" "packages")
+        _ (write-package dir "1.0.0" version-one)
+        before (core-rows)
+        applied (run-with base (stub-registry "") (fn () (packages/apply-plugin! "pkgsreg" true)))
+        package-dir (run-with base (stub-registry "") (fn () (packages/pkg-dir "pkgsreg")))
+        loaded-model (beat (ed-init (make-buffer "x")))
+        while-loaded {:idle (contains? (idle-names) :pkgsreg-idle)
+                      :ran (:pkgsreg-idle-ran loaded-model)
+                      :event (:pkgsreg-event-seen (ed-update loaded-model [:pkgsreg-event] 80 24))
+                      :exit (ed-live-processes loaded-model)
+                      :command (includes? (interactive/command-names) "pkgsreg-hello")
+                      :theme (includes? (themes/themes-names) "pkgsreg-theme")
+                      :type (editor/layers/layers-for-type :pkgsreg)
+                      :file-type (editor/layers/buffer-type-for {:file "/tmp/a.pkgsreg"})
+                      :setting (settings/spec-of :bedit/settings :pkgsreg-setting)
+                      :key-label (keyhelp/ed-key-label "a")
+                      :claims (count (ownership/claims-under package-dir))}
+        _ (run-with base (stub-registry "") (fn () (packages/remove! "pkgsreg")))
+        removed-model (beat (ed-init (make-buffer "x"))))
+    (assert= applied true)
+    ;; it was all there
+    (is (:idle while-loaded))
+    (is (:ran while-loaded))
+    (is (:event while-loaded))
+    (is (includes? (:exit while-loaded) "pkgsreg: busy"))
+    (is (:command while-loaded))
+    (is (:theme while-loaded))
+    (assert= (:type while-loaded) '(pkgsreg/pkgsreg-mode-layer modes/text-mode-layer))
+    (assert= (:file-type while-loaded) :pkgsreg)
+    (is (map? (:setting while-loaded)))
+    (assert= (:key-label while-loaded) "patched")
+    (is (> (:claims while-loaded) 15))
+    ;; none of it is left
+    (assert= (ownership/claims-under package-dir) [])
+    (refute (contains? (idle-names) :pkgsreg-idle))
+    (assert= (registry/lookup :model/task-replies :pkgsreg-slot) nil)
+    (assert= (ed-registered-event-handler :pkgsreg-event) nil)
+    (assert= (registry/lookup :model/down-handlers :pkgsreg-down) nil)
+    (assert= (registry/lookup :model/exit-queries :pkgsreg-exit) nil)
+    (assert= (get (ed-timer-clients) :pkgsreg-timer) nil)
+    (assert= (registry/lookup :model/post-steps :pkgsreg-step) nil)
+    (assert= (registry/lookup :model/layout-keepers :pkgsreg-keeper) nil)
+    (assert= (registry/lookup :statusbar/segments :pkgsreg-chip) nil)
+    (refute (includes? (interactive/command-names) "pkgsreg-hello"))
+    (refute (interactive/prefix-consuming? 'pkgsreg/cmd-pkgsreg-hello))
+    (assert= (registry/lookup :keymaps/profiles :pkgsreg-profile) nil)
+    (refute (includes? (themes/themes-names) "pkgsreg-theme"))
+    (assert= (editor/layers/layers-for-type :pkgsreg) ())
+    (assert= (editor/layers/buffer-type-for {:file "/tmp/a.pkgsreg"}) :fundamental)
+    (assert= (get editor/layers/*auto-type-by-interpreter* "pkgsreg-sh") nil)
+    (assert= (settings/spec-of :bedit/settings :pkgsreg-setting) nil)
+    (assert= (registry/lookup :theme/chrome-faces 'pkgsreg/pkgsreg-face) nil)
+    (assert= (grammars/grammar-source :pkgsreg) nil)
+    (refute (bound? 'pkgsreg/idle-run))
+    ;; the core rows and the core function it replaced are back, and work
+    (assert= (core-rows) before)
+    (assert= (keyhelp/ed-key-label "a") "a")
+    ;; the editor still runs: an event, the idle beat, a frame
+    (refute (:pkgsreg-idle-ran removed-model))
+    (refute (:pkgsreg-event-seen (ed-update removed-model [:pkgsreg-event] 80 24)))
+    (assert= (ed-live-processes removed-model) [])
+    (is (vector? (ed-view (ed-update removed-model "a" 80 24) 80 24)))
+    ;; installed again, then updated to version 2
+    (write-package dir "1.0.0" version-one)
+    (assert= (run-with base
+               (stub-registry version-two)
+               (fn () (packages/apply-plugin! "pkgsreg" true)))
+      true)
+    (assert= (keyhelp/ed-key-label "a") "patched")
+    (let (done (run-with base
+                 (stub-registry version-two)
+                 (fn ()
+                   (packages/launch-job (ed-init (make-buffer "")) {:kind :update :name "pkgsreg"})))
+          model (beat (ed-init (make-buffer "x"))))
+      (is (includes? (:echo done) "updated pkgsreg → 2.0.0"))
+      ;; exactly the new version's rows: its idle job and its command's two entries
+      (assert= (ownership/claims-under package-dir)
+        [[:interactive/command-syms "pkgsreg-hello"]
+          [:interactive/commands "pkgsreg-hello"]
+          [:model/idle-jobs :pkgsreg-idle]])
+      (assert= (count (seq/filter (ed-idle-jobs) (fn (job) (= (:name job) :pkgsreg-idle)))) 1)
+      (assert= (:pkgsreg-idle-ran model) 2)
+      (assert= (count (seq/filter (interactive/command-names) (fn (name) (= name "pkgsreg-hello"))))
+        1)
+      (refute (includes? (themes/themes-names) "pkgsreg-theme"))
+      (assert= (editor/layers/buffer-type-for {:file "/tmp/a.pkgsreg"}) :fundamental)
+      (assert= (core-rows) before)
+      (run-with base (stub-registry "") (fn () (packages/remove! "pkgsreg")))
+      (assert= (ownership/claims-under package-dir) [])
+      (refute (includes? (interactive/command-names) "pkgsreg-hello")))))
+
+(describe "a package's registrations go with it"
+  :isolated (test "removed: every row goes and every core row it replaced comes back; updated: the new rows once"
+    (plugin-registry-round-trip)))

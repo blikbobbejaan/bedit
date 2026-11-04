@@ -23,7 +23,7 @@ contribution (themes today), and the UI. A plugin that lacks its entry or throws
 applied, and the install says why — one bad package never blocks the editor."
   (:use editor/keymap :only [keymap-bind]) ; the mode keymap below
   (:use interactive) ; defcommand — the M-x commands
-  (:use themes) ; register-theme! / unregister-theme! — apply/unapply a theme contribution
+  (:use themes) ; register-theme! — a theme contribution, claimed for its package
   (:use config) ; config-dir — the user package dir lives under it
   (:use model) ; message / ed-headless? / register-task-reply / register-exit-query
   (:use pool) ; ed-show-named / ed-name-prompt / ed-goto-line / ed-upsert-named
@@ -120,28 +120,140 @@ nothing that is still registered."
                            (try ((reflect/eval entry)) (catch _ nil))))
         (when (map? contribution) contribution)))))
 
+(defn- source-files (name)
+  "Every `.blsp` file under package `name`'s src/."
+  (let (dir (path/join (pkg-dir name) "src"))
+    (if (file/exists? dir)
+      (seq/filter (file/walk-files dir) (fn (path) (string/ends-with? path ".blsp")))
+      ())))
+
+(defn package-modules (name)
+  "The modules package `name`'s files declare — each file's `(defmodule …)` — as a set of
+strings. A file that does not open with one declares none."
+  (into #{}
+    (seq/keep (source-files name)
+      (fn (file)
+        (let (head (check-allow :discarded-catch
+                     (try (reflect/read-first (file/slurp file)) (catch _ nil))))
+          (when (and (list? head) (= (first head) 'defmodule) (symbol? (second head)))
+            (->string (second head))))))))
+
+(defn- global-namespace (global)
+  ;; everything before the last `/` of a global's name, nil for a root name
+  (let (parts (string/split (->string global) "/"))
+    (when (> (count parts) 1) (string/join (take parts (dec (count parts))) "/"))))
+
 (defn plugin-definitions (name)
-  "Every global package `name`'s code defined in this image: the names whose definition was
-loaded from a file under its directory (`reflect/source-location`) — private ones and ones a
-macro generated included, which no reading of its source could list."
-  (let (prefix (str (pkg-dir name) "/"))
+  "Every global package `name`'s code defined in this image: the names IN ITS OWN MODULES
+([[package-modules]]) whose definition was loaded from a file under its directory
+(`reflect/source-location`) — private ones and ones a macro generated included, which no
+reading of its source could list. A core name the package redefined is not among them: its
+file is the package's, its module is not, and taking it away would break the editor."
+  (let (prefix (str (pkg-dir name) "/")
+        modules (package-modules name))
     (vec (seq/filter (reflect/global-names)
            (fn (global)
              (let (site (reflect/source-location global))
-               (and (vector? site) (string/starts-with? (str (first site)) prefix))))))))
+               (and (vector? site)
+                 (string/starts-with? (str (first site)) prefix)
+                 (contains? modules (global-namespace global)))))))))
+
+;; ---- core names a package redefined ----------------------------------------
+;; A package's file may redefine a name the editor already had — a core function it patches
+;; (`(defn /bedit/keyhelp/ed-key-label …)`). Retiring that by source location undefined it:
+;; the core function was gone until a restart. So a package's load is compared with the
+;; globals as they were before it ([[global-values]]): a name sited in its files afterwards,
+;; outside its own modules, that was bound before with another value is a REDEFINITION,
+;; kept with the value it replaced (`:packages/redefined`), and removing or updating the
+;; package puts that value back (Emacs's `unload-feature` restores a function the same way).
+
+(defn- global-values ()
+  "Every global's value now, by name — what a package's load is compared against."
+  (fold (reflect/global-names)
+    {}
+    (fn (acc global)
+      (assoc acc
+        global (check-allow :discarded-catch (try (reflect/eval global) (catch _ nil)))))))
+
+(defn plugin-redefinitions (name before)
+  "The globals package `name`'s files REDEFINED, as `{global value-before}`: sited under its
+directory now, outside its own modules ([[package-modules]]), bound in `before` (a
+[[global-values]] taken before its load) with a value it no longer has."
+  (let (prefix (str (pkg-dir name) "/")
+        modules (package-modules name))
+    (into {}
+      (seq/keep (reflect/global-names)
+        (fn (global)
+          (let (site (reflect/source-location global))
+            (when (and (contains? before global)
+                    (vector? site)
+                    (string/starts-with? (str (first site)) prefix)
+                    (not (contains? modules (global-namespace global)))
+                    (not (= (get before global)
+                           (check-allow :discarded-catch
+                             (try (reflect/eval global) (catch _ nil))))))
+              [global (get before global)])))))))
+
+(defn- note-redefinitions (name before)
+  ;; the earliest value wins: a name already noted keeps the value from before the package
+  (let (noted (registry/lookup :packages/redefined name {}))
+    (registry/put! :packages/redefined name (merge (plugin-redefinitions name before) noted))))
+
+(defn- restore-redefinitions (name)
+  "Put back every core global package `name` redefined, with the value it had before, and
+answer how many."
+  (let (noted (registry/lookup :packages/redefined name {}))
+    (doseq ([global value] noted)
+      (reflect/eval (list 'def (symbol (str "/" global)) (list 'quote value))))
+    (registry/remove! :packages/redefined name)
+    (count noted)))
 
 (defn- retire-definitions (name)
   "Remove every global package `name`'s code defined (`reflect/undef`, brood ADR-391) and answer
 how many went. What an update does BEFORE loading the new version, so a function the new
 version dropped is gone rather than callable with the old body, and what a remove does so the
 removed package's code stops running. A caller still holding one raises `unbound symbol
-(removed by reflect/undef …)` — said, not silently old. Its commands leave `M-x` with them
-(`interactive/unregister-commands`); the new version's `defcommand`s register theirs again."
-  (let (retired (seq/filter (plugin-definitions name)
-                  (fn (global)
-                    (check-allow :discarded-catch (try (reflect/undef global) (catch _ false))))))
-    (unregister-commands (into #{} retired))
-    (count retired)))
+(removed by reflect/undef …)` — said, not silently old. Its registrations are taken back
+first ([[release-registrations]]), so nothing the editor runs still names one."
+  (count (seq/filter (plugin-definitions name)
+           (fn (global)
+             (check-allow :discarded-catch (try (reflect/undef global) (catch _ false)))))))
+
+(defn- claimant-file (name)
+  ;; what a registration made while package `name` is applied, outside a load of one of its
+  ;; files, is claimed for (`ownership/*claimant*`): a file under its directory
+  (path/join (pkg-dir name) "project.blsp"))
+
+(defn release-registrations (name)
+  "Take back every registry entry package `name` made — its idle jobs, task replies, event,
+down and timer handlers, exit queries, post-steps, mode line chips, commands, modes, file
+types, settings and themes, whatever registered them (`ownership/release-under!`) — and
+answer the `[kind key]`s released. An entry it replaced comes back. What removing and
+updating the package do before its globals go."
+  (ownership/release-under! (pkg-dir name)))
+
+(defn- adopt-settings (name before)
+  "Claim for package `name` the settings its sources declare ([[package-settings]]) that its
+load wrote — `settings/define` writes std's registry directly — over what the registry held
+`before` the load, so they leave init.blsp's settings with the package."
+  (doseq (setting (package-settings name))
+    (when (not (= (get before setting) (registry/lookup config/*settings* setting)))
+      (ownership/adopt! config/*settings*
+        setting
+        (claimant-file name)
+        (contains? before setting)
+        (get before setting)))))
+
+(defn retire-package (name)
+  "Take package `name` out of the live editor, in the one order that leaves nothing pointing
+at a name about to go: its registrations back ([[release-registrations]]), the core names it
+redefined restored ([[restore-redefinitions]]), then the globals its own modules defined
+removed ([[retire-definitions]]). What removing it does, and what updating it does before
+the new version loads. Answers `{:released :restored :retired}`, how many of each."
+  (let (released (release-registrations name)
+        restored (restore-redefinitions name)
+        retired (retire-definitions name))
+    {:released (count released) :restored restored :retired retired}))
 
 (defn plugin-entry (name &optional (reload? false))
   "Load package `name` (its src must be on the load-path) — again, from its files, when
@@ -168,40 +280,43 @@ package installed again) is loaded from its files too: `require-one` would take 
               (failure "its `bedit-plugin` answered " (pr-str contribution) ", not a map")))
           (catch e (failure "its `bedit-plugin` threw: " (error-message e)))))))
 
-(defn- theme-names (contribution)
-  (if (map? contribution) (into #{} (map (or (:themes contribution) []) :name)) #{}))
-
 (defn apply-plugin! (name &optional (reload? false))
   "Load package `name`'s contribution into the LIVE editor: put it on the load-path, load it,
 register its themes. Answers true, or the failure [[plugin-entry]] gave — which says why —
 and records which it was ([[package-status]]). Realtime: the theme appears in
-`M-x theme-select` immediately.
+`M-x theme-select` immediately. Everything the package registers — at load, or here — is
+claimed for it (`ownership`), so it can all be taken back.
 
 With `reload?` (an update) the old version is RETIRED first, as package.el reloads an upgraded
-package and better: every global its code defined is removed ([[retire-definitions]]) before
-the new files load, so nothing the new version dropped stays callable, and a theme the old
-version contributed and the new one does not leaves the picker. An update that fails to load
-leaves none of the old version behind either — the package reads as broken, with the reason."
+package and better: everything it registered is taken back, the core names it redefined are
+restored and every global its own code defined is removed ([[retire-package]]) before the new
+files load,
+so nothing the new version dropped stays callable or registered, and what the new version
+registers is there once. An update that fails to load leaves none of the old version behind
+either — the package reads as broken, with the reason."
   (add-to-load-path! name)
-  (let (old (when reload? (loaded-contribution name))
-        _ (when reload? (retire-definitions name))
-        contribution (plugin-entry name reload?)
-        kept (theme-names contribution))
-    (doseq (theme (theme-names old)) (when (not (contains? kept theme)) (unregister-theme! theme)))
+  (when reload? (retire-package name))
+  (let (settings-before (registry/entries config/*settings*)
+        globals-before (global-values)
+        contribution (ownership/with-claimant (claimant-file name)
+                       (fn ()
+                         (let (loaded (plugin-entry name reload?))
+                           (when (not (failure? loaded))
+                             (doseq (theme (or (:themes loaded) [])) (register-theme! theme)))
+                           loaded))))
+    (adopt-settings name settings-before)
+    (note-redefinitions name globals-before)
     (if (failure? contribution)
       (do (note-status name :broken (error-message contribution)) contribution)
-      (do
-        (doseq (theme (or (:themes contribution) [])) (register-theme! theme))
-        (note-status name :loaded nil)
-        true))))
+      (do (note-status name :loaded nil) true))))
 
 (defn unapply-plugin! (name)
-  "Remove package `name`'s contribution from the live editor: unregister the themes it added, so
-they leave `M-x theme-select`, and retire the globals its code defined ([[retire-definitions]]),
-so a removed package's code stops running without a restart. A package that never loaded
-contributed nothing, and nothing of it is loaded to take back."
-  (doseq (theme (theme-names (loaded-contribution name))) (unregister-theme! theme))
-  (retire-definitions name)
+  "Remove package `name`'s contribution from the live editor: take back everything it
+registered — its themes leave `M-x theme-select`, its commands M-x, its idle jobs the beat —
+restore the core names it redefined and retire the globals its own code defined
+([[retire-package]]), so a removed package's code stops running without a restart and nothing
+the editor runs names it. A package that never loaded registered nothing."
+  (retire-package name)
   (registry/remove! :packages/status name))
 
 ;; ---- what became of each installed package -----------------------------------------
