@@ -41,7 +41,8 @@ space or RET is typed past it, the new line starting with the paragraph's contin
 in the same undo step as the space or RET (`auto-filled`). In a code buffer — one whose mode
 stacks over `prog` — only a comment is broken (Emacs's `comment-auto-fill-only-comments`): a
 comment line, or the comment after code on a line, which goes on at its own column with its
-marker (`trailing-comment-break`, Emacs's `comment-indent-new-line`), the code never broken."
+marker (Emacs's `comment-indent-new-line`), the code never broken. A line needing many breaks gets
+them all in one left-to-right pass (`break-tail`)."
   (:use editor/buffer) ; buffer-rope / buffer-point / replace-region
   (:use interactive) ; defcommand — M-q and the auto-fill toggle
   (:use scroll :only [ed-mode-setting])
@@ -75,14 +76,19 @@ Emacs's default `adaptive-fill-regexp` keeps them in any text. Markdown names it
       (prog? buf)
         (let (syntax (stringstate/syntax-of buf))
           (into (vec (or (:comments syntax) []))
-            (if (empty? (or (:block-comments syntax) [])) [] ["*"])))
+            ;; a block comment's ` * ` lines, and its opener as the marker of its first line
+            (let (blocks (or (:block-comments syntax) []))
+              (if (empty? blocks) [] (into ["*"] (map blocks first))))))
       else nil)))
 
 (defn line-marker (text markers)
   "The comment or quote marker `text`'s line carries, of `markers` — `;;`, `#`, `>` — or \"\" for
 none: what a paragraph's lines must share to be filled together."
   ;; a one-line paragraph's rest prefix is its marker with any bullet blanked out
-  (string/trim (second (string/fill-prefixes text markers))))
+  ;; a block comment's opener (`/*`, `/**`) and its ` * ` lines are one family: the comment
+  ;; fills from its first line
+  (let (marker (string/trim (second (string/fill-prefixes text markers))))
+    (if (regex/match? "^/?\\*+$" marker) "*" marker)))
 
 (defn item-line? (text markers)
   "True when `text` starts a list item — a bullet after its indentation and marker."
@@ -189,6 +195,7 @@ alone."
                      (down here)))
         [top bottom]))))
 
+(sig line-range-text (any int int -> string))
 (defn- line-range-text (rope first-line last-line)
   ;; lines `first-line`..`last-line` of `rope`, without the newline after the last
   (let (start (text/line->char rope first-line)
@@ -215,10 +222,18 @@ Lisp docstring's lines do; anything else is `string/fill-prefixes`'.
 
 (defn paragraph-prefixes (buf text)
   "The `[first rest]` prefixes paragraph `text` of `buf` fills with: the mode's
-`:fill-prefixes` when it has one, else `string/fill-prefixes` with the mode's markers."
+`:fill-prefixes` when it has one, else `string/fill-prefixes` with the mode's markers. A
+block comment filled from its opener's line continues with ` * ` under it (`/* aa` →
+` * bb`), never with a second opener."
   (let (custom (ed-mode-service buf :fill-prefixes)
-        markers (fill-markers buf))
-    (if (fn? custom) (custom text markers) (string/fill-prefixes text markers))))
+        markers (fill-markers buf)
+        [first-prefix rest-prefix] (if (fn? custom)
+                                     (custom text markers)
+                                     (string/fill-prefixes text markers)))
+    [first-prefix
+      (if (regex/match? "^[ \t]*/\\*" rest-prefix)
+        (regex/replace "^([ \t]*)/\\*+" rest-prefix "$1 *")
+        rest-prefix)]))
 
 ;; ---- point across a refill ---------------------------------------------------------------
 ;; Point is kept by the paragraph's BODY — its text without each line's prefix — counted in
@@ -344,22 +359,38 @@ setting for its mode."
   ;; the display column `offset` in `text` (a line) reaches
   (string/display-width (string/substring text 0 offset)))
 
-(defn- break-offset (text limit from)
-  ;; the offset of the last space in `text` (a line) at or before column `limit` and after
-  ;; offset `from` (the line's prefix) — where the line breaks — or nil
-  (letrec (back (fn (i)
-                  (cond
-                    (<= i from) nil
-                    (and (= (string/char-at text i) " ") (<= (column-of text i) limit)) i
-                    else (back (dec i)))))
-    (back (dec (string/length text)))))
+(defn- pieces (text)
+  ;; `text` cut into `[separator word]` pairs, left to right: the run of spaces before each
+  ;; word (\"\" before the first) and the word; a trailing run of spaces is a last pair with \"\"
+  (let (found (regex/find-all "( *)([^ ]*)" text))
+    (into []
+      (seq/keep found
+        (fn (match)
+          (let (groups (:groups match)
+                separator (or (:text (first groups)) "")
+                word (or (:text (second groups)) ""))
+            (when (not (and (= separator "") (= word ""))) [separator word])))))))
 
-(defn trailing-comment-break (buf text bol limit)
-  "`buf` with the comment that follows code on point's line broken at its last space within the
-fill column — the comment going on, on the next line, at its own column with its own marker
-(Emacs's `comment-indent-new-line`) — or nil when the line has no such comment or no space in
-it to break at. `text` is the line up to point, `bol` where the line starts. The code before the
-comment is never broken: the break is past the comment's marker."
+(defn break-tail (head tail cont limit)
+  "The text `tail` (what follows the protected `head` on a line — a prefix, or code and its
+comment's marker) re-broken in ONE left-to-right pass so every line fits `limit` display
+columns: words stay on a line while it fits, measured from the line so far; where one does not,
+the spaces before it become a newline and `cont` (the continuation prefix). A word too long for
+any line keeps its own. Answers the new tail, or nil when nothing needed breaking — Emacs's
+`do-auto-fill` loop, without re-measuring the line once per break."
+  (let ([line broke? out] (fold (pieces tail)
+                            [head false ""]
+                            (fn ([line broke? out] [separator word])
+                              (let (candidate (str line separator word))
+                                (if (or (= word "")
+                                      (<= (string/display-width candidate) limit)
+                                      (= (string/trim line) (string/trim (if broke? cont head))))
+                                  [candidate broke? (str out separator word)]
+                                  [(str cont word) true (str out "\n" cont word)])))))
+    (when broke? out)))
+
+(defn- comment-after-code (buf text)
+  ;; `[start marker]` of the comment that follows code on `text` (a line), or nil
   (let (syntax (stringstate/syntax-of buf)
         data (stringstate/lexer-data syntax [])
         tokens (:tokens (stringstate/lex-line data text [nil ""]))
@@ -367,98 +398,67 @@ comment is never broken: the break is past the comment's marker."
                         (fn (token)
                           (and (= (nth token 2) :comment)
                             (> (first token) 0)
-                            (not (blank-line? (string/substring text 0 (first token))))))))
-        start (when comment (first comment)))
-    (when (int? start)
-      (let (marker (string/fill-prefix (string/substring text start (string/length text))
-                     (vec (or (:comments syntax) [])))
-            from (+ start (string/length marker))
-            at (break-offset (string/trimr text) limit from))
-        (when (int? at)
-          (let (space-start (letrec (back (fn (i)
-                                            (if (and (> i from)
-                                                  (= (string/char-at text (dec i)) " "))
-                                              (back (dec i))
-                                              i)))
-                              (back at))
-                space-end (letrec (on (fn (i)
-                                        (if (and (< i (string/length text))
-                                              (= (string/char-at text i) " "))
-                                          (on (inc i))
-                                          i)))
-                            (on at))
-                indent (string/repeat " " (column-of text start))
-                inserted (str "\n" indent (string/trim marker) " ")
-                point (buffer-point buf))
-            (goto-char (replace-region buf (+ bol space-start) (+ bol space-end) inserted)
-              (+ point (- (string/length inserted) (- space-end space-start))))))))))
+                            (not (blank-line? (string/substring text 0 (first token)))))))))
+    (when comment
+      (let (start (first comment))
+        [start
+          (string/fill-prefix (string/substring text start (string/length text))
+            (vec (or (:comments syntax) [])))]))))
 
 (defn auto-fill-line (buf)
-  "`buf` with point's line broken at its last space within the fill column when the text
-before point runs past it — the new line starting with the paragraph's continuation prefix —
-or nil when it needs none. One break, the step `auto-fill-mode` takes on a space or RET."
+  "`buf` with point's line broken until it fits the fill column when the text before point runs
+past it, or nil when it needs none: every break in one left-to-right pass (`break-tail`), each
+new line starting with the paragraph's continuation prefix — the marker of a comment line every
+time — and a comment after code going on at its own column with its marker (Emacs's
+`comment-indent-new-line`); the code itself is never broken. The paragraph is read once."
   (let (rope (buffer-rope buf)
         point (buffer-point buf)
         line (text/char->line rope point)
         bol (text/line->char rope line)
         text (string/substring (line-text rope line) 0 (- point bol))
         limit (fill-column buf)
-        markers (fill-markers buf))
-    (cond
-      (<= (column-of text (string/length text)) limit) nil
-      ;; a code line: only a comment after the code breaks, never the code
-      (and (prog? buf) (= "" (line-marker text markers)))
-        (trailing-comment-break buf text bol limit)
-      else
-        (let (bounds (paragraph-lines buf)
-              first-line (if bounds (first bounds) line)
-              ;; the context the prefixes are read from: the paragraph's first line, and the
-              ;; line after it when point is past it — how the paragraph continues
-              context (if (< first-line line)
-                        (str (line-text rope first-line) "\n" (line-text rope (inc first-line)))
-                        text)
-              prefixes (paragraph-prefixes buf context)
-              own-prefix (string/length (string/fill-prefix text markers))
-              ;; the break keeps the line's own prefix whole
-              at (break-offset (string/trimr text) limit own-prefix))
-          (if (nil? at)
-            nil
-            (let (space-end (letrec (skip (fn (i)
-                                            (if (and (< i (string/length text))
-                                                  (= (string/char-at text i) " "))
-                                              (skip (inc i))
-                                              i)))
-                              (skip at))
-                  ;; the spaces before the break go too
-                  space-start (letrec (skip (fn (i)
-                                              (if (and (> i own-prefix)
-                                                    (= (string/char-at text (dec i)) " "))
-                                                (skip (dec i))
-                                                i)))
-                                (skip at))
-                  inserted (str "\n" (second prefixes))
-                  broken (replace-region buf (+ bol space-start) (+ bol space-end) inserted))
-              ;; point stays where it was in the text
-              (goto-char broken
-                (+ point (- (string/length inserted) (- space-end space-start))))))))))
+        markers (fill-markers buf)
+        code-line? (and (prog? buf) (= "" (line-marker text markers)))
+        plan (cond
+               (<= (column-of text (string/length text)) limit) nil
+               code-line?
+                 (let (found (comment-after-code buf text))
+                   (when found
+                     (let ([start marker] found)
+                       {:from (+ start (string/length marker))
+                        :cont (str (string/repeat " " (column-of text start))
+                                (string/trim marker)
+                                " ")})))
+               else
+                 (let (bounds (paragraph-lines buf)
+                       first-line (if bounds (first bounds) line)
+                       ;; the prefixes are read from the paragraph's first line, and the line
+                       ;; after it when point is past it — how the paragraph continues
+                       context (if (< first-line line)
+                                 (str (line-text rope first-line)
+                                   "\n"
+                                   (line-text rope (inc first-line)))
+                                 text))
+                   {:from (string/length (string/fill-prefix text markers))
+                    :cont (second (paragraph-prefixes buf context))}))
+        from (when plan (:from plan))
+        tail (when (int? from)
+               (break-tail (string/substring text 0 from)
+                 (string/substring text from (string/length text))
+                 (:cont plan)
+                 limit)))
+    (when (and (int? from) tail)
+      ;; the tail before point is replaced; replace-region leaves point after it, where it was
+      (replace-region buf (+ bol from) point tail))))
 
 (defn auto-filled (m buf)
   "`buf` with its line auto-filled when it auto-fills in `m`, else `buf` — the step a typed space
-or RET takes INSIDE its own edit, so one undo takes it all back. Broken again and again until
-the line before point fits (Emacs's `do-auto-fill` loop: a long line yanked or pasted, then a
-space), each new line continuing the paragraph's prefix — a comment's marker every time — and
-never splitting code (`auto-fill-line`); at most `*auto-fill-breaks*` breaks."
+or RET takes INSIDE its own edit, so one undo takes it all back. Broken until the line before
+point fits (Emacs's `do-auto-fill` loop: a long line yanked or pasted, then a space), in one
+pass (`auto-fill-line`)."
   (if (and buf (auto-fill? m buf) (not (read-only? buf)))
-    (letrec (again (fn (b n)
-                     (let (broken (when (< n *auto-fill-breaks*) (auto-fill-line b)))
-                       (if (nil? broken) b (again broken (inc n))))))
-      (again buf 0))
+    (or (auto-fill-line buf) buf)
     buf))
-
-(def *auto-fill-breaks*
-  ;; how many breaks one space or RET may make — a line so long it needs more is cut short
-  ;; rather than holding the key
-  1000)
 
 (defcommand cmd-auto-fill-mode
   (m key)
