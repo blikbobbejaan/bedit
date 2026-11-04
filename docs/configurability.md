@@ -1,11 +1,51 @@
 # The customization surface (design note)
 
-**Status:** design-of-record. **Stage 1 is built (2026-10-23):** the settings registry is
-brood's `std/settings` (ADR-428), and `config.blsp` declares each of its thirteen keys once —
-the check, the fallback and the default file come from the declaration, and an unknown key
-warns. nest's own user config is its other caller. Stages 2–4 (`bind-key` + `key-parse`,
-named hooks, command properties) and a live `M-x set-variable` are not built. The text
-below predates stage 1: "Where we are" describes the editor before it.
+**Status:** design-of-record, partly built. What exists today (2026-11-04):
+
+- **Stage 1, the settings registry** — brood's `std/settings` (ADR-428). `config.blsp`
+  declares every init.blsp key once with `settings/define` (its default, type and doc); the
+  check, the fallback (`config/setting`) and the generated default file come from that
+  declaration, an unknown key warns, and a package declares its own under
+  `:bedit/settings`. nest's own user config is its other caller.
+- **Stage 2's keybinding half** — not as a `bind-key` form but as two DATA keys,
+  `:keys` (Emacs `global-set-key`) and `:mode-keys` (`define-key` in one mode's map),
+  read by std's `key-parse` (brood ADR-535) and compiled by `src/userkeys.blsp`. A
+  binding's command is its M-x name; `nil` unbinds. `C-h k` and `C-h w` report them.
+- **Stage 3, named themes** — `:theme` is a setting, themes are a registry
+  (`themes/register-theme!`, `M-x theme-select`), and a package may add one.
+- **Not built:** named hooks (`add-hook`), command properties (`command-put`), a live
+  `M-x set-variable` / `global-set-key`. Nothing in init.blsp can define a function.
+
+`M-x reload-config` re-reads the file and applies every setting, the keys, the theme and
+the font without a restart; the problems it finds go to *Messages* and the echo area.
+
+The sections below are the design as it was written before stage 1, kept for its
+reasoning; where they name a form (`(setting …)`, `(bind-key …)`, `defsetting`) the built
+surface is the one above.
+
+## What init.blsp is today
+
+`~/.config/bedit/init.blsp` is ONE `(config …)` form, read as data — never evaluated, so
+it cannot hold a `defn`, a `defdyn` or any other code (`M-x eval-buffer` on it reports
+`unbound symbol: config`):
+
+```clojure
+(config
+  :font "JetBrains Mono"
+  :font-size 16
+  :theme "Catppuccin Latte (light)"
+  :show-whitespace {:default false :prog true}
+  :lsp-autostart false
+  :keys {"C-c f" project-find-file     ; bind, by M-x name
+         "<f5>" compile
+         "C-z" nil}                    ; unbind
+  :mode-keys {markdown {"C-c C-c" markdown-preview}})
+```
+
+The first launch writes the file with every key documented and commented out. Code — a
+command of your own — lives in a package: a directory under `~/.config/bedit/packages`
+whose `project.blsp` `:enhances bedit` ([`packages.md`](packages.md)), loaded at startup;
+or, for the session only, in any buffer with `C-x C-e`.
 
 The question that started this: *the editor is internally layered and hot-swappable —
 so why can the user configure almost none of it from their init file?* This note is
@@ -90,7 +130,7 @@ This is the piece every other surface below registers through.
 
 ## The other surfaces (each a thin front door)
 
-### Keybindings as data — `bind-key`
+### Keybindings as data — `bind-key` (built as `:keys` / `:mode-keys`)
 
 The keymaps are data, profiles are a registry, dispatch is late-bound — *everything is
 in place except a user surface*. Need: an init form `(bind-key "C-c g" 'magit/cmd-git-status)`
@@ -98,13 +138,13 @@ plus a live `M-x global-set-key`, folding user binds into a highest-precedence l
 the model scope.
 
 The **only** missing primitive is an Emacs `kbd`-style **string parser**
-(`"C-c C-e"` → `[:ctrl-x :ctrl-e]`). Tellingly, the *label* half already exists
+(`"C-x C-e"` → `[:ctrl-x :ctrl-e]`). Tellingly, the *label* half already exists
 (`keyhelp/ed-key-label`), but in the editor, not in `std/editor/keymap` where its inverse
 belongs. Put both `key-describe` / `key-parse` in `std/editor/keymap` — and the
 "best-guess chord encoding" caveats littering `keymaps.blsp` (`(keyword "alt-%")`, …)
 go away.
 
-### Hooks — `add-hook` / `run-hooks`
+### Hooks — `add-hook` / `run-hooks` (not built)
 
 `std/layers` already fans events across layers (`run-event`: `:activate` / `:on-focus`
 / `:on-close`). What's missing is the *named, user-extensible* hook — Emacs
@@ -114,7 +154,7 @@ at the obvious command seams (`cmd-save` → `:after-save`, layer activation →
 `<mode>-hook`). This is the single biggest "feels like Emacs configurability" win:
 `(add-hook :prog-mode-hook 'my/enable-line-numbers)`.
 
-### Faces + named themes
+### Faces + named themes (built: `:theme`, `M-x theme-select`)
 
 `theme.blsp` is a flat file of `def`s — live-redefinable but not *selectable*
 (no `(setting :theme :catppuccin-latte)`), and `apply-syntax-theme!` is a hardcoded
@@ -123,7 +163,7 @@ already use, so the renderer reads every colour by name from one place and a **t
 pure data**. Add `register-theme`; `:theme` becomes a setting. Shipping a light theme
 becomes a data-only change.
 
-### Command properties — generalize the two registries into one
+### Command properties — generalize the two registries into one (not built)
 
 The editor already invented per-command property registries *twice*
 (`*prefix-consuming*`, `*command-inverse*`) — but then *also* hand-maintains
@@ -177,9 +217,10 @@ want `init.blsp` to do more than three things; the rest follow as the package am
 
 Two notes worth keeping:
 
-- All of this keeps `init.blsp` **declarative data** (ADR-065 holds) — `(setting …)` /
-  `(bind-key …)` / `(add-hook …)` are data forms a registry *interprets*, not eval'd
-  code. User-authored *function bodies* (a custom command) belong in a small local
-  module the config nest `(require)`s, not inline in `init.blsp`.
+- All of this keeps `init.blsp` **declarative data** (ADR-065 holds) — what it says is
+  data a registry *interprets* (as `:keys` / `:mode-keys` are), not eval'd code.
+  User-authored *function bodies* (a custom command) belong in a local package under
+  `~/.config/bedit/packages` (see "What init.blsp is today" above), not inline in
+  `init.blsp` — Brood has no `require` form for an init file to call.
 - Nothing here needs the actor-model rework (`docs/actor-architecture.md`); these are
   all single-process, pure-model abstractions.
