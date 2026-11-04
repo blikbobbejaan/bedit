@@ -27,14 +27,27 @@ kept per pool buffer in the model's `:string-caches` by std's line cache
 (`editor/highlight/line-cache-state`, brood ADR-591): a key reads its line's state from the
 cache (a checkpoint at most a few dozen lines up, or the line an edit touched) and lexes only
 its own line. Balance looks FORWARD from point only as far as the brackets around point close,
-as Emacs's `electric-pair--balance-info` does, at most `*balance-lines*` lines."
+as Emacs's `electric-pair--balance-info` does, at most `*balance-lines*` lines.
+
+**Never a cold walk on a key.** A key lexes at most `*key-lines*` lines to bring the cache to its
+line (`editor/highlight/line-cache-state-within`); past that it GUESSES the line's state from
+the nearest top-level form above it (`guess-line-state`, bounded like the balance) and takes
+that answer for that key. The cache itself is built off the loop: at once when a large buffer
+is visited or a key had to guess (a post-step, `ed-warm-now`), and on the idle beat when it
+fell behind its text (`ed-launch-string-warm`); the reply installs it."
   (:use editor/buffer) ; buffer-rope / buffer-point
   (:use task) ; task — the cache warmed off the loop
   (:use model)) ; ed-mode-service / ed-current-buf / ed-current-index / the registries
 
 (def *balance-lines*
-  ;; how many lines a balance check reads forward from point at most; past it, balanced
+  ;; how many lines a balance check reads forward from point at most; past it, balanced — and
+  ;; how far up a guessed line state looks for a top-level form (`guess-line-state`)
   2000)
+
+(def *key-lines*
+  ;; how many lines a key may lex to bring the cache to its line; past it the line's state is
+  ;; guessed (`guess-line-state`) and the background build (`ed-launch-string-warm`) catches up
+  200)
 
 (def- *default-quote-pairs* [["\"" "\""]])
 (def- *default-bracket-pairs* [["(" ")"] ["[" "]"] ["{" "}"]])
@@ -357,8 +370,27 @@ from `lex-line`."
       (let ([lo hi replacement] splice
             next (text/insert (text/delete rope lo hi) lo replacement)
             change [lo hi (+ lo (string/length replacement))])
-        [(first (editor/highlight/line-cache-state c lexer next (text/char->line next lo) change))
+        [(first (editor/highlight/line-cache-state-within c
+                  lexer
+                  next
+                  (text/char->line next lo)
+                  *key-lines*
+                  change))
           next]))))
+
+(defn guess-line-state (rope data line)
+  "What line `line` of `rope` starts inside, GUESSED within bounds — what a key answers with
+while no cache reaches its line (a large file whose cache is still being built): read from the
+nearest line above it that begins a top-level form by its look (`top-level-line?`), taken to
+start in code, at most `*balance-lines*` up. The background build replaces it when ready."
+  (let (from (letrec (up (fn (at)
+                           (if (or (<= at 0)
+                                 (>= (- line at) *balance-lines*)
+                                 (top-level-line? data (line-text rope at)))
+                             at
+                             (up (dec at)))))
+               (up line)))
+    (fold (range from line) nil (fn (inside i) (inside-after data (line-text rope i) inside)))))
 
 (defn ed-line-state (m idx buf line)
   "`[m' inside]`: what line `line` of `buf` (pool buffer `idx`) starts inside — nil, a
@@ -378,13 +410,16 @@ The edits since the cache last looked come from the buffer's splice log, taken o
                            (let ([c _] (through-splices prior (:lexer entry) old splices)
                                  [lo hi replacement] (last splices))
                              [c [lo hi (+ lo (string/length replacement))]]))
-        [cache inside] (editor/highlight/line-cache-state moved
-                         (:lexer entry)
-                         (buffer-rope buf)
-                         line
-                         change))
-    [(assoc m :string-caches (assoc (or (:string-caches m) {}) idx (assoc entry :cache cache)))
-      inside]))
+        [cache known? inside] (editor/highlight/line-cache-state-within moved
+                                (:lexer entry)
+                                (buffer-rope buf)
+                                line
+                                *key-lines*
+                                change))
+    [(assoc m
+       :string-caches
+         (assoc (or (:string-caches m) {}) idx (assoc entry :cache cache :guessed (not known?))))
+      (if known? inside (guess-line-state (buffer-rope buf) (:data entry) line))]))
 
 (defn ed-drop-string-cache-slot (m killed)
   "Drop pool slot `killed`'s string cache ahead of its removal from the pool, shifting the
@@ -698,8 +733,8 @@ its edits taken from the splice log, cheap — so the task starts from an exact 
 (sig ed-apply-string-warm (model any -> model))
 (defn ed-apply-string-warm (m result)
   "A finished warm: its cache becomes that pool buffer's, with the rope it was warmed over —
-unless the buffer's entry moved on meanwhile (its syntax changed, or the loop asked about a
-newer text), which keeps the loop's."
+unless the buffer's syntax changed meanwhile. Edits made since it was launched move it on the
+next question, from the buffer's splice log."
   (let (idx (:string-warm-index m)
         rope (:string-warm-rope m)
         warmed (when (map? result) (:cache result))
@@ -711,17 +746,36 @@ newer text), which keeps the loop's."
         entry (when (int? idx) (get (or (:string-caches cleared) {}) idx)))
     (cond
       (nil? warmed) (assoc cleared :string-warm-failed rope)
-      (or (nil? entry)
-        (not (= (:stamp entry) (:string-warm-stamp m)))
-        (not (= (:rope (:cache entry)) rope)))
-        cleared
+      (or (nil? entry) (not (= (:stamp entry) (:string-warm-stamp m)))) cleared
       else
         (assoc cleared
           :string-caches
-            (assoc (:string-caches cleared) idx (assoc entry :cache (assoc warmed :rope rope)))))))
+            (assoc (:string-caches cleared)
+              idx (dissoc (assoc entry :cache (assoc warmed :rope rope)) :guessed))))))
 
 (register-task-reply :string-warm-proc 'stringstate/ed-apply-string-warm nil nil)
 
 ;; `:stale?` ARMS the beat: a large file opened and only read has no edit to arm one
 (register-idle-job :string-warm
   {:order 95 :run 'stringstate/ed-launch-string-warm :stale? 'stringstate/ed-string-warm-stale?})
+
+(defn ed-string-warm-urgent? (m)
+  "True when the current large buffer's cache must not wait for the idle beat: it has none —
+the buffer was just created or visited — or a key had to GUESS its line's state because the
+cache did not reach it (`guess-line-state`: a cold region, or the tail after an edit that
+changed what every line below it starts inside). O(1), asked after every event."
+  (let (buf (ed-current-buf m)
+        rope (buffer-rope buf)
+        entry (get (or (:string-caches m) {}) (ed-current-index m)))
+    (and (not (:string-warm-proc m))
+      (not (= rope (:string-warm-failed m)))
+      (> (text/line-count rope) *warm-lines*)
+      (or (nil? entry) (= true (:guessed entry))))))
+
+(defn ed-warm-now (m)
+  "The post-step that starts the background build at once when it is urgent
+([[ed-string-warm-urgent?]]) — on a large buffer's visit, and after an edit that invalidated a
+large tail — rather than on the next idle beat."
+  (if (ed-string-warm-urgent? m) (ed-launch-string-warm m) m))
+
+(register-post-step :string-warm-now {:order 60 :run 'stringstate/ed-warm-now})

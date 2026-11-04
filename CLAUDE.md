@@ -382,7 +382,10 @@ src/stringstate.blsp        where a buffer's strings and comments are (Emacs's s
                             what each line starts inside lives in the model's `:string-caches` (std's
                             line cache, `line-cache-state`, brood ADR-591) and edits move it by the
                             splice log, so a key lexes its own line (~5 ms at the end of a 1 MB
-                            file); a large buffer's cache is warmed off the loop on the idle beat.
+                            file). A key never walks a cold region: it lexes at most `*key-lines*`
+                            (`line-cache-state-within`) and past that guesses from the nearest
+                            top-level form; a large buffer's cache is built off the loop at once
+                            on its visit or a guess (a post-step) and on the idle beat.
                             The held tree-sitter parse answers first when it is current and whole.
                             Brackets are counted from point's top-level form forward until they
                             close; electric pairs ask it to open, close or skip, M-q for the string
