@@ -18,6 +18,7 @@ the reverse: the two things find-file needs from above it — the hex view of a 
   (:use mincomplete) ; ed-complete-name / ed-complete-path / path candidates — the prompts
   (:use projects) ; project-root / file-display-name / remember-* — the project a file is in
   (:use autosave) ; auto-save sidecars + auto-revert
+  (:use conventions :only [prepare-for-save]) ; .editorconfig's trailing whitespace / final newline
   (:use model)) ; the pool + layout accessors, ed-stamp, message, ed-mb-edit
 ;; collab (unshare a killed slot), hosted (drop / rekey a slot), editor/layers (close hooks,
 ;; buffer types) and text (line->char) are referenced qualified below and auto-load.
@@ -39,11 +40,52 @@ the fuzzy ranking's `:boost`)."
    :rank-boost (if (empty? recent) nil (projects/history-boost recent))
    :accept-selection true})
 
-(defn- utf8-file? (path)
-  "True when the bytes at `path` decode as UTF-8 — a text file `find-file-buffer` can read.
-The decode failing IS the answer (a binary), so the error is the verdict, not a fault."
-  (check-allow :discarded-catch
-    (try (do (string/bytes-> (file/slurp-bytes path)) true) (catch e false))))
+(defn ed-large-file-size (path threshold)
+  "The size of the file at `path` when it is over `threshold` bytes — a file to ask about
+before reading it — else nil: within it, missing, a directory, or `threshold` 0 (never ask)."
+  (let (size (file/size path))
+    (when (and (> threshold 0) (int? size) (> size threshold) (not (file/dir? path))) size)))
+
+(defn ed-large-file-question (m path)
+  "The question to ask before opening `path`, or nil to open it at once: nil when it is
+already open, or not large ([[ed-large-file-size]] against `:large-file-warning-threshold` on
+the model, else `config/*large-file-warning-default*`)."
+  (let (size (ed-large-file-size path
+               (or (:large-file-warning-threshold m) config/*large-file-warning-default*)))
+    (when (and size (nil? (ed-buffer-index-by-file m (path/normalize (path/absolute path)))))
+      (str "File "
+        (path/basename path)
+        " is large ("
+        (humanize/byte-size size)
+        "), really open? (y or n)"))))
+
+;; check-allow: `open` is caller-supplied, so the checker cannot see what it returns (ADR-341's
+;; `:trusted`, as `commands/ed-map-y-or-n`).
+(check-allow :trusted
+  (sig ed-visit-file (model string &optional any -> model))
+  (defn ed-visit-file (m path &optional (open nil))
+    "Open `path` as a person asked to — the find-file prompt, dired's RET, a recent or project
+file, embark's open: `open` (a `(model path) -> model`, [[ed-find-file]] by default; C-x 4 f
+passes its other-window one), after asking first when the file is large
+([[ed-large-file-question]]). A caller that goes on to act on the buffer it opened (a jump,
+an edit a language server sent) calls `ed-find-file` itself, since a question would leave
+it acting on whichever buffer was current."
+    (let (opener (or open ed-find-file)
+          question (ed-large-file-question m path))
+      (if (nil? question)
+        (opener m path)
+        (ed-read-char m
+          question
+          (fn (mm k) (if (ed-yes-key? k) (opener mm path) (message mm "not opened"))))))))
+
+(defn ed-read-file (path)
+  "The file at `path`, read ONCE: `{:text}` when its bytes decode as UTF-8, else `{:bytes}`
+(a binary, for the hex view). It used to be read twice — a decode to ask whether it was
+text, then the read that built the buffer. Raises when the file cannot be read."
+  (let (bytes (file/slurp-bytes path)
+        ;; the decode failing IS the answer (a binary), so the error is the verdict
+        text (check-allow :discarded-catch (try (string/bytes-> bytes) (catch e nil))))
+    (if (nil? text) {:bytes bytes} {:text text})))
 
 ;; ---- dired lives in src/dired.blsp, the hex view in src/hexl.blsp -----------------
 ;; Both build on this module (the find-file prompt, the default directory, the line
@@ -70,12 +112,12 @@ anywhere does. Loads `dired` on first use; by then this module has finished load
 
 ;; check-allow: as above — `hexl/ed-open-binary` is resolved late and answers a model.
 (check-allow :trusted
-  (defn- ed-open-binary (m path root)
-    "Open `path`, a file that is not UTF-8, as a read-only hex view
+  (defn ed-open-binary (m path root bytes)
+    "Open `path`, a file that is not UTF-8 (its `bytes`, already read), as a read-only hex view
 (`hexl/ed-open-binary`, Emacs `hexl-mode`). Loads `hexl` on first use; by then this module
 has finished loading."
-    (do (require-one 'hexl) ((reflect/eval 'hexl/ed-open-binary) m path root))))
-(sig ed-open-binary (model string any -> model))
+    (do (require-one 'hexl) ((reflect/eval 'hexl/ed-open-binary) m path root bytes))))
+(sig ed-open-binary (model string any any -> model))
 
 (sig ed-goto-line (buffer int -> buffer))
 (defn ed-goto-line (b n)
@@ -357,14 +399,17 @@ pane; if the buffer is already visible, that pane is refreshed in place (press-t
 (defn- ed-ensure-file-buffer (m path)
   "Ensure the (absolute) `path` is in the pool WITHOUT changing selection — returns
 `[m idx]`. Reuses an open buffer for the file, else reads-or-news it (find-file
-semantics: an existing file is read, a missing one starts a fresh backed buffer)."
+semantics: an existing file is read, a missing one starts a fresh backed buffer). A file
+with a line over `:so-long-threshold` comes in in so-long's cheap state, and says so."
   (let (idx (ed-buffer-index-by-file m path))
     (if idx
       [m idx]
       (let (root (or (project-root (path/dirname path)) (:project-root m))
-            buf (ed-stamp (assoc (find-file-buffer path) :name (file-display-name path root)))
-            bufs (into (:buffers m) [(ed-inherit-dir m buf)]))
-        [(assoc m :buffers bufs) (dec (count bufs))]))))
+            read (ed-stamp (assoc (find-file-buffer path) :name (file-display-name path root)))
+            [buf so-long-note] (solong/so-long-visit read (solong/model-threshold m))
+            bufs (into (:buffers m) [(ed-inherit-dir m buf)])
+            added (assoc m :buffers bufs))
+        [(if so-long-note (message added so-long-note) added) (dec (count bufs))]))))
 
 (defn ed-pop-to-index (m idx &optional (line nil))
   "Show pool buffer `idx` at (1-based) `line` in a pane OTHER than the current one, select
@@ -462,24 +507,39 @@ a hex view (`ed-open-binary`)."
           ;; display name is project-relative inside a project, else the basename
           ;; (`file-display-name`) — `:file` keeps the full path for saving / dedup.
           ;; A file that exists but is not UTF-8 (an ELF, an image) opens as a hex view
-          ;; (`ed-open-binary`, Emacs hexl-mode) instead of failing on the decode.
-          (if (and (file/exists? path) (not (utf8-file? path)))
-            (ed-open-binary m path root)
-            (try
-              (let (opened-buf (assoc (find-file-buffer path) :name (file-display-name path root))
-                    ;; save-place: back where you left it (live editor only, like recentf)
-                    buf (if (:save-place m) (saveplace/restore-place opened-buf) opened-buf)
-                    opened (ed-open-buffer m buf)
-                    ;; a sidecar newer than the file: unsaved text from a session that ended
-                    ;; without saving — said INSTEAD of the open notice, so it is what you read
-                    recovery (ed-recovery-note path))
-                (message opened
-                  (or recovery
-                    (str (if (file/exists? path) (str "opened " path) (str "new file " path))
-                      ;; a tree-sitter language with no grammar loaded says how to get one
-                      (grammars/missing-note (ed-current-buf opened))))))
-              (catch e (message m (str "open failed: " (error-message e))))))))))
+          ;; (`ed-open-binary`, Emacs hexl-mode) instead of failing on the decode. The
+          ;; file is read ONCE (`ed-read-file`): the decode that tells text from binary
+          ;; is the text the buffer is built from.
+          (let (exists? (file/exists? path)
+                contents (when exists? (try (ed-read-file path) (catch e {:error e}))))
+            (cond
+              (:error contents) (message m (str "open failed: " (error-message (:error contents))))
+              (:bytes contents) (ed-open-binary m path root (:bytes contents))
+              else (ed-open-text m path root (:text contents))))))))
 (sig ed-find-file (model string -> model))
+
+(defn- ed-open-text (m path root text)
+  "The pool with `path` open in a new buffer holding `text` (its contents, already read —
+nil for a file that does not exist yet), selected, and the open said in the echo area."
+  (try
+    (let (opened-buf (assoc (if (nil? text) (find-file-buffer path) (buffer-from-file path text))
+                       :name (file-display-name path root))
+          ;; save-place: back where you left it (live editor only, like recentf)
+          placed (if (:save-place m) (saveplace/restore-place opened-buf) opened-buf)
+          ;; so-long: a line over `:so-long-threshold` puts the buffer in its cheap state at
+          ;; once, before the first frame lays that line out
+          [buf so-long-note] (solong/so-long-visit placed (solong/model-threshold m))
+          opened (ed-open-buffer m buf)
+          ;; a sidecar newer than the file: unsaved text from a session that ended
+          ;; without saving — said INSTEAD of the open notice, so it is what you read
+          recovery (ed-recovery-note path))
+      (message opened
+        (or recovery
+          (str (if (nil? text) (str "new file " path) (str "opened " path))
+            ;; a tree-sitter language with no grammar loaded says how to get one
+            (grammars/missing-note (ed-current-buf opened))
+            (if so-long-note (str " — " so-long-note) "")))))
+    (catch e (message m (str "open failed: " (error-message e))))))
 
 (defn ed-default-dir (m)
   "The current buffer's directory (Emacs `default-directory`) — its **`:dir`**: every buffer
@@ -555,7 +615,7 @@ and the list re-reads inside it).
 `open` is a parameter so `C-x 4 f` is this same prompt with a different destination
 (`ed-find-file-other-window`). WHERE a buffer goes is the only thing the two commands
 disagree about; Emacs splits them into two functions and bedit does not need to."
-  (ed-path-prompt (or prompt "Find file: ") initial recent (or open ed-find-file)))
+  (ed-path-prompt (or prompt "Find file: ") initial recent (or open ed-visit-file)))
 
 (defn ed-project-root (m)
   "The current project's root — resolved **live from the current buffer's directory**
@@ -606,6 +666,20 @@ CREATES a file does, since the next `C-x p f` must list it although git's index 
                 (assoc acc root (assoc entry :stale true))
                 acc)))))))
 
+(defn- ed-ship-save-edits (m i original prepared)
+  "`m` with the edits a save made before writing (`prepared` from `original`: the
+`.editorconfig` fix-ups) already sent to pool slot `i`'s buffer process, when it is hosted
+and they changed anything. The link remembers the buffer it brought the process up to
+(`:synced`), so the loop tail's `hosted/hosted-propagate` diffs from there and does not send
+them a second time."
+  (let (link (map/get-in m [:hosted i]))
+    (if (or (nil? (:proc link)) (= (buffer-rope original) (buffer-rope prepared)))
+      m
+      (map/assoc-in m
+        [:hosted i]
+        (assoc (editor/buffer-client/link-propagate-buffers link original prepared)
+          :synced prepared)))))
+
 (sig ed-save-buf-at (model int -> model))
 (defn ed-save-buf-at (m i)
   "Write pool buffer `i` to its file: the plain save every path shares — `C-x C-s` on the
@@ -615,8 +689,13 @@ reports the outcome in the echo area either way. The diff-hl gutter is NOT recom
 here: a save writes the working tree but touches neither the buffer text nor HEAD, so
 the buffer-vs-HEAD diff is unchanged (and any prior edit already refreshed it via the
 rope-keyed idle recompute). Leaving the cached `:vcs-line-status` in place keeps the bars
-steady — dropping it made them blink off and back on each save."
-  (let (buf (ed-buf-at m i))
+steady — dropping it made them blink off and back on each save.
+
+The buffer is first made what its `.editorconfig` asks (`conventions/prepare-for-save`:
+trailing whitespace trimmed, a final newline added) — edits on the buffer, so what is
+written is what is shown."
+  (let (original (ed-buf-at m i)
+        buf (prepare-for-save original))
     (try
       ;; `save-buffer` answers the buffer stamped with the file's new mtime, so the idle
       ;; beat's change check (`ed-revert-changed-files`) knows text and file agree again
@@ -624,7 +703,11 @@ steady — dropping it made them blink off and back on each save."
             created? (and (string? f) (not (file/exists? f)))
             saved (dissoc (save-buffer buf) :disk-warned)
             m1 (dissoc (ed-set-buf-at m i saved) :status)
-            m2 (if created? (ed-project-files-forget m1 f) m1))
+            ;; the save's own edits reach a hosted slot's process BEFORE it is told the
+            ;; buffer is saved, below — left to the loop tail they would land after the
+            ;; mark and leave the process modified
+            m2 (ed-ship-save-edits (if created? (ed-project-files-forget m1 f) m1)
+                 i original buf))
         (do
           (ed-remove-auto-save f)
           ;; A HOSTED slot's buffer process owns the buffer's state, and it has to hear about

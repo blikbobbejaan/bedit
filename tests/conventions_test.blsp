@@ -1,0 +1,244 @@
+;; A buffer's indentation and fill conventions (src/conventions.blsp): which of the buffer,
+;; its .editorconfig, the user's init.blsp and its mode's own say wins, and every consumer
+;; reading the resolved value — Shift-TAB, TAB / RET's indenter, tabs, M-q, the save.
+(defmodule conventions-test
+  (:use test)
+  (:use model)
+  (:use-internals input) ; ed-update
+  (:use editor/buffer)
+  ;; the user's settings and the .editorconfig switch, rebound per test: a `binding` is the
+  ;; test's own, where setting the global would reach the tests running beside it
+  (:use conventions) ; *user-settings*
+  (:use editorconfig)) ; *enabled*
+
+(purge-stale-temp "bedit-conventions-")
+;; at load, so the `when` below sees whether Python's grammar is installed
+(grammars/load-user-grammars)
+
+(defn- file-model (text file &optional (editorconfig nil))
+  ;; a model over `text` visiting `file`, with `editorconfig` as what its .editorconfig said
+  (let (buffer (make-buffer text file file))
+    (ed-init (if (nil? editorconfig) buffer (assoc buffer :editorconfig editorconfig)))))
+
+(defn- cur (m) (ed-current-buf m))
+(defn- at (m point) (ed-set-buf m (goto-char (cur m) point)))
+(defn- press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+(defn- text-after (m keys) (buffer-text (cur (press m keys))))
+
+(describe "precedence"
+  (test "with nothing said, Emacs's defaults"
+    (let (buf (cur (file-model "" "/p/notes.txt")))
+      (assert= (conventions/indent-width buf) 2)
+      (assert= (conventions/tab-width buf) 8)
+      (is (not (conventions/indent-tabs? buf)))
+      (assert= (conventions/fill-column buf) 70)))
+  (test "a language's own convention: Python 4 and 79, Go one tab, Ruby and Brood 2"
+    (assert= (conventions/indent-width (cur (file-model "" "/p/a.py"))) 4)
+    (assert= (conventions/fill-column (cur (file-model "" "/p/a.py"))) 79)
+    (assert= (conventions/indent-width (cur (file-model "" "/p/a.rb"))) 2)
+    (assert= (conventions/indent-width (cur (file-model "" "/p/a.blsp"))) 2)
+    (let (go (cur (file-model "" "/p/main.go")))
+      (is (conventions/indent-tabs? go))
+      (assert= (conventions/setting go :indent-width) :tab)
+      (assert= (conventions/indent-width go) 8))
+    (is (conventions/indent-tabs? (cur (file-model "" "/p/Makefile")))))
+  (test "the user's :default sits under a language's convention, and their entry for a mode over it"
+    (binding (*user-settings* {:indent-width {:default 3 'python 6}})
+      (assert= (conventions/indent-width (cur (file-model "" "/p/notes.txt"))) 3)
+      (assert= (conventions/indent-width (cur (file-model "" "/p/a.rb"))) 2)
+      (assert= (conventions/indent-width (cur (file-model "" "/p/a.py"))) 6)
+      (assert= (conventions/source (cur (file-model "" "/p/a.py")) :indent-width) :user-mode)))
+  (test "an entry for prog reaches every code mode, and a bare value is a default"
+    (binding (*user-settings* {:fill-column {'prog 100} :tab-width 4})
+      (assert= (conventions/fill-column (cur (file-model "" "/p/a.py"))) 100)
+      (assert= (conventions/fill-column (cur (file-model "" "/p/notes.txt"))) 70)
+      (assert= (conventions/tab-width (cur (file-model "" "/p/notes.txt"))) 4)))
+  (test ".editorconfig beats the user's entry for the mode, and the buffer's own beats both"
+    (binding (*user-settings* {:indent-width {'python 6}})
+      (let (buf (cur (file-model "" "/p/a.py" {:indent-width 3})))
+        (assert= (conventions/indent-width buf) 3)
+        (assert= (conventions/source buf :indent-width) :editorconfig)
+        (assert= (conventions/indent-width (conventions/with-buffer-setting buf :indent-width 5)) 5))))
+  (test "an editorconfig indent of tab is the tab width"
+    (let (buf (cur (file-model "" "/p/a.c" {:indent-tabs true :indent-width :tab :tab-width 4})))
+      (assert= (conventions/indent-width buf) 4)
+      (assert= (conventions/indentation buf 10) "\t\t  "))))
+
+(describe "Shift-TAB dedents by the buffer's indent width"
+  (test "Python dedents by 4"
+    (assert= (text-after (at (file-model "        x = 1" "/p/a.py") 8) [:back-tab]) "    x = 1"))
+  (test "a text buffer still dedents by 2"
+    (assert= (text-after (at (file-model "    x" "/p/a.txt") 4) [:back-tab]) "  x"))
+  (test "an .editorconfig indent_size of 3 dedents by 3"
+    (assert= (text-after (at (file-model "      x" "/p/a.txt" {:indent-width 3}) 6) [:back-tab])
+      "   x"))
+  (test "a Go line indented with tabs dedents by ONE tab, not eight characters"
+    (assert= (text-after (at (file-model "\t\t\tx" "/p/main.go") 3) [:back-tab]) "\t\tx")))
+
+(describe "the indenter and the indentation it writes"
+  (test "a Go buffer writes a level as a tab, at the user's tab width for Go"
+    (binding (*user-settings* {:tab-width {'go 4}})
+      (let (buf (cur (file-model "" "/p/main.go")))
+        (assert= (conventions/indent-width buf) 4)
+        (assert= (commands/ed-indentation buf 8) "\t\t"))))
+  (test "a user who wants tabs in C gets them"
+    (binding (*user-settings* {:indent-tabs {'c true}})
+      (assert= (commands/ed-indentation (cur (file-model "" "/p/a.c")) 9) "\t ")))
+  (when (grammars/grammar-loaded? :python)
+    (test "Python's indenter counts a level as the buffer's width: 4, or 2 from .editorconfig"
+      (let (source "def f():\n pass\n"
+            body (index-of source "pass"))
+        (assert= (text-after (at (file-model source "/p/a.py") body) [:tab]) "def f():\n    pass\n")
+        (assert= (text-after (at (file-model source "/p/a.py" {:indent-width 2}) body) [:tab])
+          "def f():\n  pass\n")))))
+
+(describe "M-q fills to the buffer's fill column"
+  (def- paragraph "one two three four five six seven eight nine ten eleven twelve thirteen")
+  (defn- widest (text) (reduce (map (string/split text "\n") string/length) 0 math/max))
+  (test "an .editorconfig max_line_length of 20"
+    (let (filled (text-after (file-model paragraph "/p/a.txt" {:fill-column 20}) [:alt-q]))
+      (is (<= (widest filled) 20))
+      (is (> (widest filled) 14))
+      (assert= (string/replace filled "\n" " ") paragraph)))
+  (test "M-x set-fill-column sets it for this buffer, from point's column or C-u's count"
+    (let (m (at (file-model paragraph "/p/a.txt") 25)
+          set (commands/cmd-set-fill-column m nil))
+      (assert= (conventions/fill-column (cur set)) 25)
+      (is (<= (widest (text-after set [:alt-q])) 25)))))
+
+(describe "a save does what .editorconfig asks"
+  (test "trailing whitespace trimmed and a final newline added, as one undo step"
+    (let (buf (assoc (make-buffer "a  \nb\t\r\nc" "/p/a.txt" "/p/a.txt")
+                :editorconfig {:trim-trailing-whitespace true :insert-final-newline true})
+          prepared (conventions/prepare-for-save buf))
+      (assert= (buffer-text prepared) "a\nb\r\nc\n")
+      (assert= (buffer-text (undo prepared)) "a  \nb\t\r\nc")))
+  (test "nothing asked, nothing changed"
+    (let (buf (make-buffer "a  " "/p/a.txt" "/p/a.txt"))
+      (assert= (buffer-text (conventions/prepare-for-save buf)) "a  ")))
+  (test "a visited file reads its .editorconfig, and C-x C-s writes what it asks"
+    (let (dir (temp-dir "bedit-conventions-")
+          _ (file/mkdir (path/join dir "src"))
+          _ (file/spit (path/join dir ".editorconfig")
+              "root = true\n[*]\ntrim_trailing_whitespace = true\ninsert_final_newline = true\n[*.py]\nindent_size = 3\n")
+          file (path/join dir "src" "a.py")
+          _ (file/spit file "x = 1   ")
+          m (pool/ed-find-file (ed-init (make-buffer "")) file)
+          buf (cur m))
+      (assert= (conventions/indent-width buf) 3)
+      (assert= (conventions/source buf :indent-width) :editorconfig)
+      (pool/ed-save-buf-at m (ed-current-index m))
+      (assert= (file/slurp file) "x = 1\n")))
+  (test ":editorconfig false in init.blsp leaves the files unread"
+    (let (dir (temp-dir "bedit-conventions-")
+          _ (file/mkdir dir)
+          _ (file/spit (path/join dir ".editorconfig") "[*]\nindent_size = 7\n")
+          file (path/join dir "a.txt"))
+      (binding (*enabled* false)
+        (assert= (conventions/indent-width (cur (file-model "" file))) 2))
+      (assert= (conventions/indent-width (cur (file-model "" file))) 7))))
+
+(describe "end_of_line and charset"
+  (defn- project-asking (config)
+    ;; a fresh directory whose .editorconfig is `config`; its path
+    (let (dir (temp-dir "bedit-conventions-"))
+      (file/mkdir dir)
+      (file/spit (path/join dir ".editorconfig") config)
+      dir))
+  (test "a NEW file takes the line ending .editorconfig asks for, and is saved with it"
+    (let (file (path/join (project-asking "[*]\nend_of_line = crlf\n") "new.txt")
+          m (pool/ed-find-file (ed-init (make-buffer "")) file)
+          typed (ed-set-buf m (insert (cur m) "a\nb\n")))
+      (assert= (:eol (cur m)) :crlf)
+      (pool/ed-save-buf-at typed (ed-current-index typed))
+      (assert= (file/slurp file) "a\r\nb\r\n")))
+  (test "an EXISTING file keeps its own, and describe-indentation says they disagree"
+    (let (file (path/join (project-asking "[*]\nend_of_line = crlf\ncharset = latin1\n") "old.txt")
+          _ (file/spit file "a\n")
+          m (pool/ed-find-file (ed-init (make-buffer "")) file)
+          said (:echo (commands/cmd-describe-indentation m nil)))
+      (is (nil? (:eol (cur m))))
+      (is (includes? said "line ends LF; .editorconfig asks CRLF (not converted)"))
+      (is (includes? said ".editorconfig asks charset latin1; bedit reads and writes UTF-8"))
+      (pool/ed-save-buf-at m (ed-current-index m))
+      (assert= (file/slurp file) "a\n")))
+  (test "a NEW file takes the byte-order mark charset = utf-8-bom asks for"
+    (let (file (path/join (project-asking "[*]\ncharset = utf-8-bom\n") "new.txt")
+          m (pool/ed-find-file (ed-init (make-buffer "")) file)
+          typed (ed-set-buf m (insert (cur m) "a\n")))
+      (is (:bom (cur m)))
+      (pool/ed-save-buf-at typed (ed-current-index typed))
+      (assert= (file/slurp file) "\u{feff}a\n")))
+  (test "an EXISTING file keeps its mark or its lack of one, and is told so"
+    (let (file (path/join (project-asking "[*]\ncharset = utf-8\n") "marked.txt")
+          _ (file/spit file "\u{feff}a\n")
+          m (pool/ed-find-file (ed-init (make-buffer "")) file)
+          said (:echo (commands/cmd-describe-indentation m nil)))
+      (is (includes? said "file has a byte-order mark; .editorconfig asks utf-8 (not converted)"))
+      (pool/ed-save-buf-at m (ed-current-index m))
+      (assert= (file/slurp file) "\u{feff}a\n")))
+  (test "nothing is said when the file already agrees"
+    (let (file (path/join (project-asking "[*]\nend_of_line = crlf\ncharset = utf-8\n") "crlf.txt")
+          _ (file/spit file "a\r\n")
+          m (pool/ed-find-file (ed-init (make-buffer "")) file)
+          said (:echo (commands/cmd-describe-indentation m nil)))
+      (assert= (:eol (cur m)) :crlf)
+      (is (not (includes? said "line ends")))
+      (is (not (includes? said "charset"))))))
+
+(describe "a tab is shown at the buffer's tab width"
+  ;; `[text-column cursor-column]`: where the line's `x` is painted, and the caret on it
+  (defn- painted (m point)
+    (let (ops (view/ed-view (at m point) 40 8)
+          text (seq/find ops
+                 (fn (op)
+                   (and (vector? op)
+                     (= (first op) :text)
+                     (includes? #{"x" "q"} (string/trim (nth op 3 ""))))))
+          cursor (seq/find ops (fn (op) (and (vector? op) (= (first op) :cursor)))))
+      {:text text
+       :x (+ (nth text 2) (math/max (index-of (nth text 3) "x") (index-of (nth text 3) "q")))
+       :cursor (nth cursor 2)}))
+  (test "a tab is 8 cells by default, and 4 at a tab width of 4 — the caret on the x"
+    ;; two texts, so no cell measure is shared between the cases through a memo
+    (let (default (painted (file-model "\tx\n" "/p/main.txt") 1)
+          narrow (binding (*user-settings* {:tab-width {:default 4}})
+                   (painted (file-model "\tx\n\n" "/p/other.txt") 1)))
+      (assert= (:x default) (:cursor default))
+      (assert= (:x narrow) (:cursor narrow))
+      (assert= (- (:x default) (:x narrow)) 4)
+      (is (string/starts-with? (nth (:text narrow) 3) "    x"))))
+  (test "the SAME text at another tab width is measured again — no remembered cell is reused"
+    ;; the view remembers cells by the text (`ed-point-cell-at`, `ed-row-facts-at`, …); a
+    ;; reload that changes only the tab width must not get back the width it had before
+    (let (m (file-model "\tq\n" "/p/same.txt")
+          default (painted m 1)
+          narrow (binding (*user-settings* {:tab-width {:default 4}}) (painted m 1)))
+      (assert= (- (:x default) (:x narrow)) 4)
+      (assert= (:x narrow) (:cursor narrow))))
+  (test "a click on the cell after a 4-wide tab lands on the character after it"
+    (binding (*user-settings* {:tab-width {:default 4}})
+      (let (buf (cur (file-model "\ty\n" "/p/click.txt")))
+        (assert= (panes/ed-buf-offset-at buf 0 0 0 1 0 4) 1)
+        (assert= (panes/ed-buf-offset-at buf 0 0 0 1 0 3) 0)))))
+
+(describe "the init.blsp settings"
+  (test "each takes a value or a per-mode map, and refuses a bad one"
+    (is (config/indent-width-valid? 4))
+    (is (config/indent-width-valid? :tab))
+    (is (config/indent-width-valid? {:default 2 'python 4}))
+    (is (not (config/indent-width-valid? 0)))
+    (is (not (config/width-valid? {'go "four"})))
+    (is (config/indent-tabs-valid? {'go true}))
+    (assert= (config/convention-settings {:fill-column 80})
+      {:indent-width {:default 2}
+       :tab-width {:default 8}
+       :indent-tabs {:default false}
+       :fill-column 80
+       :editorconfig true}))
+  (test "M-x describe-indentation says each value and where it came from"
+    (let (said (:echo (commands/cmd-describe-indentation (file-model "" "/p/a.py" {:tab-width 4})
+                        nil)))
+      (is (includes? said "indent 4 (the mode)"))
+      (is (includes? said "tab 4 (.editorconfig)"))
+      (is (includes? said "fill 79")))))

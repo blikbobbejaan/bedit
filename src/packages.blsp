@@ -7,16 +7,28 @@ project's build `_deps`, so a plugin is something a user adds live, never a buil
 The heavy lifting is std's: `package/registry-install` (download + sha-VERIFY + extract),
 `package/registry-enhancers` (list installable bedit plugins — the runtime `--enhances`),
 `package/registry-latest-version` (update checks), and `project/enhancers-in` (which INSTALLED
-packages enhance bedit). This module is bedit's POLICY: the user dir + load-path, applying and
-unapplying a contribution (themes today), and the UI. A plugin that lacks its entry or throws
-is skipped — one bad package never blocks the editor."
+packages enhance bedit). Each answers a failure CARRYING ITS REASON (brood ADR-559) — the
+registry unreachable, the package unpublished, a failed download, a checksum mismatch — and
+that reason is what the echo area and the *Packages* status line say.
+
+Fetching the list, installing and updating are network work, so each runs OFF the loop as a
+`std/task` (`*package-job-timeout-ms*`): one at a time, C-g cancels it, C-x C-c asks while it
+runs, and the *Packages* buffer's status line says what is running and how the last one
+ended. An install lands in a STAGING directory first and is moved into place only when it
+downloaded, verified and enhances this bedit — so a failed, refused or cancelled install
+leaves the copy that was there. Removing is local and stays on the loop.
+
+This module is bedit's POLICY: the user dir + load-path, applying and unapplying a
+contribution (themes today), and the UI. A plugin that lacks its entry or throws is not
+applied, and the install says why — one bad package never blocks the editor."
   (:use editor/keymap :only [keymap-bind]) ; the mode keymap below
   (:use interactive) ; defcommand — the M-x commands
   (:use themes) ; register-theme! / unregister-theme! — apply/unapply a theme contribution
   (:use config) ; config-dir — the user package dir lives under it
-  (:use model) ; message — echo results
-  (:use pool) ; ed-show-named / ed-name-prompt / ed-goto-line
-  (:use editor/buffer)) ; buffer-current-line — the *Packages* row at point
+  (:use model) ; message / ed-headless? / register-task-reply / register-exit-query
+  (:use pool) ; ed-show-named / ed-name-prompt / ed-goto-line / ed-upsert-named
+  (:use editor/buffer) ; buffer-current-line — the *Packages* row at point
+  (:use task :only [task])) ; task — the network work runs off the loop
 ;; A plugin needing a newer bedit than we are is not applied. What its `:enhances {bedit …}`
 ;; constraint is checked against comes from `about/bedit-version` — the manifest, read at
 ;; the moment it is asked — rather than a constant here "kept in lockstep with project.blsp".
@@ -24,6 +36,19 @@ is skipped — one bad package never blocks the editor."
 ;; (0.4.1), so every plugin declaring `:enhances {bedit ">= 0.3"}` was silently refused. A
 ;; version a human has to remember to copy is a version that is wrong.
 (def *bedit-name* "bedit")
+
+(def *package-job-timeout-ms* 300000)
+;; Five minutes before a list fetch, an install or an update is killed and reported as timed
+;; out: a large plugin over a slow link takes a while, a registry that never answers should
+;; not hold the one package slot for the rest of the session.
+
+(defdyn *registry*
+  {:enhancers (fn (app) (package/registry-enhancers app))
+   :latest-version (fn (name) (package/registry-latest-version name))
+   :install (fn (name dest-dir) (package/registry-install name dest-dir))})
+;; The three registry calls this module makes, as data: a test binds its own (no network in a
+;; test), and a launch reads it ON the loop and hands it to the task, because a binding does
+;; not cross into the task's process.
 
 ;; ---- the user package directory (~/.config/bedit/packages) ------------------
 
@@ -56,8 +81,9 @@ is skipped — one bad package never blocks the editor."
   (file/exists? (pkg-manifest name)))
 
 (defn installed-version (name)
-  "The installed version string of `name`, or nil."
-  (manifest-value name :version))
+  "The installed version string of `name`, or nil — nil without a word when it is not installed
+(every hive row asks), a logged warning only for a manifest that is there and does not read."
+  (when (installed? name) (manifest-value name :version)))
 
 (defn installed-packages ()
   "The names of packages installed in the user package dir (a dir with a project.blsp)."
@@ -71,25 +97,49 @@ is skipped — one bad package never blocks the editor."
   "Put package `name`'s src/ on `*load-path*` so `(require-one 'name)` finds it (idempotent)."
   (reflect/add-load-path (path/join (pkg-dir name) "src")))
 
-(defn- plugin-entry (name)
-  "Require package `name` (its src must be on the load-path) and return its `(bedit-plugin)`
-contribution map, or nil if it lacks the entry or throws."
-  (try
-    (do
-      (require-one (symbol name))
-      (let (entry (reflect/eval (symbol (str name "/bedit-plugin"))))
-        (if (fn? entry) (entry) nil)))
-    (catch e
-      (do (log/warn (str "packages: no plugin contribution from " name ": " (error-message e))) nil))))
+(defn- reload-sources (name)
+  "Load every source file of package `name` again — what an UPDATE of a plugin this image has
+already loaded needs, since `require-one` of a loaded module is a no-op and would keep running
+the old code until a restart. In load order (`reflect/source-load-order`): a module after the
+ones it uses, so a macro the update changed is defined again before the file that expands
+it, and one reload is enough."
+  (doseq (file (reflect/source-load-order (seq/filter (file/walk-files (path/join (pkg-dir name)
+                                                                         "src"))
+                                            (fn (path) (string/ends-with? path ".blsp")))))
+    (reflect/load file)))
 
-(defn apply-plugin! (name)
-  "Load package `name`'s contribution into the LIVE editor: put it on the load-path, require it,
-register its themes. Returns true if its entry loaded. Realtime — the theme appears in
+(defn plugin-entry (name &optional (reload? false))
+  "Load package `name` (its src must be on the load-path) — again, from its files, when
+`reload?` — and return its `(bedit-plugin)` contribution map, or a failure saying why not:
+its module did not load (the load's own error), it has no `bedit-plugin` entry, or the entry
+threw."
+  (let (module (symbol name)
+        loaded (try
+                 (do (if reload? (reload-sources name) (require-one module)) true)
+                 (catch e (failure "its module did not load: " (error-message e)))))
+    (if (failure? loaded)
+      loaded
+      (let (entry-name (symbol (str name "/bedit-plugin")))
+        (if (not (bound? entry-name))
+          (failure "it has no `" name "/bedit-plugin` entry")
+          (try
+            (let (contribution ((reflect/eval entry-name)))
+              (if (map? contribution)
+                contribution
+                (failure "its `bedit-plugin` answered " (pr-str contribution) ", not a map")))
+            (catch e (failure "its `bedit-plugin` threw: " (error-message e)))))))))
+
+(defn apply-plugin! (name &optional (reload? false))
+  "Load package `name`'s contribution into the LIVE editor: put it on the load-path, load it
+(again from its files when `reload?` — an update), register its themes. Answers true, or the
+failure [[plugin-entry]] gave — which says why. Realtime: the theme appears in
 `M-x theme-select` immediately."
   (add-to-load-path! name)
-  (let (contribution (plugin-entry name))
-    (if (nil? contribution)
-      false
+  (let (contribution (plugin-entry name reload?))
+    (if (failure? contribution)
+      (do
+        (log/warn (str "packages: " name " not applied: " (error-message contribution)))
+        contribution)
       (do
         (doseq (theme (or (:themes contribution) [])) (register-theme! theme))
         true))))
@@ -97,41 +147,235 @@ register its themes. Returns true if its entry loaded. Realtime — the theme ap
 (defn unapply-plugin! (name)
   "Remove package `name`'s contribution from the live editor: unregister the themes it added, so
 they leave `M-x theme-select`. The module stays in memory until restart (Brood has no
-`unrequire`), but its contribution is gone."
+`unrequire`), but its contribution is gone. A plugin whose entry does not load contributed
+nothing, so there is nothing to take back."
   (let (contribution (plugin-entry name))
-    (doseq (theme (or (:themes contribution) [])) (unregister-theme! (:name theme)))))
+    (when (map? contribution)
+      (doseq (theme (or (:themes contribution) [])) (unregister-theme! (:name theme))))))
 
 ;; ---- startup: discover + load what's installed -----------------------------
 
-(defn- compatible-packages ()
-  "The installed packages that `:enhances` THIS bedit — name and version range both — the
-one test `load-installed!` and `install!` share (std's `project/enhancers-in`)."
-  (project/enhancers-in (user-package-dir) *bedit-name* (about/bedit-version)))
+(defn- compatible-in (dir)
+  "The packages under `dir` that `:enhances` THIS bedit — name and version range both — the
+one test startup and an install share (std's `project/enhancers-in`)."
+  (project/enhancers-in dir *bedit-name* (about/bedit-version)))
 
 (defn load-installed! ()
   "At startup: put every installed package that `:enhances` this bedit on the load-path, and
 apply it. Returns the vector of names applied. Safe with no packages dir (⇒ []). A refused
 package (another editor's, or for another bedit version) is not put on the load path at
 all: its `src/` would otherwise shadow modules for code that never asked for it."
-  (let (ok (compatible-packages))
-    (vec (seq/keep ok (fn (name) (when (apply-plugin! name) name))))))
+  (vec (seq/keep (compatible-in (user-package-dir))
+         (fn (name) (when (= true (apply-plugin! name)) name)))))
 
-;; ---- install / remove / update (runtime, from the hive) --------------------
+;; ---- the network work: what a package job does (in its task) -------------------
+;; Each answers an OUTCOME map — never raises, so a reason never turns into a bare \"the task
+;; errored\": `{:kind :name …}` plus `:error` (the reason, a string) when it failed.
 
-(defn install! (name)
-  "Install (or reinstall) package `name` from the hive into the user dir and apply it live.
-Returns `{:name :version …}`. Errors propagate (unknown package, download failure, checksum
-mismatch — the sha256 pin `nest add` gives).
+(defn- reason-of (value)
+  "The reason a registry call gave: a failure's message, or a raised error's."
+  (error-message value))
 
-A package that does not `:enhances` this bedit version is removed again and refused with an
-error — the same test startup applies ([[compatible-packages]]). It used to be applied live
-anyway and then refused at the next start, so a plugin worked until you restarted."
-  (let (result (package/registry-install name (user-package-dir)))
-    (if (includes? (compatible-packages) name)
-      (do (apply-plugin! name) result)
-      (do
-        (file/rmdir (pkg-dir name))
-        (error (str name " does not enhance bedit " (about/bedit-version) " — not installed"))))))
+(defn- clear-stale-staging (packages-dir)
+  "Remove the staging directories a cancelled or crashed install left behind. Best effort: a
+cancelled install's extraction may still be finishing in one, and a leftover is harmless —
+it holds no manifest at the top, so it is never taken for a package."
+  (when (file/dir? packages-dir)
+    (doseq (entry (file/ls packages-dir))
+      (when (string/starts-with? entry ".staging-")
+        (check-allow :discarded-catch
+          (try (file/rmdir (path/join packages-dir entry)) (catch _ nil)))))))
+
+(defn- staged-install (registry name)
+  "Install `name` through `registry`'s `:install` into a fresh staging directory, and move it
+into place only when it arrived AND enhances this bedit. Answers the install's result map
+(its `:path` the final one), or a failure carrying the reason — the installed copy, if there
+was one, untouched. The signing pins (brood ADR-212) travel into the staging directory and
+back, so trust on first use still sees the key it pinned."
+  (let (packages-dir (user-package-dir)
+        _ (clear-stale-staging packages-dir)
+        staging (path/join packages-dir (str ".staging-" (rand/token 4)))
+        pins (path/join packages-dir ".signing-pins.blsp")
+        staged-pins (path/join staging ".signing-pins.blsp"))
+    (file/mkdir staging)
+    (when (file/exists? pins) (file/cp pins staged-pins))
+    (let (result (try ((:install registry) name staging) (catch e (failure (error-message e)))))
+      (cond
+        (failure? result) (do (file/rmdir staging) result)
+        (not (includes? (compatible-in staging) name))
+          (do
+            (file/rmdir staging)
+            (failure name " does not enhance bedit " (about/bedit-version) " — not installed"))
+        else
+          (do
+            (when (file/exists? staged-pins) (file/cp staged-pins pins))
+            (file/rmdir (pkg-dir name))
+            (file/rename (path/join staging name) (pkg-dir name))
+            (file/rmdir staging)
+            (assoc result :path (pkg-dir name)))))))
+
+(defn- fetch-list (registry)
+  ;; the hive's bedit packages, or the reason it could not say
+  (let (listed (try ((:enhancers registry) *bedit-name*) (catch e (failure (error-message e)))))
+    (cond
+      (failure? listed) {:kind :list :error (reason-of listed)}
+      (or (list? listed) (vector? listed)) {:kind :list :available (vec listed)}
+      ;; nil: a registry answer with no `:packages` — nothing published yet
+      else {:kind :list :available []})))
+
+(defn- install-job (registry name)
+  (let (result (staged-install registry name))
+    (if (failure? result)
+      {:kind :install :name name :error (reason-of result)}
+      {:kind :install :name name :result result})))
+
+(defn- update-job (registry name)
+  ;; newer on the hive: install it; current: say so; the version check failing: say why
+  (let (installed (installed-version name)
+        latest (try ((:latest-version registry) name) (catch e (failure (error-message e)))))
+    (cond
+      (failure? latest) {:kind :update :name name :error (reason-of latest)}
+      (nil? latest) {:kind :update :name name :error (str name " is not published on the registry")}
+      (and installed (not (version/newer? latest installed)))
+        {:kind :update :name name :current true}
+      else
+        (let (result (staged-install registry name))
+          (if (failure? result)
+            {:kind :update :name name :error (reason-of result)}
+            {:kind :update :name name :result result})))))
+
+(defn run-package-job (registry job)
+  "Do package `job` (`{:kind :list}`, `{:kind :install :name}` or `{:kind :update :name}`)
+through `registry` (a [[*registry*]] map) and answer its outcome: the job with `:available`
+(a list), `:result` (an install), `:current` (an update with nothing newer) — or `:error`, the
+reason it failed. Never raises. What a package task runs; inline when headless."
+  (try
+    (case (:kind job)
+      :list (fetch-list registry)
+      :install (install-job registry (:name job))
+      :update (update-job registry (:name job))
+      {:kind (:kind job) :name (:name job) :error (str "no such package job: " (:kind job))})
+    (catch e (assoc job :error (error-message e)))))
+
+;; ---- running one off the loop ------------------------------------------------
+
+(defn job-label (job)
+  "What a package job is doing, for the status line and C-x C-c: `installing foo`."
+  (case (:kind job)
+    :list "fetching the package list"
+    :install (str "installing " (:name job))
+    :update (str "updating " (:name job))
+    (str (:kind job))))
+
+(defn package-busy (m)
+  "What C-x C-c would kill (`model/register-exit-query`): the package job in flight."
+  (if (:package-job m) [(str "package manager: " (job-label (:package-job-info m)))] []))
+
+(defn launch-job (m job)
+  "Start package `job` off the loop — refused, with a message naming the running one, while
+another is in flight. Headless (a test, a batch run) runs it inline. The *Packages* status line
+says what is running.
+
+The two bindings the job reads — `*registry*` and `config/*config-base*` — are captured HERE
+and bound again in the task: a binding does not cross into the task's process, and a test's
+scratch config dir must not turn into the user's own there."
+  (cond
+    (:package-job m) (busy-message m)
+    (ed-headless?)
+      (ed-package-done (assoc m :package-job-info job) (run-package-job *registry* job))
+    else
+      (let (registry *registry*
+            config-base *config-base*
+            handle (task (fn ()
+                           (binding (*registry* registry *config-base* config-base)
+                             (run-package-job registry job)))
+                     {:timeout *package-job-timeout-ms*})
+            label (str (job-label job) "…"))
+        (refresh-packages (message (assoc m
+                                     :package-job handle
+                                     :package-job-info job
+                                     :package-status label)
+                            label)))))
+
+(defn- outcome-note (outcome)
+  "What a finished install or update says (the echo area and the status line): the version and
+signature, a failure's reason, and — when it arrived but its plugin did not load — why not."
+  (let (name (:name outcome)
+        verb (if (= (:kind outcome) :update) "update" "install"))
+    (cond
+      (:error outcome) (str verb " of " name " failed: " (:error outcome))
+      (:current outcome) (str name " is already up to date")
+      else
+        (let (applied (apply-plugin! name (= (:kind outcome) :update))
+              note (if (= (:kind outcome) :update)
+                     (str "updated " name " → " (:version (:result outcome)))
+                     (installed-note name (:result outcome))))
+          (if (failure? applied)
+            (str note " — but it was not applied: " (error-message applied))
+            (str note " — applied live"))))))
+
+(check-allow :trusted
+  ;; the network work of M-x package-list / package-install / package-update; C-g stops it
+  (register-task-reply :package-job
+    'packages/ed-package-done
+    nil
+    "packages"
+    {:cancel-on-quit? true :on-quit 'packages/ed-package-quit})
+  (register-exit-query :packages 'packages/package-busy)
+  (sig ed-package-done (model any -> model))
+  (defn ed-package-done (m outcome)
+    "Fold a finished package job: a list replaces the browser's rows, an install or update is
+applied live and redraws them — and a failure says its reason in the echo area AND on the
+*Packages* status line, rather than a bare `install failed`. A nil `outcome` is the task having
+died or timed out, said as such."
+    (let (job (or (:package-job-info m) {})
+          m1 (dissoc m :package-job :package-job-info))
+      (cond
+        (nil? outcome)
+          (let (note (str (job-label job)
+                       " failed or timed out after " *package-job-timeout-ms* "ms")
+                shown (refresh-packages (message (assoc m1 :package-status note) note)))
+            (if (= (:kind job) :list)
+              (refill-package-prompt shown note)
+              (settle-package-prompt shown)))
+        (= (:kind outcome) :list)
+        ;; an open package prompt takes the list too, or says why there is none
+          (if (:error outcome)
+            (let (note (str "could not fetch the package list: " (:error outcome)))
+              (refill-package-prompt (refresh-packages (message (assoc m1 :package-status note)
+                                                         note))
+                note))
+            (refill-package-prompt (refresh-packages (assoc m1
+                                                       :package-list (:available outcome)
+                                                       :package-status nil))))
+        else
+          (let (note (outcome-note outcome))
+            (settle-package-prompt (refresh-packages (message (assoc m1 :package-status note) note))))))))
+
+(defn settle-package-prompt (m)
+  "After a job that was not the list's ends, a package prompt opened while it ran (saying the
+manager was busy) gets what it waited for: the list fetched now when it has never been —
+the prompt saying so until it lands — and its candidates and status brought up to date. Any
+other prompt, or none, is left alone."
+  (if (nil? (map/get-in m [:minibuffer :package-prompt]))
+    m
+    (let (fetched (fetch-list-once m))
+      (cond
+        ;; the fetch is out: the prompt says so, and the list refills it when it lands
+        (:package-job fetched) (refill-package-prompt fetched (prompt-status fetched))
+        ;; no fetch was needed: the prompt over what is known, its busy note gone
+        (= fetched m) (refill-package-prompt fetched nil)
+        ;; a fetch ran inline (headless) and its landing refilled the prompt already
+        else fetched))))
+
+(defn ed-package-quit (m)
+  "C-g's clean-up for a package job (`:on-quit`; the task already killed): the status line says
+it stopped, and so does C-g. A cancelled install leaves the installed copy as it was — it never
+left its staging directory."
+  (let (note (str (job-label (or (:package-job-info m) {})) " stopped"))
+    (ed-quit-note (refresh-packages (assoc (dissoc m :package-job-info) :package-status note)) note)))
+
+;; ---- remove (local, so on the loop) ---------------------------------------------
 
 (defn remove! (name)
   "Unapply package `name` and delete it from the user dir. Returns true if it was installed."
@@ -141,20 +385,6 @@ anyway and then refused at the next start, so a plugin worked until you restarte
       (unapply-plugin! name)
       (file/rmdir (pkg-dir name))
       true)))
-
-(defn update! (name)
-  "Reinstall `name` if the hive has a newer version than installed. Returns the new version
-string when updated, nil when already current."
-  (let (installed (installed-version name)
-        latest (package/registry-latest-version name))
-    (if (and latest (or (nil? installed) (version/newer? latest installed)))
-      (do (install! name) latest)
-      nil)))
-
-(defn available ()
-  "The bedit packages published to the hive — `[{:name :latest_version :description :kind} …]`,
-or [] on a network failure."
-  (or (package/registry-enhancers *bedit-name*) []))
 
 ;; ---- the *Packages* browser (M-x package-list) -----------------------------
 ;; Rows are 0-indexed to the buffer line (the git-status/dired discipline), nil for the header
@@ -166,25 +396,26 @@ or [] on a network failure."
     (and latest (version/newer? latest installed)) :update
     else :installed))
 
-(defn package-rows ()
-  "The merged package list for the browser: every hive bedit package annotated with install
-status, plus any installed package not on the hive (a local/dev one). Each row is
+(defn package-rows (available)
+  "The merged package list for the browser: every hive bedit package in `available` (the
+registry's `{:name :latest_version :description}` maps, as last fetched) annotated with its
+install status as the DISK has it now, plus any installed package not among them (a local/dev
+one, or every installed one before the list has arrived). Each row is
 `{:name :installed :latest :status :description}`."
-  (let (avail (available)
-        avail-names (map avail :name)
-        from-hive (map avail
-                    (fn (p)
-                      (let (name (:name p)
+  (let (available-names (map available :name)
+        from-hive (map available
+                    (fn (entry)
+                      (let (name (:name entry)
                             installed (installed-version name)
-                            latest (:latest_version p))
+                            latest (:latest_version entry))
                         {:name name
                          :installed installed
                          :latest latest
-                         :description (or (:description p) "")
+                         :description (or (:description entry) "")
                          :status (row-status installed latest)})))
         orphans (seq/keep (installed-packages)
                   (fn (name)
-                    (when (not (includes? avail-names name))
+                    (when (not (includes? available-names name))
                       {:name name
                        :installed (installed-version name)
                        :latest nil
@@ -192,11 +423,9 @@ status, plus any installed package not on the hive (a local/dev one). Each row i
                        :status :installed}))))
     (append from-hive orphans)))
 
-(check-allow :non-tail-recursion
-  (defn- spaces (n) (if (<= n 0) "" (str " " (spaces (- n 1))))))
 (defn- pad (s width)
   (let (text (str (or s "-")))
-    (if (>= (count text) width) text (str text (spaces (- width (count text)))))))
+    (if (>= (count text) width) text (str text (string/repeat " " (- width (count text)))))))
 
 (defn- status-label (status)
   (cond (= status :update) "update" (= status :installed) "installed" else "available"))
@@ -209,19 +438,27 @@ status, plus any installed package not on the hive (a local/dev one). Each row i
     (pad (:latest row) 10)
     (:description row)))
 
-(def *packages-header*
-  (list "  bedit packages — i install · d remove · u update · g refresh · q quit"
-    ""
-    (str "  "
-      (pad "Status" 11)
-      (pad "Package" 30)
-      (pad "Installed" 11)
-      (pad "Latest" 10)
-      "Description")))
+(def *packages-title*
+  "  bedit packages — RET describe · i install · d remove · u update · g refresh · q quit")
 
-(defn- render-packages (rows)
-  "The *Packages* buffer text, and the line→row vector aligned to it (nil for header lines)."
-  (let (header-lines *packages-header*
+(def *packages-columns*
+  (str "  "
+    (pad "Status" 11)
+    (pad "Package" 30)
+    (pad "Installed" 11)
+    (pad "Latest" 10)
+    "Description"))
+
+(def *packages-header-lines* 3)
+;; The title, the STATUS line (what is running, how the last job ended — blank when there is
+;; nothing to say) and the column heads: the first package is the line after them.
+
+(defn render-packages (rows &optional (status nil))
+  "The *Packages* buffer text, and the line→row vector aligned to it (nil for header lines).
+`status` is the second line: what is running, or how the last job ended (one line)."
+  (let (header-lines [*packages-title*
+                       (if (nil? status) "" (str "  " (one-line status)))
+                       *packages-columns*]
         body (map rows render-package-row)
         ;; rows aligned to buffer lines: one nil per header line, then one row per body line
         line-rows (append (map header-lines (fn (_) nil)) rows))
@@ -234,28 +471,58 @@ status, plus any installed package not on the hive (a local/dev one). Each row i
         i (buffer-current-line (ed-current-buf m)))
     (if (and rows (>= i 0) (< i (count rows))) (nth rows i) nil)))
 
+(defn- browser-text (m)
+  ;; the rendering of what the model knows: the last fetched list against the disk now
+  (render-packages (package-rows (or (:package-list m) [])) (:package-status m)))
+
+(defn refresh-packages (m)
+  "Redraw *Packages* in place from what the model knows — the last fetched list, the disk as
+it is now, the status line — keeping point on its line (or, from the header, moving it to the
+first package once there is one) and the selection where it is. A no-op when the browser is not
+open (a job started from a prompt)."
+  (let (index (ed-buffer-index-by-name m "*Packages*"))
+    (if (nil? index)
+      m
+      ;; the line a reader is on: the selected window's when it shows the browser (a pane's
+      ;; point is window-local), else the buffer's own
+      (let (line (buffer-current-line (if (= (ed-current-index m) index)
+                                        (ed-current-buf m)
+                                        (nth (:buffers m) index)))
+            target (inc (math/max line *packages-header-lines*))
+            rendered (browser-text m)
+            updated (ed-upsert-named (assoc m :package-rows (:rows rendered))
+                      "*Packages*"
+                      (:text rendered)
+                      :packages)
+            placed (ed-update-named updated "*Packages*" (fn (b) (ed-goto-line b target))))
+        ;; every window on it opens at that line: a pane's point into the old text is an
+        ;; offset into a different layout now
+        (ed-map-panes placed
+          (fn (pane) (if (= (:buffer pane) index) (assoc pane :point nil :mark nil) pane)))))))
+
 (defn show-packages (m)
-  "Build/refresh *Packages* from the hive and show it, recording `:package-rows`. Point lands on
-the first package."
-  (let (rows (package-rows)
-        rendered (render-packages rows)
-        m1 (ed-show-named (assoc m :package-rows (:rows rendered))
-             "*Packages*"
-             (:text rendered)
-             :packages))
-    (ed-apply m1 (fn (b) (ed-goto-line b (count *packages-header*))))))
+  "Show *Packages* — the installed packages at once, the hive's when its list arrives — and
+fetch the list off the loop. Point lands on the first package."
+  (let (rendered (browser-text m)
+        shown (ed-show-named (assoc m :package-rows (:rows rendered))
+                "*Packages*"
+                (:text rendered)
+                :packages)
+        placed (ed-apply shown (fn (b) (ed-goto-line b (inc *packages-header-lines*)))))
+    (if (:package-job placed) placed (launch-job placed {:kind :list}))))
 
 ;; ---- commands --------------------------------------------------------------
 
 (defcommand cmd-package-list
   (m key)
-  "Browse bedit packages from the hive (`M-x package-list`) — install/remove/update live."
-  (message (show-packages m) "packages: i install · d remove · u update · g refresh · q quit"))
+  "Browse bedit packages from the hive (`M-x package-list`) — install/remove/update live. The
+list is fetched off the loop; the status line says when it is coming, and why when it cannot."
+  (show-packages m))
 
 (defcommand cmd-package-refresh
   (m key)
-  "Re-fetch the package list from the hive and redraw *Packages* (g)."
-  (show-packages m))
+  "Re-fetch the package list from the hive and redraw *Packages* (g), off the loop."
+  (launch-job m {:kind :list}))
 
 (defcommand cmd-package-quit
   (m key)
@@ -277,69 +544,170 @@ package is installed either way, and this is where the user finds out."
 
 (defcommand cmd-package-install
   (m key)
-  "Install the package on the current *Packages* line (i), live — its theme appears in
-theme-select at once. Outside the browser, prompts for a package name."
+  "Install the package on the current *Packages* line (i), off the loop — its theme appears in
+theme-select when it lands. Outside the browser, prompts for a package name."
   (let (row (package-row-at m))
-    (if (nil? row)
-      (cmd-package-install-prompt m key)
-      (let (name (:name row))
-        (if (installed? name)
-          (message m (str name " is already installed — u to update"))
-          (try
-            (let (result (install! name))
-              (show-packages (message m
-                               (str (installed-note name result) " — now in M-x theme-select"))))
-            (catch e (message m (str "install failed: " name)))))))))
+    (cond
+      (nil? row) (cmd-package-install-prompt m key)
+      (installed? (:name row)) (message m (str (:name row) " is already installed — u to update"))
+      else (launch-job m {:kind :install :name (:name row)}))))
+
+(defn- prompt-status (m)
+  ;; what a package prompt says it is waiting on: the list on its way, or why it is not
+  (let (job (:package-job-info m))
+    (cond
+      (and (:package-job m) (= (:kind job) :list)) "fetching the package list…"
+      (:package-job m) (str "the package manager is busy " (job-label job))
+      else nil)))
+
+(defn- prompt-names (m kind)
+  "The names a package prompt of `kind` completes over: the hive's packages as last fetched
+for `:install`; those and every installed one for `:describe`."
+  (let (listed (map (or (:package-list m) []) :name))
+    (if (= kind :describe) (seq/distinct (append (installed-packages) listed)) listed)))
+
+(defn package-prompt (m kind prompt on-complete)
+  "A minibuffer prompt `prompt` over the packages `m` knows — `kind` `:install` (the hive's)
+or `:describe` (those and the installed ones) — running `on-complete` on the answer, saying
+what it is waiting on (`:status`). Marked `:package-prompt kind` so the list landing refills
+it ([[refill-package-prompt]])."
+  (merge (ed-name-prompt prompt (prompt-names m kind) on-complete)
+    {:package-prompt kind :status (prompt-status m)}))
+
+(defn fetch-list-once (m)
+  "`m` with the hive's package list being fetched off the loop when it has never been and no
+package job runs — what a package prompt does before it opens."
+  (if (and (nil? (:package-list m)) (nil? (:package-job m))) (launch-job m {:kind :list}) m))
+
+(defn refill-package-prompt (m &optional note)
+  "`m` with an open package prompt ([[package-prompt]]) given the packages just fetched —
+the typed text kept, the candidates re-ranked from them — and `note` (a failure's reason, or
+nil) as what it says. Any other prompt, or none, is left alone."
+  (let (mb (:minibuffer m)
+        kind (when mb (:package-prompt mb)))
+    (if (nil? kind)
+      m
+      (let (names (prompt-names m kind)
+            fresh (ed-name-prompt "" names (:on-complete mb)))
+        (assoc (ed-mb-stop-ranker m)
+          :minibuffer
+            (assoc (merge (dissoc mb :ranker :cand-cache :sel :asked)
+                     {:complete-fn (:complete-fn fresh) :rank-source (:rank-source fresh)})
+              :status note))))))
 
 (defcommand cmd-package-install-prompt
   (m key)
-  "Prompt for a bedit package to install (M-x package-install), completing over the hive."
-  (assoc m
-    :minibuffer
-      (ed-name-prompt "Install package: "
-        (map (available) :name)
-        (fn (mm name)
-          (try
-            (let (result (install! name))
-              (message mm (installed-note name result)))
-            (catch e (message mm (str "install failed: " name))))))))
+  "Prompt for a bedit package to install (M-x package-install), completing over the hive's
+packages. Before the list has ever been fetched it is fetched now, off the loop: the prompt
+opens at once saying so, and its candidates arrive when the hive answers. Any name may be
+typed meanwhile."
+  (let (fetched (fetch-list-once m))
+    (assoc fetched
+      :minibuffer
+        (package-prompt fetched
+          :install "Install package: "
+          (fn (mm name) (launch-job mm {:kind :install :name name}))))))
+
+;; ---- what is known about one package (C-h P) -----------------------------------
+
+(def- *settings-registry-names*
+  ;; how a package's source names bedit's settings registry in a `settings/define`
+  #{:bedit/settings 'config/*settings* '*settings*})
+
+(defn- setting-declared (form)
+  "The setting name a `(settings/define <bedit's registry> :name …)` form declares, or nil."
+  (when (and (list? form)
+          (>= (count form) 3)
+          (includes? ['settings/define 'define] (first form))
+          (contains? *settings-registry-names* (second form))
+          (keyword? (nth form 2)))
+    (nth form 2)))
+
+(defn- settings-in-forms (forms)
+  "Every setting `forms` declare, at any depth, in the order they appear."
+  (letrec (walk (fn (stack found)
+                  (if (empty? stack)
+                    found
+                    (let (form (first stack)
+                          more (rest stack)
+                          declared (setting-declared form))
+                      (cond
+                        declared (walk more (conj found declared))
+                        (or (list? form) (vector? form)) (walk (append (vec form) more) found)
+                        else (walk more found))))))
+    (walk forms [])))
+
+(defn package-settings (name)
+  "The init.blsp settings installed package `name` declares — every `(settings/define …)` of
+bedit's registry its sources hold, READ, not evaluated, so a package not yet loaded answers
+too. `[]` when it declares none or is not installed."
+  (let (dir (path/join (pkg-dir name) "src"))
+    (if (not (file/exists? dir))
+      []
+      (vec (seq/distinct (mapcat (seq/filter (file/walk-files dir)
+                                   (fn (path) (string/ends-with? path ".blsp")))
+                           (fn (file)
+                             (settings-in-forms (check-allow :discarded-catch
+                                                  (try
+                                                    (reflect/read-all (file/slurp file))
+                                                    (catch e ())))))))))))
+
+(defn package-info (m name)
+  "Everything bedit knows about package `name`, or nil when nothing does: `{:name :installed
+:latest :status :description :enhances :settings :themes}` — the installed copy's manifest
+(its version, description, what it `:enhances`), the hive's row as last fetched (the newest
+version), the settings its sources declare ([[package-settings]]) and the themes its plugin
+contributes, for an installed package this bedit loads."
+  (let (row (seq/find (or (:package-list m) []) (fn (entry) (= (:name entry) name)))
+        installed (installed-version name)
+        latest (:latest_version row)
+        loaded? (and installed (includes? (compatible-in (user-package-dir)) name))
+        contribution (when loaded? (plugin-entry name)))
+    (when (or row installed)
+      {:name name
+       :installed installed
+       :latest latest
+       :status (row-status installed latest)
+       :description (or (when installed (manifest-value name :description)) (:description row))
+       :enhances (or (when installed (manifest-value name :enhances)) (:enhances row))
+       :settings (if installed (package-settings name) [])
+       :themes (if (map? contribution) (map (or (:themes contribution) []) :name) [])})))
+
+(defn- busy-message (m)
+  ;; what a refused request says while a job runs
+  (message m
+    (str "the package manager is busy " (job-label (:package-job-info m)) " — C-g stops it")))
+
+(defn remove-package (m name)
+  "Remove package `name` live and redraw *Packages* — refused while a package job runs, since
+an install or update of it landing afterwards would put it straight back."
+  (cond
+    (:package-job m) (busy-message m)
+    (remove! name) (refresh-packages (message m (str "removed " name)))
+    else (message m (str name " is not installed"))))
 
 (defcommand cmd-package-remove
   (m key)
   "Remove the package on the current *Packages* line (d), live — its theme leaves theme-select.
 Outside the browser, prompts."
   (let (row (package-row-at m))
-    (if (nil? row)
-      (cmd-package-remove-prompt m key)
-      (let (name (:name row))
-        (if (not (installed? name))
-          (message m (str name " is not installed"))
-          (do (remove! name) (show-packages (message m (str "removed " name)))))))))
+    (if (nil? row) (cmd-package-remove-prompt m key) (remove-package m (:name row)))))
 
 (defcommand cmd-package-remove-prompt
   (m key)
   "Prompt for an installed package to remove (M-x package-remove)."
   (assoc m
-    :minibuffer
-      (ed-name-prompt "Remove package: "
-        (installed-packages)
-        (fn (mm name) (do (remove! name) (message mm (str "removed " name)))))))
+    :minibuffer (ed-name-prompt "Remove package: " (installed-packages) remove-package)))
 
 (defcommand cmd-package-update
   (m key)
-  "Update the package on the current *Packages* line (u) to the hive's newest version, live.
-Outside the browser, prompts."
+  "Update the package on the current *Packages* line (u) to the hive's newest version, off the
+loop, and reload it live. Outside the browser, prompts."
   (let (row (package-row-at m))
-    (if (nil? row)
-      (cmd-package-update-prompt m key)
-      (let (name (:name row))
-        (if (not (installed? name))
-          (message m (str name " is not installed"))
-          (let (new-version (check-allow :discarded-catch (try (update! name) (catch e :error))))
-            (cond
-              (= new-version :error) (message m (str "update failed: " name))
-              (nil? new-version) (message m (str name " is already up to date"))
-              else (show-packages (message m (str "updated " name " → " new-version))))))))))
+    (cond
+      (nil? row) (cmd-package-update-prompt m key)
+      (not (installed? (:name row))) (message m (str (:name row) " is not installed"))
+      else (launch-job m {:kind :update :name (:name row)}))))
 
 (defcommand cmd-package-update-prompt
   (m key)
@@ -348,12 +716,7 @@ Outside the browser, prompts."
     :minibuffer
       (ed-name-prompt "Update package: "
         (installed-packages)
-        (fn (mm name)
-          (let (new-version (check-allow :discarded-catch (try (update! name) (catch e :error))))
-            (cond
-              (= new-version :error) (message mm (str "update failed: " name))
-              (nil? new-version) (message mm (str name " is already up to date"))
-              else (message mm (str "updated " name " → " new-version))))))))
+        (fn (mm name) (launch-job mm {:kind :update :name name})))))
 
 ;; ---- packages (the *Packages* browser — M-x package-list) -------------------
 (def packages-keymap
@@ -362,6 +725,7 @@ Outside the browser, prompts."
     (keymap-bind ["d"] 'packages/cmd-package-remove) ; d — remove it
     (keymap-bind ["u"] 'packages/cmd-package-update) ; u — update it to the newest version
     (keymap-bind ["g"] 'packages/cmd-package-refresh) ; g — re-fetch the list from the hive
+    (keymap-bind [:enter] 'help/cmd-describe-package) ; RET — describe the package under point (C-h P)
     (keymap-bind ["q"] 'packages/cmd-package-quit) ; q — bury the buffer
     (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
     (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)
@@ -370,11 +734,12 @@ Outside the browser, prompts."
 
 (def packages-mode-layer
   {:name 'packages
-   :doc "Installed and available bedit packages — i installs, u updates, x removes."
+   :doc "Installed and available bedit packages — i installs, u updates, d removes."
    :keymap packages/packages-keymap
-   ;; C-n/C-p and the arrows are rebound here to the ORDINARY line motions; claiming those
-   ;; would hide `M-x next-line` from every other buffer, so they stay global
+   ;; C-n/C-p and the arrows are rebound here to the ORDINARY line motions, and RET to C-h P's
+   ;; describe-package; claiming those would hide them from M-x in every other buffer, so
+   ;; they stay global
    :commands (modes/layer-commands packages/packages-keymap
-               {:except ["next-line" "previous-line"]})})
+               {:except ["next-line" "previous-line" "describe-package"]})})
 
 (modes/register-special-type :packages 'packages/packages-mode-layer)

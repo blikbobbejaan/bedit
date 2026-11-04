@@ -4,10 +4,13 @@ prompting), finding the repo a buffer is about (`git-resolve-root`), reading `gi
 --porcelain -z`, the upstream and how far ahead or behind it HEAD is, the refs, remotes and
 stashes, and which operation (rebase, merge, cherry-pick, revert, bisect) is part-way through.
 
-Every command that changes the repo goes through one seam here: `git-run` journals it (the
-shared process log, `$`, in `vcsproc`), `git-do` runs it and refreshes, `git-launch-op` runs a
-network one OFF the loop, and `vcsproc/vcs-confirm` asks before one that cannot be undone. The
-faces the git buffers share and the plain-text git buffer type live here too.
+Every command that changes the repo goes through one seam here, and none runs on the loop:
+`git-do` queues it (journalled in the shared process log, `$`, in `vcsproc`) and refreshes,
+`git-run-then` queues it and goes on with its result, `git-gather` asks git what a key must
+know before it can go on, `git-launch-op` runs a network one, and `vcsproc/vcs-confirm` asks
+before one that cannot be undone. Where the repo is — its root, its git dir, the operation
+part-way through — is read from the disk, with no process at all. The faces the git buffers
+share and the plain-text git buffer type live here too.
 
 Nothing here knows about the status buffer: refreshing it is `git-refresh-status`, which
 reaches `gitstatus` by name, because `gitstatus` stands on this module."
@@ -71,6 +74,19 @@ git from prompting. `opts` go to `os/cmd` (`:stdin`, `:timeout-ms`, `:env` over 
     (into ["-C" root "-c" "core.quotePath=false"] args)
     (assoc opts :env (merge *git-env* (get opts :env {})))))
 
+(defn git-read (root args &optional (opts {}))
+  "`git-git` for a READ that must leave the repository as it found it: the mode line's
+summary, the status buffer's collection, a view. `git status` and `git diff` refresh the
+index as a side effect and write it back under `index.lock` — so a summary on the idle
+beat, or a status refresh after the background fetch, could make the user's own `git
+commit` at that moment fail with \"Unable to create '.git/index.lock': File exists\".
+`GIT_OPTIONAL_LOCKS=0` stops `status` from writing; the porcelain `diff` ignores that and
+needs `diff.autoRefreshIndex=false`, which leaves its answer the same (a file whose stat
+moved but whose text did not is still compared by content, in memory)."
+  (git-git root
+    (into ["-c" "diff.autoRefreshIndex=false"] args)
+    (assoc opts :env (merge {"GIT_OPTIONAL_LOCKS" "0"} (get opts :env {})))))
+
 (defn git-output (root args)
   "What `git args` printed on stdout in `root`, trimmed — \"\" when it printed nothing. For
 a question with a one-line answer (`rev-parse`, `config`, a commit message); a caller that
@@ -82,10 +98,45 @@ must tell failure from an empty answer reads `git-git`'s `:exit`."
 For a list, one name or hash a line (`git remote`, `git log --format=%h`)."
   (seq/reject (string/split (git-output root args) "\n") empty?))
 
+;; ---- where the repo is, read from the disk ---------------------------------------
+;; The two questions nearly every command asks first — which work tree is this, and where
+;; is its `.git` — are answered by looking, not by running git: a `stat` per directory up
+;; to the top, and one small file read in a worktree. `git rev-parse` gave the same answers
+;; at the cost of a process on the loop before every key in the porcelain.
+
+(defn- git-toplevel-from (dir limit)
+  ;; the nearest directory from `dir` up that holds a `.git` (a directory, or a worktree's
+  ;; or submodule's pointer file)
+  (cond
+    (file/exists? (path/join dir ".git")) dir
+    (or (<= limit 0) (= dir (path/dirname dir))) nil
+    else (git-toplevel-from (path/dirname dir) (dec limit))))
+
 (defn git-toplevel (dir)
-  "The git work-tree root containing `dir`, or nil when `dir` isn't in a repo."
-  (let (r (os/cmd "git" ["-C" dir "rev-parse" "--show-toplevel"]))
-    (if (= (:exit r) 0) (string/trim (:stdout r)) nil)))
+  "The git work-tree root containing `dir` — the nearest directory, walking up, that holds a
+`.git` — or nil when `dir` isn't in a repo. Read from the disk, no process.
+
+    (gitcore/git-toplevel \"/\")   ;=> nil"
+  (if (nil? dir) nil (git-toplevel-from (path/absolute dir) 64)))
+
+(defn git-dir (root)
+  "The absolute git directory of the work tree `root`: `<root>/.git`, or — where `.git` is a
+FILE, as in a worktree or a submodule — the directory its `gitdir:` line names (relative to
+`root` when it is not absolute). Read from the disk; nil when there is neither."
+  (let (dot (path/join root ".git"))
+    (cond
+      (file/dir? dot) dot
+      (file/exists? dot)
+        (let (line (seq/find (string/split (file/slurp dot) "\n")
+                     (fn (l) (string/starts-with? l "gitdir:")))
+              target (if (nil? line)
+                       nil
+                       (string/trim (string/substring line 7 (string/length line)))))
+          (cond
+            (or (nil? target) (= target "")) nil
+            (path/absolute? target) target
+            else (path/normalize (path/join root target))))
+      else nil)))
 
 (defn git-branch (root)
   "The current branch name (or a short hash when detached), `?` on error — `projects`'
@@ -105,14 +156,34 @@ after `git init`, nothing could be unstaged. There, the index entry is simply re
     (into ["reset" "-q" "HEAD" "--"] paths)
     (into ["rm" "--cached" "-q" "-r" "--"] paths)))
 
+(defn git-unstage-paths (m verb paths)
+  "Take `paths` out of the index (`git-unstage-args`), reported as `verb`: whether the repo
+has a commit to reset to is asked of git off the loop, and the unstage queued straight
+after it — ahead of anything pressed meanwhile, so `u` then `s` on a file leaves it staged."
+  (git-with-root m
+    (fn (m0 root)
+      (git-gather m0
+        "rev-parse"
+        root
+        (fn (dir) (git-unstage-args dir paths))
+        (fn (mm args) (git-do mm verb args))))))
+
 (defn git-resolve-root (m)
   "The repo the current buffer is about: a git section buffer's own root (a status, a log, a
 commit — each knows which repo it shows), else the repo containing the buffer's directory,
 else the root the last git command ran in. Nil when there is none.
 
 The buffer comes first. `:git-root` is one slot on the MODEL, so reading it first meant a
-file in repo B, visited after a status of repo A, ran its git in A."
-  (or (get (sectionbuf/sb-ctx m) :root) (git-toplevel (pool/ed-default-dir m)) (:git-root m)))
+file in repo B, visited after a status of repo A, ran its git in A.
+
+Before either: the repo a FOLLOW-UP was asked in (`vcsproc/vcs-pinned-root`). A read's
+answer, a queued command's result, a prompt's answer and a y/n all run later than their
+key, and the reader may be in another repo's buffer by then — `U`, a switch to a file in B,
+and the unstage that landed used to run in B."
+  (or (vcs-pinned-root m)
+    (get (sectionbuf/sb-ctx m) :root)
+    (git-toplevel (pool/ed-default-dir m))
+    (:git-root m)))
 
 ;; ---- applying a patch (hunk- and line-level staging) --------------------------
 ;; A hunk, or a run of its lines, is turned back into a patch by `std/diff`
@@ -221,6 +292,31 @@ there is no upstream. `--left-right` counts the upstream side (behind) and the H
   "The verb of the operation in flight (`\"pull\"`, `\"push\"`, …), or nil."
   (vcs-op-running m))
 
+(defn git-subcommand (args)
+  "The git subcommand `args` run — the first word after any leading `-c name=value` pairs
+(`git-no-editor` puts some in front).
+
+    (gitcore/git-subcommand [\"-c\" \"core.editor=true\" \"commit\" \"-m\" \"x\"])   ;=> \"commit\""
+  (letrec (skip (fn (rest-args)
+                  (if (and (> (count rest-args) 1) (= (first rest-args) "-c"))
+                    (skip (drop rest-args 2))
+                    (first rest-args))))
+    (skip (into [] args))))
+
+(def- git-remote-only-subcommands
+  ;; what talks to the other side and leaves the index and the work tree alone: a fetch
+  ;; writes only remote-tracking refs, a push nothing here at all
+  #{"push" "fetch" "ls-remote"})
+
+(defn git-writes-checkout? (args)
+  "Whether running `git args` writes this checkout — its index, work tree or local refs — so
+it must take its turn against the working-tree commands (a pull racing a discard for
+`index.lock`). A push, a fetch and `ls-remote` do not.
+
+    (gitcore/git-writes-checkout? [\"push\" \"origin\"])   ;=> false
+    (gitcore/git-writes-checkout? [\"pull\" \"--ff-only\"])   ;=> true"
+  (not (contains? git-remote-only-subcommands (git-subcommand args))))
+
 ;; check-allow: `then` is an opaque caller-supplied `(model result) -> model`; the
 ;; declaration is the contract (ADR-341's `:trusted`).
 (check-allow :trusted
@@ -230,7 +326,10 @@ there is no upstream. `--left-right` counts the upstream side (behind) and the H
 `(model result) -> model` run after the report — by default refreshing *git-status* when it
 is open, which is what nearly every network command wants. For a command that already
 knows its repo and may no longer be on a buffer in it (C-c C-c has just closed the
-message buffer it was typed in)."
+message buffer it was typed in).
+
+Ordered in the working-tree queue only when it writes this checkout (`git-writes-checkout?`):
+a pull, a commit, a submodule update wait their turn; a push or a fetch runs beside staging."
     (if (nil? root)
       (message m "not in a git repository")
       (vcs-launch (assoc m :git-root root)
@@ -239,7 +338,8 @@ message buffer it was typed in)."
         root
         args
         (fn (dir arguments) (git-git dir arguments))
-        then)))
+        then
+        (git-writes-checkout? args))))
 
   (sig git-launch-op (model string seqable &optional any -> model))
   (defn git-launch-op (m verb args &optional (then git-refresh-if-open))
@@ -281,6 +381,54 @@ it. A qualified reference alone does not load a module in the released editor (t
   "Run `git args` in the repo root, journalled: `[model' result]`. The seam every
 model-threaded git command goes through, so the journal cannot disagree with what ran."
   (vcs-run m "git" args (fn () (git-git (:git-root m) args))))
+
+;; ---- off the loop, in order: what a key runs before it can go on -------------------
+;; A command that has to ASK git something before it knows what to do (is anything staged,
+;; which branch is checked out, does it track an upstream) or that shows what a command
+;; printed: each step queued behind the working-tree commands already pressed
+;; (`vcsproc/vcs-gather`, `vcs-run-queued`), so nothing a key runs blocks the loop and
+;; nothing overtakes what was pressed before it. Headless runs each step at once.
+
+;; check-allow: `collect` and `then` are opaque caller-supplied functions; the declarations
+;; are the contract (ADR-341's `:trusted`).
+(check-allow :trusted
+  (sig git-gather (model string string fn fn -> model))
+  (defn git-gather (m verb root collect then)
+    "Ask git `(collect root)` OFF the loop — behind any working-tree command still queued —
+and go on with `(then model answer)`. `collect` runs in a task: it may call git, and must
+close over nothing but plain data (never the model). `verb` names the read when it fails."
+    (vcs-gather (assoc m :git-root root) (str "git " verb) root collect then))
+
+  (sig git-gather-holding (model string string fn fn -> model))
+  (defn git-gather-holding (m verb root collect then)
+    "[[git-gather]] for an answer the reader is about to WORK IN — the message an amend opens
+on, the branch a rename renames, whether `c c` must offer to stage: the keyboard is held
+until it lands (`vcsproc/vcs-gather-holding`), so what they type meanwhile is not run as
+commands in the buffer underneath. C-g lets go and cancels it."
+    (vcs-gather-holding (assoc m :git-root root) (str "git " verb) root collect then))
+
+  (sig git-run-then (model seqable fn -> model))
+  (defn git-run-then (m args then)
+    "[[git-run]] OFF the loop: run `git args` (journalled) in `(:git-root m)` behind any
+command still queued, then `(then model result)` — for a command whose next step depends on
+how this one went (`branch -d` refused offers `-D`), which [[git-do]] would only refresh after."
+    (vcs-run-queued m "git" (:git-root m) args (fn (dir arguments) (git-git dir arguments)) then)))
+
+(defn git-run-report (m args buffer)
+  "Run `git args` (journalled) in the repo the buffer is about, off the loop, and show what it
+printed in the plain-text report `buffer` beside the page — `M l`'s remotes, `% l`'s
+worktrees, `B l`'s bisect log."
+  (let (root (git-resolve-root m))
+    (if (nil? root)
+      (message m "not in a git repository")
+      (git-run-then (assoc m :git-root root)
+        args
+        (fn (m1 r) (vcs-show-report m1 buffer (:stdout r "") :git-text {:action :pop}))))))
+
+(defn git-with-root (m then)
+  "`(then model root)` with the repo the buffer is about — or say there is none."
+  (let (root (git-resolve-root m))
+    (if (nil? root) (message m "not in a git repository") (then (assoc m :git-root root) root))))
 
 (defn- git-hunk-args (cached? reverse?)
   ;; the `git apply` a hunk runs, as the journal names it (the patch goes over stdin)
@@ -394,11 +542,12 @@ or **nil** when none is. Read from the marker `.git` leaves behind, which is how
 itself knows, so this cannot disagree with what `--continue` would resume.
 
 `.git` is a FILE, not a directory, in a worktree or a submodule (it holds a `gitdir:`
-pointer), so the markers are looked for through `git rev-parse --git-dir` rather than at
-`<root>/.git` — otherwise every one of these features would be silently dead in a
-worktree, which is where a rebase is most likely to be happening."
-  (let (dir (git-output root ["rev-parse" "--absolute-git-dir"])
-        hit (if (= dir "")
+pointer), so the markers are looked for in the directory it points at ([[git-dir]]) rather
+than at `<root>/.git` — otherwise every one of these features would be silently dead in a
+worktree, which is where a rebase is most likely to be happening. Read from the disk, no
+process: `r c` asks it on the loop, before the command it picks is queued."
+  (let (dir (git-dir root)
+        hit (if (nil? dir)
               nil
               (seq/find git-sequencer-markers
                 (fn (row) (file/exists? (path/join dir (first row)))))))

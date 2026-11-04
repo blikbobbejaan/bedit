@@ -266,16 +266,134 @@
             jumped (cmd-visit-location on-row nil))
         (assert= (buffer-name (cur jumped)) "*scratch*")
         (assert= (buffer-current-line (cur jumped)) 2))))) ; line 3 → 0-based index 2
+(defn- macro-out (m)
+  ;; what the loop does while a macro runs: fire its ticker until the run ends
+  (if (nil? (:macro-run m)) m (macro-out (ed-update m [:timer :macro-continue] 80 24))))
+(defn- run (m keys) (macro-out (press m keys)))
+
 (describe "editor keyboard macros (C-x ( / ) / e)"
   (test "record a macro and execute it replays the keys"
     ;; C-x ( type "ab" C-x ) then C-x e → "ab" typed twice = "abab"
-    (let (m (press (m-of "") [:ctrl-x "(" "a" "b" :ctrl-x ")" :ctrl-x "e"]))
+    (let (m (run (m-of "") [:ctrl-x "(" "a" "b" :ctrl-x ")" :ctrl-x "e"]))
       (assert= (buffer-text (cur m)) "abab")))
   (test "the macro body excludes the C-x ) that ended it"
     (let (m (press (m-of "") [:ctrl-x "(" "x" :ctrl-x ")"]))
       (assert= (:macro-last m) (list "x"))))
   (test "C-x e with no macro reports it"
-    (is (includes? (get (press (m-of "") [:ctrl-x "e"]) :echo) "no keyboard macro"))))
+    (is (includes? (get (press (m-of "") [:ctrl-x "e"]) :echo) "no keyboard macro")))
+  (test "C-u N C-x e runs the macro N times"
+    (let (m (run (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u "3" :ctrl-x "e"]))
+      (assert= (buffer-text (cur m)) "aaaa")))
+  (test "a bare C-u C-x e runs it four times"
+    (let (m (run (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u :ctrl-x "e"]))
+      (assert= (buffer-text (cur m)) "aaaaa")))
+  (test "a run stops at the first key that fails: a search with no next match"
+    ;; the macro: search for `x`, leave the search, type `!`. Two x's: the third pass's
+    ;; search fails, so its `!` is never typed
+    (let (m (press (m-of "x x x") [:ctrl-x "(" :ctrl-s "x" :enter "!" :ctrl-x ")"])
+          ran (run (ed-set-buf m (goto-char (cur m) 0)) [:ctrl-u "9" :ctrl-x "e"]))
+      (assert= (buffer-text (cur m)) "x! x x")
+      (assert= (buffer-text (cur ran)) "x!! x! x!")))
+  (test "C-u 0 C-x e runs until a key fails: C-n at the last line"
+    (let (m (press (m-of "a\nb\nc\nd") [:ctrl-x "(" :ctrl-a "-" :ctrl-n :ctrl-x ")"])
+          ran (run m [:ctrl-u "0" :ctrl-x "e"]))
+      (assert= (buffer-text (cur ran)) "-a\n-b\n-c\n-d")
+      (assert= (:echo ran) "End of buffer")
+      (is (nil? (:macro-executing ran)))))
+  (test "a run is sliced: it yields to the loop and its ticker resumes it"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u "3" :ctrl-x "e"]))
+        ;; a slice of one key: the recorded `a` and the run's first
+        (assert= (buffer-text (cur m)) "aa")
+        (is (:macro-executing m))
+        (is (contains? (:timers m) :macro-continue))
+        (let (done (macro-out m))
+          (assert= (buffer-text (cur done)) "aaaa")
+          (is (nil? (:macro-executing done)))
+          (is (not (contains? (:timers done) :macro-continue)))))))
+  (test "the run's ticker is a command timer, so no background ceiling cuts a slice short"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u "3" :ctrl-x "e"]))
+        (assert= (get (:timers m) :macro-continue) {:every 1 :command? true}))))
+  (test "a slice that throws ends the run and says so, never to be run again"
+    (let (broken (assoc (m-of "")
+                   :macro-executing true
+                   :macro-run {:keys ["a"] :passes :not-a-count :done 0 :index 1})
+          ended (ed-update broken [:timer :macro-continue] 80 24))
+      (is (nil? (:macro-run ended)))
+      (is (nil? (:macro-executing ended)))
+      (is (includes? (:echo ended) "keyboard macro stopped"))))
+  (test "C-g ends a run that would never fail, keeping what it did"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "x" :ctrl-x ")" :ctrl-u "0" :ctrl-x "e"])
+            ticked (press m [[:timer :macro-continue] [:timer :macro-continue]])
+            quit (press ticked [:ctrl-g]))
+        ;; past the recorded `x` and the first slice's: the ticks typed more
+        (is (string/starts-with? (buffer-text (cur ticked)) "xxx"))
+        (assert= (buffer-text (cur quit)) (buffer-text (cur ticked)))
+        (is (nil? (:macro-run quit)))
+        (is (nil? (:macro-executing quit)))
+        (is (not (contains? (:timers quit) :macro-continue)))
+        ;; and the editor takes keys again at once
+        (assert= (buffer-text (cur (press quit ["!"]))) (str (buffer-text (cur quit)) "!")))))
+  (test "C-g drops what was typed while the run went"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "x" :ctrl-x ")" :ctrl-u "0" :ctrl-x "e" "z" :ctrl-g]))
+        (assert= (buffer-text (cur m)) "xx")
+        (is (nil? (:macro-typeahead m))))))
+  (test "keys typed during a run wait for it, then fold in order"
+    (binding (*macro-slice-ms* 0)
+      (let (m (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")" :ctrl-u "3" :ctrl-x "e" "y" "z"]))
+        (assert= (buffer-text (cur m)) "aa")
+        (assert= (:macro-typeahead m) ["y" "z"])
+        (assert= (buffer-text (cur (macro-out m))) "aaaayz"))))
+  (test "a run undoes as one typing run, however it is sliced"
+    ;; the recording's own `ab` is a group of its own (C-x ) came between)
+    (let (recorded (press (m-of "") [:ctrl-x "(" "a" "b" :ctrl-x ")"])
+          whole (press (run recorded [:ctrl-u "2" :ctrl-x "e"]) [:ctrl-/])
+          sliced (binding (*macro-slice-ms* 0)
+                   (press (run recorded [:ctrl-u "2" :ctrl-x "e"]) [:ctrl-/])))
+      (assert= (buffer-text (cur whole)) "ab")
+      (assert= (buffer-text (cur sliced)) "ab")))
+  (test "a chord bound to nothing stops the macro too"
+    (let (m (assoc (press (m-of "") [:ctrl-x "(" "a" :ctrl-x ")"])
+              :macro-last ["a" :ctrl-x "4" "z" "b"])
+          ran (run m [:ctrl-u "3" :ctrl-x "e"]))
+      ;; `C-x 4 z` is bound to nothing: the first pass types `a` (after the one recording
+      ;; typed), fails there, and stops — no `b`, no second pass
+      (assert= (buffer-text (cur ran)) "aa")))
+  (test "the macro excludes the prefix argument typed before C-x ) and the chord"
+    (let (m (macro-out (press (m-of "") [:ctrl-x "(" "5" "a" :ctrl-u "2" :ctrl-x ")"])))
+      (assert= (vec (:macro-last m)) ["5" "a"])
+      ;; C-u 2 C-x ) ends the macro and runs it once more
+      (assert= (buffer-text (cur m)) "5a5a")))
+  (test "C-x e while recording ends the macro and runs it"
+    (let (m (run (m-of "") [:ctrl-x "(" "a" :ctrl-x "e"]))
+      (assert= (vec (:macro-last m)) ["a"])
+      (is (nil? (:macro-recording m)))
+      (assert= (buffer-text (cur m)) "aa")))
+  (test "the prefix argument's start is found back from the chord"
+    (assert= (ed-macro-prefix-start ["a" "5" :ctrl-u "3"]) 2)
+    (assert= (ed-macro-prefix-start ["a" "5"]) 2)
+    (assert= (ed-macro-prefix-start [:ctrl-u :ctrl-u]) 0)))
+
+(describe "a motion that cannot move fails"
+  (test "C-f at the end and C-b at the start say so"
+    (assert= (:echo (press (cm "ab" 2) [:ctrl-f])) "End of buffer")
+    (assert= (:echo (press (m-of "ab") [:ctrl-b])) "Beginning of buffer"))
+  (test "C-n on the last line and C-p on the first say so, and point stays"
+    (let (down (press (m-of "a\nb") [:ctrl-n :ctrl-n]))
+      (assert= (:echo down) "End of buffer")
+      (assert= (buffer-current-line (cur down)) 1))
+    (assert= (:echo (press (m-of "a\nb") [:ctrl-p])) "Beginning of buffer"))
+  (test "the failure is the key's own: the next key clears it"
+    (let (failed (press (cm "ab" 2) [:ctrl-f]))
+      (is (:command-failed failed))
+      (is (nil? (:command-failed (press failed [:ctrl-b]))))))
+  (test "the failure is only shown, never logged to *Messages*"
+    (let (m (press (m-of "ab") [:ctrl-b :ctrl-b :ctrl-b])
+          idx (ed-buffer-index-by-name m "*Messages*"))
+      (is (or (nil? idx) (not (includes? (buffer-text (ed-buf-at m idx)) "Beginning of buffer")))))))
 
 (describe "editor fill-paragraph"
   ;; the greedy word-wrap itself is `string/fill` (tested in brood's
@@ -283,7 +401,7 @@
   (test "M-q wraps a long paragraph, keeping every word"
     (let (long "one two three four five six seven eight nine ten eleven twelve thirteen fourteen"
           txt (buffer-text (cur (ed-update (cm long 0) :alt-q 80 24))))
-      (is (every? (string/split txt "\n") (fn (ln) (<= (string/length ln) *fill-column*))))
+      (is (every? (string/split txt "\n") (fn (ln) (<= (string/length ln) 70))))
       (assert= (string/replace txt "\n" " ") long) ; same words, only the line breaks changed
       (is (includes? txt "\n"))))) ; it actually wrapped (>1 line)
 (describe "editor zap-to-char / registers"
@@ -428,7 +546,7 @@
   ;; a QUALIFIED command with no docstring is just nil — not a retry under `commands/`
   ;; that raises (that raise cost ~9 ms a row in M-x's marginalia, every frame)
   (test "a doc-less qualified command has no doc"
-    (is (nil? (ed-doc 'bedit/commands/cmd-backward-char)))
+    (is (nil? (ed-doc 'bedit/commands/cmd-beginning-of-line)))
     (is (string? (ed-doc 'bedit/commands/cmd-find-file)))
     (is (string? (ed-doc 'cmd-find-file)))) ; a bare name still resolves under commands/
   (test "the M-x prompt declares the :command category with the keys already inverted"
@@ -447,8 +565,10 @@
                               (assoc (:minibuffer m)
                                 :edit (ed-mb-set-text (:edit (:minibuffer m)) "save")))
                  :enter 80 24))
-      (is (includes? (:echo done) "save"))
-      (is (includes? (:echo done) "file"))))) ; cmd-save's docstring mentions the file
+      ;; the page, not an echo line: *Help* selected, naming the command and its doc
+      (assert= (buffer-name (cur done)) "*Help*")
+      (is (includes? (buffer-text (cur done)) "save is an interactive command"))
+      (is (includes? (buffer-text (cur done)) "file"))))) ; cmd-save's docstring mentions the file
 (describe "editor line/word editing"
   (test "M-o opens a line below and moves there"
     (let (m (ed-update (m-of "abc") :alt-o 80 24))
@@ -787,3 +907,58 @@
         (assert= ["view" (mb-candidates mb)]
           (receive ([:fuzzy-ranked ^session query hits] [query hits]) (after 5000 :timeout)))
         (fuzzy/ranker-stop session)))))
+
+;; ---- a standing question survives an async message --------------------------------
+;; A task reply, a timer or a language server calling `message` while a y/n question (or a
+;; minibuffer prompt, or a query-replace) waits for its answer used to replace it on the echo
+;; row: the user was left answering a question they could no longer see. Emacs keeps the
+;; question and shows the message after it in brackets until the next key.
+(defn messages-log (m)
+  (buffer-text (ed-buf-at m (or (ed-buffer-index-by-name m "*Messages*") (error "no *Messages*")))))
+(defn asked (m)
+  "`m` asking `Delete foo? (y/n) `, the answer recorded as `:answered`."
+  (ed-read-char m "Delete foo? (y/n) " (fn (mm key) (assoc mm :answered (ed-yes-key? key)))))
+
+(describe "a y/n question stays visible when a message arrives"
+  (test "the prompt stays on the echo row, the message after it in brackets"
+    (let (m (message (asked (m-of "x")) "git: pushed main"))
+      (assert= (ed-echo-or-eldoc m) "Delete foo? (y/n) [git: pushed main]")
+      (is (includes? (messages-log m) "git: pushed main"))))
+  (test "a later message replaces the earlier one beside the prompt"
+    (let (m (message (message (asked (m-of "x")) "first") "second"))
+      (assert= (ed-echo-or-eldoc m) "Delete foo? (y/n) [second]")))
+  (test "before any message the prompt shows alone"
+    (assert= (ed-echo-or-eldoc (asked (m-of "x"))) "Delete foo? (y/n) "))
+  (test "the question still takes its answer, and is gone after it"
+    (let (answered (press (message (asked (m-of "x")) "lsp: indexing done") ["y"]))
+      (is (:answered answered))
+      (is (nil? (:read-char answered)))
+      (is (nil? (ed-standing-question answered)))))
+  (test "a message once the question is answered shows plainly"
+    (let (m (message (press (asked (m-of "x")) ["n"]) "afterwards"))
+      (assert= (ed-echo-or-eldoc m) "afterwards")))
+  (test "a query-replace's y/n/!/./q prompt stands the same way"
+    (let (m (message (isearch/qr-start (m-of "foo foo") "foo" "bar") "timer fired")
+          line (ed-echo-or-eldoc m))
+      (is (string/starts-with? line "Query replacing foo with bar: (y/n/!/./q)"))
+      (is (string/ends-with? line "[timer fired]"))
+      ;; the next answer asks again, the message gone
+      (assert= (ed-echo-or-eldoc (isearch/qr-handle m "n"))
+        "Query replacing foo with bar: (y/n/!/./q)"))))
+
+(describe "a minibuffer prompt keeps its line when a message arrives"
+  (test "the message shows after the input in brackets, logged too"
+    (let (prompted (type-str (press (m-of "x") [:alt-x]) "ver")
+          m (message prompted "build finished")
+          line (str (ed-echo-line m 80 24)))
+      (is (includes? line "ver"))
+      (is (includes? line "[build finished]"))
+      (is (includes? (messages-log m) "build finished"))))
+  (test "the next key clears it, as Emacs's minibuffer message"
+    (let (m (type-str (message (press (m-of "x") [:alt-x]) "build finished") "v"))
+      (is (nil? (:message (:minibuffer m))))
+      (is (not (includes? (str (ed-echo-line m 80 24)) "build finished")))))
+  (test "a message said as the prompt closes reaches the echo area"
+    (let (closed (ed-minibuffer-closed (message (press (m-of "x") [:alt-x]) "said last")))
+      (is (nil? (:minibuffer closed)))
+      (assert= (:echo closed) "said last"))))

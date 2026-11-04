@@ -175,35 +175,144 @@ order they're emitted) to recover the whole line."
       (is (> (count labels) 0))
       (is (> (count keys) 0)))))
 
-(describe "mouse drag-to-copy + copy-link"
-  (test "ed-drag-copy copies the active region to the kill ring, keeping the region"
-    (let (m0 (m-of "hello")
+;; A stand-in PRIMARY owner: what it is handed comes back as a message to this process.
+(defn primary-probe (text) (send (self) [:primary-set text]))
+(defn primary-sets ()
+  "Every text handed to `primary-probe` since the last call, oldest first."
+  (letrec (drain (fn (acc) (receive ([:primary-set text] (drain (conj acc text))) (after 0 acc))))
+    (drain [])))
+(defn os-model (text)
+  "A model of `text` whose window has an OS clipboard (`:os-clipboard`), as `main` makes it."
+  (assoc (m-of text) :os-clipboard true))
+
+(describe "mouse drag-select: PRIMARY, never the clipboard (Emacs's default) + copy-link"
+  (test "ed-drag-select sets PRIMARY and leaves the kill ring and clipboard alone"
+    (let (m0 (os-model "hello")
           m1 (ed-set-buf m0 (goto-char (set-mark (ed-current-buf m0)) 5)) ; region "hello"
-          copied (model/ed-drag-copy m1))
+          _ (primary-sets)
+          selected (binding (*primary-writer* primary-probe
+                             *clipboard-writer* (fn (text) (send (self) [:clipboard-set text])))
+                     (model/ed-drag-select m1)))
+      (assert= (primary-sets) ["hello"])
+      (assert= (:kill-ring selected) (:kill-ring m1))
+      ;; the clipboard was never set
+      (is (nil? (receive ([:clipboard-set text] text) (after 0 nil))))
+      (is (not (nil? (buffer-mark (ed-current-buf selected))))))) ; region stays active
+  (test "ed-drag-select with no region sets nothing"
+    (let (m (os-model "hello")
+          _ (primary-sets)
+          after-select (binding (*primary-writer* primary-probe) (model/ed-drag-select m)))
+      (assert= (:kill-ring after-select) (:kill-ring m))
+      (assert= (primary-sets) [])))
+  (test "a model with no clipboard at all owns no PRIMARY"
+    (let (m0 (m-of "hello")
+          m1 (ed-set-buf m0 (goto-char (set-mark (ed-current-buf m0)) 5))
+          _ (primary-sets))
+      (binding (*primary-writer* primary-probe) (model/ed-drag-select m1))
+      (assert= (primary-sets) [])))
+  (test "with :mouse-drag-copy-region on, the drag also goes on the kill ring"
+    (let (m0 (assoc (os-model "hello") :mouse-drag-copy-region true)
+          m1 (ed-set-buf m0 (goto-char (set-mark (ed-current-buf m0)) 5))
+          _ (primary-sets)
+          copied (binding (*primary-writer* primary-probe
+                           *clipboard-writer* (fn (text) nil))
+                   (model/ed-drag-select m1)))
       (assert= (first (:kill-ring copied)) "hello")
-      (is (not (nil? (buffer-mark (ed-current-buf copied))))))) ; region stays active
-  (test "ed-drag-copy with no region leaves the kill ring untouched"
-    (let (m (m-of "hello"))
-      (assert= (:kill-ring (model/ed-drag-copy m)) (:kill-ring m))))
-  (test "releasing a drag-select copies the highlighted region (mouse-drag-copy-region)"
+      (assert= (primary-sets) ["hello"])))
+  (test "a middle click inserts the PRIMARY selection at the click (mouse-yank-primary)"
+    (let (m (os-model "hello world")
+          ;; where a plain left click on the same cell puts point (past the gutter)
+          at (buffer-point (cur (ed-update (ed-update m [:mouse :press :left 0 12 []] 80 24)
+                                  [:mouse :release :left 0 12 []]
+                                  80
+                                  24)))
+          clicked (binding (*primary-reader* (fn () "XY"))
+                    (ed-update m [:mouse :press :middle 0 12 []] 80 24)))
+      (is (> at 0))
+      (assert= (buffer-text (cur clicked))
+        (str (string/substring "hello world" 0 at) "XY" (string/substring "hello world" at)))
+      (assert= (:kill-ring clicked) (:kill-ring m)) ; a middle click is not a kill
+      (is (nil? (:primary-spot clicked)))
+      (is (nil? (buffer-region (cur clicked))))))
+  (test "a middle click with nothing selected anywhere inserts nothing and says so"
+    (let (clicked (binding (*primary-reader* (fn () nil))
+                    (ed-update (os-model "hello") [:mouse :press :middle 0 12 []] 80 24)))
+      (assert= (buffer-text (cur clicked)) "hello")
+      (assert= (:echo clicked) "mouse-yank-primary: no primary selection")))
+  (test "an unreadable PRIMARY is said, not raised"
+    (let (clicked (binding (*primary-reader* (fn () (error "owner wedged")))
+                    (ed-update (os-model "hello") [:mouse :press :middle 0 12 []] 80 24)))
+      (assert= (buffer-text (cur clicked)) "hello")
+      (assert= (:echo clicked) "mouse-yank-primary: no primary selection")))
+  (test "a model with no clipboard at all has no PRIMARY to read"
+    (let (clicked (ed-update (m-of "hello") [:mouse :press :middle 0 12 []] 80 24))
+      (assert= (buffer-text (cur clicked)) "hello")
+      (assert= (:echo clicked) "mouse-yank-primary: no primary selection")))
+  (test "a served session's middle click asks its client's PRIMARY and pastes the answer"
+    (let (m (assoc (m-of "hello") :client-clipboard true)
+          clicked (binding (editor/serve/*served-client* (fn () (self))
+                            editor/serve/*served-client-can* (fn () #{:primary}))
+                    (ed-update m [:mouse :press :middle 0 12 []] 80 24))
+          question (receive ([:primary-get from asked] [from asked]) (after 1000 nil)))
+      (is (not (nil? question)))
+      ;; nothing inserted while the client answers
+      (assert= (buffer-text (cur clicked)) "hello")
+      (let (answered (ed-update clicked [:primary (second question) "XY"] 80 24))
+        (is (includes? (buffer-text (cur answered)) "XY")))))
+  (test "a served session's drag-select owns its client's PRIMARY"
+    (let (m0 (assoc (m-of "hello") :client-clipboard true)
+          m1 (ed-set-buf m0 (goto-char (set-mark (ed-current-buf m0)) 5)))
+      (binding (editor/serve/*served-client* (fn () (self))
+                editor/serve/*served-client-can* (fn () #{:primary}))
+        (model/ed-drag-select m1))
+      (assert= (receive ([:primary-set text] text) (after 1000 :none)) "hello")))
+  (test "a served client that does not handle PRIMARY is sent nothing, and has none"
+    ;; an older client (brood ADR-562): its window would ship the message back as a key
+    (let (m0 (assoc (m-of "hello") :client-clipboard true)
+          m1 (ed-set-buf m0 (goto-char (set-mark (ed-current-buf m0)) 5))
+          clicked (binding (editor/serve/*served-client* (fn () (self))
+                            editor/serve/*served-client-can* (fn () #{}))
+                    (do
+                      (model/ed-drag-select m1)
+                      (ed-update m0 [:mouse :press :middle 0 12 []] 80 24))))
+      (assert= (receive ([:primary-set _] :sent) ([:primary-get _ _] :asked) (after 0 :nothing))
+        :nothing)
+      (assert= (buffer-text (cur clicked)) "hello")
+      (assert= (:echo clicked) "mouse-yank-primary: no primary selection")))
+  (test "a PRIMARY read that lands after the user moved on goes in at the click's spot"
+    (let (m (os-model "hello world")
+          ;; the read in flight: the spot is marked, nothing inserted yet
+          [marked spot] (commands/ed-yank-mark-spot (ed-set-buf m (goto-char (cur m) 2)))
+          moved (ed-set-buf marked (goto-char (cur marked) 11))
+          landed (commands/ed-primary-answered moved "XY" spot))
+      (assert= (buffer-text (cur landed)) "heXYllo world")
+      (assert= (buffer-point (cur landed)) 13))) ; point stays where the user left it, carried
+  (test "releasing a drag-select keeps the region and touches no kill ring"
     (let (m0 (m-of "hello")
           m1 (ed-set-buf m0 (goto-char (set-mark (ed-current-buf m0)) 5)) ; region "hello"
           m (assoc m1 :text-drag {:buf 0}) ; a drag in progress
           released (ed-update m [:mouse :release :left 0 5 []] 80 24))
-      (assert= (first (:kill-ring released)) "hello")
+      (assert= (:kill-ring released) (:kill-ring m1))
+      (assert= (buffer-region (cur released)) "hello")
       (is (nil? (:text-drag released))))) ; the drag ended
   ;; A RESULTS buffer (*Tests* / *git-status* / *Occur* / *compile*) used to navigate on
   ;; press, which swallowed the gesture so its output could never be highlighted. Now a
   ;; press begins a drag-select there too; only a plain CLICK navigates.
   (defn results-model ()
     (ed-init (editor/layers/set-buffer-type (make-buffer "web/req-log\n  hello world\n") :test-menu)))
-  (test "a drag-select over a results buffer highlights + copies its text (was impossible)"
-    (let (pressed (ed-update (results-model) [:mouse :press :left 1 2 []] 80 24) ; line 1 "  hello world"
+  (test "a drag-select over a results buffer highlights its text and makes it PRIMARY"
+    (let (pressed (ed-update (assoc (results-model) :os-clipboard true)
+                    [:mouse :press :left 1 2 []]
+                    80
+                    24) ; line 1 "  hello world"
           dragged (ed-update pressed [:mouse :drag :left 1 7 []] 80 24) ; extend over "hello"
-          region (buffer-region (cur dragged)))
+          region (buffer-region (cur dragged))
+          _ (primary-sets)
+          released (binding (*primary-writer* primary-probe)
+                     (ed-update dragged [:mouse :release :left 1 7 []] 80 24)))
       (is (not (nil? region))) ; the drag formed a region
-      (assert= (first (:kill-ring (ed-update dragged [:mouse :release :left 1 7 []] 80 24)))
-        region))) ; release copied it
+      (assert= (buffer-region (cur released)) region) ; still highlighted, no navigate
+      (assert= (primary-sets) [region])))
   (test "a plain click on a results buffer selects nothing (it's a navigate, not a drag)"
     (let (clicked (ed-update (ed-update (results-model) [:mouse :press :left 1 4 []] 80 24)
                     [:mouse :release :left 1 4 []]
@@ -893,7 +1002,9 @@ order they're emitted) to recover the whole line."
     (let (opened (press (m-of "x") [:alt-x])
           done (press (type-str opened "test-boom") [:enter]))
       (is (not (:done done))) ; the editor did NOT quit
-      (is (includes? (:echo done) "kaboom")))) ; the error surfaced
+      ;; the error surfaced on the echo row — beside the M-x prompt, which still stands (the
+      ;; pre-event model is kept), as any message said while a prompt is open
+      (is (includes? (str (ed-echo-line done 80 24)) "kaboom"))))
   (test "a render error yields a safe frame instead of crashing the window"
     ;; an empty model has no :layout, so ed-body-layout throws inside ed-view; the
     ;; guard must return a frame carrying the error, not propagate it. The guard also
@@ -1322,7 +1433,60 @@ order they're emitted) to recover the whole line."
       ;; point starts on the first row, and RET visits it
       (let (visited (ed-update shown :enter 80 24))
         (assert= (:file (ed-current-buf visited)) (path/join root "a.txt"))
-        (assert= (buffer-current-line (ed-current-buf visited)) 1)))))
+        (assert= (buffer-current-line (ed-current-buf visited)) 1))))
+
+  ;; `rg` over a large tree takes seconds; on the loop each was a frozen editor
+  (test "in a live editor the search runs off the loop, and the rows land when it answers"
+    (let (root (path/temp "bedit-pfr-")
+          _ (file/mkdir root)
+          _ (file/spit (path/join root "a.txt") "x\nneedle here\n")
+          m (assoc (m-of "") :project-root root)
+          launched (binding (editor/ui/*loop* (self))
+                     (project-search/ed-project-search m root "needle")))
+      ;; the key returned with the search in flight and nothing shown yet
+      (is (not (nil? (:ready-wait-search launched))))
+      (is (not (= (buffer-name (ed-current-buf launched)) "*Project Search*")))
+      (let (answer (receive ([:task-done _ value] value) (after 10000 :lost))
+            shown (model/ed-apply-ready launched answer :ready-wait-search))
+        (assert= (buffer-name (ed-current-buf shown)) "*Project Search*")
+        (is (includes? (buffer-text (ed-current-buf shown)) "a.txt:2:needle here"))
+        (is (nil? (:ready-wait-search shown))))))
+
+  (test "a searcher that failed both ways is said, not raised"
+    (let (root (path/temp "bedit-pfr-")
+          _ (file/mkdir root)
+          m (assoc (m-of "") :project-root root)
+          launched (binding (editor/ui/*loop* (self)) (project-search/ed-project-search m root "x")))
+      ;; drop the real search's answer; fold a failure in its place
+      (receive ([:task-done _ _] nil) (after 10000 nil))
+      (assert= (:echo (model/ed-apply-ready launched {:error "rg: boom"} :ready-wait-search))
+        "search failed: rg: boom")))
+
+  ;; C-x p g and the project-task listing (compile's `ed-open-when-ready`) both wait off the
+  ;; loop; with one shared slot, starting either cancelled the other
+  (test "a search and a project-task listing in flight together both land"
+    (let (root (path/temp "bedit-pfr-")
+          _ (file/mkdir root)
+          _ (file/spit (path/join root "a.txt") "needle\n")
+          m (assoc (m-of "") :project-root root)
+          launched (binding (editor/ui/*loop* (self))
+                     (project-search/ed-project-search (model/ed-open-when-ready m
+                                                         "listing tasks"
+                                                         (fn () ["test"])
+                                                         (fn (m1 tasks)
+                                                           (assoc m1 :tasks-shown tasks)))
+                       root "needle"))
+          fold-next (fn (model)
+                      (receive
+                        ([:task-done handle value] (binding (editor/ui/*loop* (self))
+                                                     (ed-update model
+                                                       [:task-done handle value]
+                                                       80
+                                                       24)))
+                        (after 10000 (error "an off-loop call never answered"))))
+          landed (fold-next (fold-next launched)))
+      (assert= (:tasks-shown landed) ["test"])
+      (assert= (buffer-name (ed-current-buf landed)) "*Project Search*"))))
 
 ;; ---- the project file walk runs OFF the loop -------------------------------
 ;; `project-files` is `git ls-files` in a subprocess — 35 ms on a 27,310-file project, every

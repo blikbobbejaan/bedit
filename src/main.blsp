@@ -51,6 +51,7 @@ saves; C-x C-c / Esc / the window close button quits."
   (:use spell :only [spell-ranges]) ; loaded with the image: the idle-beat spell check (jinx), M-$ / C-M-$
   (:use pulse) ; a flash on the line after a jump (pulsar)
   (:use winner) ; C-c ← / C-c → window-layout undo (winner-mode)
+  (:use solong) ; so-long: a file with a very long line opens truncated, M-x so-long-mode
   (:use slowlog) ; slow turns of the loop kept across sessions, M-x slow-turns
   (:use treewarm) ; a large tree-sitter buffer's parse, warmed off the loop
   (:use autosave) ; `#file#` sidecars + auto-revert
@@ -60,7 +61,7 @@ saves; C-x C-c / Esc / the window close button quits."
   (:use lsp-commands) ; LSP autostart / text push / signature, and the `:lsp-…` events
   (:use projects) ; project-root — the current project shown on the model
   (:use config) ; init-config / window-mode — the user init file (~/.config/bedit/init.blsp)
-  (:use theme) ; apply-syntax-theme! — the editor's :syntax/* palette (src/theme.blsp)
+  (:use startup) ; the startup path the window shares with --serve: runtime, model, window
   (:use editor/buffer) ; make-buffer / buffer-from-file
   (:use editor/layers) ; set-buffer-type — the welcome scratch's :welcome stamp; the launch file's language
   ;; `:exclude [error]` — log's `error` would shadow the prelude's `error`.
@@ -89,27 +90,13 @@ clickable tutorial/playground links by keeping their marker text — or drops th
   ;; It costs one `project-release/build-info` at startup — a git call on a source run, none at all
   ;; in a release bundle, and only on the cold-start path that already reads the init file.
   (let (template (if (string? (:welcome cfg)) (:welcome cfg) *welcome-template*))
-    (str (ed-substitute-command-keys (keymaps/profile-keymap profile) template)
+    ;; the profile with init.blsp's own :keys bound in: there is no model yet, but the
+    ;; config is in hand, so the text names the keys the user will actually press
+    (str (ed-substitute-command-keys (keymaps/profile-keymap-with profile (config/user-keys cfg))
+           template)
       "\n"
       (about/version-line)
       "\n")))
-
-(defn- window-font (cfg)
-  "The window's cell font (gui/font — needs a GUI build): the init file's `:font` family,
-registered by name as `:editor` in `configure-window` (a family not installed falls back
-to brood's bundled DejaVu), at its `:font-size`."
-  {:family :editor :height (config/setting cfg :font-size)})
-
-(def *inset*
-  ;; The window content inset in logical pixels (gui/inset — needs a GUI build): a
-  ;; blank margin before the cell grid on every edge: a terminal's few pixels of padding
-  ;; (kitty, foot), enough that the text does not touch the frame and no more. The sub-cell
-  ;; remainder joins the margin on the right, and is split between the top and the bottom
-  ;; (brood ADR-508's second addendum). The margin is the window background (`gui/bg`) except
-  ;; beside a band that reaches the grid's edge: the mode line, the gutter and the current line
-  ;; continue to the frame (brood ADR-508).
-  ;; Tweak live via (gui/inset N) on C-x C-e.
-  6)
 
 (defn start-logging ()
   "Start the editor's logger under a one-for-one supervisor (parented to the editor
@@ -126,51 +113,67 @@ Prerequisite: `:editor` must already be registered (see `main`). Reused by tests
                 :restart :permanent})
     {:name :editor-sup :strategy :one-for-one}))
 
-(defn- launch-project (file directory?)
-  "The project the editor opens on (matches find-file): when opened with a file, ITS project
-(nearest ancestor with a marker), not the cwd's; a directory argument's own project. Falls
-back to the cwd's project (or none) for a scratch session or a file outside any project."
-  (or (cond
-        (nil? file) nil
-        directory? (project-root (path/absolute file))
-        else (project-root (path/dirname (path/absolute file))))
-    (project-root (file/cwd))))
-
 (defn- launch-buffer (file directory? project cfg)
-  "The buffer the editor opens on: the file, or — for a scratch session, or behind a
-directory's dired listing — the welcome scratch. That is typed :welcome: an ordinary editable
-buffer whose mode adds one thing, the tutorial/playground lines are clickable links
-(modes.blsp); `cfg`'s :welcome replaces the template text when set."
-  (if (and file (not directory?))
-    (let (opened (assoc (find-file-buffer file) :name (file-display-name file project)))
-      ;; save-place: a file named on the command line opens where you left it too
-      (if (config/setting cfg :save-place) (saveplace/restore-place opened) opened))
-    (editor/layers/set-buffer-type (make-buffer (welcome-text :emacs cfg)) :welcome)))
+  "`[buffer pending]`: the buffer the editor opens on — the file, or, for a scratch session,
+behind a directory's dired listing, or while the file is `pending`, the welcome scratch.
+That is typed :welcome: an ordinary editable buffer whose mode adds one thing, the
+tutorial/playground lines are clickable links (modes.blsp); `cfg`'s :welcome replaces the
+template text when set. `pending` is the file the window cannot start on, for
+[[open-pending]]: `:ask` when it is large, `{:bytes}` for a binary, `{:error}` when it
+cannot be read; nil when there is none. The file is read once."
+  (let (welcome (editor/layers/set-buffer-type (make-buffer (welcome-text :emacs cfg)) :welcome))
+    (cond
+      (or (nil? file) directory?) [welcome nil]
+      ;; large: asked about once there is a window to ask in ([[open-pending]])
+      (pool/ed-large-file-size file (config/setting cfg :large-file-warning-threshold))
+        [welcome :ask]
+      else
+      ;; read ONCE: a binary file's bytes, or why it could not be read, go to
+      ;; [[open-pending]] rather than failing the launch
+        (let (contents (if (file/exists? file)
+                         (try (pool/ed-read-file file) (catch e {:error e}))
+                         {:text nil}))
+          (if (contains? contents :text)
+            (let (opened (assoc (if (nil? (:text contents))
+                                  (find-file-buffer file)
+                                  (buffer-from-file file (:text contents)))
+                           :name (file-display-name file project))
+                  ;; save-place: a file named on the command line opens where you left it too
+                  placed (if (config/setting cfg :save-place)
+                           (saveplace/restore-place opened)
+                           opened))
+              ;; so-long, as every open does; `start-loop` says so (`solong/so-long-note`)
+              [(first (solong/so-long-visit placed (config/setting cfg :so-long-threshold))) nil])
+            [welcome contents])))))
+
+(defn- open-pending (m file pending)
+  "The launch `file` the window could not start on, opened now there is a model: `:ask` —
+too large to read without asking (`pool/ed-visit-file`); `{:bytes}` — a binary, as a hex
+view; `{:error}` — why it could not be read, said. nil: nothing pending."
+  (let (path (path/absolute file))
+    (cond
+      (nil? pending) m
+      (= pending :ask) (pool/ed-visit-file m path)
+      (:bytes pending) (pool/ed-open-binary m path (:project-root m) (:bytes pending))
+      else (message m (str "open failed: " (error-message (:error pending)))))))
 
 (defn- live-model (buf project disp cfg)
-  "The model the live window starts from. `config/apply-to-model` seeds the init-file's
-model-level settings (hl-line on by default, the caret shape) — the same call
-`cmd-reload-config` reuses live. The rest are live-editor-only flags that pure-model tests
-(via `ed-init`) omit."
-  (config/apply-to-model
+  "The model the live window starts from: `startup/prepare-model` (init.blsp's model-level
+settings and the live flags a served session shares — recentf, save-place) over the flags
+only a LOCAL window has, which pure-model tests (via `ed-init`) omit. The buffer conventions
+are set before `ed-init` stamps the launch buffer (`startup/prepare-buffer-settings`)."
+  (startup/prepare-buffer-settings cfg)
+  (startup/prepare-model
     (assoc (ed-init buf)
       :project-root project
-      ;; mirror kills/copies to the OS clipboard and yank from it (commands/
-      ;; ed-push-kill + ed-adopt-clipboard). On only for the live editor — pure
-      ;; model tests build via `ed-init` without it, so they never touch the
-      ;; process-global OS clipboard (which would make them order-dependent).
+      ;; mirror kills/copies to the OS clipboard and yank from it (model/ed-clipboard-write
+      ;; + ed-clipboard-read). On only for the live editor — pure model tests build via
+      ;; `ed-init` without it, so they never touch the process-global OS clipboard (which
+      ;; would make them order-dependent); a served session has its CLIENT's instead
       :os-clipboard true
       ;; the kill ring every frame shares (model/ed-start-kill-agent) — a frame inherits the
       ;; pid, so a kill in one window is yankable in all of them
       :kill-agent (ed-start-kill-agent)
-      ;; remember opened files (recentf) so find-file floats the last-used entries
-      ;; to the top of a directory listing; off in tests so they don't touch the
-      ;; on-disk cache (~/.cache/brood/recent-files.blsp).
-      :recent-files true
-      ;; save-place (pool/ed-find-file, ed-kill-at, quit): the init file's `:save-place`,
-      ;; set here rather than through a `:model-key` so a test model never reads or writes the
-      ;; user's places file, as with recentf
-      :save-place (config/setting cfg :save-place)
       ;; the native GUI frontend is active (main always runs `gui-display`), so the
       ;; view may use sub-cell `frect` rendering — rounded floating cards, etc. Pure
       ;; tests / a `editor/ui/*term-display*` run build via `ed-init` without it, so they get
@@ -180,32 +183,6 @@ model-level settings (hl-line on by default, the caret shape) — the same call
       :window (:window disp))
     cfg))
 
-(defn- configure-window (cfg disp)
-  "Give the window its look: the base cell font, the inset, the background, the init file's
-text settings and syntax palette, and its window mode. Each `gui-only` is a no-op without a
-GUI build."
-  ;; by installed name (brood ADR-442): the init file's font, and Hack, which a preset saved
-  ;; before `:font` existed names
-  (gui-only gui/font-register :editor {:family-name (config/setting cfg :font)})
-  (gui-only gui/font-register :hack {:family-name "Hack"})
-  (gui-only gui/font (window-font cfg)) ; base window font
-  (gui-only gui/inset *inset*) ; breathing room around the grid
-  (gui-only gui/bg *base*) ; clear/inset-margin fill follows the theme bg
-  (config/apply-window! cfg) ; init.blsp's :text-aa / :line-height
-  (apply-syntax-theme!) ; soft-RGB syntax colours (the :syntax/* registry) to match the chrome
-  ;; savehist: the minibuffer remembers its answers across sessions (live editor only)
-  (when (config/setting cfg :savehist) (savehist/activate!))
-  ;; the slow-turn log: every turn the watchdog reports slow, kept for M-x slow-turns
-  (slowlog/activate!)
-  ;; init.blsp's `:theme`, over the default palette just applied
-  (let (warning (themes/theme-from-config! cfg)) (when warning (log/warn warning)))
-  ;; Apply the user init file's window mode. :maximized fills the screen but keeps
-  ;; the title bar (gui/maximize); :fullscreen is borderless/no-title (gui/fullscreen).
-  (case (window-mode cfg)
-    :maximized (gui-only gui/maximize (:window disp) true)
-    :fullscreen (gui-only gui/fullscreen (:window disp) true)
-    nil))
-
 (defn- start-editor-logging ()
   "Route the logger into the editor: a `process-backend` to the editor (ui-run) process
 sends each formatted line as `[:io/write s]`, which `ed-update` folds into *Messages*. Async +
@@ -213,44 +190,18 @@ safe — the editor never blocks on a log, and the one logger process serialises
 Registers the editor pid as `:editor` (so any process can `(send (whereis :editor) [:io/write
 \"…\"])`) *before* `start-logging`, which supervises the logger and addresses the editor by
 that name — so a killed logger restarts and the fresh one still streams here. (The init.blsp
-warnings come later, from [[load-packages-later]], once every setting is declared.)"
+warnings come later, from `startup/load-packages-later`, once every setting is declared.)"
   (proc/register :editor (self))
   (start-logging)
   (log/info "bedit started"))
 
-(defn- load-packages-later (cfg)
-  "Deferred package loading, spawned in parallel with the first rendered frame so the editor
-opens fast — and then the init.blsp problems the type checker cannot see (it is read as
-data): a typo'd value or key lands in *Messages*. AFTER the packages, because a package
-declares its own settings under `:bedit/settings` when it loads, and logged before it, its
-keys read as unknown on every launch. The feature modules themselves (git, mur, lsp, web, diffhl, proctree, debugger,
-testrun, apprun, themes, tutor) load with the project image and auto-load on first qualified
-reference at their call sites — no explicit preload needed; every call site stays guarded
-with `(bound? 'ns/fn)`."
-  (spawn
-    (fn ()
-      ;; Wait for the editor to render its first frame and for JIT to warm up before the
-      ;; package scan, to avoid compile-lock contention that makes the first second of
-      ;; scrolling sluggish.
-      (receive (after 1200 nil))
-      ;; Fold in USER-installed `:enhances bedit` packages (theme plugins today) from
-      ;; ~/.config/bedit/packages — the package manager's install dir (M-x package-list),
-      ;; NOT the project's build _deps. Register their contributions into the global
-      ;; registries so M-x theme-select lists them. Deferred so a plugin's disk read never
-      ;; slows the first frame; the theme registry is process-global, so registering here
-      ;; (not in the model) is enough — a later theme-select sees them.
-      (let (loaded (packages/load-installed!))
-        (when (not (empty? loaded))
-          (log/info (str "packages: loaded " (count loaded) " — " (string/join loaded ", ")))))
-      (doseq (w (config-warnings cfg)) (log/warn w)))))
-
 (defn- appearance-of (cfg)
-  "The type setup the window was given (`window-font`, plus the config's line height), for
-`appearance/apply!`. The window has no getter for any of it, so this is what lets Ctrl+wheel
-step from the real size and `M-x preset-save` name what you are actually looking at
-(src/appearance.blsp) instead of a guess."
-  {:family (:family (window-font cfg))
-   :height (:height (window-font cfg))
+  "The type setup the window was given (`startup/window-font`, plus the config's line
+height), for `appearance/apply!`. The window has no getter for any of it, so this is what
+lets Ctrl+wheel step from the real size and `M-x preset-save` name what you are actually
+looking at (src/appearance.blsp) instead of a guess."
+  {:family (:family (startup/window-font cfg))
+   :height (:height (startup/window-font cfg))
    :line-height (config/setting cfg :line-height)})
 
 (defn- open-window (cfg)
@@ -260,13 +211,24 @@ installed .desktop entry and GNOME paints its generic fallback icon (config/*app
 assets/README.md). `:title` is only the pre-first-event placeholder; `input` sets the real
 one (`ed-window-title`) from then on. `config/*window-options*` carries `:key-repeat :os`: a
 held key repeats at the desktop's own delay and rate (brood ADR-441, input.blsp's key-repeat
-section). Opened by the loop process, which polls it: a window's input goes to the process
-that opened it."
-  (let (disp (gui-display (assoc config/*window-options* :title *app-name*)))
-    (do (configure-window cfg disp) disp)))
+section), and `config/window-options` adds the init file's `:option-meta` — which macOS
+Option key is Meta, the other composing (brood ADR-541). Opened by the loop process, which polls it: a window's input goes to the process
+that opened it.
 
-(defn- run-loop (supervisor m disp)
+Returns `[disp warnings]`: the window, and what its setup has to say — the init file's `:font`
+not installed (`startup/configure-window`), its `:theme` not existing — for [[run-loop]] to log
+into *Messages* once the logger runs (a warning logged here, before it, went to stderr) and
+for the first loop's echo area."
+  (let (disp (gui-display (assoc (config/window-options cfg) :title *app-name*))
+        font-warning (startup/configure-window cfg disp)
+        ;; the colours over the window's own background; init.blsp's `:theme` names one
+        ;; that may not exist
+        theme-warning (startup/apply-look cfg true))
+    [disp (seq/reject [font-warning theme-warning] nil?)]))
+
+(defn- run-loop (supervisor m disp warnings)
   "Run `ui-run` on `m` in `disp`, this process being the editor: the logger routed here,
+`warnings` (the window setup's, [[open-window]]) logged into *Messages* through it,
 blocking calls reported (brood ADR-517), and `supervisor` (`lifeline/supervise`) told the
 window and buffer registry, so it can save and restart if this loop dies. THE FLIP
 (docs/actor-architecture.md): every pool buffer in the live window is backed by its own
@@ -276,29 +238,44 @@ its slots to the same processes (docs/frames-plan.md). Tests/headless models nev
 `:host-buffers?`, so the pure suite stays pure."
   (do
     (start-editor-logging)
+    (doseq (warning warnings) (log/warn warning))
     ;; the loop must keep answering: a native call that blocks it is reported (brood ADR-517)
     (slowlog/responsive!)
     (lifeline/announce! supervisor (:window disp) (:buffer-reg m) (frames/frames-live-of m))
     (ui-run m ed-view ed-update disp)))
 
-(defn- start-loop (supervisor cfg file directory? project buffer)
+(defn- start-loop (supervisor init file directory? project buffer pending)
   "The first editor loop: open the window on the launch `buffer` (a directory argument —
-`bedit .` — shows its dired listing over the scratch buffer), then [[run-loop]]."
-  (let (disp (open-window cfg)
+`bedit .` — shows its dired listing over the scratch buffer; a launch file that is large,
+binary or unreadable is `pending`, opened once there is a model — [[open-pending]]), then
+[[run-loop]]. `init` is the init file as read for this start (`startup/read-init`)."
+  (let (cfg (:config init)
+        [disp warnings] (open-window cfg)
         started (live-model buffer project disp cfg)
         ;; dired auto-loads on the qualified call
-        m (if directory? (dired/ed-show-dired started (path/absolute file)) started)
-        recovery (when (and file (not directory?)) (ed-recovery-note (path/absolute file))))
+        listed (if directory? (dired/ed-show-dired started (path/absolute file)) started)
+        recovery (when (and file (not directory?) (nil? pending))
+                   (ed-recovery-note (path/absolute file)))
+        ;; an init file that does not read leaves every setting at its default, and a font
+        ;; that is not installed leaves the bundled one: said in the echo area at once, not
+        ;; only among the *Messages* lines
+        note (string/join (seq/reject (append [(:note init)]
+                                        warnings
+                                        [recovery (solong/so-long-note buffer)])
+                            nil?)
+               " · ")
+        ;; after the note, so a question it asks (a large file) is what the echo area shows
+        m (open-pending (if (empty? note) listed (message listed note)) file pending))
     (do
       ;; discovered on launch → known for C-x p p (once: the project the model settled on,
       ;; which a directory's dired may have resolved afresh)
       (remember-project! (:project-root m))
-      (load-packages-later cfg)
+      (startup/load-packages-later cfg startup/say-in-log)
       (run-loop supervisor
-        (frames/frames-registry-start (appearance/apply! (assoc (if recovery (message m recovery) m)
-                                                           :host-buffers? true)
+        (frames/frames-registry-start (appearance/apply! (assoc m :host-buffers? true)
                                         (appearance-of cfg)))
-        disp))))
+        disp
+        warnings))))
 
 (defn- restart-loop (supervisor cfg state)
   "A loop started after the last one died (`lifeline/supervise`): a fresh window over every
@@ -309,13 +286,14 @@ echo area saying what happened. Its layout, minibuffer and transient state are g
         entries (registry-entries registry)
         file-entry (seq/find (if (vector? entries) entries []) (fn (e) (:file (or (:meta e) {}))))
         show (if file-entry (:name file-entry) "*scratch*")
-        disp (open-window cfg)
+        [disp warnings] (open-window cfg)
         seeded (frames/frames-seed-model registry show (:live state))
         m (config/apply-to-model (assoc (dissoc seeded :frame?) :window (:window disp)) cfg))
     (run-loop supervisor
       (message (appearance/apply! m (appearance-of cfg))
         "the editor's loop died and was restarted — every buffer is here; check *Messages*")
-      disp)))
+      disp
+      warnings)))
 
 (defn- report-death (death)
   "Say on stderr and in the log that the editor's loop died, what was auto-saved, and
@@ -333,24 +311,20 @@ whether it is being restarted — the one record a crash leaves outside the wind
   "Open the local window on `file` (nil for a scratch session) and run the editor loop under
 `lifeline/supervise`: a loop that dies has its unsaved buffers auto-saved and is restarted
 over the same buffers. Returns when the editor quits."
-  (let (cfg (init-config) ; ~/.config/bedit/init.blsp (created on first launch)
+  (let (init (startup/read-init) ; ~/.config/bedit/init.blsp (created on first launch)
+        cfg (:config init)
         ;; `bedit .` / `bedit some/dir` — open dired, not a text file
         directory? (and file (file/dir? file))
-        project (launch-project file directory?)
-        ;; Tree-sitter grammars the runtime was not built with, from
-        ;; `~/.config/bedit/grammars`. On the STARTUP path rather than beside the mode
-        ;; definitions, because loading one registers it in the runtime and a module's
-        ;; top-level forms do not necessarily run when the program does — an image
-        ;; restores the bindings without replaying the side effects that made them.
-        ;; DECLARED, not loaded (brood ADR-481): each language's library is opened by the
-        ;; first parse that needs it, so startup pays no dlopen and no language waits for one.
-        ;; `M-x grammar-reload` re-runs the whole scan after you rebuild one.
-        _grammars (grammars/declare-user-grammars)
+        project (startup/launch-project file directory?)
+        ;; the runtime's half of startup, shared with `--serve`: the user's grammars
+        ;; declared, the slow-turn log, minibuffer history (one user here, so it may be on)
+        _runtime (startup/prepare-runtime cfg true)
         ;; after the grammars: a file of a parsed language with a line-lexer stand-in is typed by
         ;; whether its grammar is ready (`model/ed-grammar-fallback`), so it must be declared first
-        buffer (launch-buffer file directory? project cfg)
+        [buffer pending] (launch-buffer file directory? project cfg)
         outcome (lifeline/supervise (fn (supervisor)
-                                      (start-loop supervisor cfg file directory? project buffer))
+                                      (start-loop supervisor
+                                        init file directory? project buffer pending))
                   (fn (supervisor state) (restart-loop supervisor cfg state))
                   report-death))
     (if (= outcome :died) 1 nil)))

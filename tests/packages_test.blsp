@@ -6,7 +6,9 @@
 (defmodule packages-test
   (:use test)
   (:use-internals packages)
-  (:use config)) ; *config-base* — a scratch config dir, never the user's own packages
+  (:use config) ; *config-base* — a scratch config dir, never the user's own packages
+  (:use model) ; ed-init — a model the commands run on
+  (:use editor/buffer)) ; make-buffer
 (describe "row-status — installed / available / update"
   (test "not installed → available"
     (assert= (packages/row-status nil "1.0.0") :available))
@@ -23,7 +25,7 @@
                  {:name "b" :installed "1.0.0" :latest "1.0.0" :status :installed :description "e"}]
           rendered (packages/render-packages rows)
           line-rows (:rows rendered)
-          header-count (count packages/*packages-header*)
+          header-count packages/*packages-header-lines*
           text-lines (string/split (:text rendered) "\n"))
       ;; the line→row vector has exactly one entry per rendered line
       (assert= (count line-rows) (count text-lines))
@@ -32,7 +34,12 @@
       (assert= (nth line-rows (- header-count 1)) nil)
       ;; the body lines carry their package rows, in order, right after the header
       (assert= (:name (nth line-rows header-count)) "a")
-      (assert= (:name (nth line-rows (+ header-count 1))) "b"))))
+      (assert= (:name (nth line-rows (+ header-count 1))) "b")))
+  (test "the status line is the second line, one line however long the reason"
+    (let (rendered (packages/render-packages [] "install of x failed: line one\nline two")
+          lines (string/split (:text rendered) "\n"))
+      (assert= (count lines) packages/*packages-header-lines*)
+      (assert= (nth lines 1) "  install of x failed: line one line two"))))
 
 ;; ---- startup: only what enhances THIS bedit (issues.md S9) ----------------------------
 ;; A package that `:enhances` another editor, or a newer bedit, is refused at startup —
@@ -77,3 +84,381 @@ a module whose `bedit-plugin` contributes nothing."
                       :signature :key-changed
                       :warning "dark 1.1.0 is signed by a DIFFERENT key"})
           "WARNING: dark 1.1.0 is signed by a DIFFERENT key"))))
+
+;; ---- the network work, off the loop, with its reasons (issue #17) -----------------------
+;; No network here: `*registry*` is bound to stubs. An install stub writes a package into the
+;; directory it is handed (the staging dir), as `package/registry-install` does.
+
+(defn- pk-write (dir name version enhances body)
+  "Package `name`@`version` under `dir`, its module's body `body`."
+  (let (root (path/join dir name))
+    (os/cmd "mkdir" ["-p" (path/join root "src")])
+    (file/spit (path/join root "project.blsp")
+      (str "(project :name \"" name "\" :version \"" version "\" :enhances " enhances ")\n"))
+    (file/spit (path/join root "src" (str name ".blsp")) (str "(defmodule " name ")\n" body "\n"))))
+
+(defn- pk-registry (overrides)
+  "A stub registry: a one-package hive (`pkgsnet` 1.0.0), its install writing that package,
+with `overrides` replacing any of the three calls."
+  (merge {:enhancers (fn (_app) [{:name "pkgsnet" :latest_version "1.0.0" :description "a stub"}])
+          :latest-version (fn (_name) "1.0.0")
+          :install (fn (name dest-dir)
+                     (do
+                       (pk-write dest-dir
+                         name "1.0.0" "{bedit \">= 0.1\"}" "(defn bedit-plugin () {})")
+                       {:name name
+                        :version "1.0.0"
+                        :path (path/join dest-dir name)
+                        :signature :unsigned}))}
+    overrides))
+
+(defn- pk-run (base registry thunk)
+  "Run `thunk` against scratch config dir `base` and stub `registry`."
+  (binding (*config-base* base *registry* registry) (thunk)))
+
+(defn- pk-buffer-text (m name)
+  (let (index (ed-buffer-index-by-name m name))
+    (if (nil? index) (error "no buffer named " name) (buffer-text (nth (:buffers m) index)))))
+
+(defn- pk-list-job (base registry)
+  (pk-run base registry (fn () (packages/run-package-job *registry* {:kind :list}))))
+
+(defn- pk-walked-after (base first-name candidates)
+  "The first of `candidates` whose `.blsp` file a directory walk (`file/walk-files`) lists
+after `first-name`'s, on the filesystem under `base` — a directory's order is the
+filesystem's (a name hash on ext4), so a test that needs one file walked before another
+asks rather than assumes."
+  (let (probe (path/join base "walk-probe"))
+    (do
+      (file/mkdir probe)
+      (doseq (name (cons first-name candidates))
+        (file/spit (path/join probe (str name ".blsp")) ""))
+      (let (walked (map (file/walk-files probe) (fn (path) (path/stem path)))
+            first-at (index-of walked first-name))
+        (or (seq/find candidates (fn (name) (> (index-of walked name) first-at)))
+          (error "every candidate walks before " first-name))))))
+
+(defn- pk-launch (base registry job)
+  "Launch package `job` headless (inline) on a fresh model."
+  (pk-run base registry (fn () (packages/launch-job (ed-init (make-buffer "")) job))))
+
+(describe "a package job answers its outcome, with the reason when it failed"
+  (test "the list, and a registry that cannot be reached says why"
+    (let (base (temp-dir "bedit-pkgs-"))
+      (assert= (:available (pk-list-job base (pk-registry {})))
+        [{:name "pkgsnet" :latest_version "1.0.0" :description "a stub"}])
+      (assert= (:error (pk-list-job base
+                         (pk-registry {:enhancers (fn (_app)
+                                                    (failure "package: cannot reach the registry at http://hive: refused"))})))
+        "package: cannot reach the registry at http://hive: refused")
+      ;; a registry call that RAISES keeps its reason too
+      (assert= (:error (pk-list-job base
+                         (pk-registry {:enhancers (fn (_app) (error "boom: no route"))})))
+        "boom: no route"))))
+
+(describe "C-h P describes a package"
+  :isolated (test "an installed package: version against the hive's, what it enhances, its settings and themes"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir
+              "pkgsdesc"
+              "1.0.0"
+              "{bedit \">= 0.1\"}"
+              (str "(settings/define config/*settings* :pkgsdesc-width {:default 3 :doc \"How wide.\"})\n"
+                "(defn bedit-plugin () {:themes [{:name \"desc-dark\" :colors {}}]})"))
+          _ (file/spit (path/join dir "pkgsdesc" "project.blsp")
+              "(project :name \"pkgsdesc\" :version \"1.0.0\" :description \"A described package.\" :enhances {bedit \">= 0.1\"})\n")
+          registry (pk-registry {:enhancers (fn (_app)
+                                              [{:name "pkgsdesc"
+                                                :latest_version "1.2.0"
+                                                :description "hive text"}])})
+          shown (pk-run base
+                  registry
+                  (fn ()
+                    (do
+                      (packages/apply-plugin! "pkgsdesc")
+                      (let (m (assoc (ed-init (make-buffer ""))
+                                :package-list ((:enhancers registry) "bedit"))
+                            asked (help/cmd-describe-package m nil))
+                        ((:on-complete (:minibuffer asked)) asked "pkgsdesc")))))
+          page (pk-buffer-text shown "*Help*"))
+      (is (includes? page "pkgsdesc is an installed package — 1.2.0 is available"))
+      (is (includes? page "Installed  1.0.0"))
+      (is (includes? page "Latest     1.2.0"))
+      (is (includes? page "bedit"))
+      (is (includes? page "Themes     desc-dark"))
+      (is (includes? page ":pkgsdesc-width — How wide. (default 3)"))
+      (is (includes? page "A described package."))))
+  (test "a hive package not installed says so, with the hive's description"
+    (let (m (assoc (ed-init (make-buffer ""))
+              :package-list
+                [{:name "pkgshive" :latest_version "0.3.0" :description "From the hive."}])
+          asked (help/cmd-describe-package m nil)
+          shown ((:on-complete (:minibuffer asked)) asked "pkgshive")
+          page (pk-buffer-text shown "*Help*"))
+      (is (includes? page "pkgshive is available on the hive"))
+      (is (includes? page "Latest     0.3.0"))
+      (is (includes? page "From the hive."))))
+  :isolated (test "RET on a *Packages* row describes that package"
+    (let (base (temp-dir "bedit-pkgs-")
+          shown (pk-run base
+                  (pk-registry {})
+                  (fn ()
+                    (input/ed-update (packages/show-packages (ed-init (make-buffer "")))
+                      :enter 80 24))))
+      (is (includes? (pk-buffer-text shown "*Help*") "pkgsnet is available on the hive"))))
+  (test "a name nothing knows is said, not shown"
+    (let (m (assoc (ed-init (make-buffer "")) :package-list [])
+          asked (help/cmd-describe-package m nil)
+          said ((:on-complete (:minibuffer asked)) (dissoc asked :minibuffer) "ghost"))
+      (is (includes? (:echo said) "no package ghost"))))
+  (test "a package's settings are read from its source, not its loading"
+    (assert= (packages/settings-in-forms (reflect/read-all "(defn f () 1)\n(do (settings/define config/*settings* :a {}) (settings/define :other/registry :b {}))\n(settings/define :bedit/settings :c {})"))
+      [:a :c])))
+
+(describe "M-x package-install completes before the list was ever opened"
+  :isolated (test "the prompt fetches the list itself, and offers its packages"
+    (let (base (temp-dir "bedit-pkgs-")
+          prompted (pk-run base
+                     (pk-registry {})
+                     (fn () (packages/cmd-package-install-prompt (ed-init (make-buffer "")) nil))))
+      (assert= (vec (map (:package-list prompted) :name)) ["pkgsnet"])
+      (assert= (vec (:rank-source (:minibuffer prompted))) ["pkgsnet"])
+      (is (nil? (:status (:minibuffer prompted))))))
+  (test "a list landing while the prompt is open fills it, keeping what was typed"
+    (let (m (assoc (ed-init (make-buffer ""))
+              :package-job :in-flight
+              :package-job-info {:kind :list})
+          prompted (packages/cmd-package-install-prompt m nil)
+          typed (assoc prompted
+                  :minibuffer
+                    (assoc (:minibuffer prompted)
+                      :edit (ed-mb-set-text (:edit (:minibuffer prompted)) "pkg")))
+          landed (packages/ed-package-done typed
+                   {:kind :list :available [{:name "pkgsnet" :latest_version "1.0.0"}]}))
+      ;; while the list is coming, the prompt says so and has nothing to offer
+      (assert= (:status (:minibuffer prompted)) "fetching the package list…")
+      (assert= (vec (:rank-source (:minibuffer prompted))) [])
+      (assert= (vec (:rank-source (:minibuffer landed))) ["pkgsnet"])
+      (assert= (mb-text (:minibuffer landed)) "pkg")
+      (is (nil? (:status (:minibuffer landed))))))
+  :isolated (test "a prompt opened while another job ran gets the list when that job ends"
+    (let (base (temp-dir "bedit-pkgs-")
+          m (assoc (ed-init (make-buffer ""))
+              :package-job :in-flight
+              :package-job-info {:kind :install :name "other"})
+          prompted (packages/cmd-package-install-prompt m nil)
+          ended (pk-run base
+                  (pk-registry {})
+                  (fn ()
+                    (packages/ed-package-done prompted {:kind :install :name "other" :error "boom"}))))
+      ;; while the install ran, no fetch: the prompt said the manager was busy
+      (is (includes? (:status (:minibuffer prompted)) "busy"))
+      (assert= (vec (:rank-source (:minibuffer prompted))) [])
+      ;; it ended: the list was fetched (inline, headless) and fills the prompt
+      (assert= (vec (:rank-source (:minibuffer ended))) ["pkgsnet"])
+      (is (nil? (:status (:minibuffer ended))))))
+  (test "a job ending while the list is known clears a prompt's busy note"
+    (let (m (assoc (ed-init (make-buffer ""))
+              :package-list [{:name "pkgsnet" :latest_version "1.0.0"}]
+              :package-job :in-flight
+              :package-job-info {:kind :install :name "other"})
+          prompted (packages/cmd-package-install-prompt m nil)
+          ended (packages/ed-package-done prompted {:kind :install :name "other" :error "boom"}))
+      (is (includes? (:status (:minibuffer prompted)) "busy"))
+      (is (nil? (:status (:minibuffer ended))))
+      (assert= (vec (:rank-source (:minibuffer ended))) ["pkgsnet"])))
+  (test "a list that cannot be fetched says why on the prompt"
+    (let (m (assoc (ed-init (make-buffer ""))
+              :package-job :in-flight
+              :package-job-info {:kind :list})
+          prompted (packages/cmd-package-install-prompt m nil)
+          failed (packages/ed-package-done prompted {:kind :list :error "refused"}))
+      (assert= (:status (:minibuffer failed)) "could not fetch the package list: refused"))))
+
+(describe "M-x package-list and i / u, headless (the job runs inline)"
+  :isolated (test "the browser lists the hive's packages under a status line"
+    (let (base (temp-dir "bedit-pkgs-")
+          shown (pk-run base
+                  (pk-registry {})
+                  (fn () (packages/show-packages (ed-init (make-buffer ""))))))
+      (is (includes? (pk-buffer-text shown "*Packages*") "pkgsnet"))
+      ;; point on the first package, so `i` acts on it
+      (assert= (:name (packages/package-row-at shown)) "pkgsnet")))
+  :isolated (test "an install lands, is applied, and says so in the echo area and the status line"
+    (let (base (temp-dir "bedit-pkgs-")
+          registry (pk-registry {})
+          done (pk-run base
+                 registry
+                 (fn ()
+                   (packages/cmd-package-install (packages/show-packages (ed-init (make-buffer "")))
+                     nil))))
+      (is (includes? (:echo done) "installed pkgsnet 1.0.0"))
+      (is (pk-run base registry (fn () (packages/installed? "pkgsnet"))))
+      (is (includes? (nth (string/split (pk-buffer-text done "*Packages*") "\n") 1)
+            "installed pkgsnet"))
+      ;; the row says installed now, read from the disk without fetching the list again
+      (is (includes? (pk-buffer-text done "*Packages*") "installed  pkgsnet"))
+      (is (nil? (:package-job done)))))
+  :isolated (test "a failed install says the registry's reason, and installs nothing"
+    (let (base (temp-dir "bedit-pkgs-")
+          registry (pk-registry {:install (fn (_name _dir)
+                                            (failure "package: pkgsnet 1.0.0 sha256 mismatch — declared aa, got bb"))})
+          done (pk-run base
+                 registry
+                 (fn ()
+                   (packages/cmd-package-install (packages/show-packages (ed-init (make-buffer "")))
+                     nil))))
+      (assert= (:echo done)
+        "install of pkgsnet failed: package: pkgsnet 1.0.0 sha256 mismatch — declared aa, got bb")
+      (is (includes? (pk-buffer-text done "*Packages*") "sha256 mismatch"))
+      (refute (pk-run base registry (fn () (packages/installed? "pkgsnet"))))))
+  :isolated (test "a package for another editor is refused BEFORE it replaces the installed copy"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir "pkgsnet" "0.9.0" "{bedit \">= 0.1\"}" "(defn bedit-plugin () {})")
+          registry (pk-registry {:install (fn (name dest-dir)
+                                            (do
+                                              (pk-write dest-dir
+                                                name "1.0.0" "{waggle \">= 0.1\"}" "")
+                                              {:name name :version "1.0.0"}))})
+          done (pk-launch base registry {:kind :update :name "pkgsnet"}))
+      (is (includes? (:echo done) "does not enhance bedit"))
+      (assert= (pk-run base registry (fn () (packages/installed-version "pkgsnet"))) "0.9.0")
+      ;; and no staging directory is left behind
+      (is (empty? (seq/filter (file/ls dir) (fn (entry) (string/starts-with? entry ".staging")))))))
+  :isolated (test "a package whose plugin entry throws says why it was not applied"
+    (let (base (temp-dir "bedit-pkgs-")
+          registry (pk-registry {:install (fn (name dest-dir)
+                                            (do
+                                              (pk-write dest-dir
+                                                name "1.0.0" "{bedit \">= 0.1\"}"
+                                                "(defn bedit-plugin () (error \"plugin exploded\"))")
+                                              {:name name :version "1.0.0"}))})
+          done (pk-launch base registry {:kind :install :name "pkgsboom"}))
+      (is (includes? (:echo done)
+            "installed pkgsboom 1.0.0 — but it was not applied: its `bedit-plugin` threw: plugin exploded"))))
+  :isolated (test "an update reinstalls a newer version and RELOADS the plugin's code"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir
+              "pkgsupd" "1.0.0" "{bedit \">= 0.1\"}"
+              "(defn bedit-plugin () {})\n(defn generation () 1)")
+          registry (pk-registry {:latest-version (fn (_name) "1.1.0")
+                                 :install (fn (name dest-dir)
+                                            (do
+                                              (pk-write dest-dir
+                                                name "1.1.0" "{bedit \">= 0.1\"}"
+                                                "(defn bedit-plugin () {})\n(defn generation () 2)")
+                                              {:name name :version "1.1.0"}))})
+          _ (pk-run base registry (fn () (packages/apply-plugin! "pkgsupd")))
+          before ((reflect/eval 'pkgsupd/generation))
+          done (pk-launch base registry {:kind :update :name "pkgsupd"}))
+      (assert= before 1)
+      (is (includes? (:echo done) "updated pkgsupd → 1.1.0"))
+      (assert= ((reflect/eval 'pkgsupd/generation)) 2)))
+  :isolated (test "an update reloads its files in load order: a changed macro reaches its caller"
+    ;; the plugin's main file expands a macro from a file a directory walk lists AFTER it:
+    ;; reloaded in walk order it would keep the OLD expansion until a second reload
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          macros (pk-walked-after base "pkgsmac" ["aaa" "zzz" "bbb" "yyy" "ccc" "xxx"])
+          write (fn (dest-dir version answer)
+                  (let (src (path/join dest-dir "pkgsmac" "src"))
+                    (do
+                      (os/cmd "mkdir" ["-p" src])
+                      (file/spit (path/join dest-dir "pkgsmac" "project.blsp")
+                        (str "(project :name \"pkgsmac\" :version \""
+                          version "\" :enhances {bedit \">= 0.1\"})\n"))
+                      (file/spit (path/join src "pkgsmac.blsp")
+                        (str "(defmodule pkgsmac (:use "
+                          macros "))\n(defn bedit-plugin () {})\n(defn generation () (answer))\n"))
+                      (file/spit (path/join src (str macros ".blsp"))
+                        (str "(defmodule " macros ")\n(defmacro answer () " answer ")\n")))))
+          _ (write dir "1.0.0" 1)
+          registry (pk-registry {:latest-version (fn (_name) "1.1.0")
+                                 :install (fn (name dest-dir)
+                                            (do
+                                              (write dest-dir "1.1.0" 2)
+                                              {:name name :version "1.1.0"}))})
+          _ (pk-run base registry (fn () (packages/apply-plugin! "pkgsmac")))
+          before ((reflect/eval 'pkgsmac/generation))
+          done (pk-launch base registry {:kind :update :name "pkgsmac"}))
+      (assert= before 1)
+      (is (includes? (:echo done) "updated pkgsmac → 1.1.0"))
+      (assert= ((reflect/eval 'pkgsmac/generation)) 2)))
+  :isolated (test "an update with nothing newer says it is current; an unpublished one says so"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir "pkgsnet" "1.0.0" "{bedit \">= 0.1\"}" "(defn bedit-plugin () {})"))
+      (assert= (:echo (pk-launch base (pk-registry {}) {:kind :update :name "pkgsnet"}))
+        "pkgsnet is already up to date")
+      (is (includes? (:echo (pk-launch base
+                              (pk-registry {:latest-version (fn (_name) nil)})
+                              {:kind :update :name "pkgsnet"}))
+            "not published")))))
+
+(describe "one package job at a time, C-x C-c knows, C-g stops it"
+  (test "a second job while one runs is refused, naming the running one"
+    (let (m (assoc (ed-init (make-buffer ""))
+              :package-job :a-handle
+              :package-job-info {:kind :install :name "dark"})
+          refused (packages/launch-job m {:kind :list}))
+      (is (includes? (:echo refused) "busy installing dark"))
+      (assert= (:package-job refused) :a-handle)))
+  :isolated (test "a remove waits for the running job (its install would put the package back)"
+    (let (base (temp-dir "bedit-pkgs-")
+          dir (path/join base "bedit" "packages")
+          _ (pk-write dir "pkgsnet" "1.0.0" "{bedit \">= 0.1\"}" "(defn bedit-plugin () {})")
+          busy (assoc (ed-init (make-buffer ""))
+                 :package-job :a-handle
+                 :package-job-info {:kind :update :name "pkgsnet"})
+          refused (pk-run base (pk-registry {}) (fn () (packages/remove-package busy "pkgsnet")))
+          removed (pk-run base
+                    (pk-registry {})
+                    (fn () (packages/remove-package (ed-init (make-buffer "")) "pkgsnet")))
+          again (pk-run base
+                  (pk-registry {})
+                  (fn () (packages/remove-package (ed-init (make-buffer "")) "pkgsnet"))))
+      (is (includes? (:echo refused) "busy updating pkgsnet"))
+      (assert= (:echo removed) "removed pkgsnet")
+      (refute (pk-run base (pk-registry {}) (fn () (packages/installed? "pkgsnet"))))
+      (assert= (:echo again) "pkgsnet is not installed")))
+  (test "C-x C-c's question names it"
+    (assert= (packages/package-busy (assoc (ed-init (make-buffer ""))
+                                      :package-job :h
+                                      :package-job-info {:kind :update :name "dark"}))
+      ["package manager: updating dark"])
+    (assert= (packages/package-busy (ed-init (make-buffer ""))) []))
+  (test "C-g's hook leaves a note and the status line says it stopped"
+    (let (quit (packages/ed-package-quit (assoc (ed-init (make-buffer ""))
+                                           :package-job-info {:kind :install :name "dark"})))
+      (assert= (:quit-notes quit) ["installing dark stopped"])
+      (assert= (:package-status quit) "installing dark stopped")))
+  (test "a task that died or timed out is said as such"
+    (let (done (packages/ed-package-done (assoc (ed-init (make-buffer ""))
+                                           :package-job :h
+                                           :package-job-info {:kind :list})
+                 nil))
+      (is (includes? (:echo done) "fetching the package list failed or timed out"))
+      (is (nil? (:package-job done))))))
+
+(describe "a live loop: the job runs in a task and its reply is folded"
+  :isolated (test "the list arrives through the loop's own update"
+    (let (base (temp-dir "bedit-pkgs-")
+          m (ed-init (make-buffer ""))
+          running (pk-run base
+                    (pk-registry {})
+                    (fn () (binding (editor/ui/*loop* (self)) (packages/show-packages m))))
+          handle (:package-job running)
+          fetching (pk-buffer-text running "*Packages*")
+          event (receive
+                  ([:task-done ^handle value] [:task-done handle value])
+                  (after 20000 (error "the package list never arrived")))
+          landed (pk-run base
+                   (pk-registry {})
+                   (fn () (binding (editor/ui/*loop* (self)) (input/ed-update running event 80 24)))))
+      (is (not (nil? handle)))
+      (is (includes? fetching "fetching the package list…"))
+      (is (nil? (:package-job landed)))
+      (is (includes? (pk-buffer-text landed "*Packages*") "pkgsnet")))))

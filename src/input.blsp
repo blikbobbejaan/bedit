@@ -36,6 +36,7 @@ self-editing editor)."
   (:use collab) ; shared-buffer-process pushes: the [:buffer-updated …] event handler
   ; web / git / diffhl are deferred — each registers its idle-beat job when it loads
   (:use keymaps) ; ed-ensure-profile — seed the model-scope keybinding profile (emacs/vim)
+  (:use userkeys) ; ed-user-scope — the scope with init.blsp's :keys / :mode-keys bound in
   (:use editor/layers) ; scope-resolve / scope-binding (buffer + model layers) + init-buffer-layers
   (:use wrap)) ; rows-from — the last line a wrapped pane shows (ed-point-into-view)
 ;; `modes` defines the layers and registers the default (text-mode); the bindings live
@@ -58,12 +59,13 @@ created anywhere get their mode here, lazily, so dispatch always has a keymap."
 (defn ed-scope (m)
   "The scope contexts dispatch resolves through, highest precedence first: the selected
 buffer's **mode** layers, then the model's **profile** layers. The profile (emacs/vim —
-`keymaps`) lives on the model scope; the mode (brood/text/…) on the buffer.
+`keymaps`) lives on the model scope; the mode (brood/text/…) on the buffer. The init file's
+`:keys` / `:mode-keys` are bound into both (`userkeys/ed-user-scope`).
 
 Public and named because `help` reports on exactly this list (`C-h b` / `C-h k`), and a
 second spelling of it there is the one way help could come to describe a keymap the
 dispatcher is not using."
-  (list (ed-current-buf m) m))
+  (ed-user-scope (ed-current-buf m) m))
 
 (defn- ed-key-binding (m key)
   "What `key` is bound to in the keymap in force — `ed-scope`'s layers, the buffer winning
@@ -243,11 +245,10 @@ the buffer cannot type: a terminal buffer's `C-x c` is its `C-c` map, because th
 owns C-c itself. A key that is no prefix anywhere is a no-op.
 
 The map is the MODEL scope's (the profile's: `C-c t` runs the tests) with the buffer's own
-additions merged over it. Not the composed keymap the dispatcher uses, because layers
-merge shallowly and a chord belongs to its winning layer (std/editor/layers) — the term
-mode binds `C-c C-j`, which takes the whole `C-c` map with it, and a command whose entire
-purpose is to reach the editor's map would hand back only the two keys the mode added."
-  (let (profile (scope-binding (list m) key)
+additions merged over it — what dispatch resolves, since layers merge prefixes deeply
+(brood ADR-535), and the profile's map still when the buffer's mode binds `key` to a
+command of its own, which a command standing in for the prefix exists to get past."
+  (let (profile (scope-binding (list (last (ed-scope m))) key) ; the model scope, user keys in
         mode (ed-key-binding m key)
         sub (merge (if (map? profile) profile {}) (if (map? mode) mode {})))
     (if (empty? sub) m (assoc m :prefix-map sub :prefix-key key))))
@@ -320,8 +321,10 @@ the chord resolves (a command ran) or aborts."
   (let (chord (append (or (:chord m) []) [input]))
     (cond
       (map? binding) (assoc result :echo (str (ed-keys-label chord) "-") :chord chord)
+      ;; a chord bound to nothing fails, as Emacs's `undefined` rings the bell (and ends a
+      ;; keyboard macro)
       (and (nil? binding) (:pending m))
-        (assoc result :echo (str (ed-keys-label chord) " is undefined") :chord [])
+        (ed-ding (assoc result :chord []) (str (ed-keys-label chord) " is undefined"))
       ;; the command pressed a prefix: the step set the chord and echo to it
       (:pending result) result
       else (assoc result :chord []))))
@@ -411,7 +414,7 @@ prompt owns are released exactly once. Today that is its ranking session
 (`model/ed-mb-stop-ranker`): a process that outlives its prompt is a leak, and a prompt is
 closed from four places (abort, Enter on a selection, Enter on the typed text, lineedit's
 own `:submit`), which is three too many to remember it in."
-  (assoc (ed-mb-stop-ranker m) :minibuffer nil))
+  (ed-minibuffer-closed m))
 
 (defn- mb-abort (m)
   "Close the minibuffer, first firing its optional `:on-abort` hook so a previewing prompt
@@ -586,10 +589,14 @@ keep reading; on an unbound key, say so. Esc/C-g aborts."
   read-char-overlay
   (overlay-active? (_ m) (:read-char m))
   ;; no overlay-owns? — capture-all: the next key is the one being read
+  ;; a reader that holds the keyboard for an answer still on its way (vcsproc's hold) names
+  ;; what C-g must also cancel — `:on-cancel`, a `(model) -> model` symbol, run late
   (overlay-handle (_ m input)
-    (if (ed-cancel-key? input)
-      (message (dissoc m :read-char) "quit")
-      ((map/get-in m [:read-char :then]) (dissoc m :read-char) input))))
+    (let (on-cancel (map/get-in m [:read-char :on-cancel]))
+      (cond
+        (and (ed-cancel-key? input) on-cancel) ((reflect/eval on-cancel) m)
+        (ed-cancel-key? input) (message (dissoc m :read-char) "quit")
+        else ((map/get-in m [:read-char :then]) (dissoc m :read-char) input)))))
 
 (defrecord transient-overlay ()) ; a transient menu (Magit's `P`): every key is the menu's until it closes
 (impl Overlay
@@ -634,8 +641,10 @@ keep reading; on an unbound key, say so. Esc/C-g aborts."
 (impl Overlay
   minibuffer-overlay
   (overlay-active? (_ m) (:minibuffer m))
-  ;; no overlay-owns? — capture-all: every key is the minibuffer's
-  (overlay-handle (_ m input) (minibuffer-handle m input)))
+  ;; no overlay-owns? — capture-all: every key is the minibuffer's. A message shown beside the
+  ;; prompt (`model/message`) lasts until the next key, as Emacs's minibuffer message does.
+  (overlay-handle (_ m input)
+    (minibuffer-handle (assoc m :minibuffer (dissoc (:minibuffer m) :message)) input)))
 
 (defrecord completion-overlay ())
 (impl Overlay
@@ -885,9 +894,10 @@ under the click. A no-op when the buffer's mode defines no `:on-click`."
     (if (or (nil? svc) (:guest-session m)) m (svc m :mouse))))
 
 (defn- ed-drag-release (m input textrows cols rows row col)
-  "End a left press over the text: a real drag-selection copies its region to the kill
-ring + OS clipboard (Emacs `mouse-drag-copy-region`, in ANY buffer, keeping the region
-highlighted); a plain CLICK (no region) runs the buffer mode's `:on-click` — so a
+  "End a left press over the text: a real drag-selection keeps its region highlighted and
+makes it the PRIMARY selection (`model/ed-drag-select` — the clipboard and kill ring are
+left alone, as in Emacs, unless `:mouse-drag-copy-region` is on); a plain CLICK (no region)
+runs the buffer mode's `:on-click` — so a
 results-buffer row (`*Tests*` / `*git-status*` / `*Occur*` / `*compile*`) navigates to
 its source ON CLICK, while a press-and-drag in the SAME buffer selects text instead.
 That click-vs-drag split is what makes a results buffer's output highlightable/copyable
@@ -896,8 +906,8 @@ rather than every press being swallowed as a link jump.
 A navigate then re-clamps the (now-selected) SOURCE pane so the visited line is actually
 brought on screen — `ed-pop-to-file` only moves point and relies on this clamp, and unlike
 the key path (RET) a mouse release returns straight out of here, so without it a click set
-point but never scrolled the target into view. The copy path scrolls nothing (the region
-stays put)."
+point but never scrolled the target into view. The selection path scrolls nothing (the
+region stays put)."
   (let (folded (ed-mouse m input cols rows))
     ; ends the drag; the region (mark↔point) survives
     (if (nil? (buffer-region (ed-current-buf folded)))
@@ -905,7 +915,13 @@ stays put)."
         ; a plain click — navigate via :on-click (if any)
         (ed-scroll-horizontal (ed-scroll navigated textrows)
           (ed-selected-text-cols navigated cols rows)))
-      (ed-drag-copy folded)))) ; a real region — copy it, leaving it selected
+      (ed-drag-select folded)))) ; a real region — PRIMARY gets it, it stays selected
+(defn- ed-term-pane-at? (m cols rows row col)
+  "Whether the pane under cell `[row col]` shows a terminal buffer — whose program, not the
+editor, decides what a middle click there means (`panes/ed-mouse` routes it)."
+  (let (pane (ed-pane-at m cols rows row col))
+    (and pane (= (:type (ed-pane-buf m pane)) :term))))
+
 (defn- ed-menu-mouse-press (m cols rows row col)
   "A press while the context menu is open: hit-test via the view's widget zones
 (`hittest/ed-menu-hit`) and drive the pure model op — run the enabled item, stay open on a
@@ -960,6 +976,14 @@ over the view widget's zones)."
       ;; instead of being swallowed as a link jump — that's what lets you highlight and
       ;; copy text in *Tests* / *git-status* / *Occur* / *compile*.
       (and (= action :release) (:text-drag m)) (ed-drag-release m input textrows cols rows row col)
+      ;; A middle press on text yanks the PRIMARY selection there (Emacs `mouse-yank-primary`)
+      ;; — unless the pane's terminal program takes the mouse (`ed-mouse` routes it there)
+      (and (= action :press) (= button :middle) (not (ed-term-pane-at? m cols rows row col)))
+        (let ([placed moved?] (ed-mouse-set-point m cols rows row col (ed-mouse-at input)))
+          (if moved?
+            (ed-scroll-horizontal (ed-scroll (ed-mouse-yank-primary placed) textrows)
+              (ed-selected-text-cols placed cols rows))
+            placed))
       ;; A left-press on a clickable status-bar segment (the branch / git indicator) runs its
       ;; command instead of the normal press handling — so it opens *git-status*, not moves
       ;; point. `ed-modeline-click` is nil unless a segment with an `:on-click` is under it.
@@ -1020,10 +1044,16 @@ server's connection)."
 key — std/editor/serve): record the participant name and announce it on every shared
 buffer process, so collab presence (name tags, join/leave echoes) shows who this is.
 A nil/empty name is ignored. A guest (`:guest` — brood's `editor/serve` marks a client that
-attached over a guest link) gets a guest's session: the allowlist `model/ed-guest-allows?`."
+attached over a guest link) gets a guest's session: the allowlist `model/ed-guest-allows?`,
+and none of the host's on-disk memory — no recentf (the host's recent files and projects,
+and the generated state it persists) and no save-place (the host's places file, read and
+written). It keeps the host's config — the session is the host's editor, its look and its
+keys — and its own clipboard: the guest's client's, which holds nothing of the host's."
   (let (opts (nth input 1)
         named (collab-set-name m (:name opts)))
-    (if (= true (:guest opts)) (assoc named :guest-session true) named)))
+    (if (= true (:guest opts))
+      (assoc (dissoc named :recent-files :save-place) :guest-session true)
+      named)))
 
 (defn- ed-ev-key-up (m input textrows cols rows)
   "A `[:key-up k]` (a window, or a terminal once a held key stops): nothing to do — the
@@ -1116,8 +1146,7 @@ A no-op when point is already visible, so normal editing is untouched."
         bot (if (and (ed-row-wise? buf inlays) (> w 0))
               ;; from the pane's start, which may be part-way down its top line
               (let (skip (second (ed-current-start m w inlays))
-                    text-rows (seq/filter (drop (wrap/rows-from buf top w (+ textrows skip) inlays)
-                                            skip)
+                    text-rows (seq/filter (wrap/rows-from buf top w textrows inlays skip)
                                 (fn (row) (nil? (nth row 3)))))
                 (if (empty? text-rows) top (first (last text-rows))))
               (+ top (dec textrows))))
@@ -1151,11 +1180,12 @@ else — a key."
     ;; outside any transient — a close is never a key.
     (= input :close) ((reflect/eval 'commands/cmd-quit) m0 input)
     ;; the window lost focus (`:blur`): the caret goes hollow, and a composition left showing
-    ;; goes with it — not every input method says it ended
-    (= input :blur) (assoc (dissoc m0 :preedit) :unfocused true)
+    ;; goes with it — not every input method says it ended; another app may copy now
+    (= input :blur) (ed-clipboard-blur (assoc (dissoc m0 :preedit) :unfocused true))
     ;; and back: the caret is solid again (brood ADR-441's `:focus-in`), and the window
-    ;; blinks it again (it held it shown while unfocused, brood ADR-469)
-    (= input :focus-in) (dissoc m0 :unfocused)
+    ;; blinks it again (it held it shown while unfocused, brood ADR-469); what another app
+    ;; copied meanwhile is read off the loop, so a yank never waits on it
+    (= input :focus-in) (ed-clipboard-focus (dissoc m0 :unfocused))
     ;; Text that is more than one key's worth (an input method's commit, a compose sequence,
     ;; brood ADR-441): each character takes the key path, as though typed, so the minibuffer,
     ;; isearch and a terminal's program all get it the way they get typing, and the composition
@@ -1197,6 +1227,114 @@ else — a key."
                        typed))
         input textrows textcols)))
 
+;; ---- replaying a keyboard macro (C-x e) ---------------------------------------
+;; Each recorded key goes back through the whole turn (`ed-update-direct`), as if typed.
+;; Emacs's rules: a run of N passes stops at the first key whose command fails — an error,
+;; or a bell (`model/ed-ding`: a failing search, a motion at the buffer's edge, a read-only
+;; refusal) — and N = 0 runs passes until one does, or until C-g.
+;;
+;; C-g has to reach a run, so a run is not one turn: it replays keys for at most
+;; `*macro-slice-ms*` and then yields to the loop, which takes queued input before it fires
+;; the `:macro-continue` ticker that resumes the run (the idle beat's slicing). Between
+;; slices a C-g ends the run, keeping what it did, and runs as the quit it is; any other
+;; input the user types meanwhile waits in `:macro-typeahead` and is folded, in order, when
+;; the run ends — Emacs reads the macro's keys before the keyboard's. The run's state is
+;; `:macro-run` (`{:keys :passes :done :index}`); `:macro-executing` is on while it lasts,
+;; so the macro cannot start itself again.
+
+(defdyn *macro-slice-ms* 8)
+;; How long one slice of a macro run may replay keys before it yields to the loop, which
+;; then takes the input queued behind it (C-g above all). Half a 60 Hz frame, as the loop's
+;; own fold budget: a long run shows its progress every frame or two.
+
+(def- *macro-continue-timer* :macro-continue)
+
+(defn- ed-macro-end (m cols rows)
+  "End the macro run in `m`: its state and ticker gone, then the input typed while it ran
+folded in the order it came (`:macro-typeahead`)."
+  (let (typeahead (or (:macro-typeahead m) [])
+        ended (ed-drop-timer (dissoc m :macro-run :macro-executing :macro-typeahead)
+                *macro-continue-timer*))
+    (fold typeahead ended (fn (acc input) (ed-update acc input cols rows)))))
+
+(defn- ed-macro-slice (m cols rows)
+  "Replay the run in `m` (`:macro-run`) from where it stands for up to `*macro-slice-ms*` —
+at least one step, so a run always progresses. Ends the run at the first key whose command
+failed (`:command-failed`, cleared before each key so only that key's failure counts) or
+after its last pass; otherwise keeps the position and arms `:macro-continue`."
+  (let (deadline (+ (os/now) *macro-slice-ms*))
+    (letrec (step (fn (mm run stepped)
+                    (let (keys (:keys run)
+                          index (:index run))
+                      (cond
+                        (and (> stepped 0) (>= (os/now) deadline))
+                          (ed-set-timer (assoc mm :macro-run run)
+                            *macro-continue-timer*
+                            {:every 1 :command? true})
+                        (>= index (count keys))
+                          (let (done (inc (:done run)))
+                            (if (and (> (:passes run) 0) (>= done (:passes run)))
+                              (ed-macro-end mm cols rows)
+                              (step mm (assoc run :done done :index 0) (inc stepped))))
+                        else
+                          (let (after (ed-update-direct (dissoc mm :command-failed)
+                                        (nth keys index)
+                                        cols
+                                        rows))
+                            (if (:command-failed after)
+                              (ed-macro-end (dissoc after :command-failed) cols rows)
+                              (step after (assoc run :index (inc index)) (inc stepped))))))))
+      (step m (:macro-run m) 0))))
+
+(defn ed-run-macro (m request cols rows)
+  "Start replaying the last keyboard macro as `request` (`{:count N}`, from
+`cmd-execute-kbd-macro`) asks — N passes, or with N = 0 passes until one fails — and run its
+first slice ([[ed-macro-slice]]); the loop runs the rest, between the user's input."
+  (ed-macro-slice (assoc m
+                    :macro-executing true
+                    :macro-run
+                      {:keys (vec (or (:macro-last m) []))
+                       :passes (or (:count request) 1)
+                       :done 0
+                       :index 0})
+    cols rows))
+
+(defn- ed-macro-typeahead? (input)
+  "Whether `input` is the user's — a key, typed or committed text, the mouse, the close
+button — which a running macro makes wait, rather than a timer, a reply or a window event
+that folds as usual."
+  (and (not (record? input))
+    (not (= input :blur))
+    (not (= input :focus-in))
+    (or (not (vector? input)) (contains? #{:text :mouse :preedit} (first input)))))
+
+(defn- ed-macro-continue (m cols rows)
+  "The `:macro-continue` ticker fired: the run's next slice ([[ed-macro-slice]]). The ticker
+is a `:command?` timer (brood ADR-564), so the loop folds it as the user's command — no
+background ceiling stops a slice part-way and rolls it back to run again. A slice that
+throws (each key's own error is already caught, and ends the run) ends the run here too,
+said, never left to be retried."
+  (try
+    (ed-macro-slice m cols rows)
+    (catch e
+      (ed-ding (message (ed-drop-timer (dissoc m :macro-run :macro-executing :macro-typeahead)
+                          *macro-continue-timer*)
+                 (str "keyboard macro stopped: " (error-message e)))))))
+
+(sig ed-macro-input (model any int int -> model))
+(defn- ed-macro-input (m input cols rows)
+  "Fold `input` into `m` while a macro runs: its ticker resumes the run, C-g ends it — the
+work done so far kept, the typeahead dropped, and C-g then run as the quit it is — and
+other user input waits for the run to end."
+  (cond
+    (= input [:timer *macro-continue-timer*]) (ed-macro-continue m cols rows)
+    (= input :ctrl-g)
+      (ed-update-direct (ed-drop-timer (dissoc m :macro-run :macro-executing :macro-typeahead)
+                          *macro-continue-timer*)
+        input cols rows)
+    (ed-macro-typeahead? input) (assoc m :macro-typeahead (conj (or (:macro-typeahead m) []) input))
+    else (ed-update-direct m input cols rows)))
+
 (defn- ed-loop-tail (m0 result input cols rows)
   "After the event folded in: replay a keyboard macro if one was asked for, else propagate.
 
@@ -1212,16 +1350,15 @@ auto-share / follow / presence sync). Each is a map-lookup no-op on a model with
 hosted, which is what lets `share-session` turn a LIVE editor into a host without swapping
 update fns."
   (if (:run-macro result)
-    (fold (or (:macro-last result) '())
-      (dissoc result :run-macro)
-      (fn (mm ev) (ed-update mm ev cols rows)))
+    (ed-run-macro (dissoc result :run-macro) (:run-macro result) cols rows)
     (collab-step m0 (hosted-step m0 result input) input)))
 
 (defn- ed-recover (m0 e input)
   "A thrown error — from a command, the minibuffer, completion, or a re-check — surfaces in the
 echo area and the editor keeps running: a crash must never take down the whole editor (ui-run
 would otherwise restore the screen and re-raise, exiting). The pre-event model `m0` stands
-(the edit is undone by being abandoned — the buffer is immutable).
+(the edit is undone by being abandoned — the buffer is immutable), marked failed
+(`ed-ding`), so a keyboard macro running it stops here as Emacs's does on an error.
 
 A read-only span refusing an edit is not an error to surface as one: `ed-edit` already turns
 the common path into the buffer's hint, and this is the SAFETY NET for any command that edits
@@ -1231,10 +1368,11 @@ never a raw `error:`.
 The error echo appends to *Messages*, which is HOSTED under the flip — the append must still
 propagate or the pool cache silently diverges from the *Messages* process (its own guarded
 try: a propagate error here must not recurse into another echo)."
-  (let (me (if (and (map? e) (= (:kind e) :read-only))
-             (message m0
-               (or (ed-mode-service (ed-current-buf m0) :read-only-hint) "read-only text here"))
-             (message m0 (str "error: " (error-message e)))))
+  (let (me (ed-ding (if (and (map? e) (= (:kind e) :read-only))
+                      (message m0
+                        (or (ed-mode-service (ed-current-buf m0) :read-only-hint)
+                          "read-only text here"))
+                      (message m0 (str "error: " (error-message e))))))
     (try (hosted-step m0 me input) (catch e2 me))))
 
 (defn- ed-sync-title (result)
@@ -1275,7 +1413,10 @@ a large file. They run debounced on the idle beat instead (`ed-timer-fire :idle-
         ;; every such consumer inventing its own stash is how a model grows three of them.
         ;; The viewport goes on the model so page commands know it; the key is captured if a
         ;; macro is recording.
-        m0 (ed-macro-record (assoc m :view-rows textrows :view-cols textcols :frame [cols rows])
+        m0 (ed-macro-record (assoc (dissoc m :command-failed)
+                              :view-rows textrows
+                              :view-cols textcols
+                              :frame [cols rows])
              input))
     ;; a committed turn frees the tree handles it dropped (`syntaxtree`); a rolled-back one
     ;; still names them
@@ -1292,8 +1433,17 @@ a large file. They run debounced on the idle beat instead (`ed-timer-fire :idle-
                        (catch e (ed-recover m0 e input)))))))
 
 (defn ed-update (m input cols rows)
-  "ui-run update: fold one input into the next model — the whole pipeline
-([[ed-update-turn]]) unless the input can change nothing it would act on. Three can't:
+  "ui-run update: fold one input into the next model. While a keyboard macro runs
+(`:macro-run`) the input is [[ed-macro-input]]'s — the run's ticker, C-g, or typeahead that
+waits for it; otherwise [[ed-update-direct]]."
+  (if (nil? (:macro-run m))
+    (ed-update-direct m input cols rows)
+    (ed-macro-input m input cols rows)))
+
+(sig ed-update-direct (model any int int -> model))
+(defn- ed-update-direct (m input cols rows)
+  "Fold one input into the next model — the whole pipeline ([[ed-update-turn]]) unless the
+input can change nothing it would act on. Three can't:
 
 - a key's release (`[:key-up k]`): bedit keeps no state about a held key (the desktop
   repeats it, brood ADR-441, and `ui-run` holds the idle timers while one is down), so `m`
@@ -1313,11 +1463,23 @@ idle beat — the git summary, diff-hl, the diagnostics — is armed by the firs
 the first input was a cosmetic tick, that turn never came, and an editor left alone at launch never
 showed its branch."
   (cond
-    (not (:timers-synced? m)) (ed-update-turn m input cols rows)
+    (not (:timers-synced? m)) (ed-update-tabbed m input cols rows)
     (ed-key-up? input) m
     (hosted-own-echo? m input) m
     (ed-cosmetic-timer? input) (ed-cosmetic-fire m (nth input 1))
-    else (ed-update-turn m input cols rows)))
+    else (ed-update-tabbed m input cols rows)))
+
+;; check-allow: `with-cell-layout` runs its body in a thunk whose result the checker does not
+;; carry; the body is `ed-update-turn`, which answers a model
+(sig ed-update-tabbed (model any int int -> model))
+(check-allow :trusted
+  (defn- ed-update-tabbed (m input cols rows)
+    "[[ed-update-turn]] with brood's `*tab-width*` bound to the current buffer's tab width
+(`conventions/with-cell-layout`): the ONE place every fold of the model passes through, so a
+command's goal column, a row motion, the scroll clamp and the view all measure a tab as the
+buffer's. A measure that names ANOTHER buffer binds that one's itself (`wrap`'s buffer
+functions, the view's pane, a click)."
+    (conventions/with-cell-layout (ed-current-buf m) (fn () (ed-update-turn m input cols rows)))))
 
 ;; The loop's update contract, in types. `assoc` answers `vector | map` — a receiver's
 ;; type does not survive an update — so the closing `(assoc result :window-title title)`

@@ -293,3 +293,227 @@
     (is (not (model/ed-guest-allows-name? "shell-command")))
     (is (not (model/ed-guest-allows? 'git/cmd-git-status)))
     (is (model/ed-guest-allows? :self-insert))))
+
+;; A private session outlives its window (brood ADR-519): a dropped client's session parks,
+;; its buffers' sidecars written at once, and attaching again under the same name takes it
+;; back. A served `:close` (the window already gone) writes them and ends, asking nothing.
+(purge-stale-temp "bedit-remote-")
+
+(defn- r-fixture-file (text)
+  ;; a fresh file holding `text` in its own temp directory; its path
+  (let (dir (temp-dir "bedit-remote-")
+        _ (file/mkdir dir)
+        path (path/join dir "notes.txt"))
+    (do (file/spit path text) path)))
+
+(defn- r-await-file (path tries)
+  ;; `path`'s text once the off-loop writer has made it, else nil — polled, since the
+  ;; writer is a process of its own with no reply to wait on
+  (cond
+    (file/exists? path) (file/slurp path)
+    (<= tries 0) nil
+    else (receive (after 20 (r-await-file path (dec tries))))))
+
+(defn- r-named-client (mgr report)
+  ;; attach as "ann", say the session, then die when told — the dropped link
+  (send mgr [:attach (self) 80 24 {:name "ann"}])
+  (receive
+    ([:attached s] (do (send report [:session s]) (receive (:die nil))))
+    (after 2000 (send report [:session nil]))))
+
+(describe "remote — a private session outlives its window"
+  (test "a lost client's buffers are auto-saved at once, unthrottled"
+    (let (path (r-fixture-file "text\n")
+          typed (ed-update (assoc (ed-init (find-file-buffer path)) :auto-saved-at (os/now))
+                  "x" 80 24)
+          m (ed-ev-client-lost typed [:client-lost] 24 80 24))
+      (assert= (r-await-file (autosave/ed-auto-save-path path) 100) "xtext\n")
+      (is (includes? (:echo m) "auto-saved"))))
+
+  (test "a served :close ends the session with its sidecars written, asking nothing"
+    (let (path (r-fixture-file "text\n")
+          typed (ed-update (ed-init (find-file-buffer path)) "y" 80 24)
+          m (ed-served-update typed :close 80 24))
+      (is (:done m))
+      (assert= (r-await-file (autosave/ed-auto-save-path path) 100) "ytext\n")))
+
+  (test "an ordinary input still folds through ed-update"
+    (let (m (ed-served-update (ed-init (make-buffer "")) "z" 80 24))
+      (assert= (buffer-text (ed-current-buf m)) "z")))
+
+  (test "attaching again under the same name gets the parked session, typing intact"
+    (let (me (self)
+          mgr (spawn (editor/serve/serve-manager (r-empty-model)
+                       ed-view
+                       ed-served-update
+                       {:resume-ms 60000}))
+          client (spawn (r-named-client mgr me))
+          session (receive ([:session s] s) (after 2000 nil)))
+      (is (not (nil? session)))
+      (doseq (k (string/->list "Kept9")) (send session [:key k]))
+      (r-drain-frames :none)
+      (send client :die)
+      (receive (after 300 nil)) ; the session notices the client's death and parks
+      (send mgr [:attach me 80 24 {:name "ann"}])
+      (assert= (receive ([:attached s] s) (after 2000 :none)) session)
+      (is (r-frame-has? (r-drain-frames :none) "Kept9"))
+      (exit session :kill))))
+
+;; ---- a served session starts as the window does, its clipboard the client's ---------
+;; `--serve` used to build its sessions from the bare `ed-init` model: no init.blsp, no
+;; recentf or save-place, and no clipboard at all. Now a session is prepared through the
+;; window's startup path (src/startup.blsp) and kills and yanks reach the CLIENT's
+;; clipboard over the link (brood ADR-539) — here the test process is that client.
+
+;; The init file as a daemon reads it once (`startup/read-init`), built here so no test
+;; reads the user's real one.
+(defn r-init (config) {:config config :note nil})
+
+(describe "remote — a served session is prepared as the window's editor is"
+  (test "the daemon's init config reaches the session model"
+    (let (m ((ed-serve-model nil (r-init {:hl-line false :share-name "host"}))))
+      (assert= (:hl-line m) false)
+      (assert= (:recent-files m) true)
+      (assert= (:save-place m) true)
+      ;; the participant is whoever attaches, never the host's :share-name
+      (is (nil? (:participant m)))))
+
+  (test "an init file that did not read says so in the session's echo area"
+    (let (m ((ed-serve-model nil {:config {} :note "init.blsp:2:1: unclosed list"})))
+      (assert= (:echo m) "init.blsp:2:1: unclosed list")))
+
+  (test "the init file is read once, from where the daemon is told — a temp one here"
+    (let (dir (temp-dir "bedit-remote-")
+          broken (str dir "/broken.blsp")
+          fresh (str dir "/fresh/init.blsp"))
+      (file/mkdir dir)
+      (file/spit broken "(config :hl-line false)\n(stray\n")
+      (let (read (startup/read-init broken))
+        (assert= (:config read) {:hl-line false})
+        (is (string/starts-with? (:note read) "init.blsp:2:1")))
+      ;; a missing one is written with its documented defaults, and reads cleanly
+      (let (read (startup/read-init fresh))
+        (is (file/exists? fresh))
+        (is (nil? (:note read))))))
+
+  (test "its clipboard is the client's, never the daemon's OS clipboard"
+    (let (m ((ed-serve-model nil (r-init {}))))
+      (assert= (:client-clipboard m) true)
+      (is (not (:os-clipboard m)))))
+
+  (test "a guest keeps the host's config but none of its on-disk memory"
+    (let (m (ed-update ((ed-serve-model nil (r-init {:hl-line false})))
+              [:client-opts {:name "gil" :guest true}]
+              80
+              24))
+      (is (:guest-session m))
+      (assert= (:hl-line m) false)
+      (is (nil? (:recent-files m)))
+      (is (nil? (:save-place m)))
+      (assert= (:client-clipboard m) true)))
+
+  (test "without an init file the session model stays the pure one"
+    (let (m ((ed-serve-model nil)))
+      (is (nil? (:recent-files m)))
+      (is (nil? (:client-clipboard m))))))
+
+;; A served session on an empty buffer, prepared from the default config — the test process
+;; attaches as its client and is sent the session's clipboard traffic.
+(defn r-clipboard-session ()
+  (let (mgr (spawn (editor/serve/serve-manager (fn ()
+                                                 (ed-served-model (make-buffer "") nil (r-init {})))
+                     ed-view ed-update)))
+    (send mgr [:attach (self) 80 24])
+    (let (session (receive ([:attached s] s) (after 2000 nil)))
+      (receive ([:frame _] nil) (after 2000 nil))
+      session)))
+
+(defn r-press (session keys) (doseq (k keys) (send session [:key k])))
+
+;; :ok once a frame paints `sub`, skipping the frames before it; :timeout if none does
+(defn r-await-frame-has (sub)
+  (receive
+    ([:frame f] (if (r-frame-has? f sub) :ok (r-await-frame-has sub)))
+    (after 3000 :timeout)))
+
+;; the first frame that paints `sub`, skipping the frames before it; :timeout if none does
+(defn r-await-frame-with (sub)
+  (receive
+    ([:frame f] (if (r-frame-has? f sub) f (r-await-frame-with sub)))
+    (after 3000 :timeout)))
+
+;; kill `text` in the session, its clipboard-set and the frames that showed the typing taken
+(defn r-kill-text (session text)
+  (r-press session (into (string/->list text) [:ctrl-a :ctrl-k]))
+  (receive ([:clipboard-set _] nil) (after 2000 nil))
+  (r-drain-frames :none))
+
+(describe "remote — kill and yank reach the client's clipboard"
+  (test "a kill in the session is put on the client's clipboard"
+    (let (session (r-clipboard-session))
+      (r-press session ["a" "b" "c" :ctrl-a :ctrl-k])
+      (assert= (receive ([:clipboard-set text] text) (after 2000 :none)) "abc")
+      (exit session :kill)))
+
+  (test "a yank inserts what the client says its clipboard holds"
+    (let (session (r-clipboard-session))
+      (r-press session [:ctrl-y])
+      (receive
+        ([:clipboard-get from asked] (send from [:clipboard asked "from the laptop"]))
+        (after 2000 nil))
+      (assert= (r-await-frame-has "from the laptop") :ok)
+      (exit session :kill)))
+
+  (test "the loop keeps taking keys while the client is asked, and the yank lands where C-y was"
+    (let (session (r-clipboard-session))
+      (r-kill-text session "xyz")
+      (r-press session [:ctrl-y])
+      (let (question (receive ([:clipboard-get from asked] [from asked]) (after 2000 nil)))
+        (is (not (nil? question)))
+        ;; unanswered: a key typed now is folded and drawn — nothing waits on the client
+        (r-press session ["Q"])
+        (assert= (r-await-frame-has "Q") :ok)
+        (send (first question) [:clipboard (second question) "PASTE"]))
+      ;; in at the spot C-y marked, before what was typed since
+      (assert= (r-await-frame-has "PASTEQ") :ok)
+      ;; and point stayed after the typing: the next key goes at the end
+      (r-press session ["!"])
+      (assert= (r-await-frame-has "PASTEQ!") :ok)
+      (exit session :kill)))
+
+  (test "a client that never answers leaves the yank to the kill ring"
+    (let (session (r-clipboard-session))
+      (is (not (r-frame-has? (r-kill-text session "xyz") "xyz")))
+      (r-press session [:ctrl-y])
+      ;; asked, and never answered: brood answers nil at its timeout, and the ring's head goes in
+      (is (not (= (receive ([:clipboard-get _ asked] asked) (after 2000 :none)) :none)))
+      (assert= (r-await-frame-has "xyz") :ok)
+      (r-press session ["!"])
+      (assert= (r-await-frame-has "xyz!") :ok)
+      (exit session :kill)))
+
+  (test "M-y while the client is still asked does not touch the yank before it"
+    (let (session (r-clipboard-session))
+      (r-kill-text session "alpha")
+      (r-kill-text session "beta")
+      ;; a first yank, answered: "beta"
+      (r-press session [:ctrl-y])
+      (receive ([:clipboard-get from asked] (send from [:clipboard asked "beta"])) (after 2000 nil))
+      (assert= (r-await-frame-has "beta") :ok)
+      (r-drain-frames :none)
+      ;; a second, its answer held back, and M-y meanwhile: it must not cycle the FIRST
+      ;; yank's span (that would leave "alpha"), only say the yank is not done
+      (r-press session [:ctrl-y])
+      (let (question (receive ([:clipboard-get from asked] [from asked]) (after 2000 nil)))
+        (r-press session [:alt-y])
+        ;; the frame that says so still shows the first yank's "beta", not "alpha"
+        (let (said (r-await-frame-with "yank not done yet"))
+          (is (not (= said :timeout)))
+          (is (r-frame-has? said "beta"))
+          (is (not (r-frame-has? said "alpha"))))
+        (send (first question) [:clipboard (second question) "beta"]))
+      (assert= (r-await-frame-has "betabeta") :ok)
+      ;; and once it is done, M-y cycles THAT yank, as right after a C-y
+      (r-press session [:alt-y])
+      (assert= (r-await-frame-has "betaalpha") :ok)
+      (exit session :kill))))

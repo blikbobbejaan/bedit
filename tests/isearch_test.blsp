@@ -1,0 +1,411 @@
+;; isearch as Emacs 27 has it: the match count in the prompt, every visible match lit, regexp
+;; and word search, the case toggle, and query-replace by regexp with group references. The
+;; count is the part that must not cost a key: it runs in slices on its own timer, and the
+;; large-buffer test pins that typing never takes it.
+(defmodule isearch-test
+  (:use model)
+  (:use input)
+  (:use view)
+  (:use isearch) ; the count's dynamic knobs, bound bare
+  (:use main)
+  (:use editor/buffer)
+  (:use test))
+
+(defn- m-of (text) (ed-init (make-buffer text)))
+(defn- press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+(defn- type-str (m s) (press m (string/->list s)))
+(defn- match-of (m) (map/get-in m [:isearch :match]))
+(defn- point-of (m) (buffer-point (ed-current-buf m)))
+(defn- text-of (m) (buffer-text (ed-current-buf m)))
+(defn- at-point (m at) (ed-set-buf m (goto-char (ed-current-buf m) at)))
+
+(defn- counted (m)
+  "`m` with its match count run to the end, a slice per turn, as the timer would."
+  (if (isearch/isearch-count-due? m) (counted (isearch/isearch-count-step m)) m))
+
+(describe "the match count (isearch-lazy-count)"
+  (test "typing does not count; the count's timer does, and the prompt says N/M"
+    (let (typed (type-str (press (m-of "foo bar foo baz foo") [:ctrl-s]) "foo"))
+      (is (nil? (:isearch-count typed)))
+      (assert= (:echo typed) "I-search: foo")
+      (assert= (:after (isearch/isearch-count-timer typed)) *isearch-count-delay-ms*)
+      (assert= (:echo (counted typed)) "1/3 I-search: foo")
+      (is (nil? (isearch/isearch-count-timer (counted typed))))))
+  (test "C-s and C-r move the ordinal; a wrap starts it again"
+    (let (m (counted (type-str (press (m-of "foo bar foo baz foo") [:ctrl-s]) "foo"))
+          second (press m [:ctrl-s])
+          third (press second [:ctrl-s])
+          failing (press third [:ctrl-s])
+          wrapped (press failing [:ctrl-s])
+          back (press second [:ctrl-r]))
+      (assert= (:echo second) "2/3 I-search: foo")
+      (assert= (:echo third) "3/3 I-search: foo")
+      (assert= (:echo failing) "0/3 Failing I-search: foo")
+      ;; wrapped round and past where it started (point 3, origin 0): Emacs says Overwrapped
+      (assert= (:echo wrapped) "1/3 Overwrapped I-search: foo")
+      (assert= (:echo back) "2/3 I-search backward: foo")))
+  (test "a grown string is a different count, not a stale one"
+    (let (m (counted (type-str (press (m-of "foo food fool") [:ctrl-s]) "foo"))
+          grown (type-str m "l"))
+      (assert= (:echo m) "1/3 I-search: foo")
+      (assert= (:echo grown) "I-search: fool")
+      (assert= (:echo (counted grown)) "1/1 I-search: fool")))
+  (test "a large buffer: no key counts, and each turn of the count is one bounded slice"
+    ;; 400k lines, ~4.8 MB. The keys run no count at all; with the turn's budget at zero each
+    ;; turn counts ONE slice, so the prompt says `?/N+` until the last, and the slices add up.
+    (let (lines 400000
+          m (m-of (string/repeat "foo bar baz\n" lines))
+          typed (type-str (press m [:ctrl-s]) "baz")
+          next (press typed [:ctrl-s]))
+      (is (nil? (:isearch-count typed)))
+      (is (nil? (:isearch-count next)))
+      (binding (*isearch-count-budget-ms* 0)
+        (let (one (isearch/isearch-count-step next)
+              progress (:isearch-count one)
+              slice *isearch-count-slice*)
+          (assert= (count (:slices progress)) 1)
+          (is (>= (:resume progress) slice))
+          (is (< (:resume progress) (+ slice 12)))
+          (assert= (:total progress) (math/quot (:resume progress) 12))
+          (assert= (:echo one) (str "2/" (:total progress) "+ I-search: baz"))
+          (assert= (:echo (counted one)) (str "2/" lines " I-search: baz")))))))
+
+(describe "lazy highlight"
+  (test "every other match in the window is lit, the current one in its own face"
+    (let (m (type-str (press (m-of "foo bar foo baz foo") [:ctrl-s]) "foo")
+          ops (ed-view m 80 24)
+          lit (fn (face)
+                (seq/filter ops
+                  (fn (op)
+                    (and (= (first op) :text) (= (nth op 4 nil) face) (= (nth op 3 "") "foo"))))))
+      (assert= (count (lit theme/face-isearch)) 1)
+      (assert= (count (lit theme/face-isearch-lazy)) 2)
+      (assert= (map (isearch/lazy-ranges m (ed-current-buf m) 0 24 true)
+                 (fn (range) (vec (take range 2))))
+        '([0 3] [8 11] [16 19]))))
+  (test "only the window's lines are searched"
+    (let (m (type-str (press (m-of (string/repeat "foo\n" 100)) [:ctrl-s]) "foo"))
+      (assert= (count (isearch/lazy-ranges m (ed-current-buf m) 10 5 true)) 6)
+      (assert= (isearch/lazy-ranges m (ed-current-buf m) 10 5 false) '())))
+  (test "leaving the search puts the highlights out"
+    (let (m (press (type-str (press (m-of "foo foo") [:ctrl-s]) "foo") [:enter]))
+      (is (nil? (:isearch-lazy m)))
+      (assert= (isearch/lazy-ranges m (ed-current-buf m) 0 24 true) '()))))
+
+(describe "regexp search (C-M-s, C-M-r, M-r)"
+  (test "C-M-s finds a regexp, point at the match's end"
+    (let (m (type-str (press (m-of "foo bxr bar") [:ctrl-meta-s]) "b[a-z]r"))
+      (assert= (match-of m) 4)
+      (assert= (point-of m) 7)
+      (assert= (:echo m) "Regexp I-search: b[a-z]r")
+      (assert= (match-of (press m [:ctrl-s])) 8)))
+  (test "C-M-r finds the match starting last before point"
+    (let (m (at-point (m-of "ab1 ab2 ab3") 11)
+          found (type-str (press m [:ctrl-meta-r]) "ab[0-9]")
+          earlier (press found [:ctrl-r]))
+      (assert= (match-of found) 8)
+      (assert= (point-of found) 8)
+      (assert= (:echo found) "Regexp I-search backward: ab[0-9]")
+      (assert= (match-of earlier) 4)))
+  (test "a growing backward regexp stays on its match while it still matches there"
+    (let (m (at-point (m-of "foo fob") 7)
+          found (type-str (press m [:ctrl-meta-r]) "fo"))
+      (assert= (match-of found) 4)
+      (assert= (match-of (type-str found "b")) 4)
+      (assert= (match-of (type-str found "o")) 0)))
+  (test "^ and $ are a line's ends"
+    (let (m (type-str (press (m-of "a foo\nfoo b") [:ctrl-meta-s]) "^foo"))
+      (assert= (match-of m) 6)))
+  (test "M-r toggles a search to a regexp one, and DEL toggles it back"
+    (let (m (type-str (press (m-of "abc a.c") [:ctrl-s]) "a.c")
+          regexp (press m [:alt-r]))
+      (assert= (match-of m) 4)
+      (assert= (match-of regexp) 4)
+      (assert= (:echo regexp) "Regexp I-search: a.c")
+      ;; as a regexp `a.c` is `abc` too: past the last match, the wrap finds it
+      (assert= (match-of (press regexp [:ctrl-s :ctrl-s])) 0)
+      (assert= (:echo (press regexp [:backspace])) "I-search: a.c")))
+  (test "an unfinished regexp says so and keeps the match it had"
+    (let (m (type-str (press (m-of "foo foob") [:ctrl-meta-s]) "foo")
+          open (type-str m "(")
+          still (type-str open "b")
+          closed (type-str still ")"))
+      (assert= (match-of open) 0)
+      (assert= (:echo open) "Regexp I-search: foo( [incomplete input]")
+      (assert= (:echo still) "Regexp I-search: foo(b [incomplete input]")
+      (assert= (match-of closed) 4)
+      (assert= (:echo closed) "Regexp I-search: foo(b)")))
+  (test "a regexp's count counts the regexp"
+    (let (m (counted (type-str (press (m-of "a1 b22 c333") [:ctrl-meta-s]) "[0-9]+")))
+      (assert= (:echo m) "1/3 Regexp I-search: [0-9]+"))))
+
+(describe "case folding (M-c) and word search (M-s w)"
+  (test "M-c makes a folding search case-sensitive, and back"
+    (let (m (type-str (press (m-of "Foo foo") [:ctrl-s]) "foo")
+          sensitive (press m [:alt-c])
+          folding (press sensitive [:alt-c]))
+      (assert= (match-of m) 0)
+      (assert= (match-of sensitive) 4)
+      (assert= (:echo sensitive) "I-search: foo [case sensitive]")
+      (assert= (:echo (type-str sensitive "x")) "Failing case-sensitive I-search: foox")
+      (assert= (:echo folding) "I-search: foo [case insensitive]")
+      (assert= (match-of (press folding [:ctrl-r :ctrl-r])) 0)))
+  (test "a capital in a regexp's escape is not a capital"
+    (is (isearch/regexp-fold? "\\W+foo\\S"))
+    (is (not (isearch/regexp-fold? "\\WFoo"))))
+  (test "M-s w finds the words whatever lies between them"
+    (let (m (type-str (press (m-of "foobar foo--\n  bar") [:alt-s "w"]) "foo bar"))
+      (assert= (match-of m) 7)
+      (assert= (point-of m) 18)
+      (assert= (:echo m) "Word I-search: foo bar")))
+  (test "M-s w inside a search toggles it to a word search"
+    (let (m (press (type-str (press (m-of "foobar foo, bar") [:ctrl-s]) "foo bar") [:alt-s "w"]))
+      (assert= (:echo m) "Word I-search: foo bar")
+      (assert= (match-of m) 7))))
+
+(describe "query-replace by regexp (C-M-%)"
+  (test "\\1 and \\2 are the groups, \\& the whole match"
+    (assert= (isearch/expand-replacement "\\2, \\1" (regex/find "(\\w+) (\\w+)" "jane doe"))
+      "doe, jane")
+    (assert= (isearch/expand-replacement "<\\&> \\\\ \\3" (regex/find "o+" "foo")) "<oo> \\ "))
+  (test "! replaces every match with its groups swapped"
+    (let (m (isearch/qr-start (m-of "jane doe, john roe") "(\\w+) (\\w+)" "\\2 \\1" {:regexp? true})
+          done (isearch/qr-handle m "!"))
+      (assert= (text-of done) "doe jane, roe john")
+      (assert= (:echo done) "Replaced 2 occurrences")))
+  (test "y and n step the matches one at a time"
+    (let (m (isearch/qr-start (m-of "a1 b22 c333") "[0-9]+" "<\\&>" {:regexp? true})
+          done (isearch/qr-handle (isearch/qr-handle (isearch/qr-handle m "y") "n") "y"))
+      (assert= (:echo m) "Query replacing regexp [0-9]+ with <\\&>: (y/n/!/./q)")
+      (assert= (text-of done) "a<1> b22 c<333>")))
+  (test "the prompt chain reaches it from C-M-%"
+    (let (m (press (type-str (press (type-str (press (m-of "x1 x2") [(keyword "ctrl-meta-%")])
+                                      "x\\d")
+                               [:enter])
+                     "<\\&>")
+              [:enter "!"]))
+      (assert= (text-of m) "<x1> <x2>")))
+  (test "an unfinished regexp is refused before the replace starts"
+    (let (m (isearch/qr-start (m-of "a(b") "a(" "x" {:regexp? true}))
+      (is (nil? (:query-replace m)))
+      (assert= (text-of m) "a(b"))))
+
+;; paredit's splice is M-s (`paredit-splice-sexp`), and C-M-s is `isearch-forward-regexp`
+;; in every mode. In a paredit buffer M-s shadows the whole M-s search map — M-s w, M-s o —
+;; exactly as it does in Emacs with paredit-mode on.
+(describe "C-M-s and M-s in brood-mode"
+  (defn- blsp (text at)
+    (let (m (ed-init (make-buffer text "x.blsp" "x.blsp")))
+      (ed-set-buf m (goto-char (ed-current-buf m) at))))
+  (test "C-M-s is a regexp search in a .blsp buffer too"
+    (let (m (type-str (press (blsp "(a (b c))" 0) [:ctrl-meta-s]) "b|c"))
+      (assert= (:echo m) "Regexp I-search: b|c")
+      (assert= (match-of m) 4)))
+  (test "M-s splices the enclosing list, as paredit's M-s does"
+    (let (m (press (blsp "(a (b c))" 5) [:alt-s]))
+      (assert= (text-of m) "(a b c)")
+      (is (nil? (:isearch m))))))
+
+;; A regexp that can match nothing (`x*`) stops on an empty match as Emacs's does, and the
+;; next C-s steps one character on before looking again, failing at the buffer's edge.
+(describe "an empty regexp match"
+  (test "C-s stops on an empty match, then steps off it"
+    (let (m (counted (type-str (press (m-of "ab xx") [:ctrl-meta-s]) "x*"))
+          at-end (press m [:ctrl-s])
+          failing (press at-end [:ctrl-s])
+          wrapped (press failing [:ctrl-s])
+          next (press wrapped [:ctrl-s]))
+      (assert= [(match-of m) (map/get-in m [:isearch :match-end])] [3 5])
+      (assert= (:echo m) "1/1 Regexp I-search: x*")
+      ;; the empty match at the end of the buffer, numbered 0: the count holds no empty match
+      (assert= [(match-of at-end) (map/get-in at-end [:isearch :match-end])] [5 5])
+      (assert= (:echo at-end) "0/1 Regexp I-search: x*")
+      (assert= (:echo failing) "0/1 Failing regexp I-search: x*")
+      (assert= [(match-of wrapped) (point-of wrapped)] [0 0])
+      (assert= (:echo wrapped) "0/1 Wrapped regexp I-search: x*")
+      (assert= (match-of next) 1)))
+  (test "C-r steps back off an empty match too"
+    ;; on the empty match at the end, C-r turns round in place, then steps back a character
+    (let (at-end (press (type-str (press (m-of "ab xx") [:ctrl-meta-s]) "x*") [:ctrl-s])
+          turned (press at-end [:ctrl-r])
+          back (press turned [:ctrl-r]))
+      (assert= (match-of turned) 5)
+      (assert= [(match-of back) (map/get-in back [:isearch :match-end])] [4 4]))))
+
+;; C-r lands on the matches the count numbered going forward: a backward match must END by
+;; point (Emacs's search-backward), so `aa` over `aaaa` is [0 2] and [2 4] both ways, never
+;; the overlapping [1 3].
+(describe "overlapping matches"
+  (test "C-r walks the same matches C-s numbered"
+    (let (m (counted (type-str (press (m-of "aaaa") [:ctrl-s]) "aa"))
+          second (press m [:ctrl-s])
+          turned (press second [:ctrl-r])
+          back (press turned [:ctrl-r]))
+      (assert= (:echo second) "2/2 I-search: aa")
+      (assert= (match-of turned) 2)
+      (assert= (match-of back) 0)
+      (assert= (:echo back) "1/2 I-search backward: aa"))))
+
+;; ---- review fixes (integration) --------------------------------------------------
+
+(describe "C-M-s and C-M-r inside a search"
+  (test "repeat the search, as C-s and C-r do (Emacs binds them to isearch-repeat-*)"
+    (let (m (type-str (press (m-of "foo bar foo baz foo") [:ctrl-s]) "foo")
+          next (press m [:ctrl-meta-s])
+          back (press next [:ctrl-meta-r :ctrl-meta-r]))
+      (assert= (match-of next) 8)
+      (assert= (:echo next) "I-search: foo")
+      (assert= (match-of back) 0))))
+
+(describe "a wrapped search stays wrapped"
+  (test "Wrapped, then Overwrapped, for as long as the search goes on"
+    (let (m (type-str (press (at-point (m-of "foo a foo b foo") 6) [:ctrl-s]) "foo")
+          last (press m [:ctrl-s])
+          failing (press last [:ctrl-s])
+          wrapped (press failing [:ctrl-s])
+          over (press wrapped [:ctrl-s])
+          still (press over [:ctrl-s]))
+      (assert= (match-of wrapped) 0)
+      (assert= (:echo wrapped) "Wrapped I-search: foo")
+      (assert= (match-of over) 6)
+      (assert= (:echo over) "Overwrapped I-search: foo")
+      (assert= (match-of still) 12)
+      (assert= (:echo still) "Overwrapped I-search: foo"))))
+
+(describe "query-replace-regexp on an empty match"
+  (test "^ puts the replacement at every line's start"
+    (let (done (isearch/qr-handle (isearch/qr-start (m-of "a\nb\nc") "^" "> " {:regexp? true}) "!"))
+      (assert= (text-of done) "> a\n> b\n> c")
+      (assert= (:echo done) "Replaced 3 occurrences")))
+  (test "$ puts it at every line's end, once each"
+    (let (done (isearch/qr-handle (isearch/qr-start (m-of "a\nb\nc") "$" ";" {:regexp? true}) "!"))
+      (assert= (text-of done) "a;\nb;\nc;")))
+  (test "y and n step off an empty match too"
+    (let (m (isearch/qr-start (m-of "a\nb\nc") "$" ";" {:regexp? true})
+          done (isearch/qr-handle (isearch/qr-handle (isearch/qr-handle m "y") "n") "y"))
+      (assert= (text-of done) "a;\nb\nc;"))))
+
+(describe "lazy highlight on a long line"
+  (test "only the window of a long line is searched"
+    (let (m (type-str (press (m-of (string/repeat "foo " 500000)) [:ctrl-s]) "foo")
+          ranges (isearch/lazy-ranges m (ed-current-buf m) 0 24 true [0 200 {}]))
+      (is (<= (count ranges) 51))
+      (is (>= (count ranges) 49))))
+  (test "a wrapped long line's rows name the window"
+    (let (m (type-str (press (m-of (string/repeat "foo " 500000)) [:ctrl-s]) "foo")
+          ranges (isearch/lazy-ranges m (ed-current-buf m) 0 24 true [0 200 {0 [4000 4400]}]))
+      (assert= (first (first ranges)) 4000)
+      (is (<= (count ranges) 101)))))
+
+;; Emacs's perform-replace (replace.el): after a NON-EMPTY match the next may be adjacent only
+;; if it is non-empty too; an empty one there is skipped by stepping a character on, as after
+;; an empty match — and a step never lands on the end of the buffer. Expected values are what
+;; `emacs --batch` gives for `replace-regexp` on each text.
+(describe "query-replace: an empty match right after a replacement"
+  (defn- replace-all (text pattern)
+    (text-of (isearch/qr-handle (isearch/qr-start (m-of text) pattern "-" {:regexp? true}) "!")))
+  (test "! — as Emacs's replace-regexp"
+    (assert= (replace-all "xxa" "x*") "-a")
+    (assert= (replace-all "axxb" "x*") "-a-b")
+    (assert= (replace-all "xxaxx" "x*") "-a-")
+    (assert= (replace-all "a" "x*") "-a")
+    (assert= (replace-all "ab" "b*") "-a-"))
+  (test "y steps the same matches"
+    (let (m (isearch/qr-start (m-of "xxaxx") "x*" "-" {:regexp? true})
+          one (isearch/qr-handle m "y")
+          two (isearch/qr-handle one "y"))
+      (assert= (text-of one) "-axx")
+      (assert= (text-of two) "-a-")
+      (is (nil? (:query-replace two)))
+      (assert= (text-of (isearch/qr-handle (isearch/qr-start (m-of "xxa") "x*" "-" {:regexp? true})
+                          "y"))
+        "-a")))
+  (test "n skips to the same next match y would"
+    (let (m (isearch/qr-start (m-of "axxb") "x*" "-" {:regexp? true})
+          skipped (isearch/qr-handle m "n"))
+      (assert= (map/get-in skipped [:query-replace :match]) 1)
+      (assert= (text-of (isearch/qr-handle skipped "y")) "a-b"))))
+
+;; Emacs: with the region active, query-replace and query-replace-regexp work within it only
+;; (`perform-replace` with START / END), and the prompts say `in region`.
+(defn- with-region (text low high)
+  "A model of `text` with the region active over `[low, high)` — mark at `low`, point at
+`high`, as a C-SPC and a motion leave it."
+  (let (m (m-of text))
+    (ed-set-buf m (goto-char (set-mark (goto-char (ed-current-buf m) low)) high))))
+
+(describe "query-replace within the active region (M-%, C-M-%)"
+  (test "! replaces only the matches inside the region"
+    (let (done (isearch/qr-handle (isearch/qr-start (with-region "foo foo foo foo" 4 11)
+                                    "foo"
+                                    "barbaz"
+                                    {:region [4 11]})
+                 "!"))
+      (assert= (text-of done) "foo barbaz barbaz foo")
+      (assert= (:echo done) "Replaced 2 occurrences")))
+  (test "it starts at the region's start, not point, and deactivates the region"
+    (let (m (isearch/qr-start (with-region "foo foo foo foo" 4 11) "foo" "x" {:region [4 11]}))
+      (assert= (map/get-in m [:query-replace :match]) 4)
+      (is (nil? (buffer-mark (ed-current-buf m))))))
+  (test "y one at a time: the region's end moves with each replacement's length"
+    (let (m (isearch/qr-start (with-region "aa aa aa aa" 3 8) "aa" "b" {:region [3 8]})
+          one (isearch/qr-handle m "y")
+          two (isearch/qr-handle one "y"))
+      (assert= (text-of one) "aa b aa aa")
+      (assert= (map/get-in one [:query-replace :limit]) 7)
+      (assert= (text-of two) "aa b b aa")
+      (is (nil? (:query-replace two))) ; the last `aa` is past the region: finished
+      (assert= (:echo two) "Replaced 2 occurrences")))
+  (test "a longer replacement grows the region, so a match it now holds is still reached"
+    (let (done (isearch/qr-handle (isearch/qr-start (with-region "a a a a" 0 3)
+                                    "a"
+                                    "xyz"
+                                    {:region [0 3]})
+                 "!"))
+      (assert= (text-of done) "xyz xyz a a")))
+  (test "a match crossing the region's end is not replaced"
+    ;; nothing in the region matches, so the replace finishes as it starts
+    (let (done (isearch/qr-start (with-region "foobar" 0 3) "foob" "X" {:region [0 3]}))
+      (is (nil? (:query-replace done)))
+      (assert= (text-of done) "foobar")
+      (assert= (:echo done) "Replaced 0 occurrences")))
+  (test "a regexp's match stops at the region's end (re-search-forward's BOUND)"
+    (let (done (isearch/qr-handle (isearch/qr-start (with-region "aaaa" 0 2)
+                                    "a+"
+                                    "X"
+                                    {:regexp? true :region [0 2]})
+                 "!"))
+      (assert= (text-of done) "Xaa")))
+  (test "$ at the region's end is a line's end only where the text has one"
+    (let (in-line (isearch/qr-start (with-region "foo bar" 0 3)
+                    "o$"
+                    "X"
+                    {:regexp? true :region [0 3]})
+          at-eol (isearch/qr-handle (isearch/qr-start (with-region "foo\nbar" 0 3)
+                                      "o$"
+                                      "X"
+                                      {:regexp? true :region [0 3]})
+                   "!"))
+      (assert= (text-of in-line) "foo bar")
+      (assert= (text-of at-eol) "foX\nbar")))
+  (test "only the matches in the region are lit"
+    (let (m (isearch/qr-start (with-region "foo foo foo foo" 4 11) "foo" "x" {:region [4 11]})
+          ranges (isearch/lazy-ranges m (ed-current-buf m) 0 24 true))
+      (assert= (map ranges first) '(4 8))))
+  (test "M-% with a region asks `Query replace in region` and stays in it"
+    (let (asked (press (with-region "x x x x" 2 5) [(keyword "alt-%")])
+          done (press (type-str (press (type-str asked "x") [:enter]) "y") [:enter "!"]))
+      (assert= (mb-prompt (:minibuffer asked)) "Query replace in region: ")
+      (assert= (text-of done) "x y y x")))
+  (test "C-M-% with a region: `Query replace regexp in region`, then `… in region x with:`"
+    (let (asked (press (with-region "x1 x2 x3" 3 8) [(keyword "ctrl-meta-%")])
+          second (press (type-str asked "x\\d") [:enter])
+          done (press (type-str second "<\\&>") [:enter "!"]))
+      (assert= (mb-prompt (:minibuffer asked))
+        "Query replace regexp in region: ")
+      (assert= (mb-prompt (:minibuffer second))
+        "Query replace regexp in region x\\d with: ")
+      (assert= (text-of done) "x1 <x2> <x3>")))
+  (test "without a region (or with an empty one) it runs from point, as before"
+    (let (asked (press (with-region "x x" 1 1) [(keyword "alt-%")]))
+      (assert= (mb-prompt (:minibuffer asked)) "Query replace: "))))

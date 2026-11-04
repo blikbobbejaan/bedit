@@ -32,6 +32,8 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use keyhelp) ; key / command labels, where-is, docstrings
   (:use scroll) ; ed-scroll / ed-max-top / ed-long-lines — keeping point on screen
   (:use autosave) ; auto-save sidecars + auto-revert
+  ;; a buffer's indent width / tab width / tabs / fill column, by mode, init.blsp and .editorconfig
+  (:use conventions :only [with-indent-width indent-width tab-width fill-column indentation])
   (:use model)) ; current-buffer accessors, the kill ring, message
 ;; Tree-sitter's structural motions (ruby/elixir-mode) are REQUIRED, not `:use`d. They
 ;; share several names with `sexp` — `point-defun-start`, `point-down`, … — and two `:use`s
@@ -46,8 +48,27 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
 
 ;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e/M-f/M-b + the arrow keys) -------
 
-(defcommand cmd-forward-char (m key) (ed-apply m forward-char))
-(defcommand cmd-backward-char (m key) (ed-apply m backward-char))
+;; A motion that cannot move says so, as Emacs's signals `end-of-buffer` /
+;; `beginning-of-buffer`: the echo, and `ed-ding`'s failure, which is what ends a keyboard
+;; macro run with `C-u 0 C-x e` ("until it fails") at the last line.
+
+(defn- ed-edge-motion (m moved forward?)
+  "The model with the current buffer as `moved`, a motion's result — or, when the motion
+left point where it was, the model unmoved and failed ([[model/ed-ding]]) with `End of
+buffer` / `Beginning of buffer`."
+  (if (= (buffer-point moved) (buffer-point (ed-current-buf m)))
+    (ed-ding m (if forward? "End of buffer" "Beginning of buffer"))
+    (ed-set-buf m moved)))
+
+(defcommand cmd-forward-char
+  (m key)
+  "Move point one character forward (C-f); at the end of the buffer, say so and fail."
+  (ed-edge-motion m (forward-char (ed-current-buf m)) true))
+
+(defcommand cmd-backward-char
+  (m key)
+  "Move point one character back (C-b); at the start of the buffer, say so and fail."
+  (ed-edge-motion m (backward-char (ed-current-buf m)) false))
 ;; C-n / C-p move by SCREEN row in a wrapped buffer (Emacs `line-move-visual`) and by line
 ;; elsewhere, and both aim at a GOAL column in display cells: the column the first press
 ;; started from, kept while presses follow one another, so passing a short line or row
@@ -135,8 +156,11 @@ the lines a fold hides (`:hidden` in `extras`)."
                (:column held)
                here)
         moved (ed-row-motion buf rows goal w extras))
-    (assoc (ed-set-buf m moved)
-      :line-goal {:column goal :point (:point moved) :buffer (:name moved)})))
+    (if (= (:point moved) (:point buf))
+      ;; no row to move to (Emacs's `next-line` signalling `end-of-buffer`)
+      (ed-ding m (if (> rows 0) "End of buffer" "Beginning of buffer"))
+      (assoc (ed-set-buf m moved)
+        :line-goal {:column goal :point (:point moved) :buffer (:name moved)}))))
 
 (defcommand cmd-next-line (m key) (ed-line-move m 1))
 (defcommand cmd-previous-line (m key) (ed-line-move m -1))
@@ -318,7 +342,7 @@ the mirror of `backward-up-list`, and the quick way out of a form you've finishe
   (ed-apply m (fn (b) (sexp/raise b key))))
 (defcommand cmd-splice-sexp
   (m key)
-  "Remove the enclosing list's delimiters, keeping its contents (paredit C-M-s)."
+  "Remove the enclosing list's delimiters, keeping its contents (paredit M-s)."
   (ed-apply m (fn (b) (sexp/splice b key))))
 (defcommand cmd-wrap-round
   (m key)
@@ -388,8 +412,11 @@ a tree-sitter node."
 
 (sig ed-fallback-indent (any int -> int))
 (defn- ed-fallback-indent (rope bol)
-  "The simple, mode-less indent for the line at `bol`: the leading-whitespace width
-of the previous non-blank line, or 0 at the top. Tail-recursive over blank lines."
+  "The simple, mode-less indent for the line at `bol`: the COLUMN the previous non-blank
+line's text starts at — its leading whitespace's display width, a tab reaching the next stop
+of `*tab-width*` (bound by [[ed-indent-target]]) — or 0 at the top. Tail-recursive over
+blank lines. A count of characters was read as a column: after `\\tgcc x.c` in a Makefile,
+TAB wrote one space where make needs the tab."
   ;; Over the rope for the reason `ed-rope-leading-ws` is: this walks a line or two, and
   ;; the string form paid O(buffer) to do it. The previous line's start is the rope's own
   ;; line index (`text/line->char` of the line holding `bol - 1`) — the offset just past
@@ -402,7 +429,7 @@ of the previous non-blank line, or 0 at the top. Tail-recursive over blank lines
       (if (>= ws content-len)
         ; previous line is empty / all whitespace — skip it
         (ed-fallback-indent rope prev-bol)
-        ws))))
+        (string/display-width (text/slice rope prev-bol (+ prev-bol ws)))))))
 
 (defn ed-indent-target (buf &optional (held nil))
   "The column the current line should indent to: the buffer mode's `:indent` service
@@ -415,28 +442,35 @@ walks it instead of parsing the text."
   ;; reads only the lines it inspects (brood ADR-483); a Lisp mode's (`brood-indent`,
   ;; `lisp-modes/lisp-indent-with`) finds its top-level form with the rope-native form scan
   ;; and copies that form out (brood ADR-488). RET in a large file flattens nothing.
+  ;; A tree-sitter indenter counts a level as the buffer's indent width
+  ;; (`conventions/indent-width` — its .editorconfig, the user's setting for the mode, the
+  ;; language's own), handed over as `conventions/*indent-width*`.
   (let (bol (buffer-point (beginning-of-line buf))
         svc (ed-mode-service buf :indent)
         lang (ed-mode-service buf :ts-lang)
         tree (when lang (held-tree-for held buf lang)))
-    (cond
-      (nil? svc) (ed-fallback-indent (buffer-rope buf) bol)
-      ;; only a tree-sitter mode has a tree, and its `deflanguage` indenter takes one
-      tree (svc (buffer-rope buf) bol tree)
-      else (svc (buffer-rope buf) bol))))
+    ;; the answer is a COLUMN, and an indenter that reads a line's existing indentation
+    ;; (the fallback, a verbatim heredoc line, YAML's content) measures it at the buffer's
+    ;; tab width — bound here, so a caller outside the editor loop gets the same answer
+    (conventions/with-cell-layout buf
+      (fn ()
+        (with-indent-width (indent-width buf)
+          (fn ()
+            (cond
+              (nil? svc) (ed-fallback-indent (buffer-rope buf) bol)
+              ;; only a tree-sitter mode has a tree, and its `deflanguage` indenter takes one
+              tree (svc (buffer-rope buf) bol tree)
+              else (svc (buffer-rope buf) bol))))))))
 
 (sig ed-reindent-line (buffer int -> buffer))
-(def ed-indent-tab-width 8) ; the columns a tab stands for when a mode indents with tabs
 
 (sig ed-indentation (buffer int -> string))
 (defn ed-indentation (buf target)
-  "The leading whitespace that reaches column `target` in `buf`: spaces, or — when its mode
-indents with tabs (the `:indent-tabs` facet; Go, Makefiles) — tabs, then spaces for the rest
-(Emacs `indent-tabs-mode`)."
-  (if (= true (ed-mode-service buf :indent-tabs))
-    (str (string/repeat "\t" (math/quot target ed-indent-tab-width))
-      (string/repeat " " (math/mod target ed-indent-tab-width)))
-    (string/repeat " " target)))
+  "The leading whitespace that reaches column `target` in `buf`: spaces, or — when it indents
+with tabs (Emacs `indent-tabs-mode`: Go and Makefiles by default, or as its .editorconfig or
+the user's `:indent-tabs` says) — tabs of its tab width, then spaces for the rest
+(`conventions/indentation`)."
+  (indentation buf target))
 
 (defn ed-reindent-line (buf target)
   "Reindent the current line of `buf` to `target` columns (`ed-indentation` — spaces, or
@@ -464,7 +498,6 @@ brood-mode, the previous line elsewhere (`M-x indent-line`)."
 
 ;; ---- region indent / dedent (TAB / Shift-TAB on a selection) ----------------
 
-(def ed-tab-width 2) ; columns Shift-TAB removes per dedent (brood indents by 2)
 (defn- ed-region-lines (buf)
   "`[first last]` (0-based, inclusive) — the lines the active region spans, or nil. The
 last line holds the last *selected* char, so a region ending at a line start doesn't pull
@@ -559,26 +592,52 @@ so a repeated TAB keeps acting on the same block (TAB on a region, `indent-regio
 
 (sig ed-dedent-line-at (buffer int int -> buffer))
 (defn ed-dedent-line-at (buf ln width)
-  "Remove up to `width` leading spaces/tabs from line `ln`; a no-op on a line with none."
+  "Move line `ln`'s text up to `width` COLUMNS left — its indentation rewritten at the
+column that leaves (`ed-indentation`: tabs where the buffer indents with them), so a tab
+counts as the columns it spans rather than one; a no-op on a line with none."
   (let (rope (buffer-rope buf)
         bol (text/line->char rope ln)
-        drop-n (math/min width (ed-rope-leading-ws rope bol)))
-    (if (= drop-n 0) buf (replace-region buf bol (+ bol drop-n) ""))))
+        length (ed-rope-leading-ws rope bol)
+        leading (text/slice rope bol (+ bol length))
+        column (string/display-width leading 0 (tab-width buf))
+        indentation (ed-indentation buf (math/max 0 (- column width))))
+    (if (or (= length 0) (= indentation leading))
+      buf
+      (replace-region buf bol (+ bol length) indentation))))
 
 (defcommand cmd-dedent
   (m key)
-  "Shift-TAB: dedent — remove up to a tab-width of leading whitespace from the current
+  "Shift-TAB: dedent — remove up to one indent level (the buffer's indent width:
+`conventions/indent-width`, 4 in Python, 2 in Brood) of leading whitespace from the current
 line, or from every line of the active region (one undo step, keeping the region)."
-  (let (buf (ed-current-buf m) rl (ed-region-lines buf))
+  (let (buf (ed-current-buf m)
+        rl (ed-region-lines buf)
+        width (indent-width buf))
     (if (nil? rl)
-      (ed-edit m (fn (b) (ed-dedent-line-at b (buffer-current-line b) ed-tab-width)))
+      (ed-edit m (fn (b) (ed-dedent-line-at b (buffer-current-line b) width)))
       (let ([first last] rl)
         (ed-edit m
           (fn (b)
-            (ed-map-region-lines b
-              first
-              last
-              (fn (bb ln) (ed-dedent-line-at bb ln ed-tab-width)))))))))
+            (ed-map-region-lines b first last (fn (bb ln) (ed-dedent-line-at bb ln width)))))))))
+
+(defcommand cmd-describe-indentation
+  (m key)
+  "Say the current buffer's indent width, tabs or spaces, tab width and fill column, and
+where each comes from — its .editorconfig, init.blsp, its mode (M-x describe-indentation)."
+  (message m (conventions/summary (ed-current-buf m))))
+
+(defcommand cmd-set-fill-column
+  (m key)
+  "Set the current buffer's fill column (M-q's width) to the prefix argument, or without one
+to point's column (Emacs `set-fill-column`, M-x set-fill-column) — this buffer only, over
+its .editorconfig and init.blsp."
+  (let (buf (ed-current-buf m)
+        column (or (current-prefix-arg m) (buffer-column buf)))
+    (if (< column 1)
+      (message m "fill column must be at least 1")
+      (message (ed-set-buf m (conventions/with-buffer-setting buf :fill-column column))
+        (str "fill column set to " column)))))
+(register-prefix-consuming 'commands/cmd-set-fill-column)
 
 (defcommand cmd-indent-sexp
   (m key)
@@ -981,7 +1040,7 @@ block, closing the gap. Yank it back with C-x r y."
 ;; `input`) so a kill knows whether the *previous* command was also a kill (then it
 ;; appends to the head entry rather than starting a new one), and so M-y
 ;; (`cmd-yank-pop`) only fires right after a yank. The ring itself — `ed-push-kill`, the
-;; coalescing rule and `ed-drag-copy` — lives in `model`, beside the kill-ring state.
+;; coalescing rule and `ed-drag-select` — lives in `model`, beside the kill-ring state.
 (def- ed-yank-commands '(commands/cmd-yank commands/cmd-yank-pop))
 (defn- ed-yank-command? (sym) (includes? ed-yank-commands sym))
 
@@ -1266,11 +1325,11 @@ on: nothing you cycle through is lost."
 ;; share it. This command is just the editor *policy*: find the paragraph, wrap it, put
 ;; it back (preserving the trailing blank-line separation).
 
-(defdyn *fill-column* 70)
-
 (defcommand cmd-fill-paragraph
   (m key)
-  "Re-wrap the paragraph around point to `*fill-column*` (M-q), preserving the blank-line
+  "Re-wrap the paragraph around point to the buffer's fill column (M-q;
+`conventions/fill-column` — its .editorconfig's `max_line_length`, the user's
+`:fill-column`, the mode's, else 70), preserving the blank-line
 separation after it. The paragraph's prefix — its indentation and a comment or quote marker
 (`string/fill-prefix`) — is kept on every line: without it, `;; aa` / `;; bb` came back as
 `;; aa ;; bb` and an indented paragraph lost its indentation."
@@ -1285,7 +1344,7 @@ separation after it. The paragraph's prefix — its indentation and a comment or
                 ;; the prefix as the paragraph's first non-blank line spells it
                 first-line (first (seq/reject (string/split para "\n")
                                     (fn (l) (= (string/trim l) ""))))
-                filled (string/fill para *fill-column* (string/fill-prefix (or first-line ""))))
+                filled (string/fill para (fill-column b) (string/fill-prefix (or first-line ""))))
             (replace-region b s e (if (string/ends-with? para "\n") (str filled "\n") filled))))))))
 
 ;; ---- read-only toggle / spit / revert (C-x C-q / C-x C-w / revert) ----
@@ -1342,7 +1401,8 @@ A buffer whose mode refuses writing (`ed-no-write-refusal` — a hex view) is re
 (defcommand cmd-revert-buffer
   (m key)
   "Re-read the current buffer from its file on disk, discarding unsaved changes
-(M-x revert-buffer). Point is kept (clamped to the new length); undo history resets."
+(M-x revert-buffer). Point stays on its line; the revert is one undoable edit, so C-/
+brings back what was discarded."
   (let (b (ed-current-buf m) f (buffer-file b))
     (if (nil? f)
       (message m "no file to revert")
@@ -1353,30 +1413,97 @@ A buffer whose mode refuses writing (`ed-no-write-refusal` — a hex view) is re
 ;; ---- keyboard macros (C-x ( / C-x ) / C-x e) --------------------------------
 ;; Recording captures raw input events into `:macro-recording` (the capture happens in
 ;; `input/ed-update`, which sees every event); `:macro-last` holds the finished macro and
-;; `:run-macro` asks `ed-update` to replay it by re-feeding the events. Emacs C-x (/)/e.
+;; `:run-macro {:count N}` asks `ed-update` to replay it N times by re-feeding the events
+;; (`input/ed-run-macro`) — N = 0 meaning until a key fails. A replay stops at the first key
+;; whose command fails (`model/ed-ding`, or a thrown error), as Emacs's does, or at C-g: it
+;; runs in slices, between the user's input. Emacs C-x (/)/e.
 
 (defcommand cmd-start-kbd-macro
   (m key)
   "Start recording a keyboard macro (C-x (): subsequent keys are captured until C-x )."
   (assoc m :macro-recording [] :echo "Recording keyboard macro…"))
 
+(def- ed-prefix-starters
+  ;; the keys that begin a prefix argument (C-u, and the negative-argument bindings)
+  #{:ctrl-u :alt-- :ctrl-- :ctrl-meta--})
+
+(defn- ed-prefix-continues-key? (key)
+  "Whether `key` can follow the start of a prefix argument: another C-u, a digit or `-`."
+  (or (= key :ctrl-u)
+    (= key "-")
+    (and (string? key) (= (string/length key) 1) (>= (index-of "0123456789" key) 0))))
+
+(defn ed-macro-prefix-start (keys)
+  "Where the prefix argument that ends `keys` begins — the index of its C-u (or negative
+argument) — or `(count keys)` when they do not end in one. The keys a `C-u 3` typed before
+`C-x )` or `C-x e` were recorded too, and belong to that command, not the macro.
+
+    (commands/ed-macro-prefix-start [\"a\" \"5\" :ctrl-u \"3\"])   ;=> 2"
+  (letrec (back (fn (index start)
+                  (if (< index 0)
+                    start
+                    (let (key (nth keys index))
+                      (cond
+                        (contains? ed-prefix-starters key) (back (dec index) index)
+                        (and (ed-prefix-continues-key? key) (= start (count keys)))
+                          (back (dec index) start)
+                        ;; a digit before the C-u that started the argument is typed text
+                        else start)))))
+    (back (dec (count keys)) (count keys))))
+
+(defn- ed-macro-finish (m)
+  "`m` with the macro being recorded made the last macro: the keys that invoked the command
+ending it — the chord (`:chord` holds its keys before the last) and a prefix argument typed
+before it — dropped, since they were recorded before dispatch."
+  (let (recorded (:macro-recording m)
+        chord (inc (count (or (:chord m) [])))
+        body (take recorded (math/max 0 (- (count recorded) chord)))
+        body (if (nil? (current-prefix-arg m)) body (take body (ed-macro-prefix-start body))))
+    (assoc (dissoc m :macro-recording) :macro-last body)))
+
+(defn- ed-macro-run (m repeats)
+  "Ask the loop to replay the last macro `repeats` times (0: until a key fails) — or say why it
+cannot: none recorded, a negative count, or a macro already running (a macro that ran
+itself would never end)."
+  (cond
+    (nil? (:macro-last m))
+      (ed-ding (message m "no keyboard macro defined (record one with C-x ( … C-x ))"))
+    (:macro-executing m) (ed-ding m "a keyboard macro cannot run itself")
+    (< repeats 0)
+      (ed-ding m "a keyboard macro runs a positive number of times, or 0: until it fails")
+    else (assoc m :run-macro {:count repeats})))
+
 (defcommand cmd-end-kbd-macro
   (m key)
-  "Finish recording the keyboard macro (C-x )); it becomes the last macro for C-x e."
-  (let (rec (:macro-recording m))
-    (if (nil? rec)
-      (message m "not currently defining a keyboard macro")
-      ;; drop the trailing `C-x )` that invoked this command (recorded before dispatch)
-      (message (assoc (dissoc m :macro-recording)
-                 :macro-last (take rec (math/max 0 (- (count rec) 2))))
-        "Keyboard macro defined"))))
+  "Finish recording the keyboard macro (C-x )); it becomes the last macro for C-x e. With a
+prefix argument N, run it N-1 more times (Emacs's `kmacro-end-macro`); `C-u 0 C-x )` runs it
+again until a key fails."
+  (cond
+    (nil? (:macro-recording m)) (ed-ding (message m "not currently defining a keyboard macro"))
+    (nil? (current-prefix-arg m)) (message (ed-macro-finish m) "Keyboard macro defined")
+    else
+      (let (repeats (current-prefix-arg m)
+            finished (message (ed-macro-finish m) "Keyboard macro defined"))
+        (cond
+          (= repeats 0) (ed-macro-run finished 0)
+          (> repeats 1) (ed-macro-run finished (dec repeats))
+          else finished))))
 
 (defcommand cmd-execute-kbd-macro
   (m key)
-  "Execute the last keyboard macro (C-x e); `ed-update` replays its events."
-  (if (nil? (:macro-last m))
-    (message m "no keyboard macro defined (record one with C-x ( … C-x ))")
-    (assoc m :run-macro true)))
+  "Execute the last keyboard macro (C-x e); `ed-update` replays its events. With a prefix
+argument N it runs N times, and `C-u 0 C-x e` runs it until a key fails — a search that
+finds nothing, a motion at the end of the buffer (Emacs's `call-last-kbd-macro`). Any run
+stops at the first key whose command fails. Pressed while recording, it ends the recording
+first and then runs the macro (Emacs's `kmacro-end-and-call-macro`)."
+  (let (repeats (or (current-prefix-arg m) 1))
+    (if (nil? (:macro-recording m))
+      (ed-macro-run m repeats)
+      (ed-macro-run (message (ed-macro-finish m) "Keyboard macro defined") repeats))))
+
+;; both read the prefix argument as their repeat count, so they run once under it
+(register-prefix-consuming 'commands/cmd-end-kbd-macro)
+(register-prefix-consuming 'commands/cmd-execute-kbd-macro)
 
 ;; ---- zap-to-char (M-z) ------------------------------------------------------
 
@@ -1396,7 +1523,7 @@ A buffer whose mode refuses writing (`ed-no-write-refusal` — a hex view) is re
                       (buffer-point (ed-current-buf mm))
                       (isearch/search-fold? ch)))
           (if (nil? found)
-            (message mm (str "not found: " ch))
+            (ed-ding (message mm (str "not found: " ch)))
             (ed-kill-span mm (fn (b) (goto-char b (inc found)))))))))) ; kill [point, found] to ring
 
 ;; ---- occur (M-s o) ----------------------------------------------------------
@@ -1463,15 +1590,20 @@ rows (1-based source line numbers)."
   (m key)
   "Re-read ~/.config/bedit/init.blsp and apply it to the running editor (M-x
 reload-config). The live alternative to restarting — init.blsp is data (read, not eval'd),
-so it can't be applied with eval-buffer."
+so it can't be applied with eval-buffer. The window's text settings and its `:font` are
+applied too; a font that is not installed, or a theme that does not exist, is said in the
+echo area and *Messages*."
   (let (cfg (config/init-config)
-        warns (config/config-warnings cfg)
+        warns (config/init-warnings cfg)
         m1 (config/apply-to-model m cfg)
         ;; the window-side keys too (:text-aa / :line-height), so a reload re-skins the window
         _ (config/apply-window! cfg)
+        ;; and the font, which says when the one named is not installed
+        font-warning (startup/register-font (config/setting cfg :font))
         theme-warning (themes/theme-from-config! cfg))
+    (doseq (warning (seq/reject [font-warning theme-warning] nil?)) (log/warn warning))
     (message m1
-      (let (problem (or (first warns) theme-warning))
+      (let (problem (or (first warns) font-warning theme-warning))
         (if (nil? problem) "config reloaded" (str "config reloaded (" problem ")"))))))
 
 ;; ---- goto-line (M-g g) / recentf (C-x C-r) ----------------------------------
@@ -1664,21 +1796,60 @@ comment."
   "Begin an incremental search backward (C-r)."
   (isearch-start m :backward))
 
+(defcommand cmd-isearch-forward-regexp
+  (m key)
+  "Begin an incremental REGEXP search forward (C-M-s) — Brood's pattern dialect, `^`/`$` at a
+line's ends and `.` short of a newline. M-r inside any search toggles between the two."
+  (isearch-start m :forward :regexp))
+
+(defcommand cmd-isearch-backward-regexp
+  (m key)
+  "Begin an incremental regexp search backward (C-M-r)."
+  (isearch-start m :backward :regexp))
+
+(defcommand cmd-isearch-forward-word
+  (m key)
+  "Begin an incremental WORD search forward (M-s w): the words typed, whatever punctuation,
+spaces or line breaks lie between them in the buffer."
+  (isearch-start m :forward :word))
+
+(defn ed-active-region (m)
+  "The current buffer's region as `[low high]` when one is active and not empty, else nil —
+Emacs's `use-region-p`, what decides whether a replace is confined to the region."
+  (let (bounds (buffer-region-bounds (ed-current-buf m)))
+    (when (and bounds (< (first bounds) (second bounds))) bounds)))
+
+(defn- ed-query-replace-prompts (m regexp?)
+  "Ask what to replace and with what, then start the y/n/!/./q loop (`isearch/qr-start`).
+The region is read NOW, before either prompt, as Emacs's interactive spec reads it: with one
+active the replace is confined to it, and both prompts say so — `Query replace in region:`."
+  (let (region (ed-active-region m)
+        kind (str "Query replace" (if regexp? " regexp" "") (if region " in region" ""))
+        options (merge {:regexp? regexp?} (if region {:region region} {})))
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit (str kind ": ") "")
+         :on-complete (fn (mm from)
+                        (if (= from "")
+                          (message mm "(nothing to replace)")
+                          (assoc mm
+                            :minibuffer
+                              {:edit (ed-mb-edit (str kind " " from " with: ") "")
+                               :on-complete (fn (m2 to) (qr-start m2 from to options))})))})))
+
 (defcommand cmd-query-replace
   (m key)
-  "Replace occurrences of one string with another from point, asking at each (M-%).
-Prompts for the search string, then the replacement, then enters the y/n/!/./q loop
-(see `isearch`)."
-  (assoc m
-    :minibuffer
-      {:edit (ed-mb-edit "Query replace: " "")
-       :on-complete (fn (mm from)
-                      (if (= from "")
-                        (message mm "(nothing to replace)")
-                        (assoc mm
-                          :minibuffer
-                            {:edit (ed-mb-edit (str "Query replace " from " with: ") "")
-                             :on-complete (fn (m2 to) (qr-start m2 from to))})))}))
+  "Replace occurrences of one string with another from point — or within the region when one
+is active — asking at each (M-%). Prompts for the search string, then the replacement, then
+enters the y/n/!/./q loop (see `isearch`)."
+  (ed-query-replace-prompts m false))
+
+(defcommand cmd-query-replace-regexp
+  (m key)
+  "Replace matches of a regexp from point — or within the region when one is active — asking
+at each (C-M-%). The replacement may refer to what matched: `\\&` the whole match, `\\1`…`\\9`
+its groups, `\\\\` a backslash."
+  (ed-query-replace-prompts m true))
 
 ;; ---- undo / redo ------------------------------------------------------------
 
@@ -1689,10 +1860,27 @@ else start a fresh run (`undo-start`) — which, after some undos, reverses dire
 undo-after-a-break, or redo, walks the recorded undos forward). Reports `exhausted-msg`
 when the run has nothing left."
   (let (b (ed-current-buf m)
-        b1 (if (= (:last-command m) kind) b (undo-start b)))
-    (if (empty? (:pending-undo b1))
-      (message m exhausted-msg)
-      (assoc (ed-set-buf m (undo-next b1)) :status status))))
+        b1 (if (= (:last-command m) kind) b (undo-start b))
+        depth (ed-redo-depth b))
+    (cond
+      (and (= kind 'commands/cmd-redo) (<= depth 0)) (ed-ding (message m "No undo to redo"))
+      (empty? (:pending-undo b1)) (ed-ding (message m exhausted-msg))
+      else
+        (let (stepped (undo-next b1))
+          (assoc (ed-set-buf m
+                   (assoc stepped
+                     :redo-mark
+                       [(if (= kind 'commands/cmd-redo) (dec depth) (inc depth))
+                         (count (or (:undo stepped) ()))]))
+            :status status)))))
+
+(defn- ed-redo-depth (b)
+  "How many undos a redo may still reverse in buffer `b`: the count the last undo or redo
+left in its `:redo-mark`, while nothing has been recorded on the buffer's history since —
+an edit conses onto `:undo`, so a count that moved means the text changed after the undos
+and there is nothing left to redo (Emacs's `undo-redo`, which only undoes undos)."
+  (let ([depth recorded-at] (or (:redo-mark b) [0 -1]))
+    (if (= recorded-at (count (or (:undo b) ()))) depth 0)))
 
 (defcommand cmd-undo
   (m key)
@@ -1718,8 +1906,11 @@ outside your selection are simply not applied."
 
 (defcommand cmd-redo
   (m key)
-  "Redo one undone change (M-/): walk the recorded undos forward without needing a
-break. Repeated M-/ keeps redoing."
+  "Redo one undone change (C-?, Emacs's `undo-redo`): reverse the most recent undo, without
+needing a break in between. Repeated C-? keeps redoing until every undo since the last edit is
+reversed, then says `No undo to redo` — it never goes on to undo the edits before them. After
+an edit there is nothing to redo: the undos it followed are a branch now, which C-/ after a
+break still reaches (Emacs's undo tree)."
   (ed-undo-step m 'commands/cmd-redo "No further redo" "redo"))
 
 (defcommand cmd-repeat
@@ -1948,36 +2139,152 @@ on a results buffer's link line it copies the whole link — the link's absolute
   (m key)
   "Insert the most recently killed/copied text at point (C-y), recording the
 inserted span + ring index in `:yank` so M-y (`cmd-yank-pop`) can replace it. First
-adopts the OS clipboard if another app copied something newer (`ed-adopt-clipboard`).
-A read-only buffer says so and records no span."
-  (let ([m text] (ed-kill-head m))
-    (if (nil? text)
-      (message m "kill ring is empty")
-      (let (b (ed-current-buf m)
-            ;; over a region delete-selection replaces, the yank starts where the region did
-            start (if (selection-to-replace? m b) (first (buffer-region-bounds b)) (buffer-point b))
-            [m2 yanked?] (ed-try-edit m (fn (bb) (insert-replacing m bb text))))
-        (if yanked?
-          (assoc m2 :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})
-          m2)))))
+adopts the user's clipboard if another app copied something newer — ASKED for
+(`ed-clipboard-ask`), so a served session's yank does not stop the loop for the round trip
+to its client: the spot is marked now and the text goes in when the answer comes
+([[ed-yank-answered]]). A read-only buffer says so and records no span."
+  (let ([marked spot] (ed-yank-mark-spot m))
+    ;; the previous yank's span is not this one's: M-y must never reach it from here on
+    (ed-clipboard-ask (dissoc marked :yank) 'commands/ed-yank-answered spot)))
+
+(defn ed-yank-mark-spot (m)
+  "`[m' spot]` — where a yank whose text is not known yet will go: a marker at point in the
+current buffer, so text typed meanwhile cannot move it off its spot, and the `spot` that
+names it (the pool index, the buffer's name, text and point as they are now)."
+  (let (b (ed-current-buf m)
+        index (ed-current-index m)
+        spot-id (ref)
+        spot {:index index
+              :marker spot-id
+              :name (buffer-name b)
+              :rope (buffer-rope b)
+              :point (buffer-point b)}
+        marked (ed-set-buf-at m
+                 index
+                 (buffer-marker-set (ed-buf-at m index) spot-id (buffer-point b))))
+    [marked spot]))
+
+;; ---- the middle click: yank the PRIMARY selection (Emacs `mouse-yank-primary`) ----
+;; PRIMARY is what is highlighted anywhere — a drag-select here sets it (`model/ed-drag-select`)
+;; — and a middle click inserts it at the click, never touching the kill ring. Reading it waits
+;; on the app that owns it (brood ADR-536, ADR-553) or on a served session's client (ADR-562),
+;; so it is ASKED (`model/ed-primary-ask`), the spot marked as C-y marks one, and the text goes
+;; in when the answer lands ([[ed-primary-answered]]).
+
+(defn ed-mouse-yank-primary (m)
+  "A middle click, point already moved to it ([[panes/ed-mouse-set-point]]): insert the
+PRIMARY selection there (Emacs `mouse-yank-primary`) — the local window's, or a served
+session's client's. A click while a read is still out does nothing more."
+  (if (ed-primary-asking? m)
+    m
+    (let ([marked spot] (ed-yank-mark-spot m))
+      (ed-primary-ask (dissoc marked :yank)
+        'commands/ed-primary-answered spot 'commands/ed-primary-quit))))
+
+(defn ed-primary-answered (m text spot)
+  "The rest of a middle click once the PRIMARY selection's `text` is known: inserted at point
+when nothing moved since the click, else at the spot it marked ([[ed-yank-at-spot]]). Not
+on the kill ring — a middle click is not a kill. An empty or unreadable selection (nil) is
+said and inserts nothing."
+  (cond
+    (or (not (string? text)) (= text ""))
+      (message (ed-yank-unmark m spot) "mouse-yank-primary: no primary selection")
+    (ed-yank-spot-unchanged? m spot)
+      (first (ed-try-edit (ed-yank-unmark m spot) (fn (b) (insert b text))))
+    else (ed-yank-at-spot m spot text)))
+
+(defn ed-primary-quit (m spot)
+  "C-g while a middle click's read is out: the spot it marked is forgotten."
+  (ed-yank-unmark m spot))
+
+(defn ed-yank-answered (m clip spot)
+  "The rest of C-y once the clipboard's text `clip` is known ([[cmd-yank]]): the kill ring's
+head — `clip` adopted onto it when it is new, the ring's own head when the clipboard is
+empty or never answered. When nothing moved since C-y (the same buffer, text and point —
+always so when the clipboard answered at once) it is the plain yank: at point, over a region
+delete-selection replaces, its span kept for M-y. When the user went on meanwhile it goes in
+at the spot C-y marked, Emacs-like, and point stays where the user's typing left it."
+  (let ([m1 text] (ed-kill-head-with m clip)
+        cleared (ed-yank-unmark m1 spot))
+    (cond
+      (nil? text) (message cleared "kill ring is empty")
+      (ed-yank-spot-unchanged? cleared spot)
+        (let (b (ed-current-buf cleared)
+              ;; over a region delete-selection replaces, the yank starts where the region did
+              start (if (selection-to-replace? cleared b)
+                      (first (buffer-region-bounds b))
+                      (buffer-point b))
+              [m2 yanked?] (ed-try-edit cleared (fn (bb) (insert-replacing cleared bb text))))
+          (if yanked?
+            (assoc m2 :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})
+            m2))
+      else (ed-yank-at-spot m1 spot text))))
+
+(defn- ed-yank-spot-buffer (m spot)
+  "The pool buffer C-y marked its `spot` in, or nil when that slot holds another buffer now."
+  (let (b (when (< (:index spot) (count (:buffers m))) (ed-buf-at m (:index spot))))
+    (when (and b (= (buffer-name b) (:name spot))) b)))
+
+(defn- ed-yank-unmark (m spot)
+  "`m` with C-y's spot marker gone from its buffer."
+  (let (b (ed-yank-spot-buffer m spot))
+    (if (nil? b) m (ed-set-buf-at m (:index spot) (buffer-marker-delete b (:marker spot))))))
+
+(defn- ed-yank-spot-unchanged? (m spot)
+  "Whether nothing moved since C-y marked `spot`: the same buffer is current, with the same
+text and point."
+  (let (b (ed-current-buf m))
+    (and (= (ed-current-index m) (:index spot))
+      (= (buffer-name b) (:name spot))
+      (= (buffer-rope b) (:rope spot))
+      (= (buffer-point b) (:point spot)))))
+
+(defn- ed-yank-at-spot (m spot text)
+  "`text` inserted where C-y marked `spot` (its marker, which edits since have carried; the
+point it was asked at if the marker is gone), the marker removed, and the buffer's point
+kept where the user left it — moved along when the insert lands before it. No M-y span: the
+yank was not the last thing done. Into another buffer than the current one if the user
+switched meanwhile; said, and nothing inserted, if that buffer is gone or read-only."
+  (let (insert-at-spot (fn (b)
+                         (let (at (or (buffer-marker b (:marker spot))
+                                    (math/min (:point spot) (buffer-length b)))
+                               before (buffer-point b)
+                               inserted (insert (goto-char b at) text))
+                           (buffer-marker-delete (goto-char inserted
+                                                   (if (>= before at)
+                                                     (+ before (string/length text))
+                                                     before))
+                             (:marker spot))))
+        b (ed-yank-spot-buffer m spot))
+    (cond
+      (nil? b) (message m "yank: the buffer it was asked in is gone")
+      (read-only? b) (message (ed-yank-unmark m spot) "yank: that buffer is read-only")
+      (= (ed-current-index m) (:index spot)) (first (ed-try-edit m insert-at-spot))
+      else (ed-set-buf-at m (:index spot) (insert-at-spot b)))))
 
 (defcommand cmd-yank-pop
   (m key)
   "Replace the text of the immediately-preceding yank with the next-older kill,
 cycling the ring (M-y). Only valid right after a yank or yank-pop; otherwise it
 reports that the previous command was not a yank. The swap is one `replace-region`, so
-one undo takes the whole M-y back."
+one undo takes the whole M-y back. A C-y still waiting for the clipboard (a served
+session's client asked, [[cmd-yank]]) has inserted nothing to cycle yet: M-y says so, and
+works on that yank once it is in."
   (let (y (:yank m) ring (:kill-ring m))
-    (if (or (nil? y) (not (ed-yank-command? (:last-command m))) (empty? ring))
-      (message m "previous command was not a yank")
-      (let (n (count ring)
-            idx (let (i (inc (:index y))) (if (>= i n) 0 i))
-            [m2 swapped?] (ed-try-edit m
-                            (fn (b)
-                              (clear-mark (replace-region b (:start y) (:end y) (nth ring idx))))))
-        (if swapped?
-          (assoc m2 :yank {:start (:start y) :end (buffer-point (ed-current-buf m2)) :index idx})
-          m2)))))
+    (cond
+      (ed-clipboard-asking? m 'commands/ed-yank-answered)
+        (message m "yank not done yet: the clipboard has not answered")
+      (or (nil? y) (not (ed-yank-command? (:last-command m))) (empty? ring))
+        (message m "previous command was not a yank")
+      else
+        (let (n (count ring)
+              idx (let (i (inc (:index y))) (if (>= i n) 0 i))
+              [m2 swapped?] (ed-try-edit m
+                              (fn (b)
+                                (clear-mark (replace-region b (:start y) (:end y) (nth ring idx))))))
+          (if swapped?
+            (assoc m2 :yank {:start (:start y) :end (buffer-point (ed-current-buf m2)) :index idx})
+            m2)))))
 
 ;; ---- the kill ring, browsable (M-x browse-kill-ring) ---------------------------
 ;; M-y walks the ring one entry at a time, blind. *Kill Ring* shows all of it — every entry,
@@ -2349,7 +2656,7 @@ pane and the recency back as they were. `on-done` gets the model and the accepte
                  (let (mm (assoc mm-previewed :buffer-mru recency))
                    (cond
                      (ed-buffer-index-by-name mm entry) (on-done mm entry)
-                     (includes? files entry) (ed-find-file mm entry)
+                     (includes? files entry) (ed-visit-file mm entry)
                      else (on-done mm entry))))
                20
                names))
@@ -2437,7 +2744,10 @@ pane instead of replacing this one."
 
 (defn- ed-find-file-other-window-prompt (initial recent)
   "`ed-find-file-prompt` pointed at the other window, with a prompt that says so."
-  (ed-find-file-prompt initial recent ed-find-file-other-window "Find file other window: "))
+  (ed-find-file-prompt initial
+    recent
+    (fn (m path) (ed-visit-file m path ed-find-file-other-window))
+    "Find file other window: "))
 
 (defcommand cmd-switch-buffer-other-window
   (m key)
@@ -2497,11 +2807,11 @@ project's frecency (`projects/project-file-boost`), ranked in as the fuzzy `:boo
                   ;; a Vertico selection is a real project file → open it; a
                   ;; typed string with no selection falls back to a prefix match.
                   (if (includes? files t)
-                    (ed-find-file mm (path/join root t))
+                    (ed-visit-file mm (path/join root t))
                     (let (ms (project-matches t files))
                       (if (empty? ms)
                         (message mm (str "no project file matching \"" t "\""))
-                        (ed-find-file mm (path/join root (first ms)))))))
+                        (ed-visit-file mm (path/join root (first ms)))))))
    ;; Tab completes the typed path one component at a time — the identical
    ;; `complete-prefix` action as find-file's Tab, over the project files that
    ;; start with what's typed (prefix, so Tab only ever extends, never shrinks).
@@ -2768,22 +3078,35 @@ how many are modified up front is the same consent, informed, in one key."
 (defn ed-replace-span (m)
   "`[from to]` — what the replace commands act on: the active region, else point to the
 end of the buffer."
-  (let (buf (ed-current-buf m)
-        rb (buffer-region-bounds buf))
-    (if rb rb [(buffer-point buf) (buffer-length buf)])))
+  (let (buf (ed-current-buf m))
+    (or (ed-active-region m) [(buffer-point buf) (buffer-length buf)])))
+
+(defn- ed-in-region-label (m)
+  "` in region` when the replace about to be asked for is confined to the region, else `\"\"`
+— what Emacs's prompts say (`Replace string in region: `)."
+  (if (ed-active-region m) " in region" ""))
 
 (defn ed-replace-in-span (m from to regexp? verb)
   "Replace throughout `ed-replace-span` and report the count — the body `replace-string`
-and `replace-regexp` share."
-  (if (= from "")
-    (message m "(nothing to replace)")
-    (let ([lo hi] (ed-replace-span m)
-          before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
-          [after n] (isearch/replace-all-in before from to regexp?))
-      (if (= n 0)
-        (message m (str "no matches for `" from "`"))
-        (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
-          (str verb " " n " occurrence" (if (= n 1) "" "s")))))))
+and `replace-regexp` share. The buffer is searched in place (`isearch/replace-all`, which
+query-replace's `!` is too), so a `^` or `$` at the span's edge is judged by the text around
+it, never by the edge of a copy."
+  (cond
+    (= from "") (message m "(nothing to replace)")
+    (and regexp? (regex/incomplete? from))
+      (ed-ding (message m (str "Invalid regexp: " from " [incomplete input]")))
+    else
+      (let ([low high] (ed-replace-span m)
+            [edited ran? n] (ed-try-edit-with m
+                              (fn (b)
+                                (isearch/replace-all b
+                                  from
+                                  to
+                                  {:regexp? regexp? :low low :high high}))))
+        (cond
+          (not ran?) edited
+          (= n 0) (message m (str "no matches for `" from "`"))
+          else (message edited (str verb " " n " occurrence" (if (= n 1) "" "s")))))))
 
 (defn- ed-filter-lines-in-span (m pattern keep? verb)
   "`flush-lines` / `keep-lines` over `ed-replace-span`, reporting how many lines went."
@@ -2812,21 +3135,25 @@ re-nest the minibuffer by hand."
 
 (defcommand cmd-replace-string
   (m key)
-  "Replace every occurrence of a string, from point (M-x replace-string). LITERAL — the
-text you type is the text it looks for, brackets and dots and all."
-  (ed-two-part-prompt m
-    "Replace string: "
-    (fn (from) (str "Replace `" from "` with: "))
-    (fn (mm from to) (ed-replace-in-span mm from to false "replaced"))))
+  "Replace every occurrence of a string, from point — or within the region when one is active,
+which the prompt says (M-x replace-string). LITERAL — the text you type is the text it looks
+for, brackets and dots and all."
+  (let (where (ed-in-region-label m))
+    (ed-two-part-prompt m
+      (str "Replace string" where ": ")
+      (fn (from) (str "Replace string" where " `" from "` with: "))
+      (fn (mm from to) (ed-replace-in-span mm from to false "replaced")))))
 
 (defcommand cmd-replace-regexp
   (m key)
-  "Replace every match of a regexp, from point (M-x replace-regexp). `$1`…`$9` in the
-replacement stand for the pattern's groups."
-  (ed-two-part-prompt m
-    "Replace regexp: "
-    (fn (from) (str "Replace regexp `" from "` with: "))
-    (fn (mm from to) (ed-replace-in-span mm from to true "replaced"))))
+  "Replace every match of a regexp, from point — or within the region when one is active,
+which the prompt says (M-x replace-regexp). The replacement may refer to what matched, as
+C-M-%'s does: `\\&` the whole match, `\\1`…`\\9` its groups, `\\\\` a backslash."
+  (let (where (ed-in-region-label m))
+    (ed-two-part-prompt m
+      (str "Replace regexp" where ": ")
+      (fn (from) (str "Replace regexp" where " `" from "` with: "))
+      (fn (mm from to) (ed-replace-in-span mm from to true "replaced")))))
 
 (defcommand cmd-flush-lines
   (m key)
@@ -2923,7 +3250,7 @@ indentation is the part anyone wants converted."
   "Apply a whitespace transform over `ed-replace-span` and report."
   (let ([lo hi] (ed-replace-span m)
         before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
-        after (f before ed-tab-width))
+        after (f before (tab-width (ed-current-buf m))))
     (if (= before after)
       (message m (str "nothing to " verb))
       (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
@@ -3147,7 +3474,7 @@ history is **persisted across restarts** via the same recentf mechanism (`recent
           ;; marginalia per row: the key bound to the command in THIS buffer's live keymap,
           ;; its declared contract, its docstring's first line (`plume/plume-command-annotation`)
           :category :command
-          :anno-keys (ed-key-table (editor/layers/scope-keymap (list buf m)))))))
+          :anno-keys (ed-key-table (editor/layers/scope-keymap (userkeys/ed-user-scope buf m)))))))
 
 ;; ---- fuzzy in-buffer line search (M-s) --------------------------------------
 ;; The same Vertico minibuffer the other completers use, ranking the buffer's own lines
@@ -3179,7 +3506,7 @@ row, like an *Occur* line)."
 
 (defcommand cmd-fuzzy-find-line
   (m key)
-  "Fuzzy-search the current buffer's lines (M-s): a minibuffer listing every non-blank
+  "Fuzzy-search the current buffer's lines (M-s s, or M-s l as consult-line): a minibuffer listing every non-blank
 line as `\"<n>: <text>\"`, fuzzy-ranked as you type — the same list + ↑/↓ navigation as
 M-x and find-file. Enter jumps point to the selected line; a bare number jumps to it."
   (let (cands (ed-buffer-line-cands (ed-current-buf m)))
@@ -3263,20 +3590,44 @@ it means and why they are not listed as answers."
               "(no buffers saved)"
               (str "saved " n " buffer" (if (= n 1) "" "s")))))))))
 
+(defn ed-live-processes-prompt (live)
+  "The question C-x C-c asks when `live` (lines from `model/ed-live-processes`) is not
+empty: Emacs's `Active processes exist; kill them and exit anyway?`, naming them — the
+first two, and how many more — since a prompt that does not say WHICH is answered blind."
+  (let (shown (take live 2)
+        more (- (count live) (count shown)))
+    (str (if (= (count live) 1) "Still running: " "Still running — ")
+      (string/join shown "; ")
+      (if (> more 0) (str "; and " more " more") "")
+      ". Kill and exit anyway? (y or n)")))
+
+(defn- ed-quit-confirm-processes (m)
+  "The last question before quitting: when a feature has work running that quitting kills
+(`model/ed-live-processes` — a compile, a test run, the app, a terminal's program, a push),
+ask; with none, quit."
+  (let (live (ed-live-processes m))
+    (if (empty? live)
+      (ed-quit-now m)
+      (ed-read-char m
+        (ed-live-processes-prompt live)
+        (fn (mm k) (if (ed-yes-key? k) (ed-quit-now mm) (message mm "quit canceled")))))))
+
 (defn- ed-quit-ask (m pending save-all?)
   "Emacs `save-buffers-kill-terminal`: ask about each modified file buffer
 (`ed-map-y-or-n`), then — if anything is still modified — `Modified buffers exist; exit
-anyway?`. `C-g` / Esc at any prompt cancels the quit.
+anyway?`, then — if anything is still running — whether to kill it
+(`ed-quit-confirm-processes`). `C-g` / Esc at any prompt cancels the quit.
 
-`save-all?` skips the asking entirely (the `!` answer, and the caller that already knows)."
+`save-all?` skips the asking about buffers (the `!` answer, and the caller that already
+knows); the running processes are still asked about."
   (let (finish (fn (mm _)
                  (if (empty? (ed-modified-file-indices mm))
-                   (ed-quit-now mm)
+                   (ed-quit-confirm-processes mm)
                    (ed-read-char mm
                      "Modified buffers exist; exit anyway? (y or n)"
                      (fn (m2 k)
                        (if (ed-yes-key? k)
-                         (ed-quit-now m2)
+                         (ed-quit-confirm-processes m2)
                          (message m2 "quit canceled")))))))
     (if save-all?
       (finish (fold pending m (fn (acc i) (ed-save-buf-at acc i))) 0)
@@ -3291,8 +3642,10 @@ anyway?`. `C-g` / Esc at any prompt cancels the quit.
   "Quit the editor (C-x C-c, and the window's X button, delivered as `:close` — the
 model claims it with `:close-is-input?` so it lands here rather than quitting the loop
 outright). With unsaved changes to a file it asks first, buffer by buffer, the way Emacs's
-`save-buffers-kill-terminal` does (`ed-quit-ask`); with none it quits at once — and the
-primary takes every open frame with it. In a FRAME (`:frame?`) this is `delete-frame`: the
+`save-buffers-kill-terminal` does (`ed-quit-ask`); then, with a compile, a test run, the
+app, a terminal's program or a push still running, whether to kill them (Emacs's \"Active
+processes exist\"); with neither it quits at once — and the primary takes every open frame
+with it. In a FRAME (`:frame?`) this is `delete-frame`: the
 frame closes, the editor and its buffers stay (Emacs closes an emacsclient frame the same
 way). ESC is *not* quit (it's `keyboard-escape-quit`; see `modes`)."
   ;; save-place: every file's point, for the next session (live editor only; a secondary
@@ -3355,8 +3708,14 @@ of them ([[model/ed-cancel-quit-jobs]])."
         ;; in-flight LSP lookups are not tasks (nothing to kill — the server answers
         ;; anyway), but forgetting them makes their replies drop as stale
         m1 (dissoc (ed-set-buf cancelled (clear-mark (ed-current-buf cancelled)))
-             :pending :prefix-arg :lsp-pending))
-    (message m1 (if cancelled? "quit — interrupted background work" "quit"))))
+             :pending :prefix-arg :lsp-pending)
+        ;; what the jobs' hooks said they stopped (`model/ed-quit-note`), after C-g's word
+        [m2 notes] (ed-take-quit-notes m1))
+    (message m2
+      (cond
+        notes (str "quit — " notes)
+        cancelled? "quit — interrupted background work"
+        else "quit"))))
 
 ;; ---- serve the selected buffer over HTTP (the live web mirror, C-x w) -------
 
@@ -3653,7 +4012,7 @@ text and the mark after it, so the inserted text is the region."
         (fn (mm t)
           (if (or (not (file/exists? t)) (file/dir? t))
             (message mm (str "no such file: " t))
-            (let (content (:text (eol-decode (file/slurp t)))
+            (let (content (:text (file-text-decode (file/slurp t)))
                   p (buffer-point (ed-current-buf mm)))
               ;; point back at the start of the inserted text. Emacs leaves its (inactive) mark
               ;; at the end; bedit has no inactive mark — a set one IS the region, and with

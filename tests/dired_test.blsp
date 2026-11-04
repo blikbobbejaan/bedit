@@ -8,7 +8,7 @@
   (:use-internals commands)
   (:use-internals dired) ; the listing, marks and flags — split out of commands (X1)
   (:use hexl) ; hexl-row / hexl-text / hexl-fontify — the hex view, split out of commands
-  (:use main)
+  (:use-internals main) ; launch-buffer / open-pending — a launch file read once
   (:use editor/buffer)
   (:use test))
 
@@ -335,6 +335,95 @@
       (assert= (:file buf) path)
       (is (includes? (buffer-text buf) "7f45 4c46 00ff fe01"))
       (is (includes? (:echo m) "as hex")))))
+
+;; find-file read every file twice — once to ask whether it was UTF-8, once to build the
+;; buffer — and read a file of any size without asking. Emacs asks above
+;; `large-file-warning-threshold` (10 MB), since the file is read whole and the editor waits.
+(defn- vf-file (name text)
+  (let (dir (path/temp "bedit-visit-"))
+    (file/mkdir dir)
+    (let (path (path/join dir name)) (do (file/spit path text) path))))
+
+(describe "find-file reads a file once, and asks before a large one"
+  (test "ed-read-file: one read says text or binary, and keeps what it read"
+    (let (text-path (vf-file "a.txt" "héllo\r\n")
+          blob-path (path/join (path/dirname text-path) "b.bin"))
+      (file/spit-bytes blob-path (bytes 0 255 1))
+      (assert= (ed-read-file text-path) {:text "héllo\r\n"})
+      (assert= (count (:bytes (ed-read-file blob-path))) 3)))
+  (test "a text file opens from that one read: decoded, stamped, unmodified"
+    (let (path (vf-file "c.txt" "one\r\ntwo\r\n")
+          buf (cur (ed-find-file (m-of "") path)))
+      (assert= (buffer-text buf) "one\ntwo\n")
+      (assert= (buffer-eol buf) :crlf)
+      (is (not (buffer-modified? buf)))
+      (is (not (buffer-file-changed? buf)))))
+  (test "a file over the threshold is asked about: y opens it, n leaves it"
+    (let (path (vf-file "big.log" "0123456789abcdef\n")
+          m (assoc (m-of "") :large-file-warning-threshold 10)
+          asked (ed-visit-file m path))
+      (assert= (:echo asked) "File big.log is large (17 B), really open? (y or n)")
+      (is (not (= (buffer-file (cur asked)) path)))
+      (assert= (buffer-file (cur (ed-update asked "y" 80 24))) path)
+      (let (declined (ed-update asked "n" 80 24))
+        (is (not (= (buffer-file (cur declined)) path)))
+        (assert= (:echo declined) "not opened"))))
+  (test "within the threshold, 0 (never ask), already open, or missing: opened at once"
+    (let (path (vf-file "small.log" "0123456789abcdef\n"))
+      (assert= (buffer-file (cur (ed-visit-file (assoc (m-of "") :large-file-warning-threshold 100)
+                                   path)))
+        path)
+      (assert= (buffer-file (cur (ed-visit-file (assoc (m-of "") :large-file-warning-threshold 0)
+                                   path)))
+        path)
+      (let (opened (ed-find-file (assoc (m-of "") :large-file-warning-threshold 10) path))
+        (assert= (buffer-file (cur (ed-visit-file opened path))) path))
+      (let (missing (path/join (path/dirname path) "new.txt"))
+        (assert= (buffer-file (cur (ed-visit-file (assoc (m-of "") :large-file-warning-threshold 1)
+                                     missing)))
+          missing))))
+  (test "the default is Emacs's, 10 MB, when the model has none"
+    (assert= config/*large-file-warning-default* 10000000)
+    (is (nil? (ed-large-file-question (m-of "") (vf-file "d.txt" "small")))))
+  (test "the C-x C-f prompt asks, and C-x 4 f does too"
+    (let (path (vf-file "e.log" "0123456789abcdef\n")
+          m (assoc (m-of "") :large-file-warning-threshold 10))
+      (is (string/starts-with? (:echo ((:on-complete (ed-find-file-prompt "/" [])) m path))
+            "File e.log is large"))
+      (is (string/starts-with? (:echo ((:on-complete (commands/ed-find-file-other-window-prompt "/"
+                                                       [])) m
+                                        path))
+            "File e.log is large"))))
+  (test "dired's RET on a large file asks"
+    (let (path (vf-file "f.log" "0123456789abcdef\n")
+          dir (path/dirname path)
+          ;; the listing's line for f.log, whichever it is
+          line (seq/find (range 12) (fn (n) (= (dired/ed-dired-name-at (dired-on dir n)) "f.log")))
+          m (assoc (dired-on dir line) :large-file-warning-threshold 10))
+      (is (string/starts-with? (:echo (cmd-dired-open m nil)) "File f.log is large"))))
+  (test "a launch file that is large, binary or unreadable starts on the welcome buffer, pending"
+    (let (text-path (vf-file "g.txt" "hello\n")
+          dir (path/dirname text-path)
+          blob-path (path/join dir "g.bin")
+          big-path (vf-file "g.log" "0123456789abcdef\n")
+          cfg {:large-file-warning-threshold 10})
+      (file/spit-bytes blob-path (bytes 0 255 1))
+      (let ([buf pending] (main/launch-buffer text-path false nil {}))
+        (assert= (buffer-text buf) "hello\n")
+        (is (nil? pending)))
+      (let ([buf pending] (main/launch-buffer blob-path false nil {}))
+        (is (nil? (buffer-file buf)))
+        (assert= (count (:bytes pending)) 3))
+      (let ([buf pending] (main/launch-buffer big-path false nil cfg))
+        (is (nil? (buffer-file buf)))
+        (assert= pending :ask))
+      ;; and opened once there is a model: the binary as hex, the large file asked about
+      (is (includes? (:echo (main/open-pending (m-of "") blob-path {:bytes (bytes 0 255 1)}))
+            "as hex"))
+      (is (string/starts-with? (:echo (main/open-pending (assoc (m-of "")
+                                                           :large-file-warning-threshold 10)
+                                        big-path :ask))
+            "File g.log is large")))))
 
 (describe "dired-jump — C-x C-j / C-x j: the file's directory, point on the file, no prompt"
   (test "from a file buffer, dired opens on its directory with point on its name"

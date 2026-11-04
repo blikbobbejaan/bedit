@@ -1,0 +1,380 @@
+(defmodule editorconfig
+  "EditorConfig (editorconfig.org): the `.editorconfig` files above a file, read and resolved
+into the properties that file is edited with — `indent_style`, `indent_size`, `tab_width`,
+`max_line_length`, `end_of_line`, `insert_final_newline`, `trim_trailing_whitespace`,
+`charset`.
+
+The spec, as implemented here:
+
+- a file is `[section]` headers, each followed by `key = value` lines; a line starting with
+  `#` or `;` is a comment; `root = true` before the first section stops the search upward
+- keys are case-insensitive, and so are the values of the properties the spec defines;
+  `unset` removes a property an outer file or an earlier section set
+- a section's glob: `*` any run but `/`, `**` any run, `?` one char but `/`, `[abc]` /
+  `[!abc]` a char set, `{a,b}` alternatives (nesting), `{1..9}` an integer in a range, `\\`
+  escapes. A glob with a `/` is relative to its file's directory (a leading `/` dropped);
+  one without matches the file's name at any depth below it
+- the files are applied from the outermost (the one marked root, or the filesystem's top)
+  to the nearest, and within a file in order, so the nearest, latest section wins
+
+Pure but for the reader: [[properties-for]] takes the function that reads a config file,
+so tests resolve against a map of paths to text. What the editor does with the result is
+`conventions`'.
+
+It lives in bedit, not std: it is a file format built from capabilities Brood already has
+(regex, path, file), and nothing else in the tree wants it today. `nest format` is the
+plausible second caller, and the day it honours `.editorconfig` this moves into a hive
+package both depend on.")
+
+;; ---- parsing ---------------------------------------------------------------------------
+
+(def *known-properties*
+  ;; the properties the spec defines, whose VALUES are case-insensitive too
+  #{"indent_style"
+    "indent_size" "tab_width" "end_of_line" "charset" "insert_final_newline"
+    "trim_trailing_whitespace" "max_line_length" "root"})
+
+(defn- comment-line? (line) (or (string/starts-with? line "#") (string/starts-with? line ";")))
+
+(defn- section-header (line)
+  ;; the glob of a `[glob]` line, or nil
+  (when (and (string/starts-with? line "[") (string/ends-with? line "]") (> (string/length line) 1))
+    (string/substring line 1 (dec (string/length line)))))
+
+(defn- property-line (line)
+  ;; `[key value]` of a `key = value` line, or nil
+  (let (at (index-of line "="))
+    (when (> at 0)
+      (let (key (string/lower (string/trim (string/substring line 0 at)))
+            raw (string/trim (string/substring line (inc at) (string/length line))))
+        (when (not (= key ""))
+          [key (if (contains? *known-properties* key) (string/lower raw) raw)])))))
+
+(defn- with-property (state property)
+  ;; `state` after a `key = value` line: the preamble's root, or the current section's
+  (let ([key value] property
+        index (:current state))
+    (cond
+      (nil? index) (if (= property ["root" "true"]) (assoc state :root true) state)
+      else
+        (let (section (nth (:sections state) index))
+          (assoc state
+            :sections
+              (assoc (:sections state)
+                index (assoc section :properties (assoc (:properties section) key value))))))))
+
+(defn- read-line (state line)
+  ;; `state` after one trimmed line of a file
+  (let (glob (section-header line)
+        property (property-line line))
+    (cond
+      (or (= line "") (comment-line? line)) state
+      glob
+        (assoc state
+          :sections (conj (:sections state) {:glob glob :properties {}})
+          :current (count (:sections state)))
+      (nil? property) state
+      else (with-property state property))))
+
+(defn parse (text)
+  "The `.editorconfig` file `text` as `{:root bool :sections [{:glob :properties}]}`: its
+`root` declaration and its sections in order, each property keyed by its lower-cased name.
+
+    (:root (editorconfig/parse \"root = true\\n[*.py]\\nindent_size = 4\\n\"))   ;=> true"
+  (let (parsed (fold (map (string/split text "\n") string/trim)
+                 {:root false :sections [] :current nil}
+                 read-line))
+    {:root (:root parsed) :sections (:sections parsed)}))
+
+;; ---- globs -----------------------------------------------------------------------------
+
+(def- regex-specials #{"." "^" "$" "+" "(" ")" "{" "}" "|" "[" "]" "\\" "*" "?"})
+
+(defn- literal (char) (if (contains? regex-specials char) (str "\\" char) char))
+
+(defn- closing-index (chars from open close)
+  ;; the index of the `close` matching the `open` at `from`, honouring nesting and `\\`
+  ;; escapes, or nil
+  (letrec (walk (fn (i depth)
+                  (cond
+                    (>= i (count chars)) nil
+                    (= (nth chars i) "\\") (walk (+ i 2) depth)
+                    (= (nth chars i) open) (walk (inc i) (inc depth))
+                    (= (nth chars i) close) (if (= depth 1) i (walk (inc i) (dec depth)))
+                    else (walk (inc i) depth))))
+    (walk from 0)))
+
+(defn- top-level-comma? (chars from to)
+  ;; true when a `,` sits directly inside the braces at `from`..`to`
+  (letrec (walk (fn (i depth)
+                  (cond
+                    (>= i to) false
+                    (= (nth chars i) "\\") (walk (+ i 2) depth)
+                    (= (nth chars i) "{") (walk (inc i) (inc depth))
+                    (= (nth chars i) "}") (walk (inc i) (dec depth))
+                    (and (= (nth chars i) ",") (= depth 0)) true
+                    else (walk (inc i) depth))))
+    (walk (inc from) 0)))
+
+(defn- integer-range (body)
+  ;; `[low high]` of a `{low..high}` body, or nil
+  (let (found (regex/find "^([+-]?\\d+)\\.\\.([+-]?\\d+)$" body))
+    (when found
+      (let ([low high] (vec (map (:groups found) (fn (group) (string/->number (:text group))))))
+        (when (and (int? low) (int? high)) [(math/min low high) (math/max low high)])))))
+
+(defn- bracket-class (body)
+  ;; a `[…]` glob body as a regex class
+  (let (negated (or (string/starts-with? body "!") (string/starts-with? body "^"))
+        members (if negated (string/substring body 1 (string/length body)) body)
+        escaped (string/join (map (string/->list members)
+                               (fn (char)
+                                 (if (contains? #{"\\" "]" "[" "^"} char) (str "\\" char) char)))
+                  ""))
+    (str "[" (if negated "^" "") escaped "]")))
+
+(defn- translate (chars)
+  ;; `{:regex :ranges}`: the glob `chars` as a regex body, and the integer ranges its
+  ;; capture groups must fall in, in group order
+  (letrec (walk (fn (i braces out ranges)
+                  (if (>= i (count chars))
+                    {:regex (string/join out "") :ranges ranges}
+                    (let (char (nth chars i)
+                          next (nth chars (inc i) nil))
+                      (cond
+                        (= char "\\")
+                          (if (nil? next)
+                            (walk (inc i) braces (conj out "\\\\") ranges)
+                            (walk (+ i 2) braces (conj out (literal next)) ranges))
+                        (and (= char "*") (= next "*"))
+                          (if (= (nth chars (+ i 2) nil) "/")
+                            (walk (+ i 3) braces (conj out "(?:.*/)?") ranges)
+                            (walk (+ i 2) braces (conj out ".*") ranges))
+                        (= char "*") (walk (inc i) braces (conj out "[^/]*") ranges)
+                        (= char "?") (walk (inc i) braces (conj out "[^/]") ranges)
+                        (= char "[")
+                          (let (close (closing-index chars i "[" "]")
+                                body (if (nil? close)
+                                       ""
+                                       (string/join (seq/subvec chars (inc i) close) "")))
+                            (if (or (nil? close) (includes? body "/"))
+                              (walk (inc i) braces (conj out "\\[") ranges)
+                              (walk (inc close) braces (conj out (bracket-class body)) ranges)))
+                        (= char "{")
+                          (let (close (closing-index chars i "{" "}")
+                                body (when close (string/join (seq/subvec chars (inc i) close) ""))
+                                numeric (when body (integer-range body)))
+                            (cond
+                              (nil? close) (walk (inc i) braces (conj out "\\{") ranges)
+                              numeric
+                                (walk (inc close)
+                                  braces
+                                  (conj out "([+-]?\\d+)")
+                                  (conj ranges numeric))
+                              (top-level-comma? chars i close)
+                                (walk (inc i) (cons true braces) (conj out "(?:") ranges)
+                              else (walk (inc i) (cons false braces) (conj out "\\{") ranges)))
+                        (= char "}")
+                          (cond
+                            (empty? braces) (walk (inc i) braces (conj out "\\}") ranges)
+                            (first braces) (walk (inc i) (rest braces) (conj out ")") ranges)
+                            else (walk (inc i) (rest braces) (conj out "\\}") ranges))
+                        (and (= char ",") (not (empty? braces)) (first braces))
+                          (walk (inc i) braces (conj out "|") ranges)
+                        else (walk (inc i) braces (conj out (literal char)) ranges))))))
+    (walk 0 '() [] [])))
+
+(defn glob-pattern (glob)
+  "The section `glob` as `{:regex :ranges}`: an anchored regex over a path RELATIVE to the
+`.editorconfig`'s directory, and the `[low high]` each of its capture groups (a `{1..9}`)
+must lie in. A glob with no `/` matches the name at any depth.
+
+    (:regex (editorconfig/glob-pattern \"*.{js,py}\"))   ;=> \"^(?:.*/)?[^/]*\\\\.(?:js|py)$\""
+  (let (has-slash (includes? glob "/")
+        body (if (string/starts-with? glob "/") (string/substring glob 1 (string/length glob)) glob)
+        translated (translate (vec (string/->list body))))
+    (assoc translated :regex (str (if has-slash "^" "^(?:.*/)?") (:regex translated) "$"))))
+
+(defn glob-matches? (glob relative-path)
+  "True when the section `glob` matches `relative-path`, a file's path relative to the
+directory of the `.editorconfig` the glob is in.
+
+    (editorconfig/glob-matches? \"*.py\" \"src/app/main.py\")   ;=> true
+    (editorconfig/glob-matches? \"src/**/*.{c,h}\" \"src/a/b/x.h\")   ;=> true
+    (editorconfig/glob-matches? \"/Makefile\" \"lib/Makefile\")   ;=> false
+    (editorconfig/glob-matches? \"file{1..3}.txt\" \"file4.txt\")   ;=> false"
+  (let ({:keys [regex ranges]} (glob-pattern glob)
+        found (regex/find regex relative-path))
+    (and (not (nil? found))
+      (every? (seq/zip (:groups found) ranges)
+        (fn ([group [low high]])
+          (let (number (string/->number (:text group)))
+            (and (int? number) (<= low number) (<= number high))))))))
+
+;; ---- resolving -------------------------------------------------------------------------
+
+(defn read-config (path)
+  "The text of the `.editorconfig` at `path`, or nil when there is none or it cannot be read
+— the reader [[properties-for]] uses unless it is handed another."
+  (when (file/exists? path)
+    (check-allow :discarded-catch (try (file/slurp path) (catch e nil)))))
+
+(defn- relative-to (dir path)
+  (let (prefix (if (string/ends-with? dir "/") dir (str dir "/")))
+    (if (string/starts-with? path prefix)
+      (string/substring path (string/length prefix) (string/length path))
+      nil)))
+
+(defn- configs-above (dir read-file)
+  ;; `[[dir parsed] …]`, the nearest first, up to and including the first marked root
+  (letrec (walk (fn (dir acc)
+                  (let (text (read-file (path/join dir ".editorconfig"))
+                        parsed (when (string? text) (parse text))
+                        acc (if parsed (conj acc [dir parsed]) acc)
+                        parent (path/dirname dir))
+                    (if (or (and parsed (:root parsed)) (= parent dir) (= parent ""))
+                      acc
+                      (walk parent acc)))))
+    (walk dir [])))
+
+(defn- with-defaults (properties)
+  ;; `unset` dropped, then the spec's derived defaults: an `indent_size` of `tab` is the tab
+  ;; width, a tab style with no size is the tab width, and a tab width follows the size
+  (let (kept (into {} (seq/reject properties (fn ([_ value]) (= value "unset"))))
+        size (get kept "indent_size")
+        width (get kept "tab_width")
+        sized (if (and (nil? size) (= (get kept "indent_style") "tab"))
+                (assoc kept "indent_size" "tab")
+                kept))
+    (if (and (nil? width) (string? size) (not (= size "tab")))
+      (assoc sized "tab_width" size)
+      sized)))
+
+(defn properties-for (file &optional (read-file read-config))
+  "The EditorConfig properties of `file` (an absolute path), name to (lower-cased) value:
+every `.editorconfig` from the file's directory up to the one marked `root = true` (or the
+top), applied outermost first, each file's matching sections in order. `read-file` reads a
+config's text by path, nil when it has none. `{}` when nothing applies.
+
+    (editorconfig/properties-for \"/p/src/a.py\" (fn (path) (get {\"/p/.editorconfig\" \"root = true\\n[*]\\nindent_style = space\\n[*.py]\\nindent_size = 4\\n\"} path)))   ;=> {\"indent_style\" \"space\" \"indent_size\" \"4\" \"tab_width\" \"4\"}"
+  (let (configs (reverse (configs-above (path/dirname file) read-file)))
+    (with-defaults (fold configs
+                     {}
+                     (fn (acc [dir parsed])
+                       (let (relative (relative-to dir file))
+                         (if (nil? relative)
+                           acc
+                           (fold (:sections parsed)
+                             acc
+                             (fn (inner section)
+                               (if (glob-matches? (:glob section) relative)
+                                 (merge inner (:properties section))
+                                 inner))))))))))
+
+(defn- positive-int (value)
+  (let (number (when (string? value) (string/->number value)))
+    (when (and (int? number) (> number 0)) number)))
+
+(defn- boolean-value (value) (case value "true" true "false" false nil))
+
+(defn settings-of (properties)
+  "The editor settings EditorConfig `properties` ([[properties-for]]) ask for, keyed as the
+editor names them — `:indent-tabs`, `:indent-width` (a number, or `:tab` for one tab),
+`:tab-width`, `:fill-column`, `:end-of-line` (`:lf` `:crlf` `:cr`), `:insert-final-newline`,
+`:trim-trailing-whitespace`, `:charset` — holding only what was set to a valid value.
+
+    (editorconfig/settings-of {\"indent_style\" \"tab\" \"indent_size\" \"tab\" \"max_line_length\" \"100\"})   ;=> {:indent-tabs true :indent-width :tab :fill-column 100}"
+  (let (style (get properties "indent_style")
+        size (get properties "indent_size")
+        entries [[:indent-tabs (case style "tab" true "space" false nil)]
+                  [:indent-width (if (= size "tab") :tab (positive-int size))]
+                  [:tab-width (positive-int (get properties "tab_width"))]
+                  [:fill-column (positive-int (get properties "max_line_length"))]
+                  [:end-of-line
+                    (case (get properties "end_of_line") "lf" :lf "crlf" :crlf "cr" :cr nil)]
+                  [:insert-final-newline (boolean-value (get properties "insert_final_newline"))]
+                  [:trim-trailing-whitespace
+                    (boolean-value (get properties "trim_trailing_whitespace"))]
+                  [:charset (get properties "charset")]])
+    (into {} (seq/reject entries (fn ([_ value]) (nil? value))))))
+
+(defn settings-for (file &optional (read-file read-config))
+  "The editor settings the `.editorconfig` files above `file` give it ([[settings-of]] of
+[[properties-for]]); `{}` when none apply."
+  (settings-of (properties-for file read-file)))
+
+;; ---- on a buffer -------------------------------------------------------------------------
+
+(defdyn *enabled* true)
+;; Whether a visited file's `.editorconfig` is read at all — init.blsp's `:editorconfig`,
+;; re-bound by `conventions/set-user-settings`.
+
+(defn set-enabled (enabled)
+  "Read `.editorconfig` files for the buffers made from now on when `enabled`, else not."
+  (defdyn *enabled* (= true enabled))
+  nil)
+
+(defn stamp-buffer (buf)
+  "`buf` with `:editorconfig` — the settings its file's `.editorconfig` files ask for
+([[settings-for]]) — when it visits a file and has none yet; `buf` unchanged otherwise, or
+when they are turned off. A buffer reads them once, when it is made, as Emacs's
+editorconfig does on visiting.
+
+A NEW file — none on disk yet — also takes the line ending it asks for (`:eol :crlf` for
+`end_of_line = crlf`) and the byte-order mark (`:bom true` for `charset = utf-8-bom`), which
+the save writes. An existing file keeps what it was read with, whatever the config says:
+converting it silently would be a diff the user did not ask for, so `conventions/summary`
+says when the two disagree instead."
+  (let (file (get buf :file))
+    (if (or (not *enabled*) (not (string? file)) (contains? buf :editorconfig))
+      buf
+      (let (absolute (path/absolute file)
+            settings (settings-for absolute)
+            stamped (assoc buf :editorconfig settings)
+            new? (not (file/exists? absolute))
+            with-eol (if (and new? (= (:end-of-line settings) :crlf) (nil? (get buf :eol)))
+                       (assoc stamped :eol :crlf)
+                       stamped))
+        (if (and new? (= (:charset settings) "utf-8-bom"))
+          (assoc with-eol :bom true)
+          with-eol)))))
+
+(defn line-ending-note (buf)
+  "What to say when `buf`'s line ending is not the one its `.editorconfig` asks for —
+`\"line ends LF; .editorconfig asks CRLF (not converted)\"` — or nil when they agree or it
+asks for none. A buffer's ending is `:crlf` when it was read with CRLF lines, else LF; a
+`cr` ending is one bedit cannot write.
+
+    (editorconfig/line-ending-note {:editorconfig {:end-of-line :crlf}})   ;=> \"line ends LF; .editorconfig asks CRLF (not converted)\"
+    (editorconfig/line-ending-note {:eol :crlf :editorconfig {:end-of-line :crlf}})   ;=> nil"
+  (let (wanted (get (get buf :editorconfig) :end-of-line)
+        actual (or (get buf :eol) :lf)
+        spelled (fn (eol) (string/upper (->string eol))))
+    (cond
+      (or (nil? wanted) (= wanted actual)) nil
+      (= wanted :cr)
+        (str "line ends " (spelled actual) "; .editorconfig asks CR, which bedit does not write")
+      else
+        (str "line ends "
+          (spelled actual)
+          "; .editorconfig asks "
+          (spelled wanted)
+          " (not converted)"))))
+
+(defn charset-note (buf)
+  "What to say when `buf`'s `.editorconfig` asks for a charset it is not written in — one
+other than UTF-8, which bedit cannot write, or UTF-8 with or without the byte-order mark the
+file was not read with (not converted) — or nil.
+
+    (editorconfig/charset-note {:editorconfig {:charset \"latin1\"}})   ;=> \".editorconfig asks charset latin1; bedit reads and writes UTF-8\"
+    (editorconfig/charset-note {:editorconfig {:charset \"utf-8\"}})   ;=> nil
+    (editorconfig/charset-note {:bom true :editorconfig {:charset \"utf-8\"}})   ;=> \"file has a byte-order mark; .editorconfig asks utf-8 (not converted)\""
+  (let (charset (get (get buf :editorconfig) :charset)
+        bom (= true (get buf :bom)))
+    (cond
+      (not (string? charset)) nil
+      (= charset "utf-8")
+        (when bom "file has a byte-order mark; .editorconfig asks utf-8 (not converted)")
+      (= charset "utf-8-bom")
+        (when (not bom) "file has no byte-order mark; .editorconfig asks utf-8-bom (not converted)")
+      else (str ".editorconfig asks charset " charset "; bedit reads and writes UTF-8"))))

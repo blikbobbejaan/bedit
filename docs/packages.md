@@ -1,7 +1,12 @@
 # Packages — an extension ecosystem (design note)
 
-**Status:** design-of-record. Mostly **not built yet**; the editor today loads only its
-own bundled modules at startup. Revised 2026-08-02, when the substrate turned out to be
+**Status:** design-of-record, partly built. The package MANAGER exists (`src/packages.blsp`,
+`M-x package-list`): it installs, updates and removes hive packages that `:enhances bedit`
+into `~/.config/bedit/packages` at runtime and loads them at startup, and a package may
+declare its own settings (`:bedit/settings`) and themes. The registration surfaces this note
+names as `bind-key`, `add-hook` and `defsetting` are, as built, init.blsp's `:keys` /
+`:mode-keys` and std's `settings/define`; named hooks and the `(package …)` form are not
+built ([`configurability.md`](configurability.md) has what is). Revised 2026-08-02, when the substrate turned out to be
 further along than this note assumed: **[hive](../../hive) — Brood's package registry —
 is live and `nest` already speaks it.**
 
@@ -61,10 +66,10 @@ Put those two facts together and the design falls out:
 | `package-refresh-contents` | nothing to refresh — hive is queried live |
 | `package-install` | add the dep + resolve + `require`, **in the running image** |
 | `Package-Requires: ((emacs "29.1"))` | `:enhances {bedit ">= 0.1"}` (the marker *and* the version check) |
-| `defcustom` / `define-key` / `add-hook` / `auto-mode-alist` | the settings / `bind-key` / `add-hook` / `register-file-type` registries ([`configurability.md`](configurability.md)) |
+| `defcustom` / `define-key` / `add-hook` / `auto-mode-alist` | `settings/define` (`:bedit/settings`) / init.blsp's `:keys` and `:mode-keys` / `add-hook` (not built) / `register-file-type` registries ([`configurability.md`](configurability.md)) |
 | `use-package` | a declarative `(package …)` form in `init.blsp` — **data, not code** |
 | autoloads | the `M-x` registry + late-bound command symbols |
-| `M-x list-packages`, `C-h P` | `M-x package-list` (a `*Packages*` buffer), `C-h P` describe-package |
+| `M-x list-packages`, `C-h P` | `M-x package-list` (a `*Packages*` buffer), `C-h P` describe-package (`help/cmd-describe-package`: installed or not, the version against the hive's newest, what it enhances, the themes it contributes, the init.blsp settings its sources declare; RET on a `*Packages*` row) |
 
 So most of "load packages like Emacs" **already exists** — it just isn't pointed at the
 editor yet.
@@ -269,11 +274,19 @@ Built on Part 1 and on the config registries from
    keybindings take effect with no restart** — which genuinely beats Emacs's
    restart-or-autoload dance, and is a direct payoff of the late-bound design.
 4. **All of it off the loop.** Registry HTTP, tarball download and extraction take
-   *seconds*, so they run in a worker that streams progress into the buffer —
-   `src/procstream.blsp` is the shared streaming-subprocess worker the test and app runners
-   already ride, and this is the same shape (a `:packages` handler). A network fetch on the
-   `ui-run` loop would freeze the editor, which is precisely the class of thing the actor
-   work removed.
+   *seconds*, so they run in a worker. **Done (2026-11-04)** for the runtime package manager
+   (`src/packages.blsp`): the list fetch, an install and an update are a `std/task` in the
+   model's `:package-job` slot — one at a time, C-g cancels it, C-x C-c asks while it runs —
+   and the `*Packages*` status line says what is running and how the last one ended, with
+   the registry's REASON when it failed (brood ADR-559 made the registry calls answer a
+   failure carrying it instead of nil or a bare raise). An install lands in a staging dir and
+   is moved into place only once it verified and enhances this bedit, so a failed, refused
+   or cancelled install keeps the copy that was there. `M-x package-install` and `C-h P` fetch
+   the list themselves when it has never been fetched: the prompt opens at once saying so,
+   and its candidates arrive with the answer. An update reloads the plugin's files in load
+   order (brood's `reflect/source-load-order`), so a changed macro reaches its callers on the
+   one reload. A network fetch on the `ui-run` loop
+   would freeze the editor, which is precisely the class of thing the actor work removed.
 5. **`M-x package-upgrade` / `package-delete` / the lockfile.** `project.lock.blsp` in the
    config dir is a **reproducible editor config**: version + sha256 per package, so the
    same editor comes up on another machine — what Emacs users needed straight.el / elpaca
@@ -282,7 +295,9 @@ Built on Part 1 and on the config registries from
 6. **Trust, stated plainly.** A package is arbitrary Brood code in the editor's image;
    `:enhances` is author-declared metadata, **not a sandbox**. The policy: explicit installs only
    (nothing auto-installs), immutable releases pinned by checksum in the lock, and `C-h P`
-   shows what a package registers before you install it. The real answer is the one this
+   shows what the hive says of a package before you install it, and once it is installed the
+   settings its sources declare and the themes it contributes (its sources are read, not run,
+   for the settings). The real answer is the one this
    editor is already built on — **a package could run in its own process**, the way every
    buffer already does (`src/hosted.blsp`) — and that is the direction to take if untrusted
    packages ever matter. Emacs never solved this; we at least know where our answer comes

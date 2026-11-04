@@ -212,6 +212,8 @@ suppressed (no false red) rather than scanning the rest of the buffer.
         bm (ed-mode-service buf :bracket-match)
         faces [face-bracket-here face-bracket-match face-bracket-error])
     (cond
+      ;; so-long: no bracket match on a buffer whose line may be a megabyte of brackets
+      (solong/so-long? buf) '()
       bm-tree (ed-bracket-tree-overrides-at tree (buffer-rope buf) (buffer-point buf) bm-tree faces)
       (nil? bm) '()
       else (ed-bracket-overrides-at (buffer-rope buf) (buffer-point buf) bm faces))))
@@ -610,8 +612,8 @@ row's text. Bottom line first."
 ;; Render ops carry absolute screen coordinates, so a pane simply offsets every
 ;; op by its rect's origin `(x, y)` and clips text to its width `w`.
 
-(sig ed-row-slice (any int int (or nil int) int -> (tuple string int int)))
-(defn- ed-row-slice (rope line from to w)
+(sig ed-row-slice (any int int (or nil int) int &optional (or nil int) -> (tuple string int int)))
+(defn- ed-row-slice (rope line from to w &optional (known-col nil))
   "`[vis from-col base]` for the chars `[from, to)` of `line` a `w`-wide row shows (`to` nil
 for the rest of the line): the text it paints, the display column that text starts at on
 its line, and the buffer offset of its first character.
@@ -619,7 +621,11 @@ its line, and the buffer offset of its first character.
 The line is read as rope SLICES — its bounds from the line index, then only the chars the
 row shows (and, h-scrolled, the ones left of it) — not as the whole line's text with its
 newline stripped and then substringed: two fewer copies of every visible line on every
-frame that re-renders it."
+frame that re-renders it.
+
+`known-col` is the display column `from` sits at when the caller already knows it — the row
+after another row of the same wrapped line starts where that one ended — so a row in the
+middle of a megabyte line does not measure the line's text before it."
   (let (bol (text/line->char rope line)
         len (- (ed-line-end rope line) bol)
         ;; `if`, not `math/min`: the checker reads `math/min` of two ints as a `number`, and
@@ -631,8 +637,48 @@ frame that re-renders it."
         ;; file of 12,000-character lines that was a 12 KB copy per row per frame.
         end (let (cap (if (nil? to) (+ h w) to)) (if (< cap len) cap len)))
     [(ed-fit (text/slice rope (+ bol h) (+ bol (if (< end h) h end))) w)
-      (if (= h 0) 0 (string/display-width (text/slice rope bol (+ bol h))))
+      (cond
+        (= h 0) 0
+        (and (int? known-col) (= h from)) known-col
+        else (string/display-width (text/slice rope bol (+ bol h))))
       (+ bol h)]))
+
+(defn- ed-row-start-cols (rope table)
+  "Per row of a pane's row `table`, the display column its text starts at when the row
+before it was the same line's and ended where it starts (a wrapped line's next row: that
+row's column plus its width), else nil — so only the FIRST row of a line on screen measures
+the line's text before it (`ed-row-slice`)."
+  (first
+    (fold table
+      [[] nil]
+      (fn (acc row)
+        (let ([cols previous] acc
+              line (nth row 0)
+              from (nth row 1)
+              to (nth row 2)
+              inlay (nth row 3 nil)
+              bol (text/line->char rope line)
+              start (+ bol from)
+              end (when (int? to) (+ bol to))
+              ;; the guard also tells the checker the offsets are ints: a row is untyped data
+              wrapped? (and (nil? inlay) (int? start) (int? end) (nil? (nth row 4 nil)))
+              ;; this row's start column: handed on by the row before, else — for a
+              ;; wrapped row, whose end the next row needs — measured here, once
+              col (cond
+                    (not (nil? inlay)) nil
+                    (and previous (= (first previous) line) (= (second previous) from))
+                      (nth previous 2)
+                    (not wrapped?) nil
+                    (= from 0) 0
+                    (int? start) (string/display-width (text/slice rope bol start))
+                    else nil)
+              ;; where a wrapped row ends, and the column there, for the row after it
+              next (when (and wrapped? (int? col) (int? start) (int? end))
+                     [line
+                       to
+                       (+ col
+                         (string/display-width (text/slice rope start end) col))]))
+          [(conj cols col) next])))))
 
 (sig ed-row-ops (int int int string int int any any any any -> any))
 (defn- ed-row-ops (row x w vis from-col base plain? spans ranges overrides)
@@ -723,7 +769,7 @@ saved, on exactly the frames that change nothing. What makes it a win is that th
 facts are remembered (`ed-row-facts-at`) on the rope, the band and the viewport: a frame
 where nothing moved reads them back in one comparison, and only a frame that changed the
 text or scrolled pays for them, once."
-  (let (facts (ed-row-facts-at (buffer-rope buf) spans top textrows hscroll rows w)
+  (let (facts (ed-row-facts-at (buffer-rope buf) spans top textrows hscroll rows w *tab-width*)
         any-ranges? (not (empty? hl-ranges))
         paint-row (fn (row fact)
                     (let ([line
@@ -799,7 +845,7 @@ it, not code), reversed once at the end."
 ;; check-allow: a hit comes back out of the memo's store, which the checker reads as
 ;; unknown; the store only ever holds what the body below built, a list of row facts.
 (check-allow :trusted
-  (defmemo ed-row-facts-at 8 (rope spans top textrows hscroll rows w)
+  (defmemo ed-row-facts-at 8 (rope spans top textrows hscroll rows w tab-width)
     "Per screen row of a pane, what painting it reads from the TEXT: an inlay row's string,
 or `[line vis from-col base spans content bol eol plain-deps tiled-deps ellipsis]` — the
 line, the text the row shows (`ed-row-slice`) with the display column it starts at and its
@@ -829,15 +875,20 @@ deps (`ed-visible-lines`) are read back rather than rebuilt; a wrapped pane's ro
                       spans
                       top
                       (fold table -1 (fn (acc row) (math/max acc (first row)))))))
-      (map table
-        (fn (row)
+      (map (seq/zip table (ed-row-start-cols rope table))
+        (fn ([row known-col])
           (let (line (nth row 0)
                 from (nth row 1)
                 to (nth row 2)
                 inlay (nth row 3 nil)
                 clip (nth row 4 nil))
             (if (nil? inlay)
-              (let ([vis from-col base] (ed-row-slice rope line from (if clip (first clip) to) w)
+              (let ([vis from-col base] (ed-row-slice rope
+                                          line
+                                          from
+                                          (if clip (first clip) to)
+                                          w
+                                          known-col)
                     ;; a wrapped row its line goes on past ends in the continuation mark,
                     ;; painted just past the text (`ed-with-ellipsis`: the scrollbar column)
                     ellipsis (cond
@@ -854,9 +905,10 @@ deps (`ed-visible-lines`) are read back rather than rebuilt; a wrapped pane's ro
                     content [vis
                               from-col
                               w
-                              (ed-ranges-on-line (ed-rebase-ranges line-spans base)
-                                0
-                                (string/length vis))
+                              (ed-rebase-ranges (ed-ranges-on-line line-spans
+                                                  base
+                                                  (+ base (string/length vis)))
+                                base)
                               ellipsis])
                 [line
                   vis
@@ -1770,12 +1822,13 @@ was painted on, wrapped or not). Where the caret and the inline completion previ
       (math/max 1 (:text-height geometry))
       (:y geometry)
       x
-      width)))
+      width
+      *tab-width*)))
 
 ;; check-allow: a hit comes back out of the memo's store, which the checker reads as
 ;; unknown; the store only ever holds what the body below built, a cell or nil.
 (check-allow :trusted
-  (defmemo ed-point-cell-at 4 (rope point rows top hscroll vrows y text-x width)
+  (defmemo ed-point-cell-at 4 (rope point rows top hscroll vrows y text-x width tab-width)
     "`ed-point-cell` on the values it reads — the text, point and the viewport — remembered,
 because it is asked every frame the caret is painted, a blink's included, and measuring
 point's column reads the line from its start: on a long line that was the dearest step of
@@ -1790,9 +1843,10 @@ a frame in which nothing had moved."
                vrows))
       (when at
         (let ([k from] at
-              column (math/max 0 (math/min (dec width) (ed-visual-column-at rope point from))))
+              column (math/max 0
+                       (math/min (dec width) (ed-visual-column-at rope point from tab-width))))
           [(+ y k) (+ text-x column) (- width column)])))))
-(sig ed-point-cell-at (any int any int int int int int int -> any))
+(sig ed-point-cell-at (any int any int int int int int int int -> any))
 
 (defn- ed-other-cursor (m)
   "The caret a window shows while it does not have the keyboard — another pane, or every
@@ -1856,7 +1910,7 @@ its syntax face (`ed-held-spans`), so a bold keyword stays bold under the caret.
 ;; check-allow: a hit comes back out of the memo's store; it only ever holds what
 ;; `ed-point-cell` answered for that pane and buffer
 (check-allow :trusted
-  (defmemo ed-resting-point-cell 8 (pane buf)
+  (defmemo ed-resting-point-cell 8 (pane buf tab-width)
     "Point's cell in a pane that is not selected — remembered per pane and buffer, since such
 a pane builds no geometry at rest (`ed-pane-op-groups`) and is asked again every frame."
     (ed-point-cell buf (ed-pane-geometry pane buf))))
@@ -1898,17 +1952,29 @@ selected buffer is plenty)."
 
 (defn- ed-pane-hl-ranges (m pane buf)
   "The pane's highlight ranges in priority order: a tree-sitter buffer's brackets coloured by
-depth (`rainbow/ranges`, under everything), whitespace made visible for a mode the init
-file's `:show-whitespace` names (`whitespace/ranges`), the misspelled words, the region and
-overlays, other participants' selections tinted in their colour, and the hovered clickable
-row's underscore (a proper font underline)."
+depth (`rainbow/ranges`, under everything), the escape face over each glyphless character's
+`<200b>` (`glyphless/ranges`), whitespace made visible for a mode the init
+file's `:show-whitespace` names (`whitespace/ranges`), the misspelled words, a search's other
+matches (`isearch/lazy-ranges`, under its current one), the region and overlays, other
+participants' selections tinted in their colour, and the hovered clickable row's underscore
+(a proper font underline)."
   (let (top (ed-pane-top pane buf)
         rows (ed-pane-vrows pane buf))
     (append (rainbow/ranges m (map/get-in pane [:payload :buffer]) buf top rows)
-      (if (= true (ed-mode-setting (:show-whitespace m) buf false))
+      ;; a so-long buffer's line is read over the window the pane shows of it
+      (glyphless/ranges buf top rows (when (solong/so-long? buf) (ed-fontify-clip pane buf)))
+      (if (and (= true (ed-mode-setting (:show-whitespace m) buf false))
+            (not (solong/so-long? buf)))
         (whitespace/ranges buf top rows)
         '())
       (if (= true (:spell-check? m)) (spell/spell-ranges buf) '())
+      ;; a long line: only the window of it the pane shows, as the colouring reads it
+      (isearch/lazy-ranges m
+        buf
+        top
+        rows
+        (:selected pane)
+        (when (:isearch-lazy m) (ed-fontify-clip pane buf)))
       (ed-hl-ranges m buf (:selected pane))
       (ed-remote-selection-ranges m pane)
       (ed-link-hover-range m pane buf))))
@@ -2043,13 +2109,15 @@ spans, overrides, notes and the body's own memo. Its deps are every input those 
 - the palette (`ed-palette-token`), because the bands, the gutter and the notes paint
   faces derived from it rather than handed in as data;
 - the room the completion preview takes at the end of point's line (`ed-preview-push`),
-  which moves that line's notes.
+  which moves that line's notes;
+- the tab width the pane is laid out at (`*tab-width*`).
 When it misses, the body and the gutter inside still answer from their own memos."
   (let (selected? (:selected pane)
         ;; point's cell: the selected pane's caret and preview, or another pane's resting caret
         cell (cond
                (and selected? geometry) (ed-point-cell buf geometry)
-               (and (not selected?) (ed-other-cursor m)) (ed-resting-point-cell pane buf))
+               (and (not selected?) (ed-other-cursor m))
+                 (ed-resting-point-cell pane buf *tab-width*))
         ;; the inline completion preview, at the cursor's own cell — same row and column
         ;; the caret is on, so it reads as the line continuing
         ;; or, while an input method composes, the text it is composing (painted where it
@@ -2080,10 +2148,14 @@ When it misses, the body and the gutter inside still answer from their own memos
             (ed-pane-shared m pane)
             (:link-hover m)
             (:overlays m)
+            (:isearch-lazy m)
             (:hl-line m)
             (:gui m)
             (ed-palette-token)
-            push]
+            push
+            ;; the buffer's tab width (bound around this pane, `ed-pane-op-groups`): M-x
+            ;; reload-config with a new one repaints the same text with its tabs moved
+            *tab-width*]
           ;; an unselected pane at rest arrives without its geometry (`ed-pane-op-groups`)
           (fn () (ed-pane-static-ops m pane buf (or geometry (ed-pane-geometry pane buf)) push))))
       ;; the preview before the caret, so a block cursor sits ON its first character (a nil
@@ -2153,6 +2225,15 @@ frac = 0 the ops are emitted flat (no region wrapper) for test-compatibility and
 
 (sig ed-pane-op-groups (model pane -> any))
 (defn- ed-pane-op-groups (m pane)
+  "[[ed-pane-op-groups-at]] with a tab spanning to the pane's BUFFER's stops: its tab width
+(`conventions/tab-width` — .editorconfig, init.blsp, the mode) bound as `*tab-width*`
+(brood ADR-537), which every cell measure under the render reads."
+  (binding (*tab-width* (conventions/tab-width (ed-pane-buf m pane))
+            *glyphless-display* *glyphless-chars*)
+    (ed-pane-op-groups-at m pane)))
+
+(sig ed-pane-op-groups-at (model pane -> any))
+(defn- ed-pane-op-groups-at (m pane)
   "`ed-pane-ops` as op GROUPS — the scrolling layers (flat, or in their regions), then the
 fixed chrome: scrollbar + mode line, always outside the scroll-region — so `ed-view`
 flattens every pane of the frame in a single copy (`ed-flatten-ops`).
@@ -2363,15 +2444,22 @@ keep talking."
 `message`; else a **diagnostic on the current line**; else the tutorial note on the
 current line (the full verdict/hint for the box at point); else the model's cached
 `:eldoc` hint (the current buffer mode's signature for point, e.g. `(map coll f)`,
-refreshed by `model/ed-post-step` once per event); else `\"\"`."
-  (let (echo (:echo m))
-    (if (not (= echo ""))
-      echo
-      (let (buf (ed-current-buf m)
-            diag (ed-diagnostic-on-line m buf))
-        ;; the eldoc hint is cached on the model by `ed-post-step` (computed once per
-        ;; event, not re-derived here every frame) — just paint it.
-        (or diag (ed-eol-note-on-line buf) (:eldoc m) "")))))
+refreshed by `model/ed-post-step` once per event); else `\"\"`.
+
+A standing one-key QUESTION (a y/n read, a query-replace's y/n/!/./q —
+`model/ed-standing-question`) comes before all of them: its prompt stays on the row until
+it is answered, with any message that arrived meanwhile after it in brackets."
+  (let (question (ed-standing-question m)
+        echo (:echo m))
+    (cond
+      question (ed-with-question-message (:prompt question) (:message question))
+      (not (= echo "")) echo
+      else
+        (let (buf (ed-current-buf m)
+              diag (ed-diagnostic-on-line m buf))
+          ;; the eldoc hint is cached on the model by `ed-post-step` (computed once per
+          ;; event, not re-derived here every frame) — just paint it.
+          (or diag (ed-eol-note-on-line buf) (:eldoc m) "")))))
 
 (defn ed-echo-line (m cols rows)
   "The bottom row (`rows-1`): the active minibuffer prompt + input if one is open,
@@ -2392,9 +2480,28 @@ plain prompt (find-file) keeps the inline ` {a b c}` here."
                 counter (if sel? (plume-count-label (mb-sel mb) (count (mb-candidates mb))) ""))
             (str counter
               (mb-prompt mb)
-              (mb-text mb)
-              (if sel? "" (ed-mb-candidates mb)))))
+              (ed-mb-shown (mb-text mb))
+              (if sel? "" (ed-mb-candidates mb))
+              ;; what the prompt is waiting on (`:status`, its candidates still coming — M-x
+              ;; package-install fetching the list), shown until the prompt clears it
+              (if (:status mb) (str " [" (:status mb) "]") "")
+              ;; a message said while the prompt is open shows after it until the next key
+              ;; (`model/message`, Emacs's minibuffer message) rather than replacing it
+              (if (:message mb) (str " [" (:message mb) "]") ""))))
         cols))))
+
+(defn ed-mb-shown (input)
+  "Minibuffer `input` as the echo line shows it: each glyphless character — a zero width
+space, a bidi control pasted into a prompt — as its `<200b>` escape (brood ADR-556) unless the
+editor hides them (`*glyphless-chars*`), as a buffer shows it. The echo line,
+its caret and its shadow all measure this, so they agree on where the input's characters are.
+
+    (view/ed-mb-shown \"a\\u{200b}b\")   ;=> \"a<200b>b\""
+  (if (empty? (string/glyphless-indices input))
+    input
+    (binding (*glyphless-display* *glyphless-chars*)
+      ;; tabs stay as they were typed: the echo line measures by character
+      (string/join (map (string/split input "\t") string/expand-tabs) "\t"))))
 
 (sig ed-mb-input-col (any -> int))
 (defn ed-mb-input-col (mb)
@@ -2422,7 +2529,7 @@ shadowed."
           []
           [(text (- rows (ed-echo-rows m rows))
              col
-             (ed-fit (string/substring (mb-text mb) 0 end) (- cols col))
+             (ed-fit (ed-mb-shown (string/substring (mb-text mb) 0 end)) (- cols col))
              face-minibuffer-shadow)])))))
 
 (def ed-plume-style
@@ -2542,13 +2649,13 @@ LINE's start in both halves — a tab's width is a function of its line column (
 so the width of `[hscroll, point)` is the width to point less the width to `hscroll`, not
 the width of the slice on its own."
   ;; the guard proves the int the memo store cannot
-  (let (column (ed-visual-column-at (buffer-rope buf) (buffer-point buf) hscroll))
+  (let (column (ed-visual-column-at (buffer-rope buf) (buffer-point buf) hscroll *tab-width*))
     (if (int? column) column 0)))
 
 ;; check-allow: a hit comes back out of the memo's store, which the checker reads as
 ;; unknown; the store only ever holds what the body below built, an int.
 (check-allow :trusted
-  (defmemo ed-visual-column-at 4 (rope p hscroll)
+  (defmemo ed-visual-column-at 4 (rope p hscroll tab-width)
     "`ed-visual-column-from` over the rope and point, remembered: it slices and measures the
 line from its start, and the caret, the completion preview and a blink frame ask the same
 question about the same rope and point."
@@ -2562,7 +2669,7 @@ question about the same rope and point."
         else
           (- (string/display-width (text/slice rope bol p))
             (string/display-width (text/slice rope bol from)))))))
-(sig ed-visual-column-at (any int int -> any))
+(sig ed-visual-column-at (any int int int -> any))
 
 ;; ---- the right-click context menu, as a ui-kit widget -----------------------
 ;; The menu is ONE `ui-list` inside a `ui-panel` (src/ui-kit.blsp). The widget emits its
@@ -2728,9 +2835,13 @@ bar). So the caret is consistent across buffers, wide by default, and user-confi
   "What a block caret draws over its solid fill (brood ADR-515): the first character of
 `shown`, the text painted in the caret's cell, or a space where that cell shows none — a
 line's end, the buffer's end, a tab — so the caret is the same solid box everywhere."
-  (if (or (nil? shown) (= shown "") (includes? ["\n" "\t" "\r"] (string/substring shown 0 1)))
-    " "
-    (string/substring shown 0 1)))
+  (cond
+    (or (nil? shown) (= shown "") (includes? ["\n" "\t" "\r"] (string/substring shown 0 1))) " "
+    ;; a glyphless character shows as its `<200b>` escape (brood ADR-556): its cell's `<`
+    (and (= *glyphless-chars* :hex-code)
+      (not (empty? (string/glyphless-indices (string/substring shown 0 1)))))
+      "<"
+    else (string/substring shown 0 1)))
 
 (defn- ed-caret (m row col shape under face)
   "The caret op at `row` `col`: `shape`, in the theme's text colour (brood ADR-440's cursor
@@ -2787,19 +2898,29 @@ the screen's last column, where the cell shows something else."
         input-point (mb-point mb))
     (cond
       (:preedit m) (map/get-in m [:preedit :text])
-      (>= (+ (ed-mb-input-col mb) input-point) cols) nil
-      (< input-point (string/length input)) (string/substring input input-point (inc input-point))
+      (>= (ed-mb-point-column mb) cols) nil
+      ;; a glyphless character's cell is its escape's first, `<`
+      (< input-point (string/length input))
+        (string/substring (ed-mb-shown (string/substring input input-point (inc input-point)))
+          0 1)
       else nil)))
 
 (defn- ed-mb-row (m rows)
   "The prompt's row: the first of the echo area, just below the mode line."
   (- rows (ed-echo-rows m rows)))
 
+(sig ed-mb-point-column (any -> int))
+(defn- ed-mb-point-column (mb)
+  "The echo-row column of minibuffer `mb`'s point: after the counter and the prompt, and the
+input before point as it is shown ([[ed-mb-shown]] — a glyphless character's escape is
+wider than the character)."
+  (+ (ed-mb-input-col mb)
+    (string/length (ed-mb-shown (string/substring (mb-text mb) 0 (mb-point mb))))))
+
 (sig ed-mb-caret-column (any int -> int))
 (defn- ed-mb-caret-column (mb cols)
-  "The column of minibuffer `mb`'s caret: after the `N/M ` counter (a selection prompt), the
-prompt and the line editor's point, kept on the screen."
-  (math/min (dec cols) (+ (ed-mb-input-col mb) (mb-point mb))))
+  "The column of minibuffer `mb`'s caret: [[ed-mb-point-column]], kept on the screen."
+  (math/min (dec cols) (ed-mb-point-column mb)))
 
 (sig ed-mb-preedit-ops (model int int -> any))
 (defn- ed-mb-preedit-ops (m cols rows)

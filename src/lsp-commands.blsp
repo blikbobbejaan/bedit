@@ -48,7 +48,7 @@ short kind tag, e.g. `Foo.bar  (method)`."
 
 (defn- ed-imenu-jump (m s)
   "Move point to symbol `s`'s position in the current buffer."
-  (ed-apply m (fn (b) (ed-goto-line-col b (:line s) (:char s)))))
+  (ed-apply m (fn (b) (ed-goto-lsp-position b (:line s) (:char s)))))
 
 (defn- ed-imenu-prompt (m syms)
   "A Vertico minibuffer over the buffer's symbols `syms` (`{:name :kind :line :char}`).
@@ -260,11 +260,12 @@ server no longer filed: a publication already queued when it was disconnected wo
 otherwise stay merged in for the rest of the session, with nothing able to replace it."
   (let (path (nth input 1)
         conn (nth input 4 nil)
-        open? (not (nil? (ed-buffer-index-by-file m path))))
-    (if (or (not open?) (and conn (not (contains? (or (:lsp-servers m) {}) conn))))
+        index (ed-buffer-index-by-file m path))
+    (if (or (nil? index) (and conn (not (contains? (or (:lsp-servers m) {}) conn))))
       m
-      (ed-lsp-show-diags (map/assoc-in m [:lsp-diags path conn] [(nth input 2) (nth input 3 [])])
-        path))))
+      ;; the server's columns are UTF-16 units: read on the open buffer's own lines
+      (let (items (lsp/lsp-localize-diagnostics (nth input 2) (buffer-rope (ed-buf-at m index))))
+        (ed-lsp-show-diags (map/assoc-in m [:lsp-diags path conn] [items (nth input 3 [])]) path)))))
 
 (defn ed-ev-lsp-capabilities (m input textrows cols rows)
   "A connected server reporting what it can do (`[:lsp-capabilities caps conn]`), kept on
@@ -310,14 +311,19 @@ which syncs the document first, incrementally."
      :uri (lsp/lsp-path->uri file)
      :lang (lsp/lsp-language-id file)
      :line (buffer-current-line buf)
-     :char (buffer-column buf)}))
+     :char (lsp/lsp-buffer-units buf)}))
+
+(defn- ed-goto-lsp-position (b line units)
+  "Move point in `b` to the server's 0-based `line` / `units` (a UTF-16 column, converted on
+that line by `lsp/lsp-units->column`)."
+  (ed-goto-line-col b line (lsp/lsp-units->column (buffer-rope b) line units)))
 
 (defn- ed-lsp-goto-loc (m loc)
   "Jump to LSP location `loc` (`{:path :line :char}`), opening its file if needed; pushes a
 the location it leaves on the jump stack first (`ed-push-jump`), so M-, returns there."
   (let (m1 (ed-push-jump m)
         m2 (ed-find-file m1 (:path loc)))
-    (ed-apply m2 (fn (b) (ed-goto-line-col b (:line loc) (:char loc))))))
+    (ed-apply m2 (fn (b) (ed-goto-lsp-position b (:line loc) (:char loc))))))
 
 (defn- ed-lsp-loc-label (m loc)
   "A `relpath:line` label for a location (project-relative when possible) for the
@@ -645,11 +651,15 @@ Async — the docs show when they arrive."
     (record :start int :end int :text string)))
 (defn- ed-edit-offsets (b e)
   "The char-offset form `{:start :end :text}` of normalised LSP edit `e` in buffer `b`
-(offsets computed against the original buffer, clamped to its length)."
+(offsets computed against the original buffer, clamped to its length). The edit's columns
+are UTF-16 units, turned into characters on their own lines — a formatter's edit after an
+emoji would otherwise land a character late per emoji."
   (let (rope (buffer-rope b)
         len (buffer-length b)
-        s (+ (text/line->char rope (:start-line e)) (:start-char e))
-        en (+ (text/line->char rope (:end-line e)) (:end-char e)))
+        offset (fn (line units)
+                 (+ (text/line->char rope line) (lsp/lsp-units->column rope line units)))
+        s (offset (:start-line e) (:start-char e))
+        en (offset (:end-line e) (:end-char e)))
     {:start (math/min s len) :end (math/min en len) :text (:text e)}))
 
 (defn- ed-apply-text-edits (b edits)
@@ -1136,18 +1146,19 @@ uses, marked `*` (M-x lsp-servers — eglot's `eglot-list-connections`)."
   (let (line (ed-lsp-servers-line m))
     (message m (if (= line "") "lsp: no servers running" (str "lsp: " line)))))
 
-(defdyn *lsp-autostart* true)
-;; Whether opening a file whose language has an installed server starts it.
+;; Whether opening a file whose language has an installed server starts it: the model's
+;; `:lsp-autostart`, init.blsp's setting of that name (on unless it says false).
 ;;
 ;; It used to be that a server started on the first LOOKUP — the first `M-.`, hover or
 ;; rename — which was a fine rule while a server was only ever a lookup. Diagnostics
 ;; changed that: the underline on the mistake you just made is the thing you want without
 ;; asking, and a reader who never presses `M-.` in a file would never have seen one.
 ;;
-;; `(defdyn *lsp-autostart* false)` in `init.blsp` turns it off, for a project where the
-;; server's startup is heavy enough to want on demand — Expert compiles the whole mix
-;; project before it answers anything, which is a real cost to pay unasked. The name is
-;; bare, not `commands/…`: an earmuffed `defdyn` is ambient however deep the module.
+;; `:lsp-autostart false` in `init.blsp` turns it off, for a project where the server's
+;; startup is heavy enough to want on demand — Expert compiles the whole mix project before
+;; it answers anything, which is a real cost to pay unasked. A setting, not a `defdyn` the
+;; init file rebinds: init.blsp is read as data and never evaluated, so the `(defdyn …)`
+;; these lines once told you to write there did nothing.
 
 (defn ed-lsp-close-gone (m)
   "`m` with every document pushed to a server whose buffer is no longer open closed on that
@@ -1261,7 +1272,7 @@ ONE try per server and project root (`:lsp-autostarted`). A server that dies —
 once — used to be respawned on every idle beat, a process every few hundred milliseconds
 with nothing typed. Now its death is said once, and `M-x lsp-connect` is the retry."
   (let (file (buffer-file (ed-current-buf m)))
-    (if (or (not *lsp-autostart*) (nil? file) (ed-headless?))
+    (if (or (= false (:lsp-autostart m)) (nil? file) (ed-headless?))
       m
       (fold (lsp/lsp-specs-for file)
         (ed-lsp-learn-roots m file)

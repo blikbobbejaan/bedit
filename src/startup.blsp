@@ -1,0 +1,181 @@
+(defmodule startup
+  "What an editor is prepared with before its first frame — ONE path for the local window
+(`main`) and a served session (`remote`, `bedit --serve`), which used to get none of it.
+
+Three layers, by whose they are:
+
+  - the RUNTIME's ([[prepare-runtime]], [[apply-look]], [[load-packages-later]]): the
+    user's tree-sitter grammars, the slow-turn log, minibuffer history, the colours and the
+    init file's `:theme`, the installed packages. Process-global, once per runtime — a
+    daemon's sessions all render with the daemon's palette and parse with its grammars.
+  - a MODEL's ([[prepare-model]]): init.blsp's model-level settings and the live flags a
+    pure test model leaves off (recentf, save-place).
+  - a WINDOW's ([[configure-window]]): the font, the inset, the text settings, the window
+    mode — whoever owns the window applies them, so an attached client's window is set up
+    from the CLIENT machine's init file, where its fonts are installed.
+
+What a GUEST's session (brood ADR-415) keeps of this is decided where the guest is known —
+the attach identity (`input/ed-ev-client-opts`) — since a served model is built before it."
+  (:use config) ; setting / apply-to-model / window-mode / apply-window! / init-warnings
+  (:use theme) ; gui-only / apply-syntax-theme! / *base*
+  (:use projects) ; project-root — the project a launch opens on
+  (:use log :exclude [error])) ; the editor's logger, for what startup has to say
+
+;; ---- the init file --------------------------------------------------------------
+
+(defn read-init (&optional (file (init-file)))
+  "The init file at `file` (by default the user's `init.blsp`, written with its documented
+defaults on first launch) as an editor starts from it: `{:config :note}` — the parsed
+config, and the first thing in it that did not read (or nil), which an editor shows in its
+echo area at once, since every setting is then quietly back at its default. Read ONCE per
+start and handed to what builds models, so a model is never what reads the file — and a
+test hands in its own."
+  {:config (init-config file) :note (first (init-read-warnings file))})
+
+;; ---- the runtime ----------------------------------------------------------------
+
+(defn prepare-runtime (cfg history?)
+  "Prepare THIS runtime for the editors it will run, from the init `cfg`: the tree-sitter
+grammars the runtime was not built with declared (`grammars/declare-user-grammars`), the
+slow-turn log kept (`slowlog/activate!`), and — when `history?` and the init file's
+`:savehist` — the minibuffer's saved answers read (`savehist/activate!`).
+
+Before the first model is built: a file of a parsed language with a line-lexer stand-in is
+typed by whether its grammar is declared (`model/ed-grammar-fallback`). On the startup path
+rather than beside the definitions, because an image restores bindings without replaying
+the side effects that made them (brood ADR-481). History is process-global, one store for
+every editor in the runtime, which is why the caller says whether it may be on: a daemon
+that hands out guest cookies does not show its owner's answers to a guest. Returns nil."
+  (grammars/declare-user-grammars)
+  (slowlog/activate!)
+  (when (and history? (setting cfg :savehist)) (savehist/activate!))
+  nil)
+
+(defn apply-look (cfg window?)
+  "The editor's colours from `cfg`: the soft syntax palette (`apply-syntax-theme!`), then
+init.blsp's `:theme` over it (`themes/theme-from-config!`). A warning string when the theme
+it names does not exist, else nil. `window?` says whether this runtime has a window to
+colour: a `--serve` daemon has none — its frames are painted elsewhere — so it changes the
+palette and faces only, and nothing reaches the GUI backend (`*windowless-runtime*`)."
+  (binding (*windowless-runtime* (not window?))
+    (apply-syntax-theme!)
+    (themes/theme-from-config! cfg)))
+
+(defn load-packages-later (cfg say)
+  "Deferred package loading, spawned so the first frame does not wait for it — and then the
+init.blsp problems the type checker cannot see (it is read as data). AFTER the packages,
+because a package declares its own settings under `:bedit/settings` when it loads, and
+checked before it, its keys read as unknown on every launch. `say` is called `(say level
+line)` for each line (`:info` / `:warn`): the window logs them into *Messages*, a daemon
+prints them. Returns the spawned pid."
+  (spawn
+    (fn ()
+      ;; Wait for the first frame and for the JIT to warm up before the package scan, to
+      ;; avoid compile-lock contention that makes the first second of scrolling sluggish.
+      (receive (after 1200 nil))
+      ;; USER-installed `:enhances bedit` packages from ~/.config/bedit/packages (the
+      ;; package manager's install dir, M-x package-list — not the project's build _deps),
+      ;; registered into the process-global registries, so M-x theme-select lists them
+      (let (loaded (packages/load-installed!))
+        (when (not (empty? loaded))
+          (say :info (str "packages: loaded " (count loaded) " — " (string/join loaded ", ")))))
+      (doseq (warning (init-warnings cfg)) (say :warn warning)))))
+
+(defn say-in-log (level line)
+  "A [[load-packages-later]] `say` for the window: `:warn` lines as warnings, the rest as
+info, into the editor's logger (and so *Messages*)."
+  (if (= level :warn) (log/warn line) (log/info line)))
+
+;; ---- a model --------------------------------------------------------------------
+
+(defn launch-project (file directory?)
+  "The project an editor opens on (matches find-file): when opened with a file, ITS project
+(nearest ancestor with a marker), not the cwd's; a directory argument's own project. Falls
+back to the cwd's project (or none) for a scratch session or a file outside any project."
+  (or (cond
+        (nil? file) nil
+        directory? (project-root (path/absolute file))
+        else (project-root (path/dirname (path/absolute file))))
+    (project-root (file/cwd))))
+
+(defn prepare-buffer-settings (cfg)
+  "Make init.blsp's buffer conventions in `cfg` — `:editorconfig`, the indent and tab widths,
+the fill column (`config/convention-settings`) — the ones in force BEFORE the first buffer
+is made. A buffer reads its `.editorconfig` when it is stamped (`model/ed-stamp`, inside
+`ed-init`), so set after it, by [[prepare-model]], `:editorconfig false` came too late for the
+launch file and a served session's first buffer. nil."
+  (conventions/set-user-settings (config/convention-settings cfg)))
+
+(defn prepare-model (m cfg)
+  "Model `m` as a live editor starts: the live flags pure test models (`ed-init`) leave off,
+then init.blsp's model-level settings (`config/apply-to-model` — the same call
+`cmd-reload-config` makes). The flags: `:recent-files` — remember opened files (recentf)
+and projects, and persist generated state; off in tests so they never touch the on-disk
+caches — and `:save-place`, the init file's, set here rather than through a `:model-key` so
+a test model never reads or writes the places file."
+  (apply-to-model (assoc m :recent-files true :save-place (setting cfg :save-place)) cfg))
+
+;; ---- a window -------------------------------------------------------------------
+
+(def *inset*
+  ;; The window content inset in logical pixels (gui/inset — needs a GUI build): a
+  ;; blank margin before the cell grid on every edge: a terminal's few pixels of padding
+  ;; (kitty, foot), enough that the text does not touch the frame and no more. The sub-cell
+  ;; remainder joins the margin on the right, and is split between the top and the bottom
+  ;; (brood ADR-508's second addendum). The margin is the window background (`gui/bg`) except
+  ;; beside a band that reaches the grid's edge: the mode line, the gutter and the current line
+  ;; continue to the frame (brood ADR-508).
+  ;; Tweak live via (gui/inset N) on C-x C-e.
+  6)
+
+(defn window-font (cfg)
+  "The window's cell font (gui/font — needs a GUI build): the init file's `:font` family,
+registered by name as `:editor` in [[configure-window]] (a family not installed falls back
+to brood's bundled DejaVu, and [[font-warning]] says so), at its `:font-size`."
+  {:family :editor :height (setting cfg :font-size)})
+
+(defn font-warning (requested info)
+  "The line to say when the font the init file asked for, `requested` (its `:font`), is not
+the one the window got — `info` being where the family's faces came from (`gui/font-info`,
+brood ADR-442): `:origin :not-found` means nothing by that name is installed and brood's
+bundled font stands in, which used to happen without a word. nil when the font resolved, or
+when there is no `info` (no window, a headless run).
+
+    (startup/font-warning \"Hack\" {:origin :system :name \"Hack\"})   ;=> nil"
+  (when (and (map? info) (= (:origin info) :not-found))
+    (str "font \""
+      requested
+      "\" is not installed — using "
+      (or (:name info) "the bundled DejaVu Sans Mono")
+      " instead (init.blsp :font; `fc-list : family` lists the installed families)")))
+
+(defn register-font (family)
+  "Register the init file's font `family` as the window's `:editor` family, by its installed
+name (brood ADR-442) — re-measuring the cell of a window already using it — and say whether
+it resolved: the [[font-warning]] when nothing by that name is installed, else nil (and nil
+without a GUI build or window, or headless — no font engine to ask, `gui/headless?`, brood
+ADR-557)."
+  (gui-only gui/font-register :editor {:family-name family})
+  (font-warning family (when (not (gui/headless?)) (gui-only gui/font-info :editor))))
+
+(defn configure-window (cfg disp)
+  "Give the window `disp` its look from `cfg`: the base cell font, the inset, the
+background, the init file's text settings and its window mode. Each `gui-only` is a no-op
+without a GUI build. The colours are the runtime's ([[apply-look]]) — a window attached to
+a daemon is painted with the daemon's. Returns the [[font-warning]] when the init file's
+`:font` is not installed (the bundled font standing in), else nil — the caller says it."
+  ;; by installed name (brood ADR-442): the init file's font, and Hack, which a preset saved
+  ;; before `:font` existed names
+  (let (font-problem (register-font (setting cfg :font)))
+    (gui-only gui/font-register :hack {:family-name "Hack"})
+    (gui-only gui/font (window-font cfg)) ; base window font
+    (gui-only gui/inset *inset*) ; breathing room around the grid
+    (gui-only gui/bg *base*) ; clear/inset-margin fill follows the theme bg
+    (apply-window! cfg) ; init.blsp's :text-aa / :line-height
+    ;; :maximized fills the screen but keeps the title bar (gui/maximize); :fullscreen is
+    ;; borderless, no title (gui/fullscreen)
+    (case (window-mode cfg)
+      :maximized (gui-only gui/maximize (:window disp) true)
+      :fullscreen (gui-only gui/fullscreen (:window disp) true)
+      nil)
+    font-problem))
