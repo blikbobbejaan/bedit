@@ -334,16 +334,16 @@ died or timed out, said as such."
         (nil? outcome)
           (let (note (str (job-label job)
                        " failed or timed out after " *package-job-timeout-ms* "ms"))
-            (refill-install-prompt (refresh-packages (message (assoc m1 :package-status note) note))
+            (refill-package-prompt (refresh-packages (message (assoc m1 :package-status note) note))
               note))
         (= (:kind outcome) :list)
         ;; an open M-x package-install prompt takes the list too, or says why there is none
           (if (:error outcome)
             (let (note (str "could not fetch the package list: " (:error outcome)))
-              (refill-install-prompt (refresh-packages (message (assoc m1 :package-status note)
+              (refill-package-prompt (refresh-packages (message (assoc m1 :package-status note)
                                                          note))
                 note))
-            (refill-install-prompt (refresh-packages (assoc m1
+            (refill-package-prompt (refresh-packages (assoc m1
                                                        :package-list (:available outcome)
                                                        :package-status nil))))
         else
@@ -421,7 +421,7 @@ one, or every installed one before the list has arrived). Each row is
     (:description row)))
 
 (def *packages-title*
-  "  bedit packages — i install · d remove · u update · g refresh · q quit")
+  "  bedit packages — RET describe · i install · d remove · u update · g refresh · q quit")
 
 (def *packages-columns*
   (str "  "
@@ -534,30 +534,43 @@ theme-select when it lands. Outside the browser, prompts for a package name."
       (installed? (:name row)) (message m (str (:name row) " is already installed — u to update"))
       else (launch-job m {:kind :install :name (:name row)}))))
 
-(defn- install-prompt-status (m)
-  ;; what the install prompt says it is waiting on: the list on its way, or why it is not
+(defn- prompt-status (m)
+  ;; what a package prompt says it is waiting on: the list on its way, or why it is not
   (let (job (:package-job-info m))
     (cond
       (and (:package-job m) (= (:kind job) :list)) "fetching the package list…"
       (:package-job m) (str "the package manager is busy " (job-label job))
       else nil)))
 
-(defn- install-prompt (m)
-  "The M-x package-install prompt over what `m` knows of the hive's packages, saying what it
-is waiting on (`:status`); `:package-install` marks it for [[refill-install-prompt]]."
-  (merge (ed-name-prompt "Install package: "
-           (map (or (:package-list m) []) :name)
-           (fn (mm name) (launch-job mm {:kind :install :name name})))
-    {:package-install true :status (install-prompt-status m)}))
+(defn- prompt-names (m kind)
+  "The names a package prompt of `kind` completes over: the hive's packages as last fetched
+for `:install`; those and every installed one for `:describe`."
+  (let (listed (map (or (:package-list m) []) :name))
+    (if (= kind :describe) (seq/distinct (append (installed-packages) listed)) listed)))
 
-(defn refill-install-prompt (m &optional note)
-  "`m` with an open M-x package-install prompt given the packages just fetched — the typed
-text kept, the candidates re-ranked from them — and `note` (a failure's reason, or nil) as
-what it says. Any other prompt, or none, is left alone."
-  (let (mb (:minibuffer m))
-    (if (or (nil? mb) (not (:package-install mb)))
+(defn package-prompt (m kind prompt on-complete)
+  "A minibuffer prompt `prompt` over the packages `m` knows — `kind` `:install` (the hive's)
+or `:describe` (those and the installed ones) — running `on-complete` on the answer, saying
+what it is waiting on (`:status`). Marked `:package-prompt kind` so the list landing refills
+it ([[refill-package-prompt]])."
+  (merge (ed-name-prompt prompt (prompt-names m kind) on-complete)
+    {:package-prompt kind :status (prompt-status m)}))
+
+(defn fetch-list-once (m)
+  "`m` with the hive's package list being fetched off the loop when it has never been and no
+package job runs — what a package prompt does before it opens."
+  (if (and (nil? (:package-list m)) (nil? (:package-job m))) (launch-job m {:kind :list}) m))
+
+(defn refill-package-prompt (m &optional note)
+  "`m` with an open package prompt ([[package-prompt]]) given the packages just fetched —
+the typed text kept, the candidates re-ranked from them — and `note` (a failure's reason, or
+nil) as what it says. Any other prompt, or none, is left alone."
+  (let (mb (:minibuffer m)
+        kind (when mb (:package-prompt mb)))
+    (if (nil? kind)
       m
-      (let (fresh (install-prompt m))
+      (let (names (prompt-names m kind)
+            fresh (ed-name-prompt "" names (:on-complete mb)))
         (assoc (ed-mb-stop-ranker m)
           :minibuffer
             (assoc (merge (dissoc mb :ranker :cand-cache :sel :asked)
@@ -570,10 +583,77 @@ what it says. Any other prompt, or none, is left alone."
 packages. Before the list has ever been fetched it is fetched now, off the loop: the prompt
 opens at once saying so, and its candidates arrive when the hive answers. Any name may be
 typed meanwhile."
-  (let (fetched (if (and (nil? (:package-list m)) (nil? (:package-job m)))
-                  (launch-job m {:kind :list})
-                  m))
-    (assoc fetched :minibuffer (install-prompt fetched))))
+  (let (fetched (fetch-list-once m))
+    (assoc fetched
+      :minibuffer
+        (package-prompt fetched
+          :install "Install package: "
+          (fn (mm name) (launch-job mm {:kind :install :name name}))))))
+
+;; ---- what is known about one package (C-h P) -----------------------------------
+
+(def- *settings-registry-names*
+  ;; how a package's source names bedit's settings registry in a `settings/define`
+  #{:bedit/settings 'config/*settings* '*settings*})
+
+(defn- setting-declared (form)
+  "The setting name a `(settings/define <bedit's registry> :name …)` form declares, or nil."
+  (when (and (list? form)
+          (>= (count form) 3)
+          (includes? ['settings/define 'define] (first form))
+          (contains? *settings-registry-names* (second form))
+          (keyword? (nth form 2)))
+    (nth form 2)))
+
+(defn- settings-in-forms (forms)
+  "Every setting `forms` declare, at any depth, in the order they appear."
+  (letrec (walk (fn (stack found)
+                  (if (empty? stack)
+                    found
+                    (let (form (first stack)
+                          more (rest stack)
+                          declared (setting-declared form))
+                      (cond
+                        declared (walk more (conj found declared))
+                        (or (list? form) (vector? form)) (walk (append (vec form) more) found)
+                        else (walk more found))))))
+    (walk forms [])))
+
+(defn package-settings (name)
+  "The init.blsp settings installed package `name` declares — every `(settings/define …)` of
+bedit's registry its sources hold, READ, not evaluated, so a package not yet loaded answers
+too. `[]` when it declares none or is not installed."
+  (let (dir (path/join (pkg-dir name) "src"))
+    (if (not (file/exists? dir))
+      []
+      (vec (seq/distinct (mapcat (seq/filter (file/walk-files dir)
+                                   (fn (path) (string/ends-with? path ".blsp")))
+                           (fn (file)
+                             (settings-in-forms (check-allow :discarded-catch
+                                                  (try
+                                                    (reflect/read-all (file/slurp file))
+                                                    (catch e ())))))))))))
+
+(defn package-info (m name)
+  "Everything bedit knows about package `name`, or nil when nothing does: `{:name :installed
+:latest :status :description :enhances :settings :themes}` — the installed copy's manifest
+(its version, description, what it `:enhances`), the hive's row as last fetched (the newest
+version), the settings its sources declare ([[package-settings]]) and the themes its plugin
+contributes, for an installed package this bedit loads."
+  (let (row (seq/find (or (:package-list m) []) (fn (entry) (= (:name entry) name)))
+        installed (installed-version name)
+        latest (:latest_version row)
+        loaded? (and installed (includes? (compatible-in (user-package-dir)) name))
+        contribution (when loaded? (plugin-entry name)))
+    (when (or row installed)
+      {:name name
+       :installed installed
+       :latest latest
+       :status (row-status installed latest)
+       :description (or (when installed (manifest-value name :description)) (:description row))
+       :enhances (or (when installed (manifest-value name :enhances)) (:enhances row))
+       :settings (if installed (package-settings name) [])
+       :themes (if (map? contribution) (map (or (:themes contribution) []) :name) [])})))
 
 (defn- busy-message (m)
   ;; what a refused request says while a job runs
@@ -627,6 +707,7 @@ loop, and reload it live. Outside the browser, prompts."
     (keymap-bind ["d"] 'packages/cmd-package-remove) ; d — remove it
     (keymap-bind ["u"] 'packages/cmd-package-update) ; u — update it to the newest version
     (keymap-bind ["g"] 'packages/cmd-package-refresh) ; g — re-fetch the list from the hive
+    (keymap-bind [:enter] 'help/cmd-describe-package) ; RET — describe the package under point (C-h P)
     (keymap-bind ["q"] 'packages/cmd-package-quit) ; q — bury the buffer
     (keymap-bind [:ctrl-n] 'commands/cmd-next-line)
     (keymap-bind [:ctrl-p] 'commands/cmd-previous-line)

@@ -69,7 +69,7 @@ Put those two facts together and the design falls out:
 | `defcustom` / `define-key` / `add-hook` / `auto-mode-alist` | `settings/define` (`:bedit/settings`) / init.blsp's `:keys` and `:mode-keys` / `add-hook` (not built) / `register-file-type` registries ([`configurability.md`](configurability.md)) |
 | `use-package` | a declarative `(package …)` form in `init.blsp` — **data, not code** |
 | autoloads | the `M-x` registry + late-bound command symbols |
-| `M-x list-packages`, `C-h P` | `M-x package-list` (a `*Packages*` buffer), `C-h P` describe-package (not built) |
+| `M-x list-packages`, `C-h P` | `M-x package-list` (a `*Packages*` buffer), `C-h P` describe-package (`help/cmd-describe-package`: installed or not, the version against the hive's newest, what it enhances, the themes it contributes, the init.blsp settings its sources declare; RET on a `*Packages*` row) |
 
 So most of "load packages like Emacs" **already exists** — it just isn't pointed at the
 editor yet.
@@ -281,7 +281,11 @@ Built on Part 1 and on the config registries from
    the registry's REASON when it failed (brood ADR-559 made the registry calls answer a
    failure carrying it instead of nil or a bare raise). An install lands in a staging dir and
    is moved into place only once it verified and enhances this bedit, so a failed, refused
-   or cancelled install keeps the copy that was there. A network fetch on the `ui-run` loop
+   or cancelled install keeps the copy that was there. `M-x package-install` and `C-h P` fetch
+   the list themselves when it has never been fetched: the prompt opens at once saying so,
+   and its candidates arrive with the answer. An update reloads the plugin's files in load
+   order (brood's `reflect/source-load-order`), so a changed macro reaches its callers on the
+   one reload. A network fetch on the `ui-run` loop
    would freeze the editor, which is precisely the class of thing the actor work removed.
 5. **`M-x package-upgrade` / `package-delete` / the lockfile.** `project.lock.blsp` in the
    config dir is a **reproducible editor config**: version + sha256 per package, so the
@@ -291,7 +295,9 @@ Built on Part 1 and on the config registries from
 6. **Trust, stated plainly.** A package is arbitrary Brood code in the editor's image;
    `:enhances` is author-declared metadata, **not a sandbox**. The policy: explicit installs only
    (nothing auto-installs), immutable releases pinned by checksum in the lock, and `C-h P`
-   shows what a package registers before you install it. The real answer is the one this
+   shows what the hive says of a package before you install it, and once it is installed the
+   settings its sources declare and the themes it contributes (its sources are read, not run,
+   for the settings). The real answer is the one this
    editor is already built on — **a package could run in its own process**, the way every
    buffer already does (`src/hosted.blsp`) — and that is the direction to take if untrusted
    packages ever matter. Emacs never solved this; we at least know where our answer comes
