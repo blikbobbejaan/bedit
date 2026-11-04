@@ -421,8 +421,11 @@ src/stringstate.blsp        where a buffer's strings and comments are (Emacs's s
 src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string/fill-prefixes`
                             (brood ADR-589, Emacs's adaptive fill): the first line keeps its
                             prefix, the rest the paragraph's continuation — a list item HANGS under
-                            its text, a comment / quote keeps its marker. The paragraph is
-                            narrowed to point's comment, list item, or (in code) string
+                            its text, a comment / quote keeps its marker — the MODE's markers
+                            (`fill-markers`: its comment tokens, a C block comment's ` * `; so
+                            `#include` is code). The paragraph is
+                            narrowed to point's comment, list item, or (in code) a string that
+                            can span lines — its text only, the code around it untouched
                             (`stringstate/ed-string-extent`, no grammar needed); a mode's `:fill-separate`
                             lines (an Org heading, a Markdown fence) stand alone and its
                             `:fill-prefixes` answers for it (a Lisp docstring continues at column
