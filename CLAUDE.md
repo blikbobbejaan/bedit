@@ -104,7 +104,9 @@ src/model.blsp              the ui-run model: buffer pool, panes, kill ring, min
                             (`register-down-handler`), and what is still running when
                             C-x C-c asks (`register-exit-query`: a compile, a test run,
                             the app, a terminal, a push). The core names no feature: a
-                            module registers its rows when it loads. Also the OUTPUT CAP
+                            module registers its rows when it loads, each row CLAIMED for the
+                            file that registered it (`ownership/claim!`), so a package's rows
+                            go back with the package. Also the OUTPUT CAP
                             every streaming sink shares (`ed-cap-output-at`: past
                             `:output-buffer-max-lines` a buffer's oldest lines are cut,
                             point / mark / `:input-start` / `:line-links` and every pane's
@@ -200,6 +202,18 @@ src/theme.blsp              every colour the editor paints (Catppuccin Mocha), r
 src/themes.blsp             the theme registry (M-x theme-select): a live picker that swaps the
                             whole palette AND the window font — a theme is a plain map, so
                             adding one is data (theme.blsp is the palette; this is the registry)
+src/ownership.blsp          WHO registered each registry row: every `register-*` (model's idle jobs,
+                            task replies, event / down / timer handlers, exit queries, post-steps,
+                            layout keepers; statusbar chips; M-x commands; keymap profiles;
+                            modes, file patterns and interpreters; themes; chrome faces; vcs
+                            backends; grammars; language specs) writes through `claim!`, which
+                            records the file being loaded (`reflect/current-file`, or the bound
+                            `*claimant*` outside a load) as a STACK over the row that was there
+                            before. `release-under! dir` takes back every row a file under `dir`
+                            claimed in one call, giving a replaced core row back. A registry kept
+                            outside `std/registry` (the theme list, editor/layers' tables)
+                            declares how to read / write / remove a row (`define-kind`); std's
+                            `settings/define` is `adopt!`ed after a package's load
 src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
                             hive packages that `:enhances bedit` at RUNTIME, into
                             ~/.config/bedit/packages (the elpa model) — never the build's _deps.
@@ -209,11 +223,17 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             and on *Packages*' status line. An install lands in a staging dir
                             and moves into place only when it verified and enhances this bedit,
                             so a failed or cancelled one keeps the copy there; an update RETIRES
-                            the old version first — every global its files defined removed
-                            (`plugin-definitions` by def site, brood's `reflect/undef`), its
-                            dropped themes and M-x commands with them — then reloads the
-                            sources in load order (brood's `reflect/source-load-order`); a
-                            remove retires the same way. What became of each installed package
+                            the old version first (`retire-package`, ONE call): every registry
+                            row it made taken back (`ownership/release-under!` — idle jobs, task
+                            replies, handlers, exit queries, chips, commands, modes, file types,
+                            settings, themes; a core row it replaced comes back), every core
+                            global it REDEFINED restored to the value it had before the package
+                            loaded, and every global its OWN modules defined removed
+                            (`plugin-definitions`: def site under its dir AND namespace one of
+                            its modules, brood's `reflect/undef` — a core name is never undefined)
+                            — then reloads the sources in load order (brood's
+                            `reflect/source-load-order`); a remove retires the same way. What
+                            became of each installed package
                             is kept (`package-status`: loaded / broken / incompatible, with the
                             reason): startup says every one it did not load in *Messages*
                             (`load-problems` — a bedit upgrade past a package's range is said,
@@ -342,7 +362,12 @@ src/modes.blsp              modes as layers — the INFRASTRUCTURE: text-mode, t
                             a read-only report through `register-special-type` (its
                             layers over special-mode over text-mode), its M-x names
                             derived from its keymap by `layer-commands`, its line
-                            colouring through `fontify-lines` (spans per line)
+                            colouring through `fontify-lines` (spans per line).
+                            Those registrations — and `register-type`, `register-file-pattern`,
+                            `register-interpreter` — are CLAIMED (`ownership`), so a package's
+                            mode goes with it: editor/layers cannot remove a file rule, so each
+                            type gets ONE std rule reading its pattern from the claimed
+                            `:modes/file-patterns` when it runs
 src/brood-mode.blsp         brood-mode: the `.blsp` keymap (paredit, electric pairs) and
                             its services — eldoc, doc-at, completion against the live
                             image, the CST indenter, the checker as `:diagnostics`
