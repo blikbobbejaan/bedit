@@ -300,7 +300,12 @@ src/passwd.blsp             a password a program asks for (Emacs read-passwd + c
                             macro recording; slow-turn tags of typed keys are `:text`), and
                             `password-prompt?`, comint's prompt regexp (case-folded `(?i)` and
                             `[[:alpha:]]`, brood ADR-573) — the fallback for the
-                            shell's pipes and for a raw-mode program the pty cannot read
+                            shell's pipes and for a raw-mode program the pty cannot read.
+                            What the terminal and the shell share: `take-typed` (text typed
+                            ahead of the read moved into it by `redact-region`, brood ADR-581
+                            — out of the buffer, its undo history and every hosted copy) and
+                            `secret-key?`, the typing key that opens a read asked for while
+                            you were elsewhere (input's `secret-overlay`)
 src/saveplace.blsp          a file reopens where it was left (Emacs save-place, `:save-place`): its
                             point kept when its buffer is killed or the editor quits
 src/solong.blsp             so-long (Emacs so-long-mode, `:so-long-threshold`): a file opened with a line
@@ -691,7 +696,11 @@ src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a l
                             vocabulary (`:input-start`, the boundary guard, ↑/↓/C-r history)
                             that a line-mode terminal reuses. A running command whose output
                             ends at a password prompt (`passwd/password-prompt?`: `sudo -S`,
-                            `Password:`) gets the answer read masked and written to its stdin
+                            `Password:`) gets the answer read masked and written to its stdin,
+                            never the buffer, the next command or the history file: one asked
+                            while the shell was not shown waits for the first TYPED key there
+                            (input's `secret-overlay`), and input typed ahead moves into the
+                            read without a trace (`passwd/take-typed`)
 src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u M-x term):
                             a program under a pty, its screen emulated by std/vt
                             (brood ADR-384) in the buffer's worker and painted into the
@@ -708,8 +717,9 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             M-x send-invisible reads one by hand. A prompt that arrived while
                             the terminal was not shown waits for the first TYPED key there,
                             which opens the read as its first character (input's
-                            `term-secret-overlay`), never reaching the buffer or a macro; text
-                            already typed after the prompt moves into the read. The mouse reaches a program
+                            `secret-overlay`), never reaching the buffer or a macro; text
+                            already typed after the prompt moves into the read, leaving no
+                            undo step (`passwd/take-typed`). The mouse reaches a program
                             that asked for it; one that did not gets a middle click as
                             PRIMARY pasted in (Emacs's term-mouse-paste); the program's
                             cursor shape and visibility
