@@ -1879,39 +1879,79 @@ for a command and wrong for the buffer's own producer."
 ;; (`:output-max-lines`, the `:output-buffer-max-lines` setting). A cut takes it back to
 ;; nine tenths of that, so a stream at the cap pays for a cut once per tenth.
 
-(defn- ed-shift-position (position cut)
-  "`position` (a char offset, or nil) after `[0, cut)` is deleted: moved back by `cut`, a
-position inside the deleted text landing at 0, as an Emacs marker does."
-  (if (int? position) (math/max 0 (- position cut)) position))
+;; ---- carrying positions through a change of the text ------------------------------
+;; Everything that points into a buffer from outside its text — a pane's window point, mark
+;; and scroll, the buffer's own point and mark, a shell's `:input-start`, a results buffer's
+;; `:line-links` rows, a saved window layout — follows a change of the text as an Emacs
+;; marker does. One rule for every change: a head cut here, and a change another frame made
+;; that arrives as a splice (`hosted/hosted-apply-content`).
 
-(defn- ed-shift-line-links (links dropped)
-  "The off-text `:line-links` (row line → location) after the first `dropped` lines are
-deleted: every row moved up by `dropped`, the rows deleted dropped."
-  (fold links
-    {}
-    (fn (acc [line location])
-      (if (and (int? line) (>= line dropped)) (assoc acc (- line dropped) location) acc))))
+(defn ed-carry-position (position lo hi inserted)
+  "`position` (a char offset, or nil) after `[lo, hi)` is replaced by `inserted` chars, as an
+Emacs marker moves (insertion type nil): at or before `lo` it stays, inside the replaced text
+it lands at `lo`, after it it moves by the change in length.
+
+    (model/ed-carry-position 10 0 4 0)   ;=> 6
+    (model/ed-carry-position 2 0 4 0)   ;=> 0
+    (model/ed-carry-position 3 3 3 5)   ;=> 3"
+  (cond
+    (not (int? position)) position
+    (<= position lo) position
+    (< position hi) lo
+    else (+ (- position (- hi lo)) inserted)))
+
+(sig ed-carry-line (any any int int int int -> (tuple int bool)))
+(defn ed-carry-line (before after line lo hi inserted)
+  "`[line' kept?]`: the line of rope `after` that line `line` of rope `before` became — its
+start carried through `[lo, hi)` replaced by `inserted` chars ([[ed-carry-position]]) — and
+whether the line survived (false when all of it was inside the replaced text)."
+  (let (last-line (dec (text/line-count before))
+        clamped (math/max 0 (math/min line last-line))
+        start (text/line->char before clamped)
+        end (if (< clamped last-line) (text/line->char before (inc clamped)) (text/length before))
+        gone? (and (< lo hi) (>= start lo) (<= end hi) (< start end))
+        carried (ed-carry-position start lo hi inserted))
+    [(text/char->line after (math/min carried (text/length after))) (not gone?)]))
+
+(defn ed-carry-buffer-fields (buf before lo hi inserted)
+  "`buf` — a buffer after `[lo, hi)` of `before` was replaced by `inserted` chars — with what
+`before` kept beside its text carried through the change: point, mark, a shell's
+`:input-start`, and the `:line-links` rows (keyed by line; a row whose line went is dropped)."
+  (let (carry (fn (position) (ed-carry-position position lo hi inserted))
+        placed (assoc (goto-char buf (or (carry (buffer-point before)) 0))
+                 :mark (carry (buffer-mark before)))
+        inputs (if (int? (:input-start before))
+                 (assoc placed :input-start (carry (:input-start before)))
+                 placed))
+    (if (:line-links before)
+      (assoc inputs
+        :line-links
+          (fold (:line-links before)
+            {}
+            (fn (acc [line location])
+              (if (int? line)
+                (let ([moved kept?] (ed-carry-line (buffer-rope before)
+                                      (buffer-rope buf)
+                                      line
+                                      lo
+                                      hi
+                                      inserted))
+                  (if kept? (assoc acc moved location) acc))
+                acc))))
+      inputs)))
 
 (sig ed-cut-head (buffer int -> buffer))
 (defn ed-cut-head (buf cut)
   "`buf` with its first `cut` chars deleted — `cut` a line start, as every head trim makes it
-— and every position into it kept: point, mark and a shell's `:input-start` move back by
-`cut` (one inside the deleted text lands at 0), the `:line-links` rows move up by the lines
-deleted. A read-only buffer is unlocked for the cut and re-locked, as `ed-append-end`."
+— and every position into it kept ([[ed-carry-buffer-fields]]): point, mark and a shell's
+`:input-start` move back by `cut` (one inside the deleted text lands at 0), the `:line-links`
+rows move up by the lines deleted. A read-only buffer is unlocked for the cut and re-locked,
+as `ed-append-end`."
   (if (<= cut 0)
     buf
-    (let (dropped (text/char->line (buffer-rope buf) cut)
-          unlocked (if (read-only? buf) (set-read-only buf false) buf)
-          deleted (replace-region unlocked 0 cut "")
-          placed (assoc (goto-char deleted (ed-shift-position (buffer-point buf) cut))
-                   :mark (ed-shift-position (buffer-mark buf) cut))
-          inputs (if (int? (:input-start buf))
-                   (assoc placed :input-start (ed-shift-position (:input-start buf) cut))
-                   placed)
-          linked (if (:line-links buf)
-                   (assoc inputs :line-links (ed-shift-line-links (:line-links buf) dropped))
-                   inputs))
-      (if (read-only? buf) (set-read-only linked true) linked))))
+    (let (unlocked (if (read-only? buf) (set-read-only buf false) buf)
+          carried (ed-carry-buffer-fields (replace-region unlocked 0 cut "") buf 0 cut 0))
+      (if (read-only? buf) (set-read-only carried true) carried))))
 
 (sig ed-head-cut-chars (buffer int -> (or nil int)))
 (defn ed-head-cut-chars (buf limit)
@@ -1954,37 +1994,67 @@ last line rather than starting another), every position kept ([[ed-cut-head]]). 
 or under `limit`; one cut at the head — a rope splice — when over."
   (let (cut (ed-head-cut-lines buf limit)) (if (nil? cut) buf (ed-cut-head buf cut))))
 
-(defn- ed-shift-pane-top (pane dropped)
-  "A pane's payload after the first `dropped` lines of its buffer are deleted: its scroll
-moved up with the text it showed (`:top`, and the `:top-row` line a wrapped pane starts
-part-way down), never above the first line."
-  (let (top (if (int? (:top pane)) (:top pane) 0)
-        shifted (assoc pane :top (math/max 0 (- top dropped)))
+(defn- ed-carry-pane (pane before after lo hi inserted)
+  "A pane's payload after `[lo, hi)` of its buffer's rope `before` was replaced by `inserted`
+chars (giving `after`): its window point and mark carried ([[ed-carry-position]]), its scroll
+kept on the text it showed — `:top`, and the `:top-row` line a wrapped pane starts part-way
+down, dropped when that line went ([[ed-carry-line]])."
+  (let (carry (fn (position) (ed-carry-position position lo hi inserted))
+        top (if (int? (:top pane)) (:top pane) 0)
+        moved (assoc pane
+                :point (carry (:point pane))
+                :mark (carry (:mark pane))
+                :top (first (ed-carry-line before after top lo hi inserted)))
         top-row (:top-row pane))
-    (cond
-      (nil? top-row) shifted
-      (>= (first top-row) dropped)
-        (assoc shifted :top-row [(- (first top-row) dropped) (second top-row)])
-      else (dissoc shifted :top-row))))
+    (if (nil? top-row)
+      moved
+      (let ([line kept?] (ed-carry-line before after (first top-row) lo hi inserted))
+        (if kept? (assoc moved :top-row [line (second top-row)]) (dissoc moved :top-row))))))
+
+;; A window layout kept off the screen — winner's undo ring — holds window points and scroll
+;; too, and restoring one must show what it showed. A feature that keeps layouts registers
+;; how to carry them ([[register-layout-keeper]]); the core names none.
+
+(defn register-layout-keeper (name carry)
+  "A feature that keeps window layouts besides the live one: `carry` names a `(model
+buffer-name f) -> model` function applying the pane-payload function `f` to every kept window
+showing the buffer named `buffer-name`. Called when the feature's module loads."
+  (registry/put! :model/layout-keepers name carry))
+
+;; check-allow: a keeper is resolved late (`reflect/eval`), so its result is unknown to the
+;; checker; every keeper answers a model
+(sig ed-carry-panes (model int any any int int int -> model))
+(check-allow :trusted
+  (defn ed-carry-panes (m idx before after lo hi inserted)
+    "The model with every window on pool buffer `idx` — the live layout's, and each kept one's
+([[register-layout-keeper]]) — carried through `[lo, hi)` of rope `before` replaced by
+`inserted` chars, giving rope `after` ([[ed-carry-pane]]). What keeps a reader in the
+scrollback on the lines they read, in this frame and in any other, when the text above them
+changes."
+    (let (carry (fn (pane) (ed-carry-pane pane before after lo hi inserted))
+          name (buffer-name (ed-buf-at m idx))
+          shown (ed-map-panes m (fn (pane) (if (= (:buffer pane) idx) (carry pane) pane))))
+      (fold (vals (registry/entries :model/layout-keepers))
+        shown
+        (fn (acc keeper) ((reflect/eval keeper) acc name carry))))))
 
 (sig ed-cut-head-at (model int int -> model))
 (defn ed-cut-head-at (m idx cut)
   "The model with pool buffer `idx`'s first `cut` chars deleted ([[ed-cut-head]]) and every
-pane showing it kept on what it showed: its window point and mark moved back with the text,
-its scroll moved up by the lines deleted. A pane reading the scrollback reads on undisturbed;
-one at the tail stays at the tail."
+window on it kept on what it showed ([[ed-carry-panes]]): its window point and mark moved back
+with the text, its scroll moved up by the lines deleted. A pane reading the scrollback reads
+on undisturbed; one at the tail stays at the tail."
   (if (<= cut 0)
     m
     (let (buf (ed-buf-at m idx)
-          dropped (text/char->line (buffer-rope buf) cut))
-      (ed-map-panes (ed-set-buf-at m idx (ed-cut-head buf cut))
-        (fn (pane)
-          (if (= (:buffer pane) idx)
-            (ed-shift-pane-top (assoc pane
-                                 :point (ed-shift-position (:point pane) cut)
-                                 :mark (ed-shift-position (:mark pane) cut))
-              dropped)
-            pane))))))
+          cut-buf (ed-cut-head buf cut))
+      (ed-carry-panes (ed-set-buf-at m idx cut-buf)
+        idx
+        (buffer-rope buf)
+        (buffer-rope cut-buf)
+        0
+        cut
+        0))))
 
 (defn ed-output-max-lines (m)
   "How many lines a streaming output buffer keeps: the model's `:output-max-lines` (the
