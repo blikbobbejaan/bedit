@@ -106,7 +106,7 @@ it, and one reload is enough."
   (doseq (file (reflect/source-load-order (seq/filter (file/walk-files (path/join (pkg-dir name)
                                                                          "src"))
                                             (fn (path) (string/ends-with? path ".blsp")))))
-    (load-package-file name file)))
+    (reflect/load file)))
 
 (defn- entry-symbol (name) (symbol (str name "/bedit-plugin")))
 
@@ -261,8 +261,6 @@ back first, so nothing the editor runs still names one."
   ;; files, is claimed for (`ownership/*claimant*`): a file under its directory
   (path/join (pkg-dir name) "project.blsp"))
 
-(defn- module-symbols (name) (into #{} (map (package-modules name) symbol)))
-
 (defn release-registrations (name)
   "Take back every registry entry package `name` made through bedit's registries — its idle
 jobs, task replies, event, down and timer handlers, exit queries, post-steps, mode line chips,
@@ -285,10 +283,21 @@ load wrote — `settings/define` writes std's registry directly — over what th
 
 ;; A package may write std's registries DIRECTLY — `editor/layers/register-type-layers`,
 ;; `register-system-layer`, a `registry/put!` of its own — past bedit's claims. The kernel
-;; records the module whose load made each registry write (`registry/written-by`), so what the
-;; package's modules wrote is known; what each map entry held BEFORE the load is kept beside it
-;; (`:packages/std-writes`), and retiring the package puts that back, or takes the write back
-;; (`registry/retract`) where there was nothing.
+;; records who made each registry write a load made (`registry/written-by`, brood ADR-582): a
+;; module, or a file without a `defmodule` by its absolute path. So what the package's loads
+;; wrote is known ([[package-writers]]), and retiring it takes each write back
+;; (`registry/retract`) — or, where the write REPLACED an entry, puts back what was there.
+;;
+;; Two packages may write the same entry, so each map entry a package wrote keeps a STACK,
+;; as a redefined global does: `:packages/std-layers` `[global path]` -> `{:base {:present?
+;; :value} :stack [{:package :value :writer} …]}` — the entry from before any package, then
+;; each package's write in load order, the live one last. Retiring a package splices its
+;; layer out: the live one gives the entry back to the nearest layer below it (crediting that
+;; layer's writer) or to the base, a lower one leaves the live write alone — so removing A
+;; then B never puts back A's value, written by a package that is gone. Every put-back and
+;; take-back is conditional on the entry still being the package's (`registry/restore` and
+;; `registry/retract` check the writer under the registry lock), so an entry something else
+;; wrote since is left as it is.
 
 (defn- path-present? (table path)
   (let (head (first path)
@@ -297,119 +306,62 @@ load wrote — `settings/define` writes std's registry directly — over what th
       (contains? table head)
       (or (empty? more) (and (map? (get table head)) (contains? (get table head) (first more)))))))
 
+(defn package-writers (name)
+  "Who package `name`'s loads are credited to in the registries' writer journal: its modules
+(symbols) and its source files by absolute path (strings — a file without a `defmodule`
+credits itself) — those of the version that loaded, kept when it did, and those on disk now."
+  (into (registry/lookup :packages/writers name #{})
+    (append (map (package-modules name) symbol) (map (source-files name) path/absolute))))
+
 (defn- note-std-writes (name before)
-  ;; each map entry the package's modules' loads wrote, with what it held in `before`
-  (registry/put! :packages/std-writes
-    name
-    (vec (seq/keep (registry/written-by (module-symbols name))
-           (fn (write)
-             (when (:path write)
-               (let (prior (get before (:global write))
-                     present? (path-present? prior (:path write)))
-                 {:global (:global write)
-                  :path (:path write)
-                  :present? present?
-                  :before (when present? (map/get-in prior (:path write)))})))))))
+  ;; each map entry the package's loads wrote gets this package's layer on top of its stack
+  ;; (its earlier one gone), the stack's base what the entry held in `before`
+  (doseq (write (registry/written-by (package-writers name)))
+    (when (:path write)
+      (let (key [(:global write) (:path write)]
+            prior (get before (:global write))
+            present? (path-present? prior (:path write))
+            record (registry/lookup :packages/std-layers
+                     key
+                     {:base {:present? present?
+                             :value (when present? (map/get-in prior (:path write)))}
+                      :stack []})
+            others (into [] (seq/reject (:stack record) (fn (layer) (= (:package layer) name)))))
+        (registry/put! :packages/std-layers
+          key
+          (assoc record
+            :stack (conj others {:package name :value (:value write) :writer (:writer write)})))))))
+
+(defn- unstack-std-writes (name)
+  ;; package `name`'s layer out of every entry's stack; where it was the live write, the
+  ;; entry goes back to the layer below it, or the base, or goes
+  (doseq ([key record] (registry/entries :packages/std-layers))
+    (let (stack (:stack record)
+          mine (seq/find stack (fn (layer) (= (:package layer) name))))
+      (when mine
+        (let (kept (into [] (seq/reject stack (fn (layer) (= (:package layer) name))))
+              [global path] key
+              write {:global global :path path :writer (:writer mine)}
+              base (:base record))
+          (if (empty? kept)
+            (registry/remove! :packages/std-layers key)
+            (registry/put! :packages/std-layers key (assoc record :stack kept)))
+          (when (= (:package (last stack)) name)
+            (cond
+              (not (empty? kept))
+                (registry/restore write (:value (last kept)) (:writer (last kept)))
+              (:present? base) (registry/restore write (:value base))
+              else (registry/retract write))))))))
 
 (defn- retract-std-writes (name)
-  "Take back every std registry write package `name`'s modules' loads made that is still
-there — a map entry gets back what it held before the load, or goes; a list member goes —
-and answer the writes."
-  (let (recorded (registry/lookup :packages/std-writes name [])
-        writes (registry/written-by (module-symbols name)))
-    (registry/remove! :packages/std-writes name)
-    (doseq (write writes)
-      (let (prior (seq/find recorded
-                    (fn (entry)
-                      (and (= (:global entry) (:global write)) (= (:path entry) (:path write))))))
-        (if (and prior (:present? prior))
-          (registry/restore write (:before prior))
-          (registry/retract write))))
-    writes))
-
-;; A file WITHOUT a `defmodule` loads in the root namespace, and the kernel records no writer
-;; for a root write — `registry/written-by` cannot list what it registered. So such a file's
-;; load is bracketed: the std registry globals before and after it are compared, and every
-;; entry it added or changed, and every list member it added, is kept as the package's
-;; (`:packages/loose-writes`), to be put back or retracted as a module's writes are.
-
-(def- *std-registry-globals*
-  ;; the registry globals a package can write directly: std's named registries and
-  ;; editor/layers' four tables
-  ['registry/*registries*
-    'editor/layers/*type-layers* 'editor/layers/*auto-type-by-interpreter*
-    'editor/layers/*system-layers* 'editor/layers/*auto-type-by-file*])
-
-(defn- registry-snapshot ()
-  (into {} (map *std-registry-globals* (fn (global) [global (global-value global)]))))
-
-(defn- map-entry-changes (global before after)
-  ;; `{:global :path :value :present? :before}` for each entry `after` added or changed
-  (seq/keep after
-    (fn ([key value])
-      (when (or (not (map? before)) (not (contains? before key)) (not (= (get before key) value)))
-        {:global global
-         :path [key]
-         :value value
-         :present? (and (map? before) (contains? before key))
-         :before (when (map? before) (get before key))}))))
-
-(defn- registry-changes (before after)
-  "The std registry writes between two [[registry-snapshot]]s: map entries added or changed
-(`registry/*registries*` two keys deep, its bookkeeping ids left out) and list members added."
-  (let (bookkeeping #{"ownership" "packages"})
-    (vec (mapcat *std-registry-globals*
-           (fn (global)
-             (let (old (get before global)
-                   new (get after global))
-               (cond
-                 (= old new) []
-                 (= global 'registry/*registries*)
-                   (mapcat (seq/reject (vec new)
-                             (fn ([id _table])
-                               (and (keyword? id)
-                                 (contains? bookkeeping (ownership/symbol-namespace id)))))
-                     (fn ([id table])
-                       (map (map-entry-changes global (get old id) table)
-                         (fn (change) (assoc change :path [id (first (:path change))])))))
-                 (map? new) (map-entry-changes global old new)
-                 else
-                   (map (seq/reject (vec new) (fn (member) (includes? (or old ()) member)))
-                     (fn (member) {:global global :member member})))))))))
-
-(defn- defines-module? (file)
-  (let (head (check-allow :discarded-catch
-               (try (reflect/read-first (file/slurp file)) (catch _ nil))))
-    (and (list? head) (= (first head) 'defmodule))))
-
-(defn- load-package-file (name file)
-  "Load one of package `name`'s files; one without a `defmodule` with its std registry writes
-recorded for the package (`:packages/loose-writes`)."
-  (if (defines-module? file)
-    (reflect/load file)
-    (let (before (registry-snapshot)
-          _ (reflect/load file)
-          changes (registry-changes before (registry-snapshot)))
-      (registry/put! :packages/loose-writes
-        name
-        (into (registry/lookup :packages/loose-writes name []) changes)))))
-
-(defn- retract-loose-writes (name)
-  "Take back the std registry writes package `name`'s `defmodule`-less files made that are
-still as they left them — an entry gets back what it held before, or goes; a member goes —
-and answer them."
-  (let (writes (registry/lookup :packages/loose-writes name []))
-    (registry/remove! :packages/loose-writes name)
-    (doseq (write writes)
-      (let (table (global-value (:global write)))
-        (cond
-          (:member write) (when (includes? (or table ()) (:member write)) (registry/retract write))
-          (and (path-present? table (:path write))
-            (= (map/get-in table (:path write)) (:value write)))
-            (if (:present? write)
-              (registry/restore write (:before write))
-              (registry/retract write))
-          else nil)))
+  "Take back every std registry write package `name`'s loads made that is still its own — a
+map entry goes back to what it held before ([[unstack-std-writes]]), a list member and an
+entry it wrote after it loaded go — and answer the writes that were live."
+  (let (writers (package-writers name)
+        writes (registry/written-by writers))
+    (unstack-std-writes name)
+    (doseq (write (registry/written-by writers)) (registry/retract write))
+    (registry/remove! :packages/writers name)
     writes))
 
 ;; ---- the backstop: rows that still name the package ------------------------------
@@ -479,6 +431,7 @@ register for it as they run (`ownership/own-namespace!`)."
              (fn (global)
                (and (not (contains? globals-before global)) (sited-under? global prefix))))))
     (note-redefinitions name globals-before)
+    (registry/put! :packages/writers name (package-writers name))
     (note-std-writes name globals-before)
     (adopt-settings name settings-before)
     (doseq (module (package-modules name)) (ownership/own-namespace! module (claimant-file name)))))
@@ -486,21 +439,20 @@ register for it as they run (`ownership/own-namespace!`)."
 (defn retire-package (name)
   "Take package `name` out of the live editor, in the one order that leaves nothing pointing
 at a name about to go: its bedit registrations back ([[release-registrations]]), the std
-registry entries its modules wrote directly back ([[retract-std-writes]]), any row still
+registry entries its loads wrote directly back ([[retract-std-writes]]), any row still
 naming it dropped ([[drop-references]]), the core names it redefined restored
 ([[restore-redefinitions]]), then the globals it first defined removed
 ([[retire-definitions]]). The image half of [[remove!]] and [[update-plugin!]], which put
 the open buffers right ([[ed-settle-package-buffers]]) with the buffer types it answers.
 Answers `{:released :restored :retired :types}`."
   (let (released (release-registrations name)
-        loose-writes (retract-loose-writes name)
         std-writes (retract-std-writes name)
         dropped-types (drop-references name)
         restored (restore-redefinitions name)
         retired (retire-definitions name)
         types (into dropped-types
                 (append (seq/keep released (fn ([kind key]) (when (= kind :modes/type-layers) key)))
-                  (seq/keep (append std-writes loose-writes)
+                  (seq/keep std-writes
                     (fn (write)
                       (when (and (= (:global write) 'editor/layers/*type-layers*) (:path write))
                         (first (:path write))))))))
