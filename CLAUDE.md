@@ -233,7 +233,8 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             file types, settings, themes; a core row it replaced comes back);
                             every std registry entry its modules' loads wrote DIRECTLY (brood's
                             `registry/written-by` — editor/layers' tables, a `registry/put!` of
-                            its own) put back as it was before the load or retracted; any row
+                            its own; for a file with no `defmodule`, the registry globals compared
+                            around its load) put back as it was before the load or retracted; any row
                             still NAMING the package (a hook symbol in its namespace, a function
                             defined there) dropped as a backstop; every core global it REDEFINED
                             restored through a per-global STACK (two packages patching one
@@ -245,7 +246,10 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             the new version's mode, the core one it replaced, else fundamental,
                             said in *Messages* (`ed-settle-package-buffers`, Emacs's
                             `unload-feature`) — then it reloads the sources in load order (brood's
-                            `reflect/source-load-order`); a remove retires the same way. What
+                            `reflect/source-load-order`); a remove retires the same way. Both are
+                            model-level (`update-plugin!` / `remove!` take and answer the model),
+                            so every caller puts the buffers right; docs/packages.md has the one
+                            limit (KI-356). What
                             became of each installed package
                             is kept (`package-status`: loaded / broken / incompatible, with the
                             reason): startup says every one it did not load in *Messages*

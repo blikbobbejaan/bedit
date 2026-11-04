@@ -335,6 +335,39 @@ Built on Part 1 and on the config registries from
    which matters more here than in Emacs, since module load is already the dominant
    startup cost (`ROADMAP.md` §H).
 
+## What removing or updating a package takes back (built)
+
+Removing a package (`packages/remove!`, `d` in *Packages*) and updating one
+(`packages/update-plugin!`) go through ONE retirement, `packages/retire-package`, and then
+put the open buffers right. Like Emacs's `unload-feature`, it leaves the editor as it was
+before the package loaded:
+
+- **bedit's registry rows** — idle jobs, task replies, event / down / timer handlers, exit
+  queries, post-steps, mode line chips, M-x commands, keymap profiles, modes, file types,
+  interpreters, themes, chrome faces, settings — are CLAIMED for the file that registered them
+  (`src/ownership.blsp`): at load by `reflect/current-file`, at run time by the namespace of
+  the command or hook that ran (`with-symbol-claimant`). Every row a package claimed goes; a
+  core row it replaced comes back.
+- **std registries it wrote directly** (`editor/layers`' tables, a `registry/put!` of its own)
+  are found with Brood's `registry/written-by` for its modules, and for a file with no
+  `defmodule` by comparing the registry globals around that file's load; each entry gets back
+  what it held before (`registry/restore`), or is taken back (`registry/retract`).
+- **any row still naming the package** — a hook symbol in its namespace, a function defined
+  there — is dropped, as a backstop.
+- **core functions it redefined** are restored through a per-function stack, so two packages
+  patching the same function come off in either order.
+- **globals it first defined** are removed (`reflect/undef`); a core name is never undefined.
+- **open buffers in a mode it took away** are seeded again in the mode their type has now
+  (an update's, or the core mode the package replaced), else in fundamental mode, said in
+  *Messages*.
+
+**The one limit:** a hook a package registers as a bare CLOSURE from a timer or a process it
+spawned has nothing to attribute it by — no load, no command or hook symbol to take the
+claimant from, no symbol in its value to find it by — so it outlives the package. The kernel
+cannot say which package's code is running in such a process; Brood tracks it as KI-356
+(`../brood/docs/known-issues.md`). Register hooks as symbols (`'pkg/hook`), as every bedit
+registry asks, and this does not arise.
+
 ## A staged path
 
 1. **Stage 1 — the marker and a live install (no language change).** `:enhances` end to end
