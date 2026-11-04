@@ -267,6 +267,12 @@ src/cape.blsp               completion sources beside the mode's (Emacs cape): f
                             from other open buffers, ranked after this buffer's
 src/savehist.blsp           minibuffer answers kept per prompt across sessions (Emacs savehist,
                             `:savehist`): seeds the prompt's ↑ / M-p history; off until `main` turns it on
+src/passwd.blsp             a password a program asks for (Emacs read-passwd + comint's
+                            password watch): `ed-read-passwd`, a MASKED minibuffer read (`*`s
+                            via `model/mb-shown-text`, no history, no savehist, no embark, no
+                            macro recording; slow-turn tags of typed keys are `:text`), and
+                            `password-prompt?`, comint's prompt regexp — the fallback for the
+                            shell's pipes and for a raw-mode program the pty cannot read
 src/saveplace.blsp          a file reopens where it was left (Emacs save-place, `:save-place`): its
                             point kept when its buffer is killed or the editor quits
 src/solong.blsp             so-long (Emacs so-long-mode, `:so-long-threshold`): a file opened with a line
@@ -640,7 +646,9 @@ src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a l
                             PROCESS MARK (`:bshell-output-at`, comint's), before input typed
                             ahead, which the next prompt then keeps; owns the input-region
                             vocabulary (`:input-start`, the boundary guard, ↑/↓/C-r history)
-                            that a line-mode terminal reuses
+                            that a line-mode terminal reuses. A running command whose output
+                            ends at a password prompt (`passwd/password-prompt?`: `sudo -S`,
+                            `Password:`) gets the answer read masked and written to its stdin
 src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u M-x term):
                             a program under a pty, its screen emulated by std/vt
                             (brood ADR-384) in the buffer's worker and painted into the
@@ -650,7 +658,11 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             C-x C-y send the literal. LINE mode (the project REPL: iex -S
                             mix, nest repl): the input after the program's prompt is
                             bedit's, with bshell's history and boundary keys, RET sends
-                            it — C-c C-j / C-c C-k switch. The mouse reaches a program
+                            it — C-c C-j / C-c C-k switch. A PASSWORD the program asks for
+                            (the worker asks the pty on each render — echo off in line
+                            mode, `os/pty-password?`, brood ADR-570 — else the prompt's
+                            text) is read masked and sent, never inserted or remembered;
+                            M-x send-invisible reads one by hand. The mouse reaches a program
                             that asked for it; one that did not gets a middle click as
                             PRIMARY pasted in (Emacs's term-mouse-paste); the program's
                             cursor shape and visibility

@@ -1,0 +1,295 @@
+;; A password a program asks for — `src/passwd.blsp`, and its two callers: a line-mode
+;; terminal (`src/terminal.blsp`, the pty's echo flag first, brood ADR-570) and the shell
+;; (`src/bshell.blsp`, the prompt's text). The answer is read masked and goes to the program
+;; only: never into the buffer, its history, savehist, a keyboard macro or the slow-turn
+;; log. The worker is stood in for by the test process (`:term-proc` / `:bshell-proc` is
+;; `(self)`), so what reaches the program arrives in this mailbox; the last group runs a
+;; real program under a real pty.
+
+(defmodule passwd-test
+  (:use test)
+  (:use model)
+  (:use pool)
+  (:use editor/buffer)
+  (:use-internals terminal)
+  (:use-internals bshell)
+  (:use-internals input))
+
+;; ---- the prompt's text -------------------------------------------------------------------
+
+(describe "a password prompt, by its text (comint's regexp)"
+  (test "the prompts sudo, ssh, git and mix print are passwords"
+    (is (passwd/password-prompt? "[sudo] password for wilhelm: "))
+    (is (passwd/password-prompt? "wilhelm@example.com's password: "))
+    (is (passwd/password-prompt? "Password:"))
+    (is (passwd/password-prompt? "Password for 'https://me@github.com': "))
+    (is (passwd/password-prompt? "Enter passphrase for key '/home/me/.ssh/id_ed25519': "))
+    (is (passwd/password-prompt? "Enter passphrase (empty for no passphrase): "))
+    (is (passwd/password-prompt? "Enter same passphrase again: "))
+    (is (passwd/password-prompt? "Local password: "))
+    (is (passwd/password-prompt? "Retype new password: "))
+    (is (passwd/password-prompt? "Enter PIN: ")))
+  (test "a line that only mentions a password is not one"
+    (is (not (passwd/password-prompt? "Password changed.")))
+    (is (not (passwd/password-prompt? "iex(1)> ")))
+    (is (not (passwd/password-prompt? "your password is stored in the keychain")))
+    (is (not (passwd/password-prompt? ""))))
+  (test "the prompt is the last line"
+    (assert= (passwd/prompt-line "Sorry, try again.\n[sudo] password for me: ")
+      "[sudo] password for me: ")
+    (assert= (passwd/prompt-line "Password: ") "Password: ")))
+
+;; ---- the masked read ---------------------------------------------------------------------
+
+(defn type-keys (m keys) (fold keys m (fn (acc key) (ed-update acc key 80 24))))
+(defn type-text (m text) (type-keys m (string/->list text)))
+
+(defn read-model (then)
+  (passwd/ed-read-passwd (ed-init (make-buffer "")) "Password: " then))
+
+(describe "a masked read shows stars and remembers nothing"
+  (test "the echo line shows a star per character, never the text"
+    (let (m (type-text (read-model (fn (m1 _) m1)) "hunter2")
+          painted (pr-str (view/ed-view m 80 24)))
+      (assert= (mb-text (:minibuffer m)) "hunter2")
+      (assert= (mb-shown-text (:minibuffer m)) "*******")
+      (is (includes? painted "Password: *******"))
+      (is (not (includes? painted "hunter2")))))
+  (test "an input method's composition is not painted either"
+    (let (m (assoc (read-model (fn (m1 _) m1)) :preedit {:text "zebra" :range nil}))
+      (is (not (includes? (pr-str (view/ed-view m 80 24)) "zebra")))))
+  (test "RET hands the text to the reader and closes the prompt"
+    (let (m (type-keys (type-text (read-model (fn (m1 password) (assoc m1 :got password)))
+                         "hunter2")
+              [:enter]))
+      (assert= (:got m) "hunter2")
+      (is (nil? (:minibuffer m)))))
+  (test "C-g cancels: nothing is handed over"
+    (let (m (type-keys (type-text (read-model (fn (m1 password) (assoc m1 :got password))) "abc")
+              [:ctrl-g]))
+      (is (nil? (:got m)))
+      (is (nil? (:minibuffer m)))))
+  (test "the prompt is marked out of history, with nothing to recall"
+    (let (mb (:minibuffer (read-model (fn (m1 _) m1))))
+      (is (:no-history mb))
+      (assert= (map/get-in mb [:edit :history]) '())))
+  (test "embark has nothing to act on"
+    (let (m (type-keys (type-text (read-model (fn (m1 _) m1)) "pw") [(keyword "ctrl-.")]))
+      (is (:masked (:minibuffer m)))
+      (assert= (mb-text (:minibuffer m)) "pw")))
+  (test "a keyboard macro being recorded does not keep the keys"
+    (let (m (type-text (assoc (read-model (fn (m1 _) m1)) :macro-recording []) "pw"))
+      (assert= (:macro-recording m) [])))
+  (test "a slow typed key is logged as :text, never as itself"
+    (ed-report-slow {:phase "update" :tag "x" :ms 80 :input true})
+    (receive ([:ui-slow report] (assert= (:tag report) :text)) (after 500 (is false))))
+  (test "a read is withdrawn when its owner's program goes away, and only its own"
+    (let (m (passwd/ed-read-passwd (ed-init (make-buffer "")) "Password: " (fn (m1 _) m1) "*a*"))
+      (is (nil? (:minibuffer (passwd/ed-withdraw-read m "*a*"))))
+      (is (:minibuffer (passwd/ed-withdraw-read m "*b*"))))))
+
+;; ---- a line-mode terminal ----------------------------------------------------------------
+
+(def repl-name "*repl: /tmp*")
+
+(defn line-model (text)
+  "A model whose current buffer is a line-mode terminal showing `text`, the program's
+cursor at its end, its worker this test process."
+  (let (raw (insert (make-buffer "" repl-name) text)
+        buf (assoc (editor/layers/set-buffer-type raw :term)
+              :dir "/tmp"
+              :term-proc (self)
+              :term-size [80 24]
+              :term-hstart 0
+              :history-spans []
+              :face-spans []
+              :term-line-mode true
+              :input-start (string/length text)
+              :term-cursor (string/length text)
+              :bshell-history []))
+    (ed-open-buffer (ed-init (make-buffer "")) buf)))
+
+(defn screen (text password)
+  {:text text
+   :spans []
+   :cursor (string/length text)
+   :cursor-visible true
+   :cursor-style :block
+   :password password})
+
+(defn fold-screen (m scr)
+  (terminal/ed-ev-term-screen m (terminal/term-screen-event repl-name [] scr) 24 80 24))
+
+(defn repl-buf (m) (ed-buf-at m (ed-buffer-index-by-name! m repl-name)))
+
+(defn sent-line ()
+  "The line the stand-in worker was sent, or :nothing."
+  (receive ([:term-line line] line) (after 300 :nothing)))
+
+(describe "a line-mode terminal reads a password masked"
+  (test "the pty says echo is off: the masked read opens, with the program's prompt"
+    (let (m (fold-screen (line-model "$ ") (screen "$ sudo ls\nSecret: " true)))
+      (is (map/get-in m [:minibuffer :masked]))
+      (assert= (mb-prompt (:minibuffer m)) "Secret: ")))
+  (test "the answer goes to the program and nowhere else"
+    (let (asked (fold-screen (line-model "$ ") (screen "$ sudo ls\nSecret: " true))
+          answered (type-keys (type-text asked "hunter2") [:enter])
+          b (repl-buf answered))
+      (assert= (sent-line) "hunter2")
+      (is (not (includes? (buffer-text b) "hunter2")))
+      (assert= (:bshell-history b) [])
+      (is (not (includes? (pr-str (:buffers answered)) "hunter2")))))
+  (test "a redraw of the prompt already answered does not ask again"
+    (let (asked (fold-screen (line-model "$ ") (screen "$ x\nSecret: " true))
+          answered (type-keys (type-text asked "pw") [:enter])
+          _ (sent-line)
+          redrawn (fold-screen answered (screen "$ x\nSecret: " true)))
+      (is (nil? (:minibuffer redrawn)))
+      (is (not (:term-secret (repl-buf redrawn))))))
+  (test "asked again on a new line — a wrong password — it reads again"
+    (let (asked (fold-screen (line-model "$ ") (screen "$ x\nSecret: " true))
+          answered (type-keys (type-text asked "pw") [:enter])
+          _ (sent-line)
+          again (fold-screen answered (screen "$ x\nSecret: \nSorry.\nSecret: " true)))
+      (is (map/get-in again [:minibuffer :masked]))))
+  (test "echo on and an ordinary prompt: nothing to hide"
+    (let (m (fold-screen (line-model "$ ") (screen "iex(1)> " false)))
+      (is (nil? (:minibuffer m)))
+      (is (not (:term-secret (repl-buf m))))))
+  (test "the pty cannot say, the prompt's text can: comint's guess"
+    (let (m (fold-screen (line-model "$ ") (screen "Local password: " nil)))
+      (is (map/get-in m [:minibuffer :masked]))))
+  (test "a raw-mode program's own password prompt is caught by its text too"
+    (let (m (fold-screen (line-model "$ ") (screen "iex(1)> Mix.Tasks...\nLocal password: " false)))
+      (is (map/get-in m [:minibuffer :masked]))))
+  (test "a char-mode terminal is the program's own screen: left alone"
+    (let (m0 (line-model "$ ")
+          char (ed-set-buf m0 (assoc (ed-current-buf m0) :term-line-mode false :input-start nil))
+          m (fold-screen char (screen "Password: " true)))
+      (is (nil? (:minibuffer m)))))
+  (test "another prompt open: not interrupted — RET in the terminal asks later"
+    (let (busy (assoc (line-model "$ ") :minibuffer {:edit (ed-mb-edit "Find file: " "")})
+          m (fold-screen busy (screen "Password: " true)))
+      (assert= (mb-prompt (:minibuffer m)) "Find file: ")
+      (is (:term-secret (repl-buf m)))
+      (let (freed (assoc m :minibuffer nil)
+            asked (terminal/cmd-term-send-line freed nil))
+        (is (map/get-in asked [:minibuffer :masked])))))
+  (test "a line typed visibly at a password prompt is sent but never remembered"
+    (let (m0 (fold-screen (assoc (line-model "$ ") :minibuffer {:edit (ed-mb-edit "x: " "")})
+               (screen "Password: " true))
+          m1 (assoc m0 :minibuffer nil)
+          typed (ed-set-buf m1 (end-of-buffer (insert (end-of-buffer (ed-current-buf m1)) "pw")))
+          sent (terminal/cmd-term-send-line typed nil))
+      (assert= (sent-line) "pw")
+      (assert= (:bshell-history (repl-buf sent)) [])
+      (is (not (includes? (buffer-text (repl-buf sent)) "pw")))))
+  (test "M-x send-invisible reads one whether or not a prompt was seen"
+    (let (m (terminal/cmd-send-invisible (fold-screen (line-model "$ ") (screen "> " false)) nil))
+      (is (map/get-in m [:minibuffer :masked]))))
+  (test "the program exiting withdraws its open read"
+    (let (asked (fold-screen (line-model "$ ") (screen "Password: " true))
+          exited (terminal/ed-ev-term-exit asked (terminal/term-exit-event repl-name 1) 24 80 24))
+      (is (nil? (:minibuffer exited))))))
+
+;; ---- the shell ---------------------------------------------------------------------------
+
+(def shell-name (bshell/bshell-buffer-name "/tmp"))
+
+(defn running-shell ()
+  "A model whose current buffer is a /tmp shell running `sudo -S true`, its worker this
+test process."
+  (let (prompt (bshell/bshell-prompt "/tmp")
+        raw (end-of-buffer (insert (make-buffer "" shell-name) (str prompt "sudo -S true\n")))
+        buf (assoc (editor/layers/set-buffer-type raw :bshell)
+              :dir "/tmp"
+              :bshell-proc (self)
+              :bshell-running true
+              :input-start (string/length prompt)
+              :bshell-history ["sudo -S true"]))
+    (ed-open-buffer (ed-init (make-buffer "")) buf)))
+
+(defn output (m text)
+  (bshell/ed-ev-bshell-output m (bshell/bshell-output-event shell-name text []) 24 80 24))
+
+(defn shell-buf (m) (ed-buf-at m (ed-buffer-index-by-name! m shell-name)))
+
+(describe "the shell reads a password its command asks for"
+  (test "a password prompt on the command's output opens the masked read"
+    (let (m (output (running-shell) "[sudo] password for me: "))
+      (is (map/get-in m [:minibuffer :masked]))
+      (assert= (mb-prompt (:minibuffer m)) "[sudo] password for me: ")))
+  (test "a prompt split across two chunks is still seen"
+    (let (m (output (output (running-shell) "[sudo] pass") "word for me: "))
+      (is (map/get-in m [:minibuffer :masked]))))
+  (test "the answer goes to the command's stdin, not the buffer or the history"
+    (let (asked (output (running-shell) "Password: ")
+          answered (type-keys (type-text asked "hunter2") [:enter]))
+      (receive ([:bshell-input text] (assert= text "hunter2")) (after 300 (is false)))
+      (is (not (includes? (buffer-text (shell-buf answered)) "hunter2")))
+      (assert= (:bshell-history (shell-buf answered)) ["sudo -S true"])))
+  (test "a prompt is seen with input typed ahead after the process mark"
+    (let (shell (running-shell)
+          idx (ed-buffer-index-by-name! shell shell-name)
+          at (buffer-length (shell-buf shell))
+          typed (ed-set-buf-at shell
+                  idx
+                  (insert (end-of-buffer (assoc (shell-buf shell) :bshell-output-at at)) "ls"))
+          m (output typed "Password: "))
+      (is (map/get-in m [:minibuffer :masked]))
+      (is (string/ends-with? (buffer-text (shell-buf m)) "Password: ls"))))
+  (test "ordinary output asks nothing"
+    (let (m (output (running-shell) "building...\n"))
+      (is (nil? (:minibuffer m)))))
+  (test "RET while the command waits at the prompt reads it"
+    (let (busy (output (assoc (running-shell) :minibuffer {:edit (ed-mb-edit "x: " "")})
+                 "Password: ")
+          asked (bshell/cmd-bshell-send (assoc busy :minibuffer nil) nil))
+      (is (map/get-in asked [:minibuffer :masked]))))
+  (test "the command finishing withdraws the read"
+    (let (asked (output (running-shell) "Password: ")
+          done (bshell/ed-ev-bshell-done asked (bshell/bshell-done-event shell-name 1) 24 80 24))
+      (is (nil? (:minibuffer done)))
+      (is (not (:bshell-secret (shell-buf done)))))))
+
+;; ---- a real program under a real pty -----------------------------------------------------
+;; The prompt says `Secret:` — no regexp would call it a password — so only the pty's echo
+;; flag (brood ADR-570) can mark it. A nest without `os/pty-password?` answers nil, and the
+;; test says so instead of failing.
+
+(defn await-screen (want)
+  "The first `term-screen-event` whose text contains `want`, or nil."
+  (receive
+    (msg (let (scr (check-allow :discarded-catch
+                     (try (terminal/term-screen-event-screen msg) (catch _ nil))))
+           (if (and scr (includes? (:text scr) want)) scr (await-screen want))))
+    (after 8000 nil)))
+
+(defn as-editor (f)
+  (let (previous (proc/whereis :editor))
+    (proc/register :editor (self))
+    (let (out (f))
+      (when previous (proc/register :editor previous))
+      out)))
+
+(describe "the worker asks the pty"
+  :isolated (test "a program reading with echo off marks its screen; echo back on unmarks it"
+    (if (not (bound? 'os/pty-password?))
+      (io/puts "  (skipped: this nest has no os/pty-password?)")
+      (as-editor
+        (fn ()
+          (let (pid (terminal/term-connect repl-name
+                      "/tmp"
+                      "stty -echo; printf 'Secret: '; read x; stty echo; echo \"got:$x\"; sleep 5"
+                      40 6)
+                asked (await-screen "Secret: "))
+            (is (not (nil? asked)))
+            (when asked (assert= (:password asked) true))
+            (send pid [:term-line "hunter2"])
+            (let (after (await-screen "got:hunter2"))
+              (is (not (nil? after)))
+              (when after
+                (assert= (:password after) false)
+                ;; echo was off: the secret shows only where the program printed it
+                (is (not (includes? (:text after) "Secret: hunter2")))))
+            (send pid [:shutdown])))))))

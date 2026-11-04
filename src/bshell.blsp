@@ -35,7 +35,8 @@ receives `[:bshell-run line]`, runs it, and forwards each chunk as a `bshell-out
   (:use complete-at-point) ; complete-add-source! — register the path/symbol completion source
   (:use editor/highlight) ; highlight-spans / shift-spans / bracket-match — Brood input services
   (:use ansicolor :only [add-faces]) ; a command's ANSI colours as faces on its output
-  (:use editor/buffer)) ; make-buffer / insert / end-of-buffer / buffer-length / goto-char
+  (:use editor/buffer) ; make-buffer / insert / end-of-buffer / buffer-length / goto-char
+  (:use passwd)) ; ed-read-passwd / password-prompt? — a password a command asks for, read masked
 ;; formbuf (guard-clamp / tail-region), ansicolor/decode, ansi/decoder and modes (fontify + gutter
 ;; faces) are referenced qualified below — each `mod/name` auto-loads its module.
 ;; ---- prompt + per-project buffer name ---------------------------------------
@@ -196,6 +197,12 @@ a pty and a real emulator."
     ;; C-c C-c: Ctrl-C to the command and everything it started (`os/signal` reaches the
     ;; child's process group); its exit arrives as `[:proc-closed …]` like any other. A
     ;; Brood form is evaluated in THIS process, so there is nothing to interrupt then.
+    ;; a line for the running command's stdin — a password it asked for (`bshell-read-secret`)
+    ([:bshell-input text] (do
+                            (when (:proc state)
+                              (check-allow :discarded-catch
+                                (try (os/write (:proc state) (str text "\n")) (catch _ nil))))
+                            (bshell-loop state)))
     ([:bshell-interrupt] (do
                            (when (:proc state) (os/signal (:proc state) :int))
                            (bshell-loop state)))
@@ -329,12 +336,71 @@ starting at the new end (`:input-start`, on the buffer)."
 
 (defn ed-ev-bshell-output (m event textrows cols rows)
   "A `bshell-output-event` from the shell process → append the (ANSI-decoded) chunk to
-that buffer, its colours as faces, and keep the viewport following the output."
-  (ed-scroll (bshell-append-output m
-               (bshell-output-event-buffer event)
-               (bshell-output-event-text event)
-               (bshell-output-event-spans event))
-    textrows))
+that buffer, its colours as faces, and keep the viewport following the output; a chunk that
+leaves the running command at a password prompt reads the password (`bshell-watch-password`)."
+  (let (nm (bshell-output-event-buffer event))
+    (bshell-watch-password (ed-scroll (bshell-append-output m
+                                        nm
+                                        (bshell-output-event-text event)
+                                        (bshell-output-event-spans event))
+                             textrows)
+      nm)))
+
+;; ---- a password the running command asks for ------------------------------------------------
+;; A command runs on PIPES (no terminal), so nothing can say it turned echo off; what it
+;; printed last is the only signal — matched as comint matches it (`passwd/password-prompt?`:
+;; `[sudo] password for me:` from `sudo -S`, `Password:`, `Enter passphrase …`). On a match
+;; the answer is read masked and written to the command's stdin, never into the buffer or the
+;; history. `:bshell-secret` marks a command waiting for one; it is re-decided per chunk of
+;; output, so the prompt it answered cannot ask again until the command prints anew.
+
+(defn- last-line (b)
+  "The text of the line a command's output ends on, up to where its next output would land
+(`bshell-output-point`) — its prompt, without anything typed ahead after it."
+  (let (rope (buffer-rope b)
+        at (bshell-output-point b)
+        line-start (text/line->char rope (text/char->line rope at)))
+    (text/slice rope line-start at)))
+
+(defn bshell-read-secret (m nm)
+  "Read a line masked and send it to the command shell `nm` is running — the answer to a
+password prompt, kept out of the buffer and the history. Says so when nothing is running."
+  (let (idx (ed-buffer-index-by-name m nm)
+        b (if (nil? idx) nil (ed-buf-at m idx)))
+    (if (not (and b (:bshell-running b) (:bshell-proc b)))
+      (message m "no command running to send to")
+      (let (line (string/trim (last-line b)))
+        (passwd/ed-read-passwd m
+          (if (= line "") "Password: " (str line " "))
+          (fn (m1 password)
+            (let (now (ed-buffer-index-by-name m1 nm)
+                  finished "the command has finished; nothing sent")
+              (if (nil? now)
+                (message m1 finished)
+                (let (current (ed-buf-at m1 now))
+                  (if (not (and (:bshell-running current) (:bshell-proc current)))
+                    (message m1 finished)
+                    (do
+                      (send (:bshell-proc current) [:bshell-input password])
+                      (ed-set-buf-at m1 now (assoc current :bshell-secret false))))))))
+          nm)))))
+
+(defn- bshell-watch-password (m nm)
+  "After output reached shell `nm`: note whether its running command now waits at a password
+prompt, and when it has just started to — and you are looking at it, with no other prompt
+open — read the password (`bshell-read-secret`). Elsewhere RET asks."
+  (let (idx (ed-buffer-index-by-name m nm))
+    (if (nil? idx)
+      m
+      (let (b (ed-buf-at m idx))
+        (if (not (:bshell-running b))
+          m
+          (let (secret? (passwd/password-prompt? (last-line b))
+                asked? (and secret? (not (:bshell-secret b)))
+                noted (ed-set-buf-at m idx (assoc b :bshell-secret secret?)))
+            (if (and asked? (= idx (ed-current-index noted)) (passwd/ed-prompt-free? noted))
+              (bshell-read-secret noted nm)
+              noted)))))))
 
 (defn ed-ev-bshell-done (m event textrows cols rows)
   "A `bshell-done-event` → on a line of its own, a non-zero `[exit N]` (a clean exit
@@ -343,14 +409,15 @@ process mark, so input typed ahead ends up after the prompt, waiting to be sent;
 shell idle and start *its* input region where the prompt ends (all per-buffer)."
   (let (nm (bshell-done-event-buffer event)
         code (bshell-done-event-code event)
-        m0 (bshell-ensure-bol m nm) ; the prompt starts at column 0, no blank line
+        ;; a password prompt the command left open has nobody to answer now
+        m0 (bshell-ensure-bol (passwd/ed-withdraw-read m nm) nm) ; the prompt starts at column 0, no blank line
         m1 (cond
              (= code 0) m0
              (nil? code) (bshell-append m0 nm "[exit killed]\n")
              else (bshell-append m0 nm (str "[exit " code "]\n")))
         m2 (bshell-append m1 nm (bshell-prompt-for m1 nm))
         prompt-end (bshell-output-point (nth (:buffers m2) (ed-buffer-index-by-name! m2 nm)))
-        m3 (bshell-bufset m2 nm :bshell-running false))
+        m3 (bshell-bufset (bshell-bufset m2 nm :bshell-running false) nm :bshell-secret false))
     (ed-scroll (bshell-bufset m3 nm :input-start prompt-end) textrows)))
 
 ;; ---- syntax highlighting (the :fontify mode service) ------------------------
@@ -707,28 +774,32 @@ shell (each project has its own — like Emacs `project-eshell`). Reports when n
   "RET in a bshell buffer: run the current input (everything from the prompt to the buffer's
 end) in *this* buffer's shell. An empty line emits a fresh prompt; an **incomplete Brood
 form** inserts a newline so you keep typing it (REPL-style multi-line); otherwise the input
-is sent to this shell's process. Ignored in a non-bshell buffer or while a command is running."
+is sent to this shell's process. Ignored in a non-bshell buffer or while a command is running
+— unless that command waits at a password prompt, which RET then reads, masked."
   (let (b (ed-current-buf m))
-    (if (or (not (bshell-buffer? b)) (:bshell-running b))
-      m
-      (let (nm (buffer-name b)
-            line (string/trimr (input-text b)))
-        (cond
-          (string/blank? line) (bshell-emit-prompt m nm (bshell-prompt-for m nm))
-          ;; an unclosed Brood form → newline at point, keep editing (don't submit)
-          (not (bshell-complete-input? line)) (ed-set-buf m (insert b "\n"))
-          else
-            (let (m1 (bshell-remember m line))
-              ; ↑/↓ recall it later (this buffer)
-              (send (:bshell-proc b) [:bshell-run line])
-              (ed-update-named (bshell-append m1 nm "\n")
-                nm
-                ;; the process mark starts after the command line: its output goes there
-                (fn (buf)
-                  (assoc buf
-                    :bshell-running true
-                    :bshell-command line
-                    :bshell-output-at (buffer-length buf))))))))))
+    (cond
+      (not (bshell-buffer? b)) m
+      (and (:bshell-running b) (:bshell-secret b)) (bshell-read-secret m (buffer-name b))
+      (:bshell-running b) m
+      else
+        (let (nm (buffer-name b)
+              line (string/trimr (input-text b)))
+          (cond
+            (string/blank? line) (bshell-emit-prompt m nm (bshell-prompt-for m nm))
+            ;; an unclosed Brood form → newline at point, keep editing (don't submit)
+            (not (bshell-complete-input? line)) (ed-set-buf m (insert b "\n"))
+            else
+              (let (m1 (bshell-remember m line))
+                ; ↑/↓ recall it later (this buffer)
+                (send (:bshell-proc b) [:bshell-run line])
+                (ed-update-named (bshell-append m1 nm "\n")
+                  nm
+                  ;; the process mark starts after the command line: its output goes there
+                  (fn (buf)
+                    (assoc buf
+                      :bshell-running true
+                      :bshell-command line
+                      :bshell-output-at (buffer-length buf))))))))))
 
 ;; Turn the completion source on: highest precedence, but inert outside a bshell buffer.
 (complete-add-source! 'bshell/bshell-complete-source)
