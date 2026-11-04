@@ -213,7 +213,11 @@ src/ownership.blsp          WHO registered each registry row: every `register-*`
                             claimed in one call, giving a replaced core row back. A registry kept
                             outside `std/registry` (the theme list, editor/layers' tables)
                             declares how to read / write / remove a row (`define-kind`); std's
-                            `settings/define` is `adopt!`ed after a package's load
+                            `settings/define` is `adopt!`ed after a package's load. At RUN TIME
+                            a package's command (key dispatch, M-x) and hook (`ed-call-deferred`)
+                            run under the claimant of their symbol's namespace
+                            (`with-symbol-claimant`, `own-namespace!`), so a row its code
+                            registers as it runs is the package's too
 src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
                             hive packages that `:enhances bedit` at RUNTIME, into
                             ~/.config/bedit/packages (the elpa model) — never the build's _deps.
@@ -223,15 +227,24 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             and on *Packages*' status line. An install lands in a staging dir
                             and moves into place only when it verified and enhances this bedit,
                             so a failed or cancelled one keeps the copy there; an update RETIRES
-                            the old version first (`retire-package`, ONE call): every registry
-                            row it made taken back (`ownership/release-under!` — idle jobs, task
-                            replies, handlers, exit queries, chips, commands, modes, file types,
-                            settings, themes; a core row it replaced comes back), every core
-                            global it REDEFINED restored to the value it had before the package
-                            loaded, and every global its OWN modules defined removed
-                            (`plugin-definitions`: def site under its dir AND namespace one of
-                            its modules, brood's `reflect/undef` — a core name is never undefined)
-                            — then reloads the sources in load order (brood's
+                            the old version first (`retire-package`, ONE call): every bedit
+                            registry row it made taken back (`ownership/release-under!` — idle
+                            jobs, task replies, handlers, exit queries, chips, commands, modes,
+                            file types, settings, themes; a core row it replaced comes back);
+                            every std registry entry its modules' loads wrote DIRECTLY (brood's
+                            `registry/written-by` — editor/layers' tables, a `registry/put!` of
+                            its own) put back as it was before the load or retracted; any row
+                            still NAMING the package (a hook symbol in its namespace, a function
+                            defined there) dropped as a backstop; every core global it REDEFINED
+                            restored through a per-global STACK (two packages patching one
+                            function come off in either order, the live patch always the top
+                            one's); and every global it FIRST defined removed (`plugin-definitions`:
+                            noted at load — sited under its dir and unbound before, a file with no
+                            `defmodule` included — brood's `reflect/undef`; a core name is never
+                            undefined). Open buffers in a mode it took away are seeded again —
+                            the new version's mode, the core one it replaced, else fundamental,
+                            said in *Messages* (`ed-settle-package-buffers`, Emacs's
+                            `unload-feature`) — then it reloads the sources in load order (brood's
                             `reflect/source-load-order`); a remove retires the same way. What
                             became of each installed package
                             is kept (`package-status`: loaded / broken / incompatible, with the
