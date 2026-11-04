@@ -1,73 +1,156 @@
-;; tests/stringstate_test.blsp — the string and comment state a mode's string syntax gives
-;; (`stringstate`, Emacs's syntax-ppss for strings): tokens, the state at a position, unterminated
-;; strings, raw strings, block comments, the syntax a mode without one gets, and bracket balance.
+;; tests/stringstate_test.blsp — where strings, comments and brackets stand (`stringstate`,
+;; Emacs's syntax-ppss): the line lexer a mode's string syntax becomes, the state each line
+;; starts in kept in the model's `:string-caches` and moved by edits, the state at point, the
+;; held parse asked first, and bracket balance read forward from point.
 
 (defmodule stringstate-test
   (:use test)
+  (:use model)
   (:use stringstate)
   (:use editor/buffer))
 
 (def- python
-  {:strings [{:open "\"\"\"" :multiline true}
-              {:open "'''" :multiline true}
-              {:open "\""}
-              {:open "'"}]
-   :comments ["#"]})
-(def- c-like
-  {:strings [{:open "\""} {:open "`" :multiline true :raw true}]
-   :comments ["//"]
-   :block-comments [["/*" "*/"]]})
+  (lexer-data {:strings [{:open "\"\"\"" :multiline true}
+                          {:open "'''" :multiline true}
+                          {:open "\""}
+                          {:open "'"}]
+               :comments ["#"]}
+    [["(" ")"] ["[" "]"] ["{" "}"]]))
 
-(defn- at (text point syntax)
-  ;; the state's kind and opener at `point` of `text`, or nil
-  (let (state (state-at (make-buffer text) syntax point))
-    (when state [(:kind state) (:open state)])))
+(defn- lexed (data line &optional (state [nil ""])) (lex-line data line state))
 
-(describe "tokens"
-  (test "a lexer's leftmost tokens: a `#` in a string is not a comment, a quote in a comment opens nothing"
-    (let (rope (text/from-string "a = \"x # y\" # it's\nb = 'q'"))
-      (assert= (spans rope python 0 (text/length rope)) [[4 11] [12 18] [23 26]])))
-  (test "a triple quote spans lines; a one-line string ends at its line"
-    (let (rope (text/from-string "\"\"\"a\nb\"\"\" 'open\nc"))
-      (assert= (spans rope python 0 (text/length rope)) [[0 9] [10 16]]))))
+(defn- file-model (text file point)
+  (let (m (ed-init (make-buffer text file file)))
+    (ed-set-buf m (goto-char (ed-current-buf m) point))))
 
-(describe "the state at a position"
-  (test "inside a string, after it, in a comment, in code"
-    (let (text "x = \"ab\" # c")
-      (assert= (at text 6 python) [:string "\""])
-      (assert= (at text 8 python) nil)
-      (assert= (at text 11 python) [:comment nil])
-      (assert= (at text 2 python) nil)))
-  (test "an unterminated string holds point to its end; a multi-line one across lines"
-    (assert= (at "x = \"ab" 7 python) [:string "\""])
-    (assert= (at "x = \"\"\"doc\nmore" 15 python) [:string "\"\"\""])
-    (assert= (at "x = 'ab\ny" 9 python) nil))
+(defn- point-info (text file point) (second (ed-point-state (file-model text file point))))
+
+(describe "the line lexer"
+  (test "a lexer's tokens: a `#` in a string is no comment, a quote in a comment opens nothing"
+    (assert= (:tokens (lexed python "a = \"x # y\" # it's"))
+      [[4 11 [:string "\"" true]] [12 18 :comment]]))
+  (test "a triple quote carries into the next line; a one-line string ends at its line"
+    (assert= (:end (lexed python "x = \"\"\"doc")) [[:string "\"\"\"" true false] ""])
+    (assert= (:end (lexed python "y = 'open")) [nil ""])
+    (assert= (:open (lexed python "y = 'open")) [[:string "'" false false] ""]))
+  (test "a line that starts inside a string closes it"
+    (assert= (:tokens (lexed python "more\"\"\" + 1" [[:string "\"\"\"" true false] ""]))
+      [[0 7 [:string "\"\"\"" true]]]))
+  (test "brackets: the stack carried, the fewest open, the first closer that closes nothing"
+    (let (line (lexed python "f(a, [b") opened (:end line))
+      (assert= opened [nil "(["])
+      (assert= (:low (lexed python "])) x" opened)) 0)
+      (assert= (:excess (lexed python "])) x" opened)) [2 ")"])))
+  (test "a bracket in a string or a comment is not counted"
+    (assert= (:end (lexed python "s = '(' # (")) [nil ""]))
   (test "an escaped quote does not close; a raw string has no escapes"
-    (assert= (at "x = \"a\\\"b" 9 python) [:string "\""])
-    (assert= (at "`a\\` x" 5 c-like) nil))
+    (assert= (:end (lexed python "x = \"a\\\"b")) [nil ""])
+    (assert= (:open (lexed python "x = \"a\\\"b")) [[:string "\"" false false] ""])
+    (let (go (lexer-data {:strings [{:open "`" :multiline true :raw true}]} []))
+      (assert= (:end (lexed go "`a\\` x")) [nil ""])))
   (test "a block comment spans lines"
-    (assert= (at "/* a\n \" b */ \"c" 7 c-like) [:comment "*/"])
-    (assert= (at "/* a\n \" b */ \"c" 14 c-like) [:string "\""]))
-  (test "the string extent M-q fills"
-    (assert= (string-extent (goto-char (make-buffer "(def x \"aa bb\")" "a.blsp" "a.blsp") 9))
-      [7 14])))
+    (let (c (lexer-data {:strings [{:open "\""}] :block-comments [["/*" "*/"]]} []))
+      (assert= (:end (lexed c "a /* b \" c")) [[:block "*/"] ""])
+      (assert= (:open (lexed c "d */ \"e" [[:block "*/"] ""])) [[:string "\"" false false] ""])))
+  (test "the shell's `#` is a comment only at a word's start"
+    (let (shell (lexer-data {:strings [{:open "\"" :multiline true}]
+                             :comments ["#"]
+                             :comment-word-start true}
+                  [["(" ")"] ["{" "}"]]))
+      (assert= (:tokens (lexed shell "echo ${#x} $# \"a\" # c"))
+        [[14 17 [:string "\"" true]] [18 21 :comment]])
+      (assert= (:end (lexed shell "n=${#x}")) [nil ""])))
+  (test "Rust: `'x'` is a character, `'a` a lifetime, `'\"'` no string"
+    (let (rust (lexer-data {:strings [{:open "\"" :multiline true}]
+                            :char-literal "'"
+                            :comments ["//"]}
+                 [["(" ")"] ["<" ">"]]))
+      (assert= (:tokens (lexed rust "let c = '\"';")) [[8 11 :char]])
+      (assert= (:end (lexed rust "let c = '\"';")) [nil ""])
+      (assert= (:tokens (lexed rust "fn f<'a>(x: &'a str) -> char { '\\'' }")) [[31 35 :char]])
+      (assert= (:end (lexed rust "fn f<'a>(x: &'a str)")) [nil ""]))))
 
-(describe "a mode with no string syntax"
-  (test "its quote pairs are one-line strings"
-    (assert= (pairs-syntax [["(" ")"] ["\"" "\""] ["'" "'"] ["\"\"\"" "\"\"\""]])
-      {:strings [{:open "\""} {:open "'"}]}))
-  (test "and the scan starts at point's line"
-    (let (rope (text/from-string "a \"b\nc \"d"))
-      (assert= (scan-start rope (pairs-syntax [["\"" "\""]]) 8) 5)
-      (assert= (scan-start rope python 8) 0))))
+(describe "the state each line starts in, cached per buffer"
+  (test "a line's state is the lex from the top, and the cache is kept on the model"
+    (let (m (file-model "x = \"\"\"doc\nmore\n\"\"\"\ny = (1,\n2)" "a.py" 0)
+          [m2 state] (ed-line-state m (ed-current-index m) (ed-current-buf m) 1))
+      (assert= state [:string "\"\"\"" true false])
+      (is (map? (get (:string-caches m2) (ed-current-index m2))))
+      ;; a line's cached state is what it starts inside, never its brackets: those are counted
+      ;; at point from its top-level form's start, so a bracket edit moves no line's state
+      (assert= (second (ed-line-state m2 (ed-current-index m2) (ed-current-buf m2) 4)) nil)))
+  (test "an edit moves it: the lines below the edit are not trusted"
+    (let (m (file-model "a\nb\nc\nd" "a.py" 0)
+          [m2 _] (ed-line-state m (ed-current-index m) (ed-current-buf m) 3)
+          edited (ed-set-buf m2 (insert (goto-char (ed-current-buf m2) 0) "\"\"\""))
+          [_ state] (ed-line-state edited (ed-current-index edited) (ed-current-buf edited) 3))
+      (assert= state [:string "\"\"\"" true false])))
+  (test "a killed buffer's cache goes with it"
+    (let (m (assoc (file-model "a" "a.py" 0) :string-caches {0 {:x 1} 1 {:y 2} 2 {:z 3}}))
+      (assert= (:string-caches (ed-drop-string-cache-slot m 1)) {0 {:x 1} 1 {:z 3}}))))
 
-(describe "bracket balance"
-  (test "unclosed openers and the closers that close nothing, strings and comments skipped"
-    (let (buf (make-buffer "f(a, \")\" # )\n) x)"))
-      (assert= (balance buf python ["(" ")"] 0 (buffer-length buf)) {:open 0 :closers [16]})))
-  (test "a short buffer is counted whole"
-    (let (buf (make-buffer "a\n\nb"))
-      (assert= (balance-region buf) [0 4])))
-  (test "a large one by the run of non-blank lines around point"
-    (let (buf (goto-char (make-buffer (str "a\n\n(b\nc)\n\n" (string/repeat "x" 210000))) 4))
-      (assert= (balance-region buf) [3 9]))))
+(describe "the state at point"
+  (test "in a string — opened lines above — in a comment, in code"
+    (assert= (:inside (point-info "x = \"\"\"doc\nmore" "a.py" 13)) [:string "\"\"\"" true false])
+    (assert= (:kind (:token (point-info "x = 1 # c" "a.py" 8))) :comment)
+    (assert= (:inside (point-info "x = 'a' + 1" "a.py" 9)) nil)
+    (assert= (:stack (point-info "f(a, [b" "a.py" 7)) "([")
+    ;; counted from where the top-level form begins (`def` at column 0), lines above point too
+    (assert= (:stack (point-info "x = 1\ndef f():\n    x = (1,\n         2" "a.py" 37)) "("))
+  (test "a string's token in buffer offsets, closed or not"
+    (let (token (:token (point-info "x = 'abc' + 1" "a.py" 6)))
+      (assert= [(:start token) (:end token) (:open token) (:closed? token)] [4 9 "'" true])))
+  (test "the string M-q fills, followed across lines"
+    (let (m (file-model "x = 1\n'''aa\nbb\ncc''' + 2" "a.py" 13))
+      (assert= (second (ed-string-extent m)) [6 20])))
+  (test "the held parse answers first, when the buffer keeps one"
+    ;; Elixir's grammar is built in: the tree a refresh keeps for the buffer
+    (let (m (file-model "x = \"abc\"\ny = 1" "a.ex" 6)
+          held (syntaxtree/ed-sync-syntax-trees m [(ed-current-index m)])
+          info (second (ed-point-state held)))
+      (is (:tree? info))
+      (assert= (:inside info) [:string "\"" false false])
+      (assert= [(:start (:token info)) (:end (:token info))] [4 9]))))
+
+(describe "balance, read forward from point"
+  (test "a closer that closes nothing after point waits for an opener"
+    (let (m (file-model " x)" "a.py" 0))
+      (is (closer-waits? (ed-current-buf m) (second (ed-point-state m)) ["(" ")"])))
+    (let (m (file-model "(a) x" "a.py" 4))
+      (is (not (closer-waits? (ed-current-buf m) (second (ed-point-state m)) ["(" ")"])))))
+  (test "stepping over a closer balances only when what stays open closes later"
+    (let (unbalanced (file-model "((a)" "a.py" 3)
+          balanced (file-model "((a)\n)" "a.py" 3))
+      (is (not (closer-balances? (ed-current-buf unbalanced) (second (ed-point-state unbalanced)) 4)))
+      (is (closer-balances? (ed-current-buf balanced) (second (ed-point-state balanced)) 4)))))
+
+(describe "the cache warmed off the loop"
+  (test "a long buffer with no cache is stale; a warm's cache becomes its own, and then it is not"
+    (let (text (string/join (map (range 1200) (fn (i) (if (= i 600) "x = '''" "y = 1"))) "\n")
+          m (file-model text "a.py" 0)
+          idx (ed-current-index m)
+          buf (ed-current-buf m)
+          rope (buffer-rope buf)
+          _ (is (ed-string-warm-stale? m))
+          [m2 _] (ed-line-state m idx buf 0)
+          entry (get (:string-caches m2) idx)
+          warmed (warm-cache (:cache entry) (:lexer entry) rope)
+          in-flight (assoc m2
+                      :string-warm-proc :running
+                      :string-warm-index idx
+                      :string-warm-rope rope
+                      :string-warm-stamp (:stamp entry))
+          applied (ed-apply-string-warm in-flight {:cache warmed}))
+      (is (nil? (:rope warmed))) ; what crossed the message carried no rope
+      (is (nil? (:string-warm-proc applied)))
+      (is (not (ed-string-warm-stale? applied)))
+      (assert= (second (ed-line-state applied idx buf 1100)) [:string "'''" true false])))
+  (test "a failed warm is not retried on the same text; a short buffer is never warmed"
+    (let (m (file-model (string/join (map (range 1200) (fn (_) "y")) "\n") "a.py" 0)
+          failed (ed-apply-string-warm (assoc m
+                                         :string-warm-proc :running
+                                         :string-warm-index 0
+                                         :string-warm-rope (buffer-rope (ed-current-buf m)))
+                   :failed))
+      (is (not (ed-string-warm-stale? failed))))
+    (is (not (ed-string-warm-stale? (file-model "x = 1" "a.py" 0))))))

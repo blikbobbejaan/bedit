@@ -367,7 +367,8 @@ src/electric.blsp           electric pairs (Emacs electric-pair-mode) as POLICY:
                             `:electric-pair-inhibit :never` always pairs, as paredit),
                             electric-pair-preserve-balance (an opener a waiting closer balances is
                             typed alone; a closer is stepped over — past spaces, tabs and newlines —
-                            only while the brackets stay balanced), a quote's open / close / skip
+                            only while the brackets stay balanced; `:electric-pair-preserve-balance`
+                            per mode), a quote's open / close / skip
                             read from the STRING STATE at point (`stringstate`), and M-x
                             electric-pair-mode / electric-pair-local-mode. The bracket keys stay in
                             `commands`, and any character a mode pairs is electric through
@@ -376,16 +377,21 @@ src/electric.blsp           electric pairs (Emacs electric-pair-mode) as POLICY:
 src/stringstate.blsp        where a buffer's strings and comments are (Emacs's syntax-ppss, for
                             strings), from the mode's `:string-syntax` as DATA (a `deflanguage`'s
                             `:strings`: delimiters, which span lines, which are raw, line and block
-                            comments; else its quote pairs as one-line strings) — one native
-                            `regex/rope-spans` pass, no grammar. Electric pairs ask it whether a
-                            quote opens or closes and which brackets count for balance (`balance`,
-                            the whole buffer under 200 KB); M-q asks it for the docstring to fill
+                            comments, the shell's word-start `#`, Rust's char literals; else its
+                            quote pairs as one-line strings). INCREMENTAL, as syntax-ppss's cache:
+                            what each line starts inside lives in the model's `:string-caches` (std's
+                            line cache, `line-cache-state`, brood ADR-591) and edits move it by the
+                            splice log, so a key lexes its own line (~5 ms at the end of a 1 MB
+                            file); a large buffer's cache is warmed off the loop on the idle beat.
+                            The held tree-sitter parse answers first when it is current and whole.
+                            Brackets are counted from point's top-level form forward until they
+                            close; electric pairs ask it to open, close or skip, M-q for the string
 src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string/fill-prefixes`
                             (brood ADR-589, Emacs's adaptive fill): the first line keeps its
                             prefix, the rest the paragraph's continuation — a list item HANGS under
                             its text, a comment / quote keeps its marker. The paragraph is
                             narrowed to point's comment, list item, or (in code) string
-                            (`stringstate/string-extent`, no grammar needed); a mode's `:fill-separate`
+                            (`stringstate/ed-string-extent`, no grammar needed); a mode's `:fill-separate`
                             lines (an Org heading, a Markdown fence) stand alone and its
                             `:fill-prefixes` answers for it (a Lisp docstring continues at column
                             0). M-x auto-fill-mode per buffer, `:auto-fill` per mode — in code only
