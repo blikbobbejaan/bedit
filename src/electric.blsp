@@ -1,0 +1,251 @@
+(defmodule electric
+  "Electric pairs — Emacs's `electric-pair-mode` — as POLICY: which pairs a buffer has, when
+an opener types its pair, when a closer steps over the one at point, and the two switches.
+The bracket commands in `commands` ask here; the edits themselves are std's
+(`editor/buffer`'s `insert-pair` / `delete-empty-pair`, `sexp/wrap-region`).
+
+**The pairs are the MODE's** (Emacs's `electric-pair-pairs` and the syntax table's string
+delimiters, per mode): a layer's `:electric-pairs` facet, a vector of `[open close]`, else
+`*default-pairs*` — `()` `[]` `{}` and `\"\"`. So `'` pairs in Python, Ruby, JavaScript and the
+shell, where it opens a string, and not in a Lisp or in prose, where it is a quote operator or
+an apostrophe; a backtick pairs in Markdown, JavaScript, Go and the shell; `<>` nowhere. A pair
+whose opener is longer than one character is a TRIPLE quote (Python's `\"\"\"`): typing its last
+character after the rest of it opens the triple and its closer (`\"\"|` + `\"` → `\"\"\"|\"\"\"`).
+
+**The user's** `:electric-pair` setting is a bool or a per-mode map
+(`scroll/ed-mode-setting`): `{:default true :org false}` turns it off for Org, and a mode's
+entry may be a vector of pairs, which REPLACES the mode's (`{:markdown [[\"(\" \")\"] [\"*\"
+\"*\"]]}`).
+
+**The switches**: `M-x electric-pair-mode` toggles it everywhere (the model's
+`:electric-pair?`), `M-x electric-pair-local-mode` in one buffer (the buffer's
+`:electric-pair-local`, which wins over both the global switch and the setting).
+
+**When it pairs** — after Emacs's `electric-pair-default-inhibit`: not before a word character
+(`(` typed before `foo` is a `(`), not before the same character, not as the third of a run
+(`((` + `(`) — except in a Lisp, whose `:electric-pair-inhibit :never` always pairs, as paredit
+keeps its parens balanced. And `electric-pair-preserve-balance`, Emacs's default: an opener a
+waiting closer already balances is typed alone (`stringstate/closer-waits?`), and a closer is stepped over
+only while the brackets stay balanced — `((a|)` + `)` types it (`skip-target`). The balance is
+counted with strings and comments skipped, from where point's top-level form begins and forward
+only as far as the brackets around point close (`stringstate`); off per mode with the
+`:electric-pair-preserve-balance` setting.
+A quote's meaning comes from the STRING STATE at point (`stringstate/ed-point-state`, Emacs's
+`syntax-ppss`), not the character before it: in code it opens a pair, in a string it closes it
+(or steps over the closer at point), in a comment it pairs as prose on the line
+(`quote-action`). A closer at point is stepped over, and so is one past only whitespace —
+spaces, tabs and newlines, Emacs's `electric-pair-skip-whitespace-chars`.
+
+An active region is wrapped by any opener or closer of the table, mode on or off — a selection
+plus a bracket has one meaning."
+  (:use editor/buffer) ; buffer-char-before / -after, buffer-rope, buffer-point
+  (:use interactive) ; defcommand — the two mode toggles
+  (:use scroll :only [ed-mode-setting])
+  (:use stringstate :only [syntax-of]) ; string state and bracket balance, from the mode's syntax
+  (:use model)) ; ed-current-buf, ed-mode-service, message
+
+(def *default-pairs*
+  ;; every buffer's, unless its mode says otherwise: the brackets and the double quote
+  [["(" ")"] ["[" "]"] ["{" "}"] ["\"" "\""]])
+
+;; ---- the switches -----------------------------------------------------------------
+
+(sig electric-pair? (model -> bool))
+(defn electric-pair? (m)
+  "Whether electric-pair-mode is on globally: the `M-x electric-pair-mode` switch
+(`:electric-pair?`) when it has been flipped, else the `:electric-pair` setting unless that is
+a plain `false` (a per-mode map is on, its entries deciding per mode)."
+  (let (on (:electric-pair? m))
+    (if (bool? on) on (not (= false (:electric-pair m))))))
+
+(defn- setting-for (m buf)
+  ;; the `:electric-pair` setting's value for `buf`'s mode: true, false or a pairs vector. A
+  ;; plain bool is the GLOBAL switch's business (`electric-pair?`), not a mode's
+  (let (setting (:electric-pair m))
+    (if (map? setting) (ed-mode-setting setting buf true) true)))
+
+(sig electric-pair-in? (model any -> bool))
+(defn electric-pair-in? (m buf)
+  "Whether `buf` pairs: its own `electric-pair-local-mode` when toggled, else the global switch
+and the setting's entry for its mode."
+  (let (local (when buf (:electric-pair-local buf)))
+    (cond
+      (bool? local) local
+      (nil? buf) false
+      (not (electric-pair? m)) false
+      else (not (= false (setting-for m buf))))))
+
+(defn pairs-for (m buf)
+  "The `[open close]` pairs `buf` has: the user's vector for its mode, else its mode's
+`:electric-pairs` facet, else `*default-pairs*`."
+  (let (value (if (nil? buf) true (setting-for m buf)))
+    (cond
+      (vector? value) value
+      (nil? buf) *default-pairs*
+      else (or (ed-mode-service buf :electric-pairs) *default-pairs*))))
+
+;; ---- which pair a key is ----------------------------------------------------------
+
+(defn- single? (pair) (= 1 (string/length (first pair))))
+
+(defn opener-pair (pairs key)
+  "The one-character pair `key` opens in `pairs`, or nil."
+  (seq/find pairs (fn (pair) (and (single? pair) (= (first pair) key)))))
+
+(defn closer-pair (pairs key)
+  "The one-character pair `key` closes in `pairs` (a quote both opens and closes), or nil."
+  (seq/find pairs (fn (pair) (and (single? pair) (= (second pair) key)))))
+
+(defn triple-pair (pairs buf key)
+  "The multi-character pair `key` completes at point in `buf` — `\"\"\"` when `key` is `\"` and
+`\"\"` is just before point — or nil. Whether point is in code, where alone a triple opens, is the
+caller's to ask (`stringstate/ed-point-state`)."
+  (let (point (buffer-point buf))
+    (seq/find pairs
+      (fn (pair)
+        (let (open (first pair)
+              n (string/length open))
+          (and (> n 1)
+            (string/ends-with? open key)
+            (>= point (dec n))
+            (= (text/slice (buffer-rope buf) (- point (dec n)) point)
+              (string/substring open 0 (dec n)))))))))
+
+;; ---- when an opener pairs -------------------------------------------------------------
+
+(defn word-char? (c)
+  "True when `c` (a one-character string) is a letter or a digit — a word constituent in every
+language's syntax table."
+  (and (string? c) (regex/match? "^[[:alnum:]]$" c)))
+
+(defn- char-at (buf offset)
+  ;; the character at `offset`, or nil off either end
+  (when (and (>= offset 0) (< offset (buffer-length buf)))
+    (text/slice (buffer-rope buf) offset (inc offset))))
+
+(defn inhibit? (buf key)
+  "Whether typing opener `key` at point in `buf` should NOT type its pair — after Emacs's
+`electric-pair-default-inhibit`: the next character is a word character or `key` itself, or
+`key` would be the third of a run (`((` + `(`). A mode whose `:electric-pair-inhibit` is
+`:never` always pairs — the Lisps, whose parens paredit keeps balanced."
+  (let (after (buffer-char-after buf)
+        point (buffer-point buf))
+    (and (not (= :never (ed-mode-service buf :electric-pair-inhibit)))
+      (or (word-char? after)
+        (= after key)
+        (and (= (char-at buf (dec point)) key) (= (char-at buf (- point 2)) key))))))
+
+(sig preserve-balance? (model any -> bool))
+(defn preserve-balance? (m buf)
+  "Whether `buf` keeps its brackets balanced as it pairs (Emacs's
+`electric-pair-preserve-balance`, default true): the `:electric-pair-preserve-balance` setting,
+per mode."
+  (not (= false (ed-mode-setting (:electric-pair-preserve-balance m) buf true))))
+
+(defn in-comment? (info)
+  "Whether point stands in a comment, by `stringstate/ed-point-state`'s `info`."
+  (let (token (:token info)) (and token (= (:kind token) :comment))))
+
+(defn quote-action (m buf key info)
+  "What a typed quote `key` (a pair whose opener is its closer) does at point — `:skip` over the
+quote there, `:pair`, or `:insert` it alone — from where point stands (`info`,
+`stringstate/ed-point-state`), as Emacs reads it from `syntax-ppss`:
+  - in a string, at its closer, it steps over it (`\"abc|\"`); elsewhere in a string it is typed
+    — it closes the string, or is a character of another quote's
+  - in a comment it pairs when it opens one of its own on the line (an even count before it)
+  - in code it pairs, unless the inhibit rules say not (`inhibit?`)."
+  (let (point (buffer-point buf)
+        after (buffer-char-after buf)
+        token (:token info)
+        inside (:inside info))
+    (cond
+      (not (electric-pair-in? m buf)) :insert
+      (and inside (= (first inside) :string))
+        (if (and (= after key)
+              token
+              (:closed? token)
+              (string/ends-with? (or (:open token) "") key)
+              (>= point (- (:end token) (string/length (:open token)))))
+          :skip :insert)
+      (in-comment? info)
+        (let (rope (buffer-rope buf)
+              from (math/max (:start token) (text/line->char rope (text/char->line rope point)))
+              before (text/slice rope from point)
+              quotes (count (seq/filter (string/->list before) (fn (c) (= c key)))))
+          (cond
+            (and (math/odd? quotes) (= after key)) :skip
+            (math/odd? quotes) :insert
+            (inhibit? buf key) :insert
+            else :pair))
+      (inhibit? buf key) :insert
+      else :pair)))
+
+(defn should-pair? (m buf pair key info)
+  "Whether bracket opener `key` of `pair` types its pair at point: the buffer pairs, nothing
+inhibits it (`inhibit?`), and — under `preserve-balance?` — no closer after point already
+waits for it (`stringstate/closer-waits?`, Emacs's `electric-pair-inhibit-if-helps-balance`). A
+Lisp (`:electric-pair-inhibit :never`) always pairs."
+  (and (electric-pair-in? m buf)
+    (not (inhibit? buf key))
+    (or (= :never (ed-mode-service buf :electric-pair-inhibit))
+      (not (preserve-balance? m buf))
+      (not (stringstate/closer-waits? buf info pair)))))
+
+;; ---- closers --------------------------------------------------------------------------
+
+(defn closer-ahead (buf key)
+  "Where the closer `key` ends when only whitespace — spaces, tabs and newlines, Emacs's
+`electric-pair-skip-whitespace-chars` — separates it from point: the offset just past it, or
+nil."
+  (let (rope (buffer-rope buf)
+        n (buffer-length buf))
+    (letrec (scan (fn (i)
+                    (let (c (when (< i n) (text/slice rope i (inc i))))
+                      (cond
+                        (= c key) (inc i)
+                        (or (= c " ") (= c "\t") (= c "\n")) (scan (inc i))
+                        else nil))))
+      (scan (buffer-point buf)))))
+
+(defn skip-target (m buf pair key info)
+  "Where a typed closer `key` of `pair` steps to — past the closer at point or past whitespace
+to it (`closer-ahead`) — or nil to type it: Emacs's `electric-pair-skip-self`, which under
+`preserve-balance?` steps over only when that keeps the brackets balanced
+(`stringstate/closer-balances?`) — `((a|)` + `)` types the closer the first opener needs."
+  (when (electric-pair-in? m buf)
+    (let (ahead (closer-ahead buf key))
+      (when (and ahead
+              (or (not (preserve-balance? m buf)) (stringstate/closer-balances? buf info ahead)))
+        ahead))))
+
+(defn empty-pair-at (m buf)
+  "The `[open close]` of `buf`'s pairs point sits inside with nothing between — `(|)` — or nil:
+what an electric backspace takes both of."
+  (let (before (buffer-char-before buf)
+        after (buffer-char-after buf))
+    (when (and before after)
+      (seq/find (pairs-for m buf)
+        (fn (pair) (and (single? pair) (= (first pair) before) (= (second pair) after)))))))
+
+;; ---- the toggles ---------------------------------------------------------------------
+
+(defcommand cmd-electric-pair-mode
+  (m key)
+  "Toggle electric-pair-mode everywhere: whether an opener types its pair, a closer at point
+is stepped over and a backspace between an empty pair takes both. A buffer's own
+`electric-pair-local-mode` still wins. Wrapping a selection is not affected — that has one
+meaning either way."
+  (let (on (not (electric-pair? m)))
+    (message (assoc m :electric-pair? on)
+      (if on "Electric pair mode enabled" "Electric pair mode disabled"))))
+
+(defcommand cmd-electric-pair-local-mode
+  (m key)
+  "Toggle electric-pair-mode in this buffer only (Emacs `electric-pair-local-mode`): the
+buffer's own switch wins over the global one and the `:electric-pair` setting."
+  (let (buf (ed-current-buf m)
+        on (not (electric-pair-in? m buf)))
+    (message (ed-set-buf m (assoc buf :electric-pair-local on))
+      (if on
+        "Electric pair mode enabled in this buffer"
+        "Electric pair mode disabled in this buffer"))))

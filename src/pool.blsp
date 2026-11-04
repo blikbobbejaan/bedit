@@ -222,6 +222,8 @@ loop."
         m0 (syntaxtree/ed-drop-syntax-tree-slot m0 killed-idx)
         ;; and its line cache, the caches above it shifted the same way
         m0 (linecache/ed-drop-line-cache-slot m0 killed-idx)
+        ;; and its string-state cache (electric pairs, M-q), likewise
+        m0 (stringstate/ed-drop-string-cache-slot m0 killed-idx)
         removed (seq/remove-nth (:buffers m0) killed-idx)
         label (str "killed " (buffer-name buf))
         m1 (if (ed-has-editable? removed)
@@ -335,18 +337,111 @@ Selection is left untouched."
   (let (existing (ed-pane-showing layout idx))
     (if (nil? existing) (ed-place-aside layout idx) {:layout layout :path existing})))
 
+;; ---- display-buffer rules (Emacs's `display-buffer-alist`) --------------------------------
+;; WHERE a buffer goes is the user's to say: init.blsp's `:display-buffer` is an ordered list of
+;; rules, each `{:match … :action …}`, consulted first match wins, before the defaults
+;; (`config/*display-buffer-defaults*`, which are rules too and say what every command got
+;; before there were rules). A rule's
+;;   `:match`   — a regex on the buffer's NAME (`"^\\*compilation\\*$"`), or a keyword / symbol
+;;                naming its type or a mode in its stack (`:help`, `git-status`, `:prog`);
+;;                absent, every buffer
+;;   `:request` — optional: only when the command asked for that (`:here`, `:pop`, `:display`)
+;;   `:action`  — `:same-window` (the selected pane), `:other-window` (a pane already showing
+;;                it, else one beside the selected), `:reuse` (a pane already showing it, else
+;;                the next rule decides), `:side` / `{:side :bottom :size 0.3}` (a pane along
+;;                that side of the whole frame, the fraction `:size` of it, reused while it
+;;                is there), `:new-frame` (a second window, C-x 5 2's)
+;; Selection is the COMMAND's: one that asked to pop (or to show here) moves to the buffer,
+;; a preview (`:display`) stays put — the rule says where, not whether you go there.
+
+(def *display-actions* #{:same-window :other-window :reuse :side :new-frame})
+
+(defn display-rule-action (rule)
+  "A `:display-buffer` rule's action as `{:kind … :side … :size …}`: a keyword from
+`*display-actions*`, or a map `{:side :bottom :size 0.3}` for a side window (the rule's own
+`:side` / `:size` keys serve too), defaulting to the bottom and 0.3 of the frame."
+  (let (action (:action rule)
+        side-map (if (map? action) action {}))
+    {:kind (if (map? action) :side action)
+     :side (or (:side side-map) (:side rule) :bottom)
+     :size (or (:size side-map) (:size rule) 0.3)}))
+
+(defn- name-of (value)
+  ;; a keyword's or a symbol's name, without the colon
+  (let (text (->string value))
+    (if (string/starts-with? text ":") (string/substring text 1 (string/length text)) text)))
+
+(defn display-rule-matches? (rule name buf request)
+  "Whether `:display-buffer` rule `rule` applies to the buffer `buf` named `name` shown at the
+command's `request` (`:here` / `:pop` / `:display`)."
+  (let (match (:match rule)
+        wanted (:request rule))
+    (and (or (nil? wanted) (= wanted request))
+      (cond
+        (nil? match) true
+        (string? match) (regex/match? match name)
+        (or (keyword? match) (symbol? match))
+          (or (= (name-of match) (name-of (or (:type buf) "")))
+            (not (nil? (conventions/mode-key {match true} buf))))
+        else false))))
+
+(defn- ed-display-rules (m)
+  ;; the user's rules, then the defaults — a user list need not repeat them
+  (let (user (:display-buffer m))
+    (append (if (vector? user) user []) config/*display-buffer-defaults*)))
+
+(defn ed-display-action (m name buf request)
+  "The action the first `:display-buffer` rule matching the buffer `buf` named `name` gives it
+(`display-rule-action`), skipping a `:reuse` when no pane shows it — Emacs's
+`display-buffer-reuse-window` falling through to the next action. With none, the request's
+own: `:same-window` for `:here`, else `:other-window`."
+  (let (shown? (not (nil? (ed-pane-showing (:layout m) (ed-buffer-index-by-name m name))))
+        rule (seq/find (ed-display-rules m)
+               (fn (rule)
+                 (and (display-rule-matches? rule name buf request)
+                   (or shown? (not (= (:action rule) :reuse)))))))
+    (if (nil? rule)
+      {:kind (if (= request :here) :same-window :other-window) :side :bottom :size 0.3}
+      (display-rule-action rule))))
+
+(defn- ed-place-side (layout idx side size)
+  ;; buffer `idx` in the side pane along `side`, `{:layout :path}`: the pane already there
+  ;; (its payload marked `:side`), re-pointed, else a new one along that side of the frame
+  (let (existing (seq/find (pane-leaf-paths layout)
+                   (fn (p) (= side (:side (pane-payload-at layout p))))))
+    (if (nil? existing)
+      (let (grown (pane-split-edge layout side (assoc (ed-pane idx) :side side) size)
+            paths (pane-leaf-paths grown))
+        {:layout grown :path (if (or (= side :top) (= side :left)) (first paths) (last paths))})
+      {:layout (pane-update-path layout
+                 existing
+                 (fn (w) (assoc w :buffer idx :top 0 :point nil :mark nil)))
+       :path existing})))
+
+;; check-allow: `frames-spawn-showing` is resolved late (`reflect/eval` — frames loads on
+;; demand), so its result is unknown to the checker; it answers a model
+(check-allow :trusted
+  (defn- ed-display-in-frame (m name)
+    ;; a second window showing `name` (C-x 5 2's): the live editor's; a model with no buffer
+    ;; registry (a test, a headless session) answers nil, and the caller shows it beside
+    (if (nil? (:buffer-reg m))
+      nil
+      (do (require-one 'frames) ((reflect/eval 'frames/frames-spawn-showing) m name)))))
+(sig ed-display-in-frame (model string -> (or nil model)))
 (defn ed-display-buffer (m nm text &optional (type nil) (opts {}))
   "The single place a command hands a report buffer to the window manager — an Emacs
 `display-buffer`/`pop-to-buffer` analog, so callers say WHAT to show and HOW, never WHERE.
 Upserts `nm`/`text`/`type` into the pool (stamping `type` so a special mode + its read-only
-`:activate` hook apply, and re-apply on every re-show), then places it by `(:action opts)`:
-  `:here`    — the selected pane, replacing it, and select it (the default).
-  `:pop`     — another pane, moving selection there (Emacs `pop-to-buffer`).
-  `:display` — another pane, selection left put — a preview (press-to-preview lists).
-  `:none`    — nowhere new: the pool takes it, and only a pane already showing it shows the
-              new text — a refresh landing behind a reader who has moved on.
-Reuse first: if some pane already shows `nm`, that pane is used in place — no new split —
-matching `display-buffer`'s reuse rule. The reuse seam for generated/refreshable buffers
+`:activate` hook apply, and re-apply on every re-show), then places it by the user's
+`:display-buffer` rules and the defaults after them (`ed-display-action`), given what the
+command asked for, `(:action opts)`:
+  `:here`    — show it and select it; by default the selected pane, replacing it (the default).
+  `:pop`     — show it and select it; by default another pane (Emacs `pop-to-buffer`).
+  `:display` — show it, selection left put; by default another pane — a preview.
+  `:none`    — nowhere new, whatever the rules say: the pool takes it, and only a pane already
+              showing it shows the new text — a refresh landing behind a reader who has moved on.
+Another pane is the one already showing `nm` when there is one — no new split — matching
+`display-buffer`'s reuse rule. The reuse seam for generated/refreshable buffers
 (*Process List*, *git-log*, *git-diff*, …).
 
 Two more options shape a buffer that is RE-shown as it changes rather than regenerated:
@@ -355,7 +450,7 @@ whose faces no lexer can recover — a rendered preview); `:keep-scroll` leaves 
 pane's scroll where it was instead of returning it to the top, so a refresh under a
 reader does not yank the view (the caller then places it — `mdpreview` follows the
 cursor)."
-  (let (action (:action opts :here)
+  (let (request (:action opts :here)
         m1 (ed-upsert-named m nm text type)
         idx (ed-buffer-index-by-name! m1 nm) ; `ed-upsert-named` just put it there
         m1 (if (contains? opts :spans)
@@ -363,31 +458,41 @@ cursor)."
                :buffers
                  (assoc (:buffers m1) idx (assoc (ed-buf-at m1 idx) :face-spans (:spans opts))))
              m1)
-        layout (:layout m1))
-    (if (= action :here)
-      (ed-select m1 idx)
-      (let (showing (ed-pane-showing layout idx)
-            ;; `:none` goes nowhere new: only a pane already showing it takes the new text
-            placed (cond
-                     (not (= action :none)) (ed-place-other layout idx)
-                     (nil? showing) nil
-                     else {:layout layout :path showing}))
-        (if (nil? placed)
-          m1
-          ;; Reset the target pane to the top of the (freshly regenerated) report, clearing
-          ;; any stale scroll/point a reused pane carried from a previous, longer buffer — a
-          ;; shorter refresh would otherwise render a point past the new end (out-of-bounds).
-          ;; A `:keep-scroll` caller keeps the scroll (`ed-pane-top` clamps it into the buffer).
-          (let (reset (pane-update-path (:layout placed)
-                        (:path placed)
-                        (fn (w)
-                          (if (:keep-scroll opts)
-                            (assoc w :point nil :mark nil)
-                            (assoc w :top 0 :point nil :mark nil))))
-                m2 (assoc m1 :layout reset))
-            (if (= action :pop)
-              (assoc m2 :layout (pane-select-path (:layout m2) (:path placed)))
-              m2)))))))
+        layout (:layout m1)
+        showing (ed-pane-showing layout idx)
+        action (if (= request :none)
+                 {:kind :none}
+                 (ed-display-action m1 nm (ed-buf-at m1 idx) request))
+        kind (:kind action)
+        framed (when (= kind :new-frame) (ed-display-in-frame m1 nm)))
+    (cond
+      (not (nil? framed)) framed
+      (= kind :same-window) (ed-select m1 idx)
+      else
+        (let (placed (case kind
+                       :none (if (nil? showing) nil {:layout layout :path showing})
+                       :reuse {:layout layout :path showing}
+                       :side (ed-place-side layout idx (:side action) (:size action))
+                       (ed-place-other layout idx))
+              m1 (if (and (= kind :new-frame) (nil? framed))
+                   (message m1 "a new frame needs the live editor; shown beside instead")
+                   m1))
+          (if (nil? placed)
+            m1
+            ;; Reset the target pane to the top of the (freshly regenerated) report, clearing
+            ;; any stale scroll/point a reused pane carried from a previous, longer buffer — a
+            ;; shorter refresh would otherwise render a point past the new end (out-of-bounds).
+            ;; A `:keep-scroll` caller keeps the scroll (`ed-pane-top` clamps it into the buffer).
+            (let (reset (pane-update-path (:layout placed)
+                          (:path placed)
+                          (fn (w)
+                            (if (:keep-scroll opts)
+                              (assoc w :point nil :mark nil)
+                              (assoc w :top 0 :point nil :mark nil))))
+                  m2 (assoc m1 :layout reset))
+              (if (or (= request :pop) (= request :here))
+                (assoc m2 :layout (pane-select-path (:layout m2) (:path placed)))
+                m2)))))))
 
 (defn ed-show-named (m nm text &optional (type nil))
   "Show report buffer `nm`/`text`/`type` in the selected pane (replacing it) and select it —

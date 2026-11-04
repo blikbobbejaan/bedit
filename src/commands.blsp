@@ -32,8 +32,10 @@ model lives in `std/buffer.blsp`; keymaps in `input`."
   (:use keyhelp) ; key / command labels, where-is, docstrings
   (:use scroll) ; ed-scroll / ed-max-top / ed-long-lines — keeping point on screen
   (:use autosave) ; auto-save sidecars + auto-revert
+  (:use electric :only [pairs-for]) ; electric pairs: the buffer's pairs and when they pair
+  (:use fill :only [ed-auto-fill]) ; M-q and auto-fill — a typed space or RET breaks the line
   ;; a buffer's indent width / tab width / tabs / fill column, by mode, init.blsp and .editorconfig
-  (:use conventions :only [with-indent-width indent-width tab-width fill-column indentation])
+  (:use conventions :only [with-indent-width indent-width tab-width indentation])
   (:use model)) ; current-buffer accessors, the kill ring, message
 ;; Tree-sitter's structural motions (ruby/elixir-mode) are REQUIRED, not `:use`d. They
 ;; share several names with `sexp` — `point-defun-start`, `point-down`, … — and two `:use`s
@@ -673,7 +675,7 @@ tutorial), which outrank the vim profile, so the check has to live here."
     (cmd-next-line m key)
     ;; the indent is asked of the text the newline made: the held tree is followed to it
     ;; (an incremental update of one splice) rather than the indenter parsing the document
-    (ed-edit-following-tree m
+    (ed-edit-following-tree (ed-auto-fill m)
       (fn (b held follow)
         (let (nb (insert b "\n")
               current (follow held nb))
@@ -842,11 +844,53 @@ one undo step."
   ;; a delete command's edit: the region when there is one to replace, else `edit`
   (fn (b) (if (selection-to-replace? m b) (delete-region b) (edit b))))
 
+(defn- ed-type (m key)
+  ;; the plain insert every typing command falls back to — over the region when
+  ;; delete-selection is on — with auto-fill's break first when a space runs past the column
+  (ed-edit (if (= key " ") (fill/ed-auto-fill m) m) (fn (b) (insert-replacing m b key))))
+
 (defcommand cmd-self-insert
   (m key)
   "Insert the typed character `key` (a 1-char string) at point — over the region when
-delete-selection is on (`insert-replacing`)."
-  (ed-edit m (fn (b) (insert-replacing m b key))))
+delete-selection is on (`insert-replacing`). A character the buffer's electric pairs name
+(`electric/pairs-for` — `'` in Python, a backtick in Markdown, a user's `<`) is electric here
+whatever key typed it: it goes to [[cmd-open-delimiter]] or [[cmd-electric-close]]. A space past
+the fill column breaks the line when the buffer auto-fills (`fill/ed-auto-fill`)."
+  (let (b (ed-current-buf m)
+        pairs (when (string? key) (electric/pairs-for m b)))
+    (cond
+      (nil? pairs) (ed-type m key)
+      (or (electric/opener-pair pairs key) (electric/triple-pair pairs b key))
+        (cmd-open-delimiter m key)
+      (electric/closer-pair pairs key) (cmd-electric-close m key)
+      else (ed-type m key))))
+
+;; ---- electric brackets -----------------------------------------------------------
+;; The policy — which pairs a buffer has, when an opener pairs, the switches — is `electric`'s;
+;; these are the keys. Two behaviours, split the way Emacs splits them:
+;;  - an opener or closer typed over an ACTIVE REGION wraps the region — always, since a
+;;    selection plus a bracket has exactly one meaning;
+;;  - otherwise, with electric-pair-mode on in the buffer, an opener types its pair and lands
+;;    inside (`insert-pair`), a closer at point is stepped over, and a backspace between an
+;;    empty pair takes both (`delete-empty-pair`) — so what one key put there, one key takes
+;;    away. The mechanism is std's (`sexp/wrap-region`, `editor/buffer`'s `insert-pair` /
+;;    `delete-empty-pair`).
+
+(defn- step-to (m offset)
+  ;; point moved to `offset`: stepping over a closer
+  (ed-apply m (fn (bb) (goto-char bb offset))))
+
+(defn- wrap-region-in (m pair after-close?)
+  ;; the active region wrapped in `pair`, point inside the opener — or after the closer when
+  ;; a closer was typed (Emacs's electric-pair does the same)
+  (ed-edit m
+    (fn (bb)
+      (let ([lo hi] (buffer-region-bounds bb)
+            [open close] pair
+            wrapped (sexp/wrap-region bb open close))
+        (if after-close?
+          (goto-char wrapped (+ hi (string/length open) (string/length close)))
+          wrapped)))))
 
 (defcommand cmd-close-delimiter
   (m key)
@@ -854,119 +898,94 @@ delete-selection is on (`insert-replacing`)."
 are in, move over it instead of typing a second (`editor/highlight/closer-redundant?`).
 
 Emacs's `electric-pair-mode` skip, and paredit's `close-round`: with point at `(+ 1 2|)`,
-typing `)` gives you `(+ 1 2)|` rather than `(+ 1 2))`. The condition is about the enclosing
-FORM, not the next character, which is what keeps it from eating a delimiter you meant — at
-top level a stray `)` closes nothing and is typed, `[1 2|)` is a mismatch and is typed, and
-inside a string or a comment a bracket is a character and is typed. Bound on brood-keymap
-(every other mode has [[cmd-electric-close]], which steps over the closer at point): the scan
-reads Brood syntax (`;` comments, `\"` strings), which is not Ruby's."
-  (let (b (ed-current-buf m))
+typing `)` gives you `(+ 1 2)|` rather than `(+ 1 2))`, and a closer past whitespace is stepped to
+as well, newlines included (`electric-pair-skip-whitespace`). The condition is about the enclosing
+FORM, not the next character, which is what keeps it from eating a delimiter you meant — at top
+level a stray `)` closes nothing and is typed, `[1 2|)` is a mismatch and is typed, and inside a
+string or a comment a bracket is a character and is typed. Over an active region it wraps the
+region, point after the closer. Bound on brood-keymap (every other mode has
+[[cmd-electric-close]], which counts the balance): the scan reads Brood syntax (`;` comments,
+`\"` strings), which is not Ruby's."
+  (let (b (ed-current-buf m)
+        pair (electric/closer-pair (electric/pairs-for m b) key))
     ;; Over the rope (brood ADR-488): the test reads the char at point first, and only when it
     ;; is this closer the top-level form up to point — never the whole buffer, which a
     ;; `buffer-text` copy and its char-index build cost (~4 ms per keystroke on a 2 MB file).
-    (if (and b (editor/highlight/closer-redundant? (buffer-rope b) (buffer-point b) key))
-      (ed-apply m (fn (bb) (goto-char bb (inc (buffer-point bb)))))
-      (cmd-self-insert m key))))
+    (cond
+      (and pair (buffer-region-bounds b)) (wrap-region-in m pair true)
+      (editor/highlight/closer-redundant? (buffer-rope b) (buffer-point b) key)
+        (step-to m (inc (buffer-point b)))
+      else
+        (let (ahead (when (electric/electric-pair-in? m b) (electric/closer-ahead b key)))
+          (if (and ahead
+                (> ahead (inc (buffer-point b)))
+                (editor/highlight/closer-redundant? (buffer-rope b) (dec ahead) key))
+            (step-to m ahead)
+            (ed-type m key))))))
 
 (defcommand cmd-electric-close
   (m key)
-  "Type the closing bracket `key` — or, with electric-pair-mode on and that closer already at
-point, step over it: Emacs's `electric-pair-mode` skip, for every mode that has no reader of
-its own. A brood buffer binds `cmd-close-delimiter` instead, which also knows whether the
-closer belongs to the form you are in."
-  (let (b (ed-current-buf m))
-    (if (and b (electric-pair? m) (= (buffer-char-after b) key) (not (selection-to-replace? m b)))
-      (ed-apply m (fn (bb) (goto-char bb (inc (buffer-point bb)))))
-      (cmd-self-insert m key))))
-
-;; ---- electric brackets (brood-mode) ------------------------------------------
-;; Two behaviours behind the bracket keys, split the way Emacs splits them:
-;;  - an opener typed over an ACTIVE REGION wraps the region (`sexp/wrap-region`) —
-;;    always, since a selection plus a bracket has exactly one meaning;
-;;  - otherwise, with `electric-pair-mode` on (the default), an opener types its pair
-;;    and lands inside (`insert-pair`), a closer already there is stepped over
-;;    (`cmd-close-delimiter`, above), and a backspace between an empty pair takes both
-;;    (`delete-empty-pair`) — so what one key put there, one key takes away.
-;; `M-x electric-pair-mode` toggles the second half; `(config :electric-pair false)`
-;; starts with it off. The mechanism is std's (`sexp/wrap-region`, `editor/buffer`'s
-;; `insert-pair` / `delete-empty-pair`); this is the policy.
-(def *bracket-pairs* {"(" ")" "[" "]" "{" "}"})
-
-;; Self-closing pairs — a delimiter whose opener and closer are the SAME character, so one
-;; key both opens and (typed again) skips over the close. `"` is the one that earns this in
-;; a Brood editor: it opens a string and lands you inside. `'` is deliberately NOT here —
-;; in Brood `'` is the quote operator (`'foo`) and in prose an apostrophe (`don't`), so
-;; auto-pairing it fights the writer; Emacs inhibits it heuristically for the same reason.
-;; A different mode may bind `'` to `cmd-open-delimiter` where it is a real pair.
-(def *self-pairs* {"\"" "\""})
-
-(sig delim-close (string -> (or nil string)))
-(defn delim-close (key)
-  "The closer for opening delimiter `key` — a bracket (`(`→`)`) or a self-closing quote
-(`\"`→`\"`), or nil for anything that is not an electric opener."
-  (or (get *bracket-pairs* key) (get *self-pairs* key)))
-
-(sig electric-pair? (model -> bool))
-(defn electric-pair? (m)
-  "Whether electric-pair-mode is on — the model's `:electric-pair?`, default true."
-  (let (on (:electric-pair? m)) (if (nil? on) true (= on true))))
-
-(defn- self-pair-should-open? (b key)
-  "For a self-closing delimiter (`\"`): open a fresh pair only where a quote plausibly
-STARTS one — at the buffer edge, after whitespace, or right after an opening bracket. After
-a word or another quote it self-inserts instead, which is how you close a string you typed
-by hand (`\"hello world|` + `\"` → `\"hello world\"`, not a new empty pair)."
-  (let (before (buffer-char-before b))
-    (or (nil? before)
-      (string/blank? before)
-      (not (nil? (get *bracket-pairs* before))))))
+  "Type the closing bracket `key` — or, with electric-pair-mode on in the buffer and that closer
+at point or past only whitespace (newlines included), step over it while that keeps the brackets
+balanced (`electric/skip-target`, Emacs's `electric-pair-preserve-balance`): `(a|)` + `)` steps,
+`((a|)` + `)` types the second closer the first opener needs. Over an active region it wraps the
+region in the pair, point after the closer. A brood buffer binds `cmd-close-delimiter` instead,
+which reads the form you are in."
+  (let (b (ed-current-buf m)
+        pair (electric/closer-pair (electric/pairs-for m b) key))
+    (cond
+      (and pair (buffer-region-bounds b)) (wrap-region-in m pair true)
+      (and pair (electric/electric-pair-in? m b) (not (selection-to-replace? m b)))
+        (let ([m2 info] (stringstate/ed-point-state m)
+              target (electric/skip-target m2 b pair key info))
+          (if target (step-to m2 target) (ed-type m2 key)))
+      else (ed-type m key))))
 
 (defcommand cmd-open-delimiter
   (m key)
-  "Type the opening delimiter `key`. Over an active region, wrap the region in the pair
-(point lands inside the opener). For a self-closing quote already at point, step over it
-(one `\"` closes the string rather than typing a second). Otherwise, with
-electric-pair-mode on, type the pair and land between — a quote only where one plausibly
-opens ([[self-pair-should-open?]]); else just the character. Bound to `(` `[` `{` `\"` in
-every buffer (the global keymap; brood-keymap too)."
-  (let (close (delim-close key)
-        b (ed-current-buf m)
-        self? (= key close))
+  "Type the opening delimiter `key`. Over an active region, wrap the region in the pair (point
+lands inside the opener). With electric-pair-mode on in the buffer, where point stands decides
+(`stringstate/ed-point-state`, Emacs's `syntax-ppss` — the held parse, else the mode's string
+syntax over the cached state of point's line): the last character of a triple quote in code
+(`\"\"` + `\"`) opens the triple and its closer (`electric/triple-pair`); a quote opens a pair in
+code, closes the string it is in, steps over that string's closer (`electric/quote-action`); a
+bracket types its pair and lands between unless Emacs's inhibit and balance rules say not
+(`electric/should-pair?`). The pairs are the buffer's mode's (`electric/pairs-for`); a key it
+does not pair is just typed. Bound to `(` `[` `{` `\"` in every buffer, and reached from
+[[cmd-self-insert]] for any other opener a mode pairs."
+  (let (b (ed-current-buf m)
+        pairs (electric/pairs-for m b)
+        pair (electric/opener-pair pairs key)
+        triple (electric/triple-pair pairs b key))
     (cond
-      (nil? close) (cmd-self-insert m key)
-      (buffer-region-bounds b) (ed-edit m (fn (bb) (sexp/wrap-region bb key close)))
-      ;; a self-closing quote sitting at point: skip over it instead of doubling it
-      (and self? (= (buffer-char-after b) key))
-        (ed-apply m (fn (bb) (goto-char bb (inc (buffer-point bb)))))
-      (and (electric-pair? m) (or (not self?) (self-pair-should-open? b key)))
-        (ed-edit m (fn (bb) (insert-pair bb key close)))
-      else (cmd-self-insert m key))))
+      (and pair (buffer-region-bounds b)) (wrap-region-in m pair false)
+      (or (and (nil? pair) (nil? triple)) (not (electric/electric-pair-in? m b))) (ed-type m key)
+      else
+        (let ([m2 info] (stringstate/ed-point-state m))
+          (cond
+            (and triple (nil? (:inside info)) (not (electric/in-comment? info)))
+              (ed-edit m2 (fn (bb) (insert-pair bb key (second triple))))
+            (nil? pair) (ed-type m2 key)
+            (= (first pair) (second pair))
+              (case (electric/quote-action m2 b key info)
+                :skip (step-to m2 (inc (buffer-point b)))
+                :pair (ed-edit m2 (fn (bb) (insert-pair bb key (second pair))))
+                (ed-type m2 key))
+            (electric/should-pair? m2 b pair key info)
+              (ed-edit m2 (fn (bb) (insert-pair bb key (second pair))))
+            else (ed-type m2 key))))))
 
 (defcommand cmd-electric-backspace
   (m key)
-  "Backspace — and, with electric-pair-mode on and point between an empty pair (`(|)`),
-delete both delimiters; with a region delete-selection replaces, the region. Bound to
-Backspace in every buffer (the global keymap)."
-  (if (and (electric-pair? m) (not (selection-to-replace? m (ed-current-buf m))))
-    (ed-edit m
-      (fn (b)
-        (let (before (buffer-char-before b))
-          (if (nil? before)
-            (delete-backward-char b)
-            (let (close (delim-close before))
-              (if (and close (= (buffer-char-after b) close))
-                (delete-empty-pair b before close)
-                (delete-backward-char b)))))))
-    (cmd-delete-backward m key)))
-
-(defcommand cmd-electric-pair-mode
-  (m key)
-  "Toggle electric-pair-mode: whether an opening bracket types its pair and a backspace
-between an empty pair takes both. Wrapping a selection with a bracket is not affected —
-that has one meaning either way."
-  (let (on (not (electric-pair? m)))
-    (message (assoc m :electric-pair? on)
-      (if on "Electric pair mode enabled" "Electric pair mode disabled"))))
+  "Backspace — and, with electric-pair-mode on in the buffer and point between an empty pair of
+its mode (`(|)`), delete both delimiters; with a region delete-selection replaces, the region.
+Bound to Backspace in every buffer (the global keymap)."
+  (let (b (ed-current-buf m)
+        pair (when (and (electric/electric-pair-in? m b) (not (selection-to-replace? m b)))
+               (electric/empty-pair-at m b)))
+    (if pair
+      (ed-edit m (fn (bb) (delete-empty-pair bb (first pair) (second pair))))
+      (cmd-delete-backward m key))))
 
 ;; ---- rectangles (Emacs C-x r k/M-w/d/y/o/c/t) --------------------------------
 ;; The column-block editing ops of `editor/buffer` (`extract`/`delete`/`open`/`clear`/
@@ -1031,7 +1050,11 @@ block, closing the gap. Yank it back with C-x r y."
         {:edit (ed-mb-edit "String rectangle: " "")
          :on-complete (fn (mm t) (ed-edit mm (fn (b) (string-rectangle b t))))})))
 
-(defcommand cmd-newline (m key) (ed-edit m (fn (b) (insert-replacing m b "\n"))))
+(defcommand cmd-newline
+  (m key)
+  "Insert a newline at point (RET) — over the region when delete-selection is on; a line past
+the fill column is broken first when the buffer auto-fills (`fill/ed-auto-fill`)."
+  (ed-edit (ed-auto-fill m) (fn (b) (insert-replacing m b "\n"))))
 (defcommand cmd-delete-char (m key) (ed-edit m (deleting-selection m delete-char)))
 (defcommand cmd-delete-backward (m key) (ed-edit m (deleting-selection m delete-backward-char)))
 
@@ -1320,34 +1343,6 @@ on: nothing you cycle through is lost."
 
 ;; (cycle-spacing's stash lives on the model as `:cycle-spacing`; nothing else reads it,
 ;; and `:last-command` is what decides whether it is still live.)
-
-;; ---- fill-paragraph (M-q) ---------------------------------------------------
-;; The line-breaking itself is `string/fill` — a general `string -> string`
-;; word-wrap, no editor dependency, promoted out of here so the REPL / doc tools can
-;; share it. This command is just the editor *policy*: find the paragraph, wrap it, put
-;; it back (preserving the trailing blank-line separation).
-
-(defcommand cmd-fill-paragraph
-  (m key)
-  "Re-wrap the paragraph around point to the buffer's fill column (M-q;
-`conventions/fill-column` — its .editorconfig's `max_line_length`, the user's
-`:fill-column`, the mode's, else 70), preserving the blank-line
-separation after it. The paragraph's prefix — its indentation and a comment or quote marker
-(`string/fill-prefix`) — is kept on every line: without it, `;; aa` / `;; bb` came back as
-`;; aa ;; bb` and an indented paragraph lost its indentation."
-  (ed-edit m
-    (fn (b)
-      (let (s (buffer-point (backward-paragraph b))
-            e (buffer-point (forward-paragraph (goto-char b s)))
-            para (buffer-region (assoc b :mark s :point e)))
-        (if (or (nil? para) (= para ""))
-          b
-          (let (
-                ;; the prefix as the paragraph's first non-blank line spells it
-                first-line (first (seq/reject (string/split para "\n")
-                                    (fn (l) (= (string/trim l) ""))))
-                filled (string/fill para (fill-column b) (string/fill-prefix (or first-line ""))))
-            (replace-region b s e (if (string/ends-with? para "\n") (str filled "\n") filled))))))))
 
 ;; ---- read-only toggle / spit / revert (C-x C-q / C-x C-w / revert) ----
 
@@ -2571,6 +2566,18 @@ any frame has laid the panes out — `ed-layout-now`)."
       (message m (str "no window " (get ed-dir-name dir)))
       (assoc m :layout (pane-select-path (:layout m) to)))))
 
+(defn ed-keep-sides (before after)
+  "`after` — `before` with its payloads moved between the same leaves (a swap, a rotation) —
+with each leaf's `:side` mark as it was in `before`: a side window (`pool/ed-display-buffer`'s
+`:side` rule) is a PLACE, so the buffer moved into it is shown there and the mark stays."
+  (fold (pane-leaf-paths after)
+    after
+    (fn (tree path)
+      (let (side (:side (pane-payload-at before path)))
+        (pane-update-path tree
+          path
+          (fn (payload) (if (nil? side) (dissoc payload :side) (assoc payload :side side))))))))
+
 (sig ed-swap-pane (model keyword -> model))
 (defn ed-swap-pane (m dir)
   "Move the selected pane's buffer into the pane in direction `dir`, taking that pane's
@@ -2580,7 +2587,8 @@ buffer (`buffer-move`'s `buf-move-<dir>`). At the edge, says so."
     (if (nil? to)
       (message m (str "no window " (get ed-dir-name dir) " to swap with"))
       (let (here (pane-selected-path (:layout m)))
-        (assoc m :layout (pane-select-path (pane-swap (:layout m) here to) to))))))
+        (assoc m
+          :layout (pane-select-path (ed-keep-sides (:layout m) (pane-swap (:layout m) here to)) to))))))
 
 (defcommand cmd-windmove-left
   (m key)
@@ -2593,35 +2601,60 @@ buffer (`buffer-move`'s `buf-move-<dir>`). At the edge, says so."
 (defcommand cmd-windmove-up (m key) "Select the pane above (M-<up>)." (ed-windmove m :up))
 (defcommand cmd-windmove-down (m key) "Select the pane below (M-<down>)." (ed-windmove m :down))
 
-(defcommand cmd-swap-pane-left
+(defcommand cmd-windmove-swap-states-left
   (m key)
-  "Move this window left: swap its buffer with the pane to the left and follow it (C-S-<left>)."
+  "Move this window left: swap its buffer with the pane to the left and follow it (Emacs
+`windmove-swap-states-left`). Bound to C-S-<left>, and to Emacs's own s-S-<left>
+(`windmove-swap-states-default-keybindings` binds Shift+Super + arrows unless given other
+modifiers) — which a desktop may keep for itself (GNOME moves a window between monitors with
+it), so C-S-<left> is the key that always arrives."
   (ed-swap-pane m :left))
-(defcommand cmd-swap-pane-right
+(defcommand cmd-windmove-swap-states-right
   (m key)
-  "Move this window right: swap its buffer with the pane to the right and follow it (C-S-<right>)."
+  "Move this window right: swap its buffer with the pane to the right and follow it (Emacs
+`windmove-swap-states-right`). Bound to C-S-<right>, and to Emacs's own s-S-<right>, which a
+desktop may keep for itself — see [[cmd-windmove-swap-states-left]]."
   (ed-swap-pane m :right))
-(defcommand cmd-swap-pane-up
+(defcommand cmd-windmove-swap-states-up
   (m key)
-  "Move this window up: swap its buffer with the pane above and follow it (C-S-<up>)."
+  "Move this window up: swap its buffer with the pane above and follow it (Emacs
+`windmove-swap-states-up`). Bound to C-S-<up>, and to Emacs's own s-S-<up>, which a desktop
+may keep for itself — see [[cmd-windmove-swap-states-left]]."
   (ed-swap-pane m :up))
-(defcommand cmd-swap-pane-down
+(defcommand cmd-windmove-swap-states-down
   (m key)
-  "Move this window down: swap its buffer with the pane below and follow it (C-S-<down>)."
+  "Move this window down: swap its buffer with the pane below and follow it (Emacs
+`windmove-swap-states-down`). Bound to C-S-<down>, and to Emacs's own s-S-<down>, which a
+desktop may keep for itself — see [[cmd-windmove-swap-states-left]]."
   (ed-swap-pane m :down))
+
+(defcommand cmd-window-swap-states
+  (m key)
+  "Swap this window's buffer with the next window's (Emacs `window-swap-states`, M-x
+window-swap-states): each pane shows what the other did, scroll and point with it, and
+selection stays in this pane — now on the other buffer. With one window, says so."
+  (let (layout (:layout m)
+        here (pane-selected-path layout)
+        paths (pane-leaf-paths layout))
+    (if (< (count paths) 2)
+      (message m "no other window to swap with")
+      (let (next (nth paths (math/mod (inc (index-of paths here)) (count paths))))
+        (assoc m :layout (ed-keep-sides layout (pane-swap layout here next)))))))
 
 (defcommand cmd-rotate-panes
   (m key)
   "Rotate every pane's buffer one step forward through the layout (M-x rotate-windows;
 `C-u N` for N steps, a negative argument turns the other way). Selection stays in
 place, so the pane you are in shows the next buffer along."
-  (message (assoc m :layout (pane-rotate (:layout m) 1)) "windows rotated"))
+  (message (assoc m :layout (ed-keep-sides (:layout m) (pane-rotate (:layout m) 1)))
+    "windows rotated"))
 
 (defcommand cmd-rotate-panes-backward
   (m key)
   "Rotate every pane's buffer one step backward through the layout (M-x
 rotate-windows-backward) — `rotate-windows` under a negative argument."
-  (message (assoc m :layout (pane-rotate (:layout m) -1)) "windows rotated back"))
+  (message (assoc m :layout (ed-keep-sides (:layout m) (pane-rotate (:layout m) -1)))
+    "windows rotated back"))
 (register-inverse 'commands/cmd-rotate-panes 'commands/cmd-rotate-panes-backward)
 
 (defcommand cmd-transpose-panes

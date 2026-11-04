@@ -1,0 +1,163 @@
+;; tests/display_buffer_test.blsp — init.blsp's `:display-buffer` rules (Emacs's
+;; display-buffer-alist): each action, rule order, a rule matched by name, by type and by what
+;; the command asked, `:reuse` falling through, the side window kept as a place, and the
+;; defaults expressed as rules.
+;;
+;; The placement mechanism (`ed-display-buffer` with no rules: :here / :pop / :display / :none
+;; and the reuse of a pane already showing the buffer) is pinned in panes_projects_test; these
+;; pin the rules over it. `pane-split-edge` is std's (brood ADR-590).
+
+(defmodule display-buffer-test
+  (:use test)
+  (:use model)
+  (:use pool)
+  (:use editor/pane)
+  (:use editor/buffer)
+  (:use input :only [ed-update])
+  (:use config)) ; *config-base* — a scratch config dir: a new frame reads its window options
+
+(defn- work (&optional (rules nil))
+  ;; one pane on "work", with `rules` as the user's `:display-buffer`
+  (let (m (ed-init (make-buffer "text" "work")))
+    (if (nil? rules) m (assoc m :display-buffer rules))))
+(defn- current-name (m) (buffer-name (ed-current-buf m)))
+(defn- shown (m)
+  ;; the buffer name in every pane, in traversal order
+  (map (pane-leaf-paths (:layout m))
+    (fn (p) (buffer-name (ed-buf-at m (:buffer (pane-payload-at (:layout m) p)))))))
+(defn- show (m name request &optional (type nil))
+  (ed-display-buffer m name "body" type {:action request}))
+
+(describe "each action"
+  (test ":same-window shows it in the selected pane even when the command asked to pop"
+    (let (m (show (work [{:match "^\\*rep\\*$" :action :same-window}]) "*rep*" :pop))
+      (assert= (shown m) (list "*rep*"))
+      (assert= (current-name m) "*rep*")))
+  (test ":other-window splits for a command that asked to show it here, and goes there"
+    (let (m (show (work [{:match "rep" :action :other-window}]) "*rep*" :here))
+      (assert= (shown m) (list "work" "*rep*"))
+      (assert= (current-name m) "*rep*")))
+  (test "a preview keeps selection whatever the rule: the rule says where, not whether you go"
+    (let (m (show (work [{:match "rep" :action :other-window}]) "*rep*" :display))
+      (assert= (shown m) (list "work" "*rep*"))
+      (assert= (current-name m) "work")))
+  (test ":reuse takes a pane already showing it — the selected one too — and falls through without"
+    (let (rules [{:match "rep" :action :reuse} {:match "rep" :action :same-window}]
+          first-time (show (work rules) "*rep*" :pop))
+      ;; nothing shows it yet: the next rule (same window) decides
+      (assert= (shown first-time) (list "*rep*"))
+      ;; split, go back to the other pane, show it again: the pane already showing it is used
+      (let (work-index (ed-buffer-index-by-name first-time "work")
+            split (assoc first-time
+                    :layout
+                      (pane-select-path (pane-split (:layout first-time) :col (ed-pane work-index))
+                        '(:b)))
+            again (show split "*rep*" :pop))
+        (assert= (current-name split) "work")
+        (assert= (shown again) (list "*rep*" "work"))
+        (assert= (current-name again) "*rep*"))))
+  (test ":side puts it along that side of the whole frame, at its size, and reuses that pane"
+    (let (two (show (work) "*left*" :pop)
+          rules [{:match "compilation" :action {:side :bottom :size 0.25}}]
+          m (show (assoc two :display-buffer rules) "*compilation*" :display))
+      (assert= (count (shown m)) 3)
+      (assert= (:dir (:layout m)) :row) ; the whole frame was split, not the selected pane
+      (assert= (:ratio (:layout m)) 0.75)
+      (assert= (last (shown m)) "*compilation*")
+      (assert= (:side (pane-payload-at (:layout m) '(:b))) :bottom)
+      ;; another buffer the same rule sends there takes the same side pane
+      (let (rules2 [{:match "compil|grep" :action :side :side :bottom}]
+            again (show (assoc m :display-buffer rules2) "*grep*" :display))
+        (assert= (count (shown again)) 3)
+        (assert= (last (shown again)) "*grep*"))))
+  (test ":side :top and :left come first"
+    (let (m (show (work [{:match "rep" :action {:side :left :size 0.2}}]) "*rep*" :pop))
+      (assert= (shown m) (list "*rep*" "work"))
+      (assert= (current-name m) "*rep*")))
+  (test ":new-frame without the live editor shows it beside and says why"
+    (let (m (show (work [{:match "rep" :action :new-frame}]) "*rep*" :pop))
+      (assert= (shown m) (list "work" "*rep*"))
+      (is (includes? (:echo m) "new frame")))))
+
+;; ---- :new-frame, live: a second frame process opened by the rule --------------------------
+;; A frame is its own process running its own `ui-run` (frames.blsp); headless, its window is
+;; a fake one and its loop runs unchanged. To ask a running frame what it shows, the test
+;; registers an event handler its loop dispatches like any other inbound `[tag …]` event.
+
+(defn answer-current (m input textrows cols rows)
+  "A test probe's handler: `[:display-buffer-test-ask pid]` — send `pid` the name of the buffer
+this loop's selected pane shows."
+  (do (send (second input) [:display-buffer-test-shows (buffer-name (ed-current-buf m))]) m))
+(register-event-handler :display-buffer-test-ask 'display-buffer-test/answer-current)
+
+(defn- frame-shows (pid deadline)
+  ;; what frame `pid` shows once it shows something other than its scratch, asked until
+  ;; `deadline` (ms, `os/now`) — the frame adopts the buffer when the registry
+  ;; announces it, an event routed through a third process, so this polls rather than guesses
+  (send pid [:display-buffer-test-ask (self)])
+  (let (answer (receive ([:display-buffer-test-shows name] name) (after 200 nil)))
+    (if (or (and answer (not (= answer "*scratch*"))) (> (os/now) deadline))
+      answer
+      (frame-shows pid deadline))))
+
+(describe ":new-frame, live"
+  :isolated (test "the rule opens a second frame process, and that frame shows the buffer"
+    (if (not (gui/headless?))
+      ;; a test never opens a real window over the desktop: run it headless
+      (is true)
+      (let (base (path/join (temp-dir "bedit-new-frame-") "config")
+            reg (editor/buffer-registry/registry-start)
+            primary (ed-update (assoc (work [{:match "rep" :action :new-frame}])
+                                 :host-buffers? true
+                                 :buffer-reg reg)
+                      :right 80 24)
+            shown-frame (binding (*config-base* base) (show primary "*rep*" :pop))
+            ;; the loop's next turn hosts the new buffer, which shares it through the registry
+            hosted (ed-update shown-frame :right 80 24)
+            pid (first (:frames hosted)))
+        (is (pid? pid))
+        (is (includes? (:echo shown-frame) "frame opened on *rep*"))
+        ;; this frame is as it was: the buffer went to the other one
+        (assert= (shown hosted) (list "work"))
+        (assert= (frame-shows pid (+ (os/now) 10000)) "*rep*")
+        (frames/frames-close-all hosted)
+        (editor/buffer-registry/registry-stop reg)))))
+
+(describe "which rule"
+  (test "the first matching rule wins"
+    (let (m (show (work [{:match "rep" :action :same-window} {:match "rep" :action :other-window}])
+              "*rep*" :pop))
+      (assert= (shown m) (list "*rep*"))))
+  (test "a rule names a buffer by type or mode as well as by name"
+    (let (m (show (work [{:match :help :action :other-window}]) "*Help*" :here :help))
+      (assert= (shown m) (list "work" "*Help*")))
+    (let (m (show (work [{:match :help :action :other-window}]) "*rep*" :here))
+      (assert= (shown m) (list "*rep*"))))
+  (test "`:request` limits a rule to what the command asked"
+    (let (rules [{:match "rep" :request :display :action :same-window}])
+      (assert= (shown (show (work rules) "*rep*" :display)) (list "*rep*"))
+      (assert= (shown (show (work rules) "*rep*" :pop)) (list "work" "*rep*"))))
+  (test ":none is never placed by a rule"
+    (let (m (show (work [{:match "rep" :action :other-window}]) "*rep*" :none))
+      (assert= (shown m) (list "work"))
+      (is (not (nil? (ed-buffer-index-by-name m "*rep*")))))))
+
+(describe "the defaults are rules"
+  (test "with no rule of the user's, the defaults give what each request always did"
+    (assert= (shown (show (work) "*rep*" :here)) (list "*rep*"))
+    (assert= (shown (show (work) "*rep*" :pop)) (list "work" "*rep*"))
+    (assert= (current-name (show (work) "*rep*" :display)) "work"))
+  (test "the setting's default value is those rules, which C-h v shows, and they are valid"
+    (assert= (config/setting {} :display-buffer) config/*display-buffer-defaults*)
+    (is (config/display-buffer-valid? config/*display-buffer-defaults*))
+    (is (every? config/*display-buffer-defaults* (fn (rule) (contains? rule :request)))))
+  (test "a user's rules come first and the defaults still follow them"
+    (let (m (work [{:match "only-this" :action :same-window}]))
+      (assert= (shown (show m "*rep*" :pop)) (list "work" "*rep*"))))
+  (test "the setting checks a rule's shape"
+    (is (config/display-buffer-valid? [{:match "x" :action {:side :bottom :size 0.3}}]))
+    (is (config/display-buffer-valid? [{:match :help :action :reuse}]))
+    (is (not (config/display-buffer-valid? [{:match "x" :action :sideways}])))
+    (is (not (config/display-buffer-valid? [{:match "x" :action {:side :middle}}])))
+    (is (not (config/display-buffer-valid? [{:match "x" :action :side :size 3}])))
+    (is (not (config/display-buffer-valid? {:match "x"})))))

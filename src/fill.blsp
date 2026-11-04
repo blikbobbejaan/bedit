@@ -1,0 +1,306 @@
+(defmodule fill
+  "Filling — M-q (`fill-paragraph`) and `auto-fill-mode` — as the editor's POLICY over std's
+`string/fill`: which lines are the paragraph, which prefixes it keeps, where point lands.
+
+**The prefixes** are Emacs's adaptive fill (`string/fill-prefixes`): the first line keeps its
+own — indentation, a comment or quote marker, a list bullet — and the lines after it take the
+paragraph's SECOND line's, or for a one-line paragraph the first's with its bullet turned to
+spaces. So a list item continues under its text (a HANGING indent), a `;;` / `#` / `//` / `>`
+paragraph keeps its marker, and an indented paragraph keeps its indentation. A mode may answer
+for itself through its `:fill-prefixes` facet (Emacs's `adaptive-fill-function`): the Lisps
+continue a one-line docstring at column 0 (`docstring-fill-prefixes`).
+
+**The paragraph** is the run of non-blank lines around point, narrowed the way Emacs's modes
+narrow it with `paragraph-start`:
+  - to the lines that share point's line's comment or quote MARKER — so M-q in a comment
+    above code fills the comment and leaves the code alone, and a `> ` quote stops at the
+    text after it;
+  - to the list ITEM point is in — a line starting with a bullet starts a new one, so a list
+    is never run together into one line;
+  - by the mode's `:fill-separate` facet, a regex of lines that are paragraphs of their own
+    (an Org heading, a Markdown fence);
+  - in code, outside a comment, to the lines of the string point is in — a docstring — found
+    by the mode's string syntax (`stringstate`), so it needs no grammar; elsewhere in code
+    there is nothing to fill.
+
+**Auto-fill** (`M-x auto-fill-mode`, per buffer; the `:auto-fill` setting per mode, as a
+`text-mode-hook` turns it on) breaks the line at the last space within the fill column when a
+space or RET is typed past it, the new line starting with the paragraph's continuation prefix.
+In a code buffer — one whose mode stacks over `prog` — only a comment line is broken
+(Emacs's `comment-auto-fill-only-comments`)."
+  (:use editor/buffer) ; buffer-rope / buffer-point / replace-region
+  (:use interactive) ; defcommand — M-q and the auto-fill toggle
+  (:use scroll :only [ed-mode-setting])
+  (:use conventions :only [fill-column])
+  (:use stringstate :only [ed-string-extent]) ; the string M-q fills in code
+  (:use model)) ; ed-edit, ed-current-buf, ed-mode-service, message
+
+;; ---- a line's shape ---------------------------------------------------------------
+
+(sig line-text (any int -> string))
+(defn- line-text (rope line)
+  ;; line `line` of `rope` without its newline
+  (let (text (text/line rope line))
+    (if (string/ends-with? text "\n") (string/substring text 0 (dec (string/length text))) text)))
+
+(defn- blank-line? (text) (= (string/trim text) ""))
+
+(defn line-marker (text)
+  "The comment or quote marker `text`'s line carries — `;;`, `#`, `>` — or \"\" for none: what
+a paragraph's lines must share to be filled together."
+  ;; a one-line paragraph's rest prefix is its marker with any bullet blanked out
+  (string/trim (second (string/fill-prefixes text))))
+
+(defn item-line? (text)
+  "True when `text` starts a list item — a bullet after its indentation and marker."
+  (let ([first-prefix rest-prefix] (string/fill-prefixes text))
+    (not (= first-prefix rest-prefix))))
+
+(def- *quote-line* "^[ \t]*(\"\"\"|'''|\"|'|```)[ \t]*$")
+;; a line that is only a string's delimiter — a Python docstring's closing `"""` — which is never
+;; filled into the text above it, in any mode
+
+(defn- separate? (separate text)
+  ;; a line that is a paragraph of its own: the mode's `:fill-separate` regex, or a quote line
+  (or (regex/match? *quote-line* text) (and (string? separate) (regex/match? separate text))))
+
+(defn- prog? (buf)
+  ;; a code buffer: its mode stacks over `prog`
+  (= true (ed-mode-setting {:prog true} buf false)))
+
+;; ---- the paragraph ----------------------------------------------------------------
+
+(defn- line-in-extent? (rope extent line)
+  ;; whether `line` overlaps the char `extent` — every line does when there is none
+  (or (nil? extent)
+    (let (bol (text/line->char rope line))
+      (and (< bol (second extent))
+        (>= (+ bol (string/length (line-text rope line))) (first extent))))))
+
+(defn- line-belongs? (rope separate marker extent line)
+  ;; whether `line` is part of the paragraph: non-blank, not a separate line, carrying the
+  ;; paragraph's marker and, in a string, one of its lines
+  (let (text (line-text rope line))
+    (and (not (blank-line? text))
+      (not (separate? separate text))
+      (= (line-marker text) marker)
+      (line-in-extent? rope extent line))))
+
+(defn paragraph-lines (buf &optional (string-extent nil))
+  "The `[first last]` lines M-q fills around point in `buf`, or nil when there is nothing to
+fill (point on a blank line with only blank lines after it, or on a separate line). Point on a
+blank line fills the paragraph after it, as Emacs's does. In code, the lines of the comment
+point is in, or of the string `string-extent` (`[start end]`, `stringstate/ed-string-extent`: the held
+parse, else the mode's string syntax — no grammar needed) — anywhere else nothing, as Emacs's
+`fill-paragraph` leaves code alone."
+  (let (rope (buffer-rope buf)
+        n (text/line-count rope)
+        separate (ed-mode-service buf :fill-separate)
+        start-line (text/char->line rope (buffer-point buf))
+        here (letrec (skip (fn (i)
+                             (cond
+                               (>= i n) nil
+                               (blank-line? (line-text rope i)) (skip (inc i))
+                               else i)))
+               (skip start-line))
+        marker (when here (line-marker (line-text rope here)))
+        ;; in code and not in a comment: only inside a string, and only its lines
+        extent (when (and here (= marker "") (prog? buf)) string-extent))
+    (when (and here
+            (not (separate? separate (line-text rope here)))
+            (or (not (= marker ""))
+              (not (prog? buf))
+              (and extent (line-in-extent? rope extent here))))
+      (let (
+            ;; up: stop BELOW a non-member, and AT an item line (it starts this item)
+            top (letrec (up (fn (i)
+                              (cond
+                                (item-line? (line-text rope i)) i
+                                (and (> i 0) (line-belongs? rope separate marker extent (dec i)))
+                                  (up (dec i))
+                                else i)))
+                  (up here))
+            ;; down: stop before a non-member or the next item
+            bottom (letrec (down (fn (i)
+                                   (if (and (< (inc i) n)
+                                         (line-belongs? rope separate marker extent (inc i))
+                                         (not (item-line? (line-text rope (inc i)))))
+                                     (down (inc i))
+                                     i)))
+                     (down here)))
+        [top bottom]))))
+
+(defn- line-range-text (rope first-line last-line)
+  ;; lines `first-line`..`last-line` of `rope`, without the newline after the last
+  (let (start (text/line->char rope first-line)
+        end (if (< (inc last-line) (text/line-count rope))
+              (dec (text/line->char rope (inc last-line)))
+              (text/length rope)))
+    (text/slice rope start end)))
+
+(defn docstring-fill-prefixes (text)
+  "The Lisps' `:fill-prefixes` (Emacs's `adaptive-fill-function` for them): a one-line
+paragraph whose text opens a string — a docstring's first line — continues at column 0, as a
+Lisp docstring's lines do; anything else is `string/fill-prefixes`'.
+
+    (fill/docstring-fill-prefixes \"  \\\"Doc\")   ;=> [\"  \" \"\"]"
+  (let (prefixes (string/fill-prefixes text)
+        lines (seq/reject (string/split text "\n") blank-line?)
+        first-line (if (empty? lines) "" (first lines))
+        body (string/substring first-line
+               (string/length (first prefixes))
+               (string/length first-line)))
+    (if (and (= (count lines) 1) (string/starts-with? body "\""))
+      [(first prefixes) ""]
+      prefixes)))
+
+(defn paragraph-prefixes (buf text)
+  "The `[first rest]` prefixes paragraph `text` of `buf` fills with: the mode's
+`:fill-prefixes` when it has one, else `string/fill-prefixes`."
+  (let (custom (ed-mode-service buf :fill-prefixes))
+    (if (fn? custom) (custom text) (string/fill-prefixes text))))
+
+(defn- words-before (text offset)
+  ;; how many non-whitespace characters `text` has before `offset` — what point keeps
+  ;; across a refill, which changes only whitespace
+  (count (seq/reject (string/->list (string/substring text 0 offset)) string/blank?)))
+
+(defn- offset-after-words (text k)
+  ;; the offset in `text` just past its `k`th non-whitespace character (0 for none)
+  (letrec (walk (fn (chars i seen)
+                  (cond
+                    (>= seen k) i
+                    (empty? chars) i
+                    else
+                      (walk (rest chars)
+                        (inc i)
+                        (if (string/blank? (first chars)) seen (inc seen))))))
+    (walk (string/->list text) 0 0)))
+
+(defn fill-paragraph (buf &optional (string-extent nil))
+  "`buf` with the paragraph around point refilled to its fill column, point kept on the
+same character — the buffer M-q makes. `string-extent` is the string point is in, when it is
+(`stringstate/ed-string-extent`): in code, what is filled."
+  (let (bounds (paragraph-lines buf string-extent))
+    (if (nil? bounds)
+      buf
+      (let ([first-line last-line] bounds
+            rope (buffer-rope buf)
+            start (text/line->char rope first-line)
+            text (line-range-text rope first-line last-line)
+            end (+ start (string/length text))
+            filled (string/fill text (fill-column buf) (paragraph-prefixes buf text))
+            point (buffer-point buf)
+            kept (if (and (>= point start) (<= point end)) (words-before text (- point start)) 0))
+        (if (= filled text)
+          buf
+          (goto-char (replace-region buf start end filled)
+            (+ start
+              (if (and (>= point start) (<= point end))
+                ;; past the prefix of the line it lands on, when that is where it was
+                (offset-after-words filled kept)
+                0))))))))
+
+(defcommand cmd-fill-paragraph
+  (m key)
+  "Re-wrap the paragraph around point to the buffer's fill column (M-q;
+`conventions/fill-column` — its .editorconfig's `max_line_length`, the user's
+`:fill-column`, the mode's, else 70). The first line keeps its prefix and the lines after it
+the paragraph's continuation prefix (`string/fill-prefixes`): a list item hangs under its
+text, a comment keeps its marker. Only the comment, quote or list item point is in is filled
+(`paragraph-lines`), and point stays on the character it was on."
+  (let ([m2 extent] (stringstate/ed-string-extent m))
+    (ed-edit m2 (fn (b) (fill-paragraph b extent)))))
+
+;; ---- auto-fill ----------------------------------------------------------------------
+
+(sig auto-fill? (model any -> bool))
+(defn auto-fill? (m buf)
+  "Whether `buf` auto-fills: its own `M-x auto-fill-mode` when toggled, else the `:auto-fill`
+setting for its mode."
+  (let (local (when buf (:auto-fill buf)))
+    (cond
+      (bool? local) local
+      (nil? buf) false
+      else (= true (ed-mode-setting (:auto-fill m) buf false)))))
+
+(defn- column-of (text offset)
+  ;; the display column `offset` in `text` (a line) reaches
+  (string/display-width (string/substring text 0 offset)))
+
+(defn- break-offset (text limit from)
+  ;; the offset of the last space in `text` (a line) at or before column `limit` and after
+  ;; offset `from` (the line's prefix) — where the line breaks — or nil
+  (letrec (back (fn (i)
+                  (cond
+                    (<= i from) nil
+                    (and (= (string/char-at text i) " ") (<= (column-of text i) limit)) i
+                    else (back (dec i)))))
+    (back (dec (string/length text)))))
+
+(defn auto-fill-line (buf)
+  "`buf` with point's line broken at its last space within the fill column when the text
+before point runs past it — the new line starting with the paragraph's continuation prefix —
+or nil when it needs none. One break, the step `auto-fill-mode` takes on a space or RET."
+  (let (rope (buffer-rope buf)
+        point (buffer-point buf)
+        line (text/char->line rope point)
+        bol (text/line->char rope line)
+        text (string/substring (line-text rope line) 0 (- point bol))
+        limit (fill-column buf)
+        ;; a code buffer (its mode stacks over `prog`) breaks only its comments
+        code? (= true (ed-mode-setting {:prog true} buf false)))
+    (if (or (<= (column-of text (string/length text)) limit) (and code? (= "" (line-marker text))))
+      nil
+      (let (bounds (paragraph-lines buf)
+            first-line (if bounds (first bounds) line)
+            ;; the context the prefixes are read from: the paragraph's first line, and the
+            ;; line after it when point is past it — how the paragraph continues
+            context (if (< first-line line)
+                      (str (line-text rope first-line) "\n" (line-text rope (inc first-line)))
+                      text)
+            prefixes (paragraph-prefixes buf context)
+            own-prefix (string/length (first (string/fill-prefixes text)))
+            ;; the break keeps the line's own prefix whole
+            at (break-offset (string/trimr text) limit own-prefix))
+        (if (nil? at)
+          nil
+          (let (space-end (letrec (skip (fn (i)
+                                          (if (and (< i (string/length text))
+                                                (= (string/char-at text i) " "))
+                                            (skip (inc i))
+                                            i)))
+                            (skip at))
+                ;; the spaces before the break go too
+                space-start (letrec (skip (fn (i)
+                                            (if (and (> i own-prefix)
+                                                  (= (string/char-at text (dec i)) " "))
+                                              (skip (dec i))
+                                              i)))
+                              (skip at))
+                inserted (str "\n" (second prefixes))
+                broken (replace-region buf (+ bol space-start) (+ bol space-end) inserted))
+            ;; point stays where it was in the text
+            (goto-char broken
+              (+ point (- (string/length inserted) (- space-end space-start))))))))))
+
+(defn ed-auto-fill (m)
+  "`m` with the current buffer's line auto-filled (`auto-fill-line`) when it auto-fills — the
+hook a typed space and RET run before their own edit lands."
+  (let (buf (ed-current-buf m))
+    (if (and buf (auto-fill? m buf) (not (read-only? buf)))
+      (let (filled (auto-fill-line buf))
+        (if (nil? filled)
+          m
+          (ed-edit m (fn (_) filled))))
+      m)))
+
+(defcommand cmd-auto-fill-mode
+  (m key)
+  "Toggle auto-fill-mode in this buffer (Emacs `auto-fill-mode`): a space or RET typed past
+the fill column breaks the line at its last space within it, the new line continuing the
+paragraph's prefix. The `:auto-fill` setting turns it on per mode."
+  (let (buf (ed-current-buf m)
+        on (not (auto-fill? m buf)))
+    (message (ed-set-buf m (assoc buf :auto-fill on))
+      (if on "Auto fill mode enabled in this buffer" "Auto fill mode disabled in this buffer"))))

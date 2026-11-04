@@ -377,14 +377,64 @@ src/input.blsp              dispatch: fold a key/mouse/tick event into the next 
 src/commands.blsp           the GENERAL editing commands, each a (model key) -> model — motion,
                             editing, kill ring, panes, buffers, prompts. A feature's commands
                             live in its own module (dired, help, vim, registers, hexl,
-                            eval-commands, shell-command), bound by qualified symbol
+                            eval-commands, shell-command), bound by qualified symbol. The
+                            window movers are Emacs's windmove-swap-states-* (C-S-arrows and
+                            Emacs's s-S-arrows) and window-swap-states; a side window's `:side`
+                            mark stays with its PLACE (`ed-keep-sides`)
+src/electric.blsp           electric pairs (Emacs electric-pair-mode) as POLICY: the pairs are the
+                            MODE's — a layer's `:electric-pairs` (a `deflanguage`'s `:pairs`: `'`
+                            where it opens a string, a backtick in Markdown / JS / Go / shell,
+                            Python's triple quotes), else `()` `[]` `{}` `""`; `<>` nowhere — the
+                            user's `:electric-pair` per mode (a bool or the mode's pairs), Emacs's
+                            inhibit rules (not before a word or the same character; a Lisp's
+                            `:electric-pair-inhibit :never` always pairs, as paredit),
+                            electric-pair-preserve-balance (an opener a waiting closer balances is
+                            typed alone; a closer is stepped over — past spaces, tabs and newlines —
+                            only while the brackets stay balanced; `:electric-pair-preserve-balance`
+                            per mode), a quote's open / close / skip
+                            read from the STRING STATE at point (`stringstate`), and M-x
+                            electric-pair-mode / electric-pair-local-mode. The bracket keys stay in
+                            `commands`, and any character a mode pairs is electric through
+                            `cmd-self-insert`; an opener or closer over a region wraps it, mode on
+                            or off
+src/stringstate.blsp        where a buffer's strings and comments are (Emacs's syntax-ppss, for
+                            strings), from the mode's `:string-syntax` as DATA (a `deflanguage`'s
+                            `:strings`: delimiters, which span lines, which are raw, line and block
+                            comments, the shell's word-start `#`, Rust's char literals; else its
+                            quote pairs as one-line strings). INCREMENTAL, as syntax-ppss's cache:
+                            what each line starts inside lives in the model's `:string-caches` (std's
+                            line cache, `line-cache-state`, brood ADR-591) and edits move it by the
+                            splice log, so a key lexes its own line (~5 ms at the end of a 1 MB
+                            file). A key never walks a cold region: it lexes at most `*key-lines*`
+                            (`line-cache-state-within`) and past that guesses from the nearest
+                            top-level form; a large buffer's cache is built off the loop at once
+                            on its visit or a guess (a post-step) and on the idle beat.
+                            The held tree-sitter parse answers first when it is current and whole.
+                            Brackets are counted from point's top-level form forward until they
+                            close; electric pairs ask it to open, close or skip, M-q for the string
+src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string/fill-prefixes`
+                            (brood ADR-589, Emacs's adaptive fill): the first line keeps its
+                            prefix, the rest the paragraph's continuation — a list item HANGS under
+                            its text, a comment / quote keeps its marker. The paragraph is
+                            narrowed to point's comment, list item, or (in code) string
+                            (`stringstate/ed-string-extent`, no grammar needed); a mode's `:fill-separate`
+                            lines (an Org heading, a Markdown fence) stand alone and its
+                            `:fill-prefixes` answers for it (a Lisp docstring continues at column
+                            0). M-x auto-fill-mode per buffer, `:auto-fill` per mode — in code only
+                            comments break
 src/registers.blsp          registers (C-x r SPC / j / s / i) behind a `Register` ability, and
                             bookmarks (C-x r m / b)
 src/hexl.blsp               hexl-mode: a non-UTF-8 file opened as a read-only hex view (pool's
                             find-file reaches it late-bound); the mode's `:no-write` facet is
                             what makes C-x C-s / C-x C-w refuse it
 src/pool.blsp               the buffer pool and where its buffers are shown — open / select /
-                            kill, `ed-display-buffer` (Emacs display-buffer), `ed-pop-to-file`
+                            kill, `ed-display-buffer` (Emacs display-buffer: init.blsp's
+                            `:display-buffer` RULES first — `{:match name-regex | type-or-mode
+                            :request :action :same-window | :other-window | :reuse | {:side
+                            :size} | :new-frame}` — then the defaults, rules too,
+                            `config/*display-buffer-defaults*`; a side window is `editor/pane`'s
+                            `pane-split-edge`, brood ADR-590, its pane marked `:side`; a new frame
+                            is `frames/frames-spawn-showing`), `ed-pop-to-file`
                             (next-error), find-file + its path prompt, the default dir and
                             project root, saving. What most modules `:use` instead of
                             `commands`: showing a report buffer needs none of the commands
