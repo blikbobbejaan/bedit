@@ -1049,8 +1049,11 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             files' sidecars written from the buffer processes
                             (`lifeline/emergency-save!`) and restarts over the same registry for
                             the same client (`ed-served-restart`, a guest still a guest), within
-                            3 a minute; a shared session saves from and restarts over its collab
-                            registry
+                            3 a minute, the keys typed through it replayed by std; the shown
+                            buffer and every point come back too (a post-step hands the session
+                            a snapshot, `ed-served-retain-step`). A shared session saves from its
+                            collab registry and restarts with every document it had open linked
+                            again (`ed-collab-reopen`)
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
