@@ -1,0 +1,116 @@
+(defmodule ansicolor
+  "A program's ANSI colours on the buffer its output streams into — Emacs's `ansi-color`
+for *compilation*, a shell buffer and *Run* — over std's streaming decoder
+(`ansi/decoder` / `ansi/feed`, brood ADR-567).
+
+A producer keeps ONE decoder per stream (stdout and stderr are two) and threads it through
+every chunk, so an escape split across two reads (`ESC[1` then `mERROR`) is finished by
+the second instead of leaking `1mERROR` into the text. Off the loop the worker [[decode]]s
+a chunk into its plain text and its attribute spans; on the loop the append lays the text
+in and [[add-faces]] stamps the spans as `:output-spans` on the buffer. They stay SGR
+attributes (`{:fg 1 :bold true}`): the view resolves them through the theme's sixteen ANSI
+colours (`theme/ansi-palette`) as it paints, UNDER the mode's own colouring
+(`view/ed-span-layers`) — as font-lock lays over ansi-color's faces, and as those faces
+follow a theme switch.
+
+A carriage return is dropped, as `ansi/strip` drops it: these buffers are logs, and a
+`\\r\\n` line end is the common case. A buffer that only wants the text (*Tests*) takes the
+decoded text and leaves the spans.")
+
+(defn- without-returns (segments)
+  "Decoded `segments` with their carriage returns dropped and any segment left empty gone."
+  (into []
+    (seq/reject (map segments
+                  (fn (segment) [(string/replace (first segment) "\r" "") (second segment)]))
+      (fn (segment) (= (first segment) "")))))
+
+(defn decode (decoder chunk)
+  "Decode the next `chunk` of a stream: `[decoder' text spans]` — the chunk's text with its
+escapes (and carriage returns) gone, and its SGR attributes as `[start end attr]` ranges
+from offset 0 of `text` (`ansi/segments-spans`). An escape the chunk ends inside waits in
+`decoder'` for the next chunk.
+
+    (rest (ansicolor/decode (ansi/decoder) (str (string/int->char 27) \"[1mok\\r\\n\")))   ;=> (\"ok\\n\" [[0 3 {:bold true}]])
+
+The newline is bold too: no reset came before it, and a line's end carries its colour."
+  (let ([next-decoder segments] (ansi/feed decoder chunk)
+        clean (if (includes? chunk "\r") (without-returns segments) segments))
+    [next-decoder (ansi/segments-text clean) (ansi/segments-spans clean 0)]))
+
+(defn- append-spans (before spans shift)
+  "The ascending span vector `before` followed by `spans` moved by `shift` — and a run that
+a chunk boundary cut (`before`'s last span ending where the first of `spans` begins, in the
+same attribute) joined again, so where a read happened to end never shows in the spans."
+  (let (shifted (into []
+                  (map spans
+                    (fn (span) (let ([from to attr] span) [(+ from shift) (+ to shift) attr]))))
+        tail (last before)
+        head (first shifted)
+        joined (and tail head (= (second tail) (first head)) (= (nth tail 2) (nth head 2))))
+    (if joined
+      (into (assoc before (dec (count before)) [(first tail) (second head) (nth tail 2)])
+        (rest shifted))
+      (into before shifted))))
+
+(defn add-faces (buf spans offset)
+  "`buf` with attribute `spans` (from offset 0 of text just appended at `offset`) added to
+its `:output-spans`, moved to `offset` — joined to the last one when they continue it.
+Appends keep them ascending; no spans, no change.
+
+    (:output-spans (ansicolor/add-faces {} [[0 2 {:fg 1}]] 5))   ;=> [[5 7 {:fg 1}]]"
+  (if (or (nil? spans) (empty? spans))
+    buf
+    (assoc buf :output-spans (append-spans (or (:output-spans buf) []) spans offset))))
+
+;; ---- line-buffered output ------------------------------------------------------
+;; A line-oriented consumer (procstream) splits decoded text at newlines. Attributes carry
+;; across lines — `ESC[31m` on one line, the reset three lines down — so each complete
+;; line takes the spans that fall in it, clipped and made line-relative, and a span that
+;; crosses a newline continues on the next line.
+
+(defn- line-spans (spans line-start line-end acc)
+  "The ascending `spans` (a list) that fall in the line `[line-start line-end)`, clipped and
+relative to `line-start`: `[this-line remaining]` — `remaining` the spans the next lines
+still need, the rest of one that runs past this line's newline among them."
+  (if (empty? spans)
+    [(into [] (reverse acc)) spans]
+    (let ([from to attr] (first spans)
+          clipped-from (math/max from line-start)
+          clipped-to (math/min to line-end)
+          kept (if (< clipped-from clipped-to)
+                 (cons [(- clipped-from line-start) (- clipped-to line-start) attr] acc)
+                 acc))
+      (cond
+        (>= from line-end) [(into [] (reverse acc)) spans]
+        ;; reaches past this line's newline: its part here, the rest on the next line
+        (> to (inc line-end))
+          [(into [] (reverse kept)) (cons [(inc line-end) to attr] (rest spans))]
+        else (line-spans (rest spans) line-start line-end kept)))))
+
+(defn split-lines (text spans)
+  "`text` (its attribute `spans` from offset 0) cut at newlines: `[lines partial]` —
+`lines` a vector of `[line line-spans]` for every complete line (newline dropped, spans
+relative to the line), `partial` the `[text spans]` after the last newline, which the
+next chunk continues.
+
+    (ansicolor/split-lines \"ab\\ncd\\ne\" [[1 4 :x]])   ;=> [[[\"ab\" [[1 2 :x]]] [\"cd\" [[0 1 :x]]]] [\"e\" []]]"
+  (let (parts (into [] (string/split text "\n"))
+        last-index (dec (count parts)))
+    (letrec (walk (fn (k start remaining out)
+                    (let (line (nth parts k "")
+                          end (+ start (string/length line))
+                          [this-line others] (line-spans remaining start end ()))
+                      (if (= k last-index)
+                        [out [line this-line]]
+                        (walk (inc k) (inc end) others (conj out [line this-line]))))))
+      (walk 0 0 (apply list spans) []))))
+
+(defn continue-partial (partial text spans)
+  "The `[text spans]` `partial` left by [[split-lines]] continued by the next decoded
+`text` and its `spans`: one `[text spans]`, the new spans shifted past the partial — a run
+the chunk boundary cut joined again.
+
+    (ansicolor/continue-partial [\"ab\" [[0 1 :x]]] \"cd\" [[1 2 :y]])   ;=> [\"abcd\" [[0 1 :x] [3 4 :y]]]
+    (ansicolor/continue-partial [\"ab\" [[1 2 :x]]] \"cd\" [[0 1 :x]])   ;=> [\"abcd\" [[1 3 :x]]]"
+  (let ([before before-spans] partial)
+    [(str before text) (append-spans before-spans spans (string/length before))]))

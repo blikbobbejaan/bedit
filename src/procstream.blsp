@@ -17,17 +17,27 @@ process shared by every frame, so where an event goes is a fact about the RUN, w
 only the worker holds. Each takes the run token as its LAST argument, so a stale run's
 events are distinguishable from the fresh run's on the editor side:
 
-  :on-line      (line token)  — each complete stdout line (the trailing partial
+  :on-line      (line spans token)  — each complete stdout line (the trailing partial
                 flushes on exit); the consumer decodes/classifies
-  :on-err-line  (line token)  — each non-blank stderr line
+  :on-err-line  (line spans token)  — each non-blank stderr line
   :on-done      (code token)  — the child exited (nil = killed, incl. via [:shutdown])
+
+A line arrives DECODED: each stream keeps its own ANSI decoder (`ansicolor/decode`, over
+std's `ansi/feed`), so an escape split across two reads is finished by the second rather
+than leaking into the text, and the line holds no escape at all. Its colours come beside
+it as `spans` — `[start end attr]` from the line's start, attributes carried from one
+line to the next — for a consumer that paints them (*Run*); one that wants the text
+(*Tests*) ignores them. A partial line past `*procstream-line-max*` chars is delivered as it
+stands, so the worker's buffer is bounded; an escape cut there waits in the decoder.
 
 A handler that throws is caught and reported through `:on-err-line` rather than
 killing the worker (which would orphan the OS child, unread). The handlers are
 captured at the worker's FIRST spawn (a named spawn is idempotent), so redefining a
 consumer's dispatch fn live reaches the worker only after a shutdown+respawn — the
 one late-binding exception in the runner stack, traded for one worker implementation
-instead of three.") ; no imports — hibernate / proc-spawn / string ops are all prelude
+instead of three."
+  (:use ansicolor :only [split-lines])) ; loads it with the worker; its calls are written qualified (ansicolor/decode …), as a spawned worker's are
+
 (defn close-quietly (proc label)
   "Close the child `proc`, logging (under `label`) rather than raising when it will not
 close — a worker replacing or stopping its child must not die over the old one."
@@ -35,76 +45,88 @@ close — a worker replacing or stopping its child must not die over the old one
     (os/close proc)
     (catch e (log/warn (str label ": close failed: " (error-message e))))))
 
-(defn- procstream-deliver (run f a)
-  "Build the event `(f a token)` and send it to the run's reply address, routing a throw
-through `:on-err-line` so a handler bug can't kill the worker and orphan the child.
-`run` is `{:handlers :token :reply}`."
+(defn- procstream-deliver (run f arguments)
+  "Build the event `(f ...arguments token)` and send it to the run's reply address,
+routing a throw through `:on-err-line` so a handler bug can't kill the worker and orphan
+the child. `run` is `{:handlers :token :reply}`."
   (let (token (:token run)
         event (try
-                (f a token)
+                (apply f (conj arguments token))
                 (catch e
                   ((:on-err-line (:handlers run)) (str "procstream handler error: "
                                                     (error-message e))
+                    []
                     token))))
     (when event (send (:reply run) event))))
 
-(defn- procstream-out-line (run line)
+(defn- procstream-out-line (run line spans)
   "Deliver a stdout `line` through `:on-line` — every line, a blank one included."
-  (procstream-deliver run (:on-line (:handlers run)) line))
+  (procstream-deliver run (:on-line (:handlers run)) [line spans]))
 
-(defn- procstream-err-line (run line)
+(defn- procstream-err-line (run line spans)
   "Deliver a stderr `line` through `:on-err-line`, unless it is blank."
   (when (not (= (string/trim line) ""))
-    (procstream-deliver run (:on-err-line (:handlers run)) line)))
+    (procstream-deliver run (:on-err-line (:handlers run)) [line spans])))
 
 (defdyn *procstream-line-max* 65536)
 ;; The longest partial line the worker holds before it delivers it as a line of its own. A
 ;; child that writes without a newline (a progress bar, a minified dump) would otherwise grow
 ;; the partial without end — and re-copy it on every chunk.
 
-(defn- procstream-feed (run buf data deliver)
-  "Fold a chunk into the line buffer `buf`: `(deliver run line)` each complete line, return
-the trailing partial. One splitter for both streams — stdout and stderr differ only in
-`deliver`. A partial past [[*procstream-line-max*]] chars is delivered as it stands and the
-partial starts again empty, so the worker's buffer is bounded whatever the child writes."
-  (let (parts (string/split (str buf data) "\n")
-        complete (take parts (dec (count parts)))
-        partial (last parts))
-    (doseq (line complete) (deliver run line))
-    (if (> (string/length partial) *procstream-line-max*)
-      (do (deliver run partial) "")
-      partial)))
+(defn procstream-stream ()
+  "A stream's state before its first chunk: a fresh ANSI decoder and no partial line."
+  {:decoder (ansi/decoder) :partial ["" []]})
+
+(defn- procstream-feed (run stream data deliver)
+  "Fold a chunk into `stream` (`procstream-stream`): decode it, `(deliver run line spans)`
+each complete line, and return the stream with the decoder and the trailing partial line
+to continue from. One splitter for both streams — stdout and stderr differ only in
+`deliver` (and each has its own `stream`). A partial past [[*procstream-line-max*]] chars
+is delivered as it stands, with its spans, and the partial starts again empty, so the
+worker's buffer is bounded whatever the child writes. An escape the chunk ended inside is
+held by the DECODER, not the partial, so a cut there never splits one: the next chunk
+finishes it."
+  (let ([decoder text spans] (ansicolor/decode (:decoder stream) data)
+        [whole whole-spans] (ansicolor/continue-partial (:partial stream) text spans)
+        [lines partial] (ansicolor/split-lines whole whole-spans))
+    (doseq (line lines) (deliver run (first line) (second line)))
+    (if (> (string/length (first partial)) *procstream-line-max*)
+      (do (deliver run (first partial) (second partial)) {:decoder decoder :partial ["" []]})
+      {:decoder decoder :partial partial})))
+
+(defn- procstream-flush (run stream deliver)
+  "Deliver the partial line `stream` ended on — the child exited without a final newline."
+  (let ([line spans] (:partial stream))
+    (when (not (= (string/trim line) "")) (deliver run line spans))))
 
 (defn- procstream-start (handlers cmd argv root token reply)
   "Spawn the child for a run and start receiving from it."
   (procstream-recv (os/spawn cmd argv {:cwd root})
-    ""
+    (procstream-stream)
     {:handlers handlers :token token :reply reply}
-    ""))
+    (procstream-stream)))
 
-(defn- procstream-recv (proc buf run errbuf)
-  ;; `errbuf` carries the stderr partial so a backtrace split across read chunks is
-  ;; line-assembled like stdout (the contract promises whole lines).
+(defn- procstream-recv (proc out run err)
+  ;; `out` / `err` are the two streams' states: a decoder each, and the partial line, so
+  ;; a backtrace split across read chunks is line-assembled like stdout (the contract
+  ;; promises whole lines) and an escape split across them is never shown.
   (let (handlers (:handlers run))
     (receive
       ([:proc p data] (procstream-recv proc
-                        (if (= p proc) (procstream-feed run buf data procstream-out-line) buf)
+                        (if (= p proc) (procstream-feed run out data procstream-out-line) out)
                         run
-                        errbuf))
+                        err))
       ([:proc-err p data] (procstream-recv proc
-                            buf
+                            out
                             run
-                            (if (= p proc)
-                              (procstream-feed run errbuf data procstream-err-line)
-                              errbuf)))
+                            (if (= p proc) (procstream-feed run err data procstream-err-line) err)))
       ([:proc-closed p code] (if (= p proc)
                                (do
-                                 (when (not (= (string/trim buf) ""))
-                                   (procstream-out-line run buf))
-                                 (procstream-err-line run errbuf)
-                                 (procstream-deliver run (:on-done handlers) code)
+                                 (procstream-flush run out procstream-out-line)
+                                 (procstream-flush run err procstream-err-line)
+                                 (procstream-deliver run (:on-done handlers) [code])
                                  (procstream-loop handlers))
-                               (procstream-recv proc buf run errbuf)))
+                               (procstream-recv proc out run err)))
       ([:run cmd argv root new-token reply] (do
                                               (close-quietly proc "procstream")
                                               (procstream-start handlers
@@ -113,7 +135,7 @@ partial starts again empty, so the worker's buffer is bounded whatever the child
         (do
           (close-quietly proc "procstream")
           ;; a stop is an exit — the consumer clears its UI
-          (procstream-deliver run (:on-done handlers) nil)
+          (procstream-deliver run (:on-done handlers) [nil])
           :procstream-stopped)))))
 
 (defn procstream-loop (handlers)

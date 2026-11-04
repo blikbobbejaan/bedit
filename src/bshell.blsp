@@ -34,8 +34,9 @@ receives `[:bshell-run line]`, runs it, and forwards each chunk as a `bshell-out
   (:use eval-command) ; eval-source — a line starting with `(` is evaluated as Brood (REPL)
   (:use complete-at-point) ; complete-add-source! — register the path/symbol completion source
   (:use editor/highlight) ; highlight-spans / shift-spans / bracket-match — Brood input services
+  (:use ansicolor :only [add-faces]) ; a command's ANSI colours as faces on its output
   (:use editor/buffer)) ; make-buffer / insert / end-of-buffer / buffer-length / goto-char
-;; formbuf (guard-clamp / tail-region), ansi/strip-ansi and modes (fontify + gutter
+;; formbuf (guard-clamp / tail-region), ansicolor/decode, ansi/decoder and modes (fontify + gutter
 ;; faces) are referenced qualified below — each `mod/name` auto-loads its module.
 ;; ---- prompt + per-project buffer name ---------------------------------------
 
@@ -115,9 +116,20 @@ corrupt history file must never stop a shell opening (the shared reader guarante
 Best-effort via the shared writer — a failure is swallowed, never breaking the editor."
   (persist-write! (bshell-history-path) (bshell-history-trim history)))
 
-;; ---- ANSI stripping (pipes carry colour escapes; we render plain text) -------
-;; Delegated to std/ansi.blsp (`ansi/strip-ansi`) — the shared implementation used
-;; by both bshell and compile.
+;; ---- ANSI colour (pipes carry colour escapes) -----------------------------------
+;; The worker keeps one decoder per stream of the command it runs (`ansicolor/decode`, over
+;; std's streaming `ansi/feed`), so an escape split across two reads never shows; the
+;; colours travel with the text and land as faces on it (`ansicolor/add-faces`), as
+;; Emacs's shell-mode colours a command's output.
+
+(defn- bshell-forward (state stream data)
+  "Decode the chunk `data` of `stream` (`:out` or `:err`) with that stream's decoder in
+`state`, send its text and colours to the editor, and return `state` with the decoder
+advanced."
+  (let ([decoder text spans] (ansicolor/decode (get state stream) data))
+    (when (not (= text ""))
+      (send (:reply state) (bshell/bshell-output-event (:buffer state) text spans)))
+    (assoc state stream decoder)))
 
 ;; ---- the shell process (one per buffer; mirrors lsp's connection process) ----
 ;; State: {:buffer <name> :root <dir> :proc <handle|nil> :reply <loop>}. Owns the child `proc` so its
@@ -149,7 +161,7 @@ a REPL — and off the editor loop), then push the formatted result + a success 
         out (eval-source line))
     ; never throws: captured output then `=> value`, or `error: …`
     (do
-      (send (:reply state) (bshell/bshell-output-event buf (str out "\n")))
+      (send (:reply state) (bshell/bshell-output-event buf (str out "\n") []))
       (send (:reply state) (bshell/bshell-done-event buf 0))
       (bshell-loop state))))
 
@@ -162,23 +174,22 @@ a REPL — and off the editor loop), then push the formatted result + a success 
 (defn- bshell-loop (state)
   "The shell process's receive loop: `[:bshell-run line]` evaluates `line` as Brood when it
 starts with `(`, else spawns `sh -c line` in `:root`; the child's stdout/stderr forward to
-the editor as a `bshell-output-event` (ANSI-stripped: a pipe's output is append-only text
-that happens to be coloured); its exit as a `bshell-done-event`; `:shutdown` kills any live
-child and stops. A LONG-LIVED program — the project REPL — is not hosted here: that is a
-terminal buffer (terminal.blsp), under a pty and a real emulator."
+the editor as a `bshell-output-event` (ANSI-decoded: a pipe's output is append-only text
+that happens to be coloured, so its escapes become faces — each stream with its own
+decoder, fresh per command — rather than an emulated screen); its exit as a
+`bshell-done-event`; `:shutdown` kills any live child and stops. A LONG-LIVED program —
+the project REPL — is not hosted here: that is a terminal buffer (terminal.blsp), under
+a pty and a real emulator."
   (receive
     ([:bshell-run line] (if (bshell-brood-form? line)
                           (bshell-eval-and-reply state line)
                           (let (p (os/spawn "sh" ["-c" line] {:cwd (:root state)}))
-                            (bshell-loop (assoc state :proc p)))))
-    ([:proc p data] (do
-                      (send (:reply state)
-                        (bshell/bshell-output-event (:buffer state) (ansi/strip data)))
-                      (bshell-loop state)))
-    ([:proc-err p data] (do
-                          (send (:reply state)
-                            (bshell/bshell-output-event (:buffer state) (ansi/strip data)))
-                          (bshell-loop state)))
+                            (bshell-loop (assoc state
+                                           :proc p
+                                           :out (ansi/decoder)
+                                           :err (ansi/decoder))))))
+    ([:proc p data] (bshell-loop (bshell-forward state :out data)))
+    ([:proc-err p data] (bshell-loop (bshell-forward state :err data)))
     ([:proc-closed p code] (do
                              (send (:reply state) (bshell/bshell-done-event (:buffer state) code))
                              (bshell-loop (assoc state :proc nil))))
@@ -198,7 +209,12 @@ buffer under `:bshell-proc`). `(bshell-shutdown pid)` stops it. Output and exits
 the loop that opened the shell (`editor/ui/*loop*`), so a shell opened in a second frame answers
 there — `:editor` only for one started before any loop runs."
   (let (reply (ed-loop-address))
-    (spawn (bshell-loop {:buffer buffer :root root :proc nil :reply reply}))))
+    (spawn (bshell-loop {:buffer buffer
+                         :root root
+                         :proc nil
+                         :reply reply
+                         :out (ansi/decoder)
+                         :err (ansi/decoder)}))))
 
 (defn bshell-interrupt (pid)
   "Interrupt whatever command shell process `pid` is running (Ctrl-C to its process group);
@@ -245,28 +261,54 @@ input region moved to that point."
   "Append raw text `s` at the end of buffer `nm` (creating it if absent), point following
 the inserted text. Unlike `model/ed-append-named` it forces **no** trailing newline — a
 stream chunk isn't line-aligned, so a forced newline would split mid-line output. `insert`
-preserves the buffer's other fields (`:bshell-*`), so its per-buffer state survives. The
-buffer then keeps only its newest lines (`ed-cap-output`, Emacs's
-`comint-buffer-maximum-size`), its `:input-start` and every pane's cursor moving with the
-text."
+preserves the buffer's other fields (`:bshell-*`), so its per-buffer state survives."
+  (bshell-append-output m nm s nil))
+
+;; While a command runs, its output lands at the PROCESS MARK (`:bshell-output-at`, comint's
+;; `process-mark`), not at the end: anything typed ahead stays after it, below the output and,
+;; once the command ends, after the new prompt as input waiting to be sent. That is also what
+;; keeps the output's colour spans true — every edit the user makes is after them.
+
+(defn- bshell-output-point (b)
+  "Where output lands in shell buffer `b`: while a command runs, its process mark — before
+anything typed ahead — else the buffer's end."
+  (let (end (buffer-length b)
+        at (:bshell-output-at b))
+    (if (and (:bshell-running b) (int? at)) (math/min at end) end)))
+
+(defn- bshell-append-output (m nm s spans)
+  "`bshell-append` of a chunk of command output at the process mark (`bshell-output-point`),
+its ANSI colours (`spans` from the chunk's start, `ansicolor/decode`'s) laid on it as faces
+(`ansicolor/add-faces`), the mark advanced past it and point at the buffer's end. The buffer
+then keeps only its newest lines (`ed-cap-output`, Emacs's `comint-buffer-maximum-size`): its
+`:input-start`, process mark, colour spans and every pane's cursor move with the text."
   (ed-cap-output (if (nil? (ed-buffer-index-by-name m nm))
-                   (update m :buffers into [(ed-stamp (insert (ed-log-buffer nm) s))])
-                   (bshell-write m nm (fn (b) (insert (end-of-buffer b) s))))
+                   (update m
+                     :buffers into
+                     [(add-faces (ed-stamp (insert (ed-log-buffer nm) s)) spans 0)])
+                   (bshell-write m
+                     nm
+                     (fn (b)
+                       (let (at (bshell-output-point b)
+                             written (insert (goto-char b at) s))
+                         (end-of-buffer (add-faces (assoc written
+                                                     :bshell-output-at (+ at (string/length s)))
+                                          spans at))))))
     nm))
 
 (defn- bshell-buffer-end (m nm)
   "The char length of buffer `nm` — where freshly-emitted input begins."
   (buffer-length (nth (:buffers m) (ed-buffer-index-by-name! m nm))))
 
-(defn- bshell-text (m nm)
-  "The full text of buffer `nm`."
-  (buffer-text (nth (:buffers m) (ed-buffer-index-by-name! m nm))))
-
 (defn- bshell-ensure-bol (m nm)
-  "Append a newline to buffer `nm` only if it doesn't already end at a line start — so a
-fresh prompt sits at column 0 without a spurious blank line after newline-terminated output."
-  (let (txt (bshell-text m nm))
-    (if (or (= (string/length txt) 0) (string/ends-with? txt "\n")) m (bshell-append m nm "\n"))))
+  "Append a newline to buffer `nm` only if its output doesn't already end at a line start —
+so a fresh prompt sits at column 0 without a spurious blank line after newline-terminated
+output. Asked at the process mark (`bshell-output-point`), not the end, which may hold
+input typed ahead."
+  (let (b (nth (:buffers m) (ed-buffer-index-by-name! m nm))
+        at (bshell-output-point b)
+        before (if (= at 0) nil (buffer-char-before (goto-char b at))))
+    (if (or (nil? before) (= before "\n")) m (bshell-append m nm "\n"))))
 
 (defn- bshell-emit-prompt (m nm prompt)
   "Append `prompt` (preceded by a newline) to buffer `nm` and mark its input region as
@@ -282,19 +324,23 @@ starting at the new end (`:input-start`, on the buffer)."
 ;; Each folds through its named `ed-ev-*` fn (`model/defuievent`), so redefining one
 ;; hot-swaps the live editor (the impl's global call resolves late, like a keymap binding).
 
-(defuievent bshell-output-event (buffer text) ed-ev-bshell-output) ; a chunk of shell/eval output
+(defuievent bshell-output-event (buffer text spans) ed-ev-bshell-output) ; a chunk of shell/eval output, ANSI-decoded, and its colours
 (defuievent bshell-done-event (buffer code) ed-ev-bshell-done) ; the command's exit (nil = killed)
 
 (defn ed-ev-bshell-output (m event textrows cols rows)
-  "A `bshell-output-event` from the shell process → append the (ANSI-stripped) chunk to
-that buffer and keep the viewport following the output."
-  (ed-scroll (bshell-append m (bshell-output-event-buffer event) (bshell-output-event-text event))
+  "A `bshell-output-event` from the shell process → append the (ANSI-decoded) chunk to
+that buffer, its colours as faces, and keep the viewport following the output."
+  (ed-scroll (bshell-append-output m
+               (bshell-output-event-buffer event)
+               (bshell-output-event-text event)
+               (bshell-output-event-spans event))
     textrows))
 
 (defn ed-ev-bshell-done (m event textrows cols rows)
   "A `bshell-done-event` → on a line of its own, a non-zero `[exit N]` (a clean exit
-0 is silent; a signal is `[exit killed]`), then a fresh prompt for that buffer; mark *that*
-shell idle and reset *its* input region to the new end (all per-buffer)."
+0 is silent; a signal is `[exit killed]`), then a fresh prompt for that buffer — all at the
+process mark, so input typed ahead ends up after the prompt, waiting to be sent; mark *that*
+shell idle and start *its* input region where the prompt ends (all per-buffer)."
   (let (nm (bshell-done-event-buffer event)
         code (bshell-done-event-code event)
         m0 (bshell-ensure-bol m nm) ; the prompt starts at column 0, no blank line
@@ -303,8 +349,9 @@ shell idle and reset *its* input region to the new end (all per-buffer)."
              (nil? code) (bshell-append m0 nm "[exit killed]\n")
              else (bshell-append m0 nm (str "[exit " code "]\n")))
         m2 (bshell-append m1 nm (bshell-prompt-for m1 nm))
+        prompt-end (bshell-output-point (nth (:buffers m2) (ed-buffer-index-by-name! m2 nm)))
         m3 (bshell-bufset m2 nm :bshell-running false))
-    (ed-scroll (bshell-bufset m3 nm :input-start (bshell-buffer-end m3 nm)) textrows)))
+    (ed-scroll (bshell-bufset m3 nm :input-start prompt-end) textrows)))
 
 ;; ---- syntax highlighting (the :fontify mode service) ------------------------
 ;; bash colours its prompt; we colour the prompt prefix (green/bold) of each prompt line,
@@ -676,7 +723,12 @@ is sent to this shell's process. Ignored in a non-bshell buffer or while a comma
               (send (:bshell-proc b) [:bshell-run line])
               (ed-update-named (bshell-append m1 nm "\n")
                 nm
-                (fn (buf) (assoc buf :bshell-running true :bshell-command line)))))))))
+                ;; the process mark starts after the command line: its output goes there
+                (fn (buf)
+                  (assoc buf
+                    :bshell-running true
+                    :bshell-command line
+                    :bshell-output-at (buffer-length buf))))))))))
 
 ;; Turn the completion source on: highest precedence, but inert outside a bshell buffer.
 (complete-add-source! 'bshell/bshell-complete-source)

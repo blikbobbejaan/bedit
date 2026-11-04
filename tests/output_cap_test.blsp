@@ -9,6 +9,7 @@
   (:use-internals testrun) ; testrun-append-link — the *Tests* row and its off-text link
   (:use-internals compile) ; compile-append — *compilation*'s raw-chunk stream
   (:use-internals procstream) ; procstream-feed — the worker's line buffer
+  (:use-internals bshell) ; bshell-append-output — a shell's output at its process mark
   (:use-internals vcsproc) ; vcs-entry-tail — a journal entry's output
   (:use-internals config)) ; apply-to-model / setting — the settings reaching the model
 
@@ -102,15 +103,87 @@
 
 (describe "a child's endless partial line is bounded"
   (test "past *procstream-line-max* the partial is delivered as a line and starts again"
-    (let (run {:handlers {:on-line (fn (line token) [:line (string/length line)])
-                          :on-err-line (fn (line token) nil)
+    (let (run {:handlers {:on-line (fn (line spans token) [:line (string/length line)])
+                          :on-err-line (fn (line spans token) nil)
                           :on-done (fn (code token) nil)}
                :token :t
                :reply (self)}
+          stream (procstream/procstream-feed run
+                   (procstream/procstream-stream)
+                   "abcdefgh"
+                   procstream/procstream-out-line)
           rest (binding (*procstream-line-max* 10)
-                 (procstream/procstream-feed run "abcdefgh" "ijklmn" procstream/procstream-out-line)))
-      (assert= rest "")
-      (assert= (receive ([:line n] n) (after 500 :timeout)) 14))))
+                 (procstream/procstream-feed run stream "ijklmn" procstream/procstream-out-line)))
+      (assert= (:partial rest) ["" []])
+      (assert= (receive ([:line n] n) (after 500 :timeout)) 14)))
+  (test "an escape the cut falls inside waits in the decoder and colours the next line"
+    (let (run {:handlers {:on-line (fn (line spans token) [:line line spans])
+                          :on-err-line (fn (line spans token) nil)
+                          :on-done (fn (code token) nil)}
+               :token :t
+               :reply (self)}
+          cut (binding (*procstream-line-max* 5)
+                (procstream/procstream-feed run
+                  (procstream/procstream-stream)
+                  "abcdefgh\e[3"
+                  procstream/procstream-out-line))
+          _ (procstream/procstream-feed run cut "1mXY\n" procstream/procstream-out-line))
+      (assert= (receive ([:line line spans] [line spans]) (after 500 :timeout)) ["abcdefgh" []])
+      (assert= (receive ([:line line spans] [line spans]) (after 500 :timeout))
+        ["XY" [[0 2 {:fg 1}]]]))))
+
+(describe "colour spans are cut with the lines they colour"
+  (test "a head cut moves the spans back, clips one it splits and drops one it deletes"
+    (let (b (assoc (make-buffer (lines-text 0 4)) :output-spans [[0 4 :a] [5 9 :b] [10 16 :c]])
+          cut (ed-cut-head b 7))
+      (assert= (:output-spans cut) [[0 2 :b] [3 9 :c]])))
+  (test "a foreign splice carries the spans as markers"
+    (assert= (ed-carry-spans [[0 3 :a] [5 9 :b]] 4 4 2) [[0 3 :a] [7 11 :b]])
+    (assert= (ed-carry-spans [[0 3 :a] [5 9 :b]] 1 6 0) [[0 1 :a] [1 4 :b]]))
+  (test "a shell's process mark moves with the cut"
+    (assert= (:bshell-output-at (ed-cut-head (assoc (make-buffer (lines-text 0 4))
+                                               :bshell-output-at 20)
+                                  14))
+      6))
+  (test "*compilation*'s capped colours still cover the words they coloured"
+    (let (m (fold (range 30)
+              (assoc (ed-init (make-buffer "")) :output-max-lines 10)
+              (fn (acc i) (compile/compile-append acc (str "ERR " i "\n") [[0 3 {:fg 1}]])))
+          out (ed-buf-at m (output-index m compile/*compile-buf*))
+          text (buffer-text out)
+          spans (:output-spans out))
+      (is (<= (ed-complete-lines out) 10))
+      (assert= (count spans) (ed-complete-lines out))
+      (is (every? spans (fn (span) (= (string/substring text (first span) (second span)) "ERR"))))))
+  (test "a results stream's capped colours still cover the words they coloured"
+    (let (m (fold (range 30)
+              (assoc (ed-init (make-buffer "")) :output-max-lines 10)
+              (fn (acc i) (ed-append-follow acc "*Run*" (str "ok " i) 80 8 [[0 2 {:fg 2}]])))
+          out (ed-buf-at m (output-index m "*Run*"))
+          text (buffer-text out)
+          spans (:output-spans out))
+      (assert= (count spans) (ed-complete-lines out))
+      (is (every? spans (fn (span) (= (string/substring text (first span) (second span)) "ok"))))))
+  (test "a shell's capped output keeps its colours and its process mark on the text"
+    (let (m0 (bshell/bshell-append-output (assoc (ed-init (make-buffer "")) :output-max-lines 10)
+               "*sh*" "$ make\n" nil)
+          idx (output-index m0 "*sh*")
+          running (ed-set-buf-at m0
+                    idx
+                    (assoc (ed-buf-at m0 idx) :bshell-running true :bshell-output-at 7))
+          ;; something typed ahead, after the process mark
+          typed (ed-set-buf-at running idx (insert (end-of-buffer (ed-buf-at running idx)) "ls"))
+          m (fold (range 30)
+              typed
+              (fn (acc i)
+                (bshell/bshell-append-output acc "*sh*" (str "WARN " i "\n") [[0 4 {:fg 3}]])))
+          out (ed-buf-at m idx)
+          text (buffer-text out)
+          spans (:output-spans out))
+      (is (<= (ed-complete-lines out) 10))
+      (is (string/ends-with? text "WARN 29\nls"))
+      (assert= (:bshell-output-at out) (- (string/length text) 2))
+      (is (every? spans (fn (span) (= (string/substring text (first span) (second span)) "WARN")))))))
 
 (describe "a VCS journal entry keeps its last lines"
   (test "older lines are dropped and counted"

@@ -500,9 +500,21 @@ src/frames.blsp             frames (C-x 5 2 / o / 0): a second OS window is a PR
                             made carries this frame's windows, points and `:input-start` with the
                             text (`hosted/hosted-carried`)
 src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
-                            apprun's :apprun ride it): line-buffered stdout -> handler fns;
+                            apprun's :apprun ride it): line-buffered stdout -> handler fns,
+                            each line ANSI-decoded (a decoder per stream) with its colour spans;
                             a partial line past `*procstream-line-max*` is delivered as it
-                            stands, so the worker's buffer is bounded
+                            stands, so the worker's buffer is bounded (an escape cut there
+                            waits in the decoder)
+src/ansicolor.blsp          a program's ANSI colours on the buffer its output streams into (Emacs
+                            ansi-color), over std's streaming decoder (`ansi/feed`, brood ADR-567):
+                            a decoder per stream, so an escape split across two reads never leaks
+                            (`1mERROR`, issue #24); the SGR attributes kept as `:output-spans` and
+                            resolved through `theme/ansi-palette` as the view paints them, UNDER the
+                            mode's colouring (`view/ed-span-layers`) — so a theme switch recolours
+                            them. *compilation*, the shell buffer, *Run* and M-!'s output colour;
+                            *Tests* keeps the text; the vcs log is `ansi/render`ed. The spans are
+                            positions like markers: the output cap's head cut and a foreign splice
+                            carry them (`model/ed-carry-spans`)
 src/wrap.blsp              where a line falls on screen rows: the pure break rule (a line →
                             `[from to]` row segments, word-wrapped at the pane width) and the
                             ONE row of a truncated line (`one-row`: cut before the cells its
@@ -622,11 +634,13 @@ src/formbuf.blsp            FORM BUFFERS: generated text with editable regions (
                             input, a tutorial's boxes) — the region algebra, `splice`, and the
                             `:veto` / `:clamp` guards. Pure; moved from brood's std by ADR-417
 src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a line
-                            typed at bedit's own prompt runs as `sh -c` (pipes, output
-                            stripped) or, starting with `(`, evaluates as Brood in the
-                            worker; owns the input-region vocabulary (`:input-start`, the
-                            boundary guard, ↑/↓/C-r history) that a line-mode terminal
-                            reuses
+                            typed at bedit's own prompt runs as `sh -c` (pipes, its ANSI
+                            colours as faces — ansicolor) or, starting with `(`, evaluates
+                            as Brood in the worker; a running command's output lands at the
+                            PROCESS MARK (`:bshell-output-at`, comint's), before input typed
+                            ahead, which the next prompt then keeps; owns the input-region
+                            vocabulary (`:input-start`, the boundary guard, ↑/↓/C-r history)
+                            that a line-mode terminal reuses
 src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u M-x term):
                             a program under a pty, its screen emulated by std/vt
                             (brood ADR-384) in the buffer's worker and painted into the
