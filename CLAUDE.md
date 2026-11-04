@@ -150,8 +150,10 @@ src/autosave.blsp           `#file#` auto-save sidecars (owner-only, on the idle
                             their own) + auto-revert of files changed on disk (one undoable edit, std's
                             `revert-buffer`); the note a visit
                             shows when a sidecar is newer than its file. A file edited as root
-                            (sudoedit) keeps its sidecar PRIVATE — `state/auto-save/#%2Fetc%2Fhosts#`,
-                            never beside the file — and auto-revert leaves it alone
+                            (sudoedit) keeps its sidecar PRIVATE — `state/auto-save/#%2Fsudo::%2Fetc%2Fhosts#`,
+                            its TRAMP path (the user in it) percent-encoded, a long one hashed with
+                            the path in `NAME.spec` beside it; never beside the file — and
+                            auto-revert leaves it alone. Only a MODIFIED buffer is ever written
 src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and `sudo-edit`) over brood's
                             `sudo` (ADR-588): `C-x C-f /sudo::/etc/hosts` (or `/sudo:USER@:PATH`, this
                             machine only), `M-x sudo-edit` (the current file, its unsaved text kept),

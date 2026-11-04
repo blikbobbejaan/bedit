@@ -22,104 +22,193 @@ editor's own state folder, `…/bedit/state/auto-save` — never beside the file
 root could write one and anyone who can read the directory would see the name."
   (path/join (config/config-dir) "state" "auto-save"))
 
-(defn ed-auto-save-path (path &optional (sudo? false))
+(defn sidecar-user (sudo)
+  "The user a file is edited as, from a `sudo` argument: a user's name as given, `true` for
+root, nil (or false) for a file edited as yourself.
+
+    (autosave/sidecar-user \"www\")   ;=> \"www\"
+    (autosave/sidecar-user true)   ;=> \"root\"
+    (autosave/sidecar-user false)   ;=> nil"
+  (cond
+    (string? sudo) sudo
+    (= true sudo) "root"
+    else nil))
+
+(defn ed-auto-save-path (path &optional (sudo false))
   "The auto-save sidecar path: `#basename#` in the same directory as `path` — or, for a file
-edited as root (`sudo?`, a buffer's `:sudo`), `#%2Fetc%2Fhosts#` in [[ed-private-auto-save-dir]],
-as Emacs puts a TRAMP file's — the whole path in the name, percent-encoded
-([[private-sidecar-name]]) — owner-only like every sidecar.
+edited as another user (`sudo`: the user's name, or `true` for root, a buffer's `:sudo` and
+`:sudo-user`), a name in [[ed-private-auto-save-dir]] that is the whole TRAMP-style path,
+percent-encoded ([[private-sidecar-name]]) — owner-only like every sidecar.
 
     (autosave/ed-auto-save-path \"/home/me/notes.txt\")   ;=> \"/home/me/#notes.txt#\"
-    (path/basename (autosave/ed-auto-save-path \"/etc/hosts\" true))   ;=> \"#%2Fetc%2Fhosts#\""
-  (if sudo?
-    (path/join (ed-private-auto-save-dir) (private-sidecar-name path))
-    (path/join (path/dirname path) (str "#" (path/basename path) "#"))))
+    (path/basename (autosave/ed-auto-save-path \"/etc/hosts\" true))   ;=> \"#%2Fsudo::%2Fetc%2Fhosts#\""
+  (let (user (sidecar-user sudo))
+    (if user
+      (path/join (ed-private-auto-save-dir) (private-sidecar-name path user))
+      (path/join (path/dirname path) (str "#" (path/basename path) "#")))))
 
-(defn private-sidecar-name (path)
-  "The private sidecar's name for `path`: `#…#` around the path PERCENT-ENCODED — `%` as `%25`,
-`/` as `%2F` — so no two paths share one. (Emacs's `!!`/`!` scheme does not tell `/a/!b`
-from `/a!/b`.) [[private-sidecar-path]] reads it back.
+(def *private-sidecar-name-max* 200)
+;; The longest private sidecar name spelled out whole; a longer one is hashed (most
+;; filesystems refuse a name past 255 bytes, and the auto-save failed with only a log line).
 
-    (autosave/private-sidecar-name \"/etc/hosts\")   ;=> \"#%2Fetc%2Fhosts#\""
-  (str "#" (string/replace (string/replace path "%" "%25") "/" "%2F") "#"))
+(defn- sidecar-spec (path user)
+  ;; the TRAMP spelling of `path` edited as `user`: `/sudo::/etc/hosts`, `/sudo:www@:/srv/a`
+  (str "/sudo:" (if (= user "root") "" (str user "@")) ":" path))
 
-(defn private-sidecar-path (name)
-  "The file a private sidecar `name` belongs to ([[private-sidecar-name]] read back), or nil
-when `name` is not one.
+(defn- percent-encode (text)
+  (string/replace (string/replace text "%" "%25") "/" "%2F"))
 
-    (autosave/private-sidecar-path \"#%2Fetc%2Fa!b#\")   ;=> \"/etc/a!b\"
-    (autosave/private-sidecar-path \"notes\")   ;=> nil"
-  (when (and (string/starts-with? name "#%2F")
-          (string/ends-with? name "#")
-          (> (string/length name) 2))
-    (letrec (decode (fn (text acc)
-                      (cond
-                        (= text "") acc
-                        (string/starts-with? text "%2F")
-                          (decode (string/substring text 3 (string/length text)) (str acc "/"))
-                        (string/starts-with? text "%25")
-                          (decode (string/substring text 3 (string/length text)) (str acc "%"))
-                        else
-                          (decode (string/substring text 1 (string/length text))
-                            (str acc (string/substring text 0 1))))))
-      (decode (string/substring name 1 (dec (string/length name))) ""))))
+(defn- percent-decode (text)
+  ;; `percent-encode` read back: `%2F` a slash, `%25` a percent sign
+  (letrec (decode (fn (rest acc)
+                    (cond
+                      (= rest "") acc
+                      (string/starts-with? rest "%2F")
+                        (decode (string/substring rest 3 (string/length rest)) (str acc "/"))
+                      (string/starts-with? rest "%25")
+                        (decode (string/substring rest 3 (string/length rest)) (str acc "%"))
+                      else
+                        (decode (string/substring rest 1 (string/length rest))
+                          (str acc (string/substring rest 0 1))))))
+    (decode text "")))
 
-(defn ensure-private-sidecar-dir (sidecar)
-  "Make the folder of a private `sidecar` ([[ed-private-auto-save-dir]]), owner-only (0700):
-the names in it say which root files were being edited."
-  (file/mkdir-private (path/dirname sidecar)))
+(defn private-sidecar-name (path &optional (user "root"))
+  "The private sidecar's name for `path` edited as `user`: `#…#` around its TRAMP path
+(`/sudo::/etc/hosts`, `/sudo:www@:/srv/a`) PERCENT-ENCODED (`%` as `%25`, `/` as `%2F`), so
+no two files or users share one — Emacs's `!!` / `!` scheme does not tell `/a/!b` from
+`/a!/b`, and a name without the user mixed root's sidecar with www's. A name that would pass
+`*private-sidecar-name-max*` bytes is `#` + a hash of the TRAMP path + the tail of the file's
+name + `#` instead, its TRAMP path kept beside it in `NAME.spec` ([[ensure-private-sidecar]]).
+[[private-sidecar-spec]] reads either back.
+
+    (autosave/private-sidecar-name \"/etc/hosts\")   ;=> \"#%2Fsudo::%2Fetc%2Fhosts#\"
+    (autosave/private-sidecar-name \"/srv/a\" \"www\")   ;=> \"#%2Fsudo:www@:%2Fsrv%2Fa#\""
+  (let (spec (sidecar-spec path user)
+        whole (str "#" (percent-encode spec) "#"))
+    (if (<= (count (string/->bytes whole)) *private-sidecar-name-max*)
+      whole
+      (let (base (string/replace (string/replace (path/basename path) "%" "_") "#" "_")
+            tail (if (> (string/length base) 40)
+                   (string/substring base (- (string/length base) 40) (string/length base))
+                   base))
+        (str "#" (string/substring (hash/sha256 spec) 0 32) "-" tail "#")))))
+
+(defn private-sidecar-hashed? (name)
+  "Whether private sidecar `name` is a hashed one ([[private-sidecar-name]]), whose TRAMP path
+is in `NAME.spec` beside it."
+  (not (string/starts-with? name "#%2F")))
+
+(defn private-sidecar-spec (name &optional (dir nil))
+  "The TRAMP path (`/sudo::/etc/hosts`) a private sidecar `name` in `dir` belongs to
+([[private-sidecar-name]] read back) — a hashed name's from its `NAME.spec` — or nil when
+`name` is not one.
+
+    (autosave/private-sidecar-spec \"#%2Fsudo::%2Fetc%2Fa!b#\")   ;=> \"/sudo::/etc/a!b\"
+    (autosave/private-sidecar-spec \"notes\")   ;=> nil"
+  (cond
+    (or (not (string/starts-with? name "#"))
+      (not (string/ends-with? name "#"))
+      (< (string/length name) 3))
+      nil
+    (not (private-sidecar-hashed? name))
+      (percent-decode (string/substring name 1 (dec (string/length name))))
+    (nil? dir) nil
+    else
+      (let (spec-file (path/join dir (str name ".spec")))
+        (when (file/exists? spec-file)
+          (check-allow :discarded-catch (try (string/trim (file/slurp spec-file)) (catch _ nil)))))))
+
+(defn sidecar-spec-parts (spec)
+  "`[path user]` of a TRAMP sudo path (`/sudo::/etc/hosts` → root, `/sudo:www@:/x` → www), or
+nil when `spec` is not one.
+
+    (autosave/sidecar-spec-parts \"/sudo:www@:/srv/a\")   ;=> [\"/srv/a\" \"www\"]
+    (autosave/sidecar-spec-parts \"/sudo::/etc/hosts\")   ;=> [\"/etc/hosts\" \"root\"]"
+  (when (and (string? spec) (string/starts-with? spec "/sudo:"))
+    (let (rest (string/substring spec 6 (string/length spec))
+          colon (index-of rest ":"))
+      (when (>= colon 0)
+        (let (host (string/substring rest 0 colon)
+              user (if (string/ends-with? host "@")
+                     (string/substring host 0 (dec (string/length host)))
+                     "root"))
+          [(string/substring rest (inc colon) (string/length rest)) (if (= user "") "root" user)])))))
+
+(defn ensure-private-sidecar (path user)
+  "Get ready to write `path`'s private sidecar as `user` edits it: its folder made owner-only
+(0700, since the names in it say which files were being edited as root) and, for a hashed name
+([[private-sidecar-name]]), its TRAMP path written beside it (`NAME.spec`, owner-only) for
+recovery. The sidecar's path."
+  (let (sidecar (ed-auto-save-path path user)
+        name (path/basename sidecar))
+    (do
+      (file/mkdir-private (path/dirname sidecar))
+      (when (private-sidecar-hashed? name)
+        (file/spit-private (str sidecar ".spec") (sidecar-spec path user)))
+      sidecar)))
 
 (defn ed-buffer-auto-save-path (buf)
   "The sidecar of file buffer `buf` ([[ed-auto-save-path]]), private when it is edited as
-root; nil for a buffer with no file."
-  (let (file (buffer-file buf)) (when file (ed-auto-save-path file (= true (:sudo buf))))))
+another user; nil for a buffer with no file."
+  (let (file (buffer-file buf)) (when file (ed-auto-save-path file (buffer-sudo-user buf)))))
 
-(defn ed-remove-auto-save (path &optional (sudo? false))
-  "Delete `path`'s `#basename#` sidecar (the private one when `sudo?`), if there is one — what
-a successful write of the file does (`C-x C-s`, `C-x C-w`), since the sidecar's text is now
-on disk. A nil `path` (a fileless buffer) is a no-op; a sidecar that cannot be removed is
-logged, never raised — the save itself succeeded."
-  (let (sidecar (when path (ed-auto-save-path path sudo?)))
-    (when (and sidecar (file/exists? sidecar))
-      (try
-        (file/rm sidecar)
-        (catch e (log/warn (str "could not remove auto-save " sidecar ": " (error-message e))))))))
+(defn buffer-sudo-user (buf)
+  "The user buffer `buf` is edited as through sudo (`:sudo-user`, root when unnamed), or nil
+for a buffer edited as yourself — the `sudo` argument the sidecar functions take.
+
+    (autosave/buffer-sudo-user {:sudo true :sudo-user \"www\"})   ;=> \"www\"
+    (autosave/buffer-sudo-user {})   ;=> nil"
+  (when (= true (:sudo buf)) (or (:sudo-user buf) "root")))
+
+(defn ed-remove-auto-save (path &optional (sudo false))
+  "Delete `path`'s `#basename#` sidecar (the private one when `sudo` names a user, `true`
+root), and a hashed one's `NAME.spec`, if there is one — what a successful write of the file
+does (`C-x C-s`, `C-x C-w`), since the sidecar's text is now on disk. A nil `path` (a fileless
+buffer) is a no-op; a sidecar that cannot be removed is logged, never raised — the save itself
+succeeded."
+  (let (sidecar (when path (ed-auto-save-path path sudo)))
+    (when sidecar
+      (doseq (file [sidecar (str sidecar ".spec")])
+        (when (file/exists? file)
+          (try
+            (file/rm file)
+            (catch e (log/warn (str "could not remove auto-save " file ": " (error-message e))))))))))
 
 (defn ed-auto-save-due (m)
   "What this auto-save round has to write: `{path rope}` for every modified file buffer —
 the `:due` ones, whose rope is not the one last written for that path (`:auto-saved`, the
-previous round's whole map), and the `:all` map the round leaves behind — and `:sudo`, the
-set of those paths edited as root, whose sidecars are private ([[ed-auto-save-path]]). A
+previous round's whole map), and the `:all` map the round leaves behind — and `:sudo`, `{path
+user}` for those edited as another user through sudo, whose sidecars are private ([[ed-auto-save-path]]). A
 buffer nobody touched since the last round costs a rope-handle compare, not a rewrite of
 its file; one saved since (unmodified now) drops out, so its next edit is written again."
   (let (written (or (:auto-saved m) {}))
     (fold (:buffers m)
-      {:due {} :all {} :sudo #{}}
+      {:due {} :all {} :sudo {}}
       (fn (acc buf)
         (let (path (buffer-file buf))
           (if (and path (buffer-modified? buf))
             (let (rope (buffer-rope buf)
-                  with-all (map/assoc-in (if (= true (:sudo buf))
-                                           (assoc acc :sudo (conj (:sudo acc) path))
+                  with-all (map/assoc-in (if (buffer-sudo-user buf)
+                                           (map/assoc-in acc [:sudo path] (buffer-sudo-user buf))
                                            acc)
                              [:all path]
                              rope))
               (if (= (get written path) rope) with-all (map/assoc-in with-all [:due path] rope)))
             acc))))))
 
-(defn ed-auto-save-write (due &optional (sudo-paths #{}))
+(defn ed-auto-save-write (due &optional (sudo-users {}))
   "Write each `{path rope}` in `due` to the path's `#basename#` sidecar — the private one for
-a path in `sudo-paths` ([[ed-auto-save-path]], its folder made first) — the text built from
+a path in `sudo-users`, as its user ([[ed-auto-save-path]], made ready by
+[[ensure-private-sidecar]]) — the text built from
 the rope here, in the writer process `ed-auto-save!` spawns, so neither the text nor the
 disk is paid for on the editor's loop. A sidecar that cannot be written is logged and the
 rest still are. Returns nil."
   (doseq (entry due)
     (let ([path rope] entry
-          sudo? (contains? sudo-paths path)
-          sidecar (ed-auto-save-path path sudo?))
+          user (get sudo-users path))
       (try
-        (do
-          (when sudo? (ensure-private-sidecar-dir sidecar))
-          (file/spit-private sidecar (text/->string rope)))
+        (file/spit-private (if user (ensure-private-sidecar path user) (ed-auto-save-path path))
+          (text/->string rope))
         (catch e (log/warn (str "auto-save of " path " failed: " (error-message e))))))))
 
 (defn ed-auto-save! (m)
@@ -166,21 +255,21 @@ you stopped typing stayed unwritten until the next key."
 ;; The sidecars are worth something only if they come back: a file visited with a sidecar
 ;; newer than itself says so, and `recover/cmd-recover-this-file` puts the text back.
 
-(defn ed-auto-save-newer? (path &optional (sudo? false))
-  "Whether `path` has an auto-save sidecar (the private one when `sudo?`) written after the
+(defn ed-auto-save-newer? (path &optional (sudo false))
+  "Whether `path` has an auto-save sidecar (the private one when `sudo` names a user, `true` root) written after the
 file was — unsaved text the editor (or one that crashed) left behind. A sidecar of a file
 that no longer exists counts."
-  (let (sidecar-mtime (file/mtime (ed-auto-save-path path sudo?))
+  (let (sidecar-mtime (file/mtime (ed-auto-save-path path sudo))
         file-mtime (file/mtime path))
     (and (not (nil? sidecar-mtime)) (or (nil? file-mtime) (> sidecar-mtime file-mtime)))))
 
-(defn ed-recovery-note (path &optional (sudo? false))
-  "What visiting `path` (as root when `sudo?`) should say when it has newer auto-save data
+(defn ed-recovery-note (path &optional (sudo false))
+  "What visiting `path` (as the user `sudo` names, `true` root) should say when it has newer auto-save data
 ([[ed-auto-save-newer?]]), or nil. Emacs's \"has auto save data; consider M-x
 recover-this-file\".
 
     (autosave/ed-recovery-note \"/nowhere/at/all\")   ;=> nil"
-  (when (ed-auto-save-newer? path sudo?)
+  (when (ed-auto-save-newer? path sudo)
     (str (path/basename path) " has unsaved auto-save data — M-x recover-this-file to restore it")))
 
 (def *follow-points-max-chars* 400000) ; past this, a re-read keeps the character offset
