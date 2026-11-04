@@ -109,7 +109,13 @@ src/model.blsp              the ui-run model: buffer pool, panes, kill ring, min
                             `:output-buffer-max-lines` a buffer's oldest lines are cut,
                             point / mark / `:input-start` / `:line-links` and every pane's
                             cursor and scroll moving with the text — Emacs's
-                            comint-buffer-maximum-size), and `ed-ding`: a command's FAILURE
+                            comint-buffer-maximum-size) on the one CARRY rule every change of
+                            text shares (`ed-carry-position` / `ed-carry-panes`: positions move
+                            as Emacs markers do — a head cut here, another frame's splice in
+                            `hosted`, the layouts a feature keeps via `register-layout-keeper`),
+                            the PRIMARY selection read as an ask (`ed-primary-ask`: a task for
+                            the local window, the client for a served session), and `ed-ding`: a
+                            command's FAILURE
                             (a motion at the edge, a failing search, a read-only refusal),
                             which is what stops a keyboard macro. `message` never covers a
                             STANDING QUESTION (a y/n read, a query-replace, a minibuffer prompt):
@@ -203,13 +209,19 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             and on *Packages*' status line. An install lands in a staging dir
                             and moves into place only when it verified and enhances this bedit,
                             so a failed or cancelled one keeps the copy there; an update reloads
-                            the plugin's sources. The registry calls are `*registry*` (tests stub it)
+                            the plugin's sources in load order (brood's
+                            `reflect/source-load-order`). A package prompt (M-x package-install,
+                            C-h P) fetches the list itself when it has none, saying so
+                            (`package-prompt`); `package-info` is what C-h P shows. The registry
+                            calls are `*registry*` (tests stub it)
 src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a function's *Help*
                             page: the whole docstring, keys in force, arguments, signature,
                             module and source line — brood's reflect, seeing through contract
                             shims, ADR-560) and C-h v (an init.blsp setting's page: doc, type,
                             default, the value in effect and whether init.blsp or the default
-                            gave it, per-mode values, a session change, an unloaded edit)
+                            gave it, per-mode values, a session change, an unloaded edit) and
+                            C-h P (a package's page over `packages/package-info`: installed or
+                            not, version against the hive's, enhances, themes, settings)
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model); the
                             row table every row↔line question reads (`ed-pane-rows`), from the
                             pane's start row; `ed-visible-windows`, the char ranges a per-window
@@ -231,7 +243,8 @@ src/pulse.blsp              a flash on the line after a JUMP (Emacs pulsar, `:pu
                             key command's jump (another window or buffer, 5+ lines) from typing and
                             the mouse by `:command-count`, a timer fades the band the view lays over it
 src/winner.blsp             C-c ← / C-c → window-layout undo and redo (Emacs winner-mode, `:winner`): a
-                            post-step row keeps the layouts the window SHAPE changed from
+                            post-step row keeps the layouts the window SHAPE changed from, carried
+                            with their buffers' text (`model/register-layout-keeper`)
 src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
                             `:show-whitespace`, per mode through `scroll/ed-mode-setting`)
 src/glyphless.blsp          the invisible format characters SHOWN (Emacs glyphless-char-display):
@@ -272,7 +285,10 @@ src/ui-kit.blsp             the widget kit over editor/display: a widget is `(ar
 src/input.blsp              dispatch: fold a key/mouse/tick event into the next model; and the
                             keyboard-macro REPLAY (`ed-run-macro`): N passes (C-u N C-x e), or
                             until one fails (C-u 0), each stopping at the first key whose
-                            command fails (`model/ed-ding` or a throw), as Emacs's does
+                            command fails (`model/ed-ding` or a throw), as Emacs's does — in
+                            SLICES of `*macro-slice-ms*` resumed by the `:macro-continue`
+                            ticker, so C-g between them quits the run (its work kept) and other
+                            input waits for it (`:macro-typeahead`)
 src/commands.blsp           the GENERAL editing commands, each a (model key) -> model — motion,
                             editing, kill ring, panes, buffers, prompts. A feature's commands
                             live in its own module (dired, help, vim, registers, hexl,
@@ -396,7 +412,9 @@ src/conventions.blsp        a buffer's INDENT WIDTH, TAB WIDTH, tabs-or-spaces a
                             escape (src/glyphless.blsp gives it a face) — and an indent target is a COLUMN
                             at it (a Makefile's tab stays a tab); a save trims
                             and adds the final newline when .editorconfig asks (a new file takes
-                            its end_of_line; an existing one's mismatch is said, not converted).
+                            its end_of_line, and with charset = utf-8-bom a byte-order mark —
+                            brood's `:bom`, a file's mark kept off its text and written back
+                            (ADR-563); an existing one's mismatch is said, not converted).
                             M-x describe-indentation says where each value came from
 src/editorconfig.blsp       `.editorconfig` (editorconfig.org): the parser, the section globs
                             (`*` `**` `?` `[…]` `{a,b}` `{1..9}`), the walk up to `root = true`, and
@@ -478,7 +496,9 @@ src/hosted.blsp             THE FLIP: every pool buffer backed by its own proces
 src/frames.blsp             frames (C-x 5 2 / o / 0): a second OS window is a PROCESS with its own
                             ui-run whose pool slots link to the same buffer processes, named by
                             std/editor/buffer-registry — a buffer opened, edited or killed in one
-                            frame is in every frame (docs/frames-plan.md)
+                            frame is in every frame (docs/frames-plan.md); a change another frame
+                            made carries this frame's windows, points and `:input-start` with the
+                            text (`hosted/hosted-carried`)
 src/procstream.blsp         the shared streaming-subprocess worker (testrun's :testrun and
                             apprun's :apprun ride it): line-buffered stdout -> handler fns;
                             a partial line past `*procstream-line-max*` is delivered as it
@@ -503,7 +523,9 @@ src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) mod
                             (`lazy-ranges`), over std regex's rope search (brood ADR-540). With
                             the region active, M-% / C-M-% stay inside it (`Query replace in
                             region:`): its end moves with each replacement, and a regexp is
-                            searched with it as the bound (brood ADR-554)
+                            searched with it as the bound (brood ADR-554). M-x replace-string /
+                            replace-regexp are `!` at the first match (`replace-all`): the same
+                            search, `\&` / `\1` and case rule, one undo group
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)
 src/eval-commands.blsp      the C-x C-e family as commands (eval-last-sexp / -region / -buffer):
                             off the loop as a std/task, C-g cancels; loaded with the image (main)
@@ -615,7 +637,9 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             mix, nest repl): the input after the program's prompt is
                             bedit's, with bshell's history and boundary keys, RET sends
                             it — C-c C-j / C-c C-k switch. The mouse reaches a program
-                            that asked for it; the program's cursor shape and visibility
+                            that asked for it; one that did not gets a middle click as
+                            PRIMARY pasted in (Emacs's term-mouse-paste); the program's
+                            cursor shape and visibility
                             are painted; history above the screen keeps its colour and
                             is capped; the mode line chip says which program and mode
                             (named to dodge std's `term`, as formatter dodges `format`)
@@ -801,7 +825,9 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             (src/startup.blsp) and its kills and yanks go to the CLIENT's
                             clipboard over the link (`:client-clipboard`, brood ADR-539) — never
                             the daemon's; a C-y ASKS (`model/ed-clipboard-ask`) and lands at the
-                            spot it marked when the answer comes, the loop never waiting. A guest
+                            spot it marked when the answer comes, the loop never waiting. Its
+                            PRIMARY is the client's the same way (brood ADR-562): a drag sets it,
+                            a middle click asks for it (`model/ed-primary-ask`). A guest
                             keeps the host's config and loses recentf and save-place; a `--listen`
                             daemon keeps savehist off. A session whose loop dies loses its
                             buffers — no lifeline or hosting there yet (brood KI-334)
