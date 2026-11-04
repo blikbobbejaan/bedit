@@ -77,8 +77,23 @@ applied, and the install says why — one bad package never blocks the editor."
       (do (log/warn (str "packages: cannot read the manifest of " name ": " (error-message e))) nil))))
 
 (defn installed? (name)
-  "Whether package `name` is installed in the user package dir."
-  (file/exists? (pkg-manifest name)))
+  "Whether package `name` is installed in the user package dir: a package NAME (one path
+component, `project/valid-dep-name?` — never a path typed into a prompt, never `..`) whose
+directory there holds a manifest."
+  (and (project/valid-dep-name? name) (file/exists? (pkg-manifest name))))
+
+(defn- removable-dir (name)
+  "The directory removing package `name` may delete, or nil: `name` is an installed package
+([[installed?]], listed by [[installed-packages]]) and its directory, symbolic links resolved,
+is a direct child of the user package dir — so neither a typed path, a `..`, nor a link
+leading out of the package dir can make a removal retire or delete anything else."
+  (let (packages (os/canonicalize (user-package-dir))
+        real (when (installed? name) (os/canonicalize (pkg-dir name))))
+    (when (and packages
+            real
+            (includes? (installed-packages) name)
+            (= real (path/join packages name)))
+      real)))
 
 (defn installed-version (name)
   "The installed version string of `name`, or nil — nil without a word when it is not installed
@@ -111,14 +126,11 @@ it, and one reload is enough."
 (defn- entry-symbol (name) (symbol (str name "/bedit-plugin")))
 
 (defn- loaded-contribution (name)
-  "What package `name`'s plugin contributes in the image AS IT IS — its entry called if it is
-bound, loading nothing — or nil: a package never loaded, or one whose entry fails, contributed
-nothing that is still registered."
-  (let (entry (entry-symbol name))
-    (when (bound? entry)
-      (let (contribution (check-allow :discarded-catch
-                           (try ((reflect/eval entry)) (catch _ nil))))
-        (when (map? contribution) contribution)))))
+  "What package `name`'s plugin contributed when it was applied — kept then, so asking calls
+nothing: its entry run again would register its rows a second time, outside the package's
+claim, and the claims would lose them — or nil: a package never applied, or one whose entry
+failed, contributed nothing that is still registered."
+  (registry/lookup :packages/contributions name))
 
 (defn- source-files (name)
   "Every `.blsp` file under package `name`'s src/."
@@ -143,116 +155,160 @@ strings. A file that does not open with one declares none."
   (let (parts (string/split (->string global) "/"))
     (when (> (count parts) 1) (string/join (take parts (dec (count parts))) "/"))))
 
+(defn- exact (global)
+  ;; `global` behind the root escape: the global of exactly that name, never the project's
+  ;; module of the same short name (a package module `org` beside bedit's `org`)
+  (symbol (str "/" global)))
+
 (defn- sited-under? (global prefix)
   ;; whether `global`'s definition was last loaded from a file under `prefix`
-  (let (site (reflect/source-location global))
+  (let (site (reflect/source-location (exact global)))
     (and (vector? site) (string/starts-with? (str (first site)) prefix))))
 
 (defn- global-value (global)
-  (check-allow :discarded-catch (try (reflect/eval global) (catch _ nil))))
+  (check-allow :discarded-catch (try (reflect/eval (exact global)) (catch _ nil))))
 
 (defn- define-global (global value)
   ;; `global` bound to `value` again — the root escape names it whatever module asks
-  (reflect/eval (list 'def (symbol (str "/" global)) (list 'quote value))))
+  (reflect/eval (list 'def (exact global) (list 'quote value))))
+
+(defn- undefine-global (global)
+  ;; `global` removed (`reflect/undef`, brood ADR-391); false when it cannot be
+  (check-allow :discarded-catch (try (reflect/undef (exact global)) (catch _ false))))
+
+;; ---- the globals a package's code defined ------------------------------------------
+;; A package's load binds names: its own functions, and maybe a name the editor or another
+;; package already had — a core function it patches (`(defn bedit/keyhelp/ed-key-label …)`),
+;; another package's function, a root name a second package's loose file defines too. So each
+;; global a package's load bound keeps a STACK, as a registry row does (`ownership`):
+;; `:packages/definitions` global -> `{:base {:present? :known? :value} :stack [{:package
+;; :value} …]}` — what the global held before any package, then each package's binding in load
+;; order, the live one last. A package updated pushes its new binding on top. Retiring a
+;; package splices its layer out: the live one gives the global back to the layer below it,
+;; else to the base, else removes it; a lower one leaves the live binding alone. So removing A
+;; while B's patch of A's function is live keeps B's, and removing B then removes the function
+;; (A's is gone) — never A's old body. Emacs's `unload-feature` restores a function the same
+;; way.
+;;
+;; What a load bound is read from the runtime (`reflect/rebound-since`, brood ADR-597), not from
+;; every global's value: the value a name had BEFORE the load is kept only for the names the
+;; package's sources spell ([[source-names]]) and the registries — what it can rebind.
+
+(defn- file-names (forms module)
+  "Every symbol `forms` spell, at any depth — and, in a file of `module`, each bare one as
+`module/name` too: the names a load of them could bind."
+  (letrec (walk (fn (stack found)
+                  (if (empty? stack)
+                    found
+                    (let (form (first stack)
+                          more (rest stack))
+                      (cond
+                        (symbol? form)
+                          (walk more
+                            (if (and module (nil? (global-namespace form)))
+                              (conj (conj found form) (symbol (str module "/" form)))
+                              (conj found form)))
+                        (or (list? form) (vector? form)) (walk (append (vec form) more) found)
+                        (map? form) (walk (append (keys form) (vals form) more) found)
+                        else (walk more found))))))
+    (walk forms #{})))
+
+(defn- source-names (name)
+  "The names package `name`'s sources spell, module-qualified where they are bare in a module
+file — a superset of the globals its load can bind outside a macro's expansion."
+  (fold (source-files name)
+    #{}
+    (fn (names file)
+      (let (forms (check-allow :discarded-catch
+                    (try (reflect/read-all (file/slurp file)) (catch _ ())))
+            head (first forms)
+            module (when (and (list? head) (= (first head) 'defmodule) (symbol? (second head)))
+                     (->string (second head))))
+        (into names (file-names forms module))))))
+
+(defn- values-before (name)
+  "What package `name`'s load is compared against: `{:generation :names :values}` — the
+runtime's generation, every bound global's name, and the values of the ones its sources spell
+and of every registry."
+  (let (spelled (source-names name)
+        bound (into #{} (reflect/global-names)))
+    {:generation (reflect/generation)
+     :names bound
+     :values (fold (append (seq spelled) (%registry-names))
+               {}
+               (fn (acc global)
+                 (if (contains? bound global) (assoc acc global (global-value global)) acc)))}))
+
+(defn- note-definitions (name before)
+  ;; each global the load bound in the package's files gets this package's layer on top (its
+  ;; earlier one gone), the stack's base what the global held before
+  (let (prefix (str (pkg-dir name) "/"))
+    (doseq (global (reflect/rebound-since (:generation before)))
+      ;; `bound?` asks the global table by exactly this name
+      (when (and (bound? global) (sited-under? global prefix))
+        (let (present? (contains? (:names before) global)
+              known? (contains? (:values before) global)
+              record (registry/lookup :packages/definitions
+                       global
+                       {:base {:present? present?
+                               :known? (or known? (not present?))
+                               :value (get (:values before) global)}
+                        :stack []})
+              others (into [] (seq/reject (:stack record) (fn (layer) (= (:package layer) name)))))
+          (registry/put! :packages/definitions
+            global
+            (assoc record :stack (conj others {:package name :value (global-value global)}))))))))
 
 (defn plugin-definitions (name)
-  "Every global package `name`'s code FIRST defined in this image: the names its load left
-sited in its files that were unbound before it ([[note-loaded]] keeps them — a file without
-a `defmodule` included, whose names are root names), and any name in its own modules
-([[package-modules]]) sited there. A core name the package REDEFINED is not among them: it
-was bound before, and retiring the package restores it ([[restore-redefinitions]])."
-  (let (prefix (str (pkg-dir name) "/")
-        modules (package-modules name)
-        noted (seq/filter (registry/lookup :packages/defined name []) (fn (global) (bound? global))))
-    (vec (seq/distinct (append noted
-                         (seq/filter (reflect/global-names)
-                           (fn (global)
-                             (and (contains? modules (global-namespace global))
-                               (sited-under? global prefix)))))))))
+  "Every global package `name`'s code bound that it still has a layer in — its own functions,
+and a name it patched — sorted."
+  (vec (sort (seq/keep (registry/entries :packages/definitions)
+               (fn ([global record])
+                 (when (any? (:stack record) (fn (layer) (= (:package layer) name))) global))))))
 
-;; ---- core names a package redefined ----------------------------------------
-;; A package's file may redefine a name the editor already had — a core function it patches
-;; (`(defn bedit/keyhelp/ed-key-label …)`). Retiring that by source location undefined it:
-;; the core function was gone until a restart. So a package's load is compared with the
-;; globals as they were before it ([[global-values]]): a name sited in its files afterwards,
-;; outside its own modules, that was bound before with another value is a REDEFINITION.
-;;
-;; Two packages may patch the same function, so each redefined global keeps a STACK, as a
-;; registry row does (`ownership`): `:packages/redefinitions` global -> `{:base :stack [{:package
-;; :value} …]}`, the value from before any package and each package's on top, the live one
-;; last. Retiring a package splices its layer out: the top one restores the layer below it
-;; (or the base), a lower one leaves the live patch alone — so removing A while B's patch is
-;; live keeps B's, and removing B then gives back the core function, never A's (whose helpers
-;; went with A). Emacs's `unload-feature` restores a function the same way.
-
-(defn- global-values ()
-  "Every global's value now, by name — what a package's load is compared against."
-  (fold (reflect/global-names) {} (fn (acc global) (assoc acc global (global-value global)))))
-
-(defn plugin-redefinitions (name before)
-  "The globals package `name`'s files REDEFINED, as `{global value-before}`: sited under its
-directory now, outside its own modules ([[package-modules]]), bound in `before` (a
-[[global-values]] taken before its load) with a value it no longer has."
-  (let (prefix (str (pkg-dir name) "/")
-        modules (package-modules name))
-    (into {}
-      (seq/keep (reflect/global-names)
-        (fn (global)
-          (when (and (contains? before global)
-                  (sited-under? global prefix)
-                  (not (contains? modules (global-namespace global)))
-                  (not (= (get before global) (global-value global))))
-            [global (get before global)]))))))
-
-(defn- note-redefinitions (name before)
-  ;; each redefined global's stack gets this package's layer on top (its earlier one gone)
-  (doseq ([global value-before] (plugin-redefinitions name before))
-    (let (record (registry/lookup :packages/redefinitions global {:base value-before :stack []})
-          others (into [] (seq/reject (:stack record) (fn (layer) (= (:package layer) name)))))
-      (registry/put! :packages/redefinitions
-        global
-        (assoc record :stack (conj others {:package name :value (global-value global)}))))))
-
-(defn restore-redefinitions (name)
-  "Take package `name`'s layer out of every redefined global's stack: where it was the live
-patch the layer below it is bound again (another package's, or the value from before any
-package), where it was not the live patch is left alone. Answers how many globals it had
-patched."
-  (fold (registry/entries :packages/redefinitions)
-    0
-    (fn (patched [global record])
-      (let (stack (:stack record)
-            kept (into [] (seq/reject stack (fn (layer) (= (:package layer) name)))))
-        (cond
-          (= (count kept) (count stack)) patched
-          (empty? kept)
-            (do
-              (registry/remove! :packages/redefinitions global)
-              (define-global global (:base record))
-              (inc patched))
-          (= (:package (last stack)) name)
-            (do
-              (registry/put! :packages/redefinitions global (assoc record :stack kept))
-              (define-global global (:value (last kept)))
-              (inc patched))
-          else
-            (do
-              (registry/put! :packages/redefinitions global (assoc record :stack kept))
-              (inc patched)))))))
+(defn- retire-layer (name global record)
+  "Package `name`'s layer out of `global`'s stack (`record`), the global put right: true when
+its binding changed."
+  (let (stack (:stack record)
+        kept (into [] (seq/reject stack (fn (layer) (= (:package layer) name))))
+        base (:base record)
+        live? (= (:package (last stack)) name))
+    (if (empty? kept)
+      (registry/remove! :packages/definitions global)
+      (registry/put! :packages/definitions global (assoc record :stack kept)))
+    (cond
+      (not live?) false
+      (not (empty? kept)) (do (define-global global (:value (last kept))) true)
+      (and (:present? base) (:known? base)) (do (define-global global (:value base)) true)
+      ;; bound before by something the load could not see coming: left as it is
+      (:present? base) false
+      else (= true (undefine-global global)))))
 
 (defn- retire-definitions (name)
-  "Remove every global package `name`'s code first defined (`reflect/undef`, brood ADR-391)
-and answer how many went. What an update does BEFORE loading the new version, so a function
-the new version dropped is gone rather than callable with the old body, and what a remove
-does so the removed package's code stops running. A caller still holding one raises `unbound
-symbol (removed by reflect/undef …)` — said, not silently old. Its registrations are taken
-back first, so nothing the editor runs still names one."
-  (let (retired (count (seq/filter (plugin-definitions name)
-                         (fn (global)
-                           (check-allow :discarded-catch
-                             (try (reflect/undef global) (catch _ false)))))))
-    (registry/remove! :packages/defined name)
-    retired))
+  "Take package `name`'s layer out of every global it bound ([[note-definitions]]): where it
+was the live binding the layer below it is bound again — another package's, or what the
+global held before any package — or, with none, the global is removed (`reflect/undef`, brood
+ADR-391); where it was not live it is left alone. Then any global of one of its own modules
+still sited in its files (one its code defined at run time) is removed too. Answers how many
+globals changed. What an update does BEFORE loading the new version, so a function the new
+version dropped is gone rather than callable with the old body, and what a remove does so the
+removed package's code stops running."
+  (let (prefix (str (pkg-dir name) "/")
+        modules (package-modules name)
+        module-prefixes (map (seq modules) (fn (module) (str module "/")))
+        changed (count (seq/filter (registry/entries :packages/definitions)
+                         (fn ([global record])
+                           (and (any? (:stack record) (fn (layer) (= (:package layer) name)))
+                             (retire-layer name global record)))))
+        own (seq/filter (reflect/global-names)
+              (fn (global)
+                (let (spelled (->string global))
+                  (and (any? module-prefixes (fn (module) (string/starts-with? spelled module)))
+                    (contains? modules (global-namespace global))
+                    (nil? (registry/lookup :packages/definitions global))
+                    (sited-under? global prefix)
+                    (= true (undefine-global global)))))))
+    (+ changed (count own))))
 
 ;; ---- registrations the package made ----------------------------------------------
 
@@ -360,7 +416,10 @@ entry it wrote after it loaded go — and answer the writes that were live."
   (let (writers (package-writers name)
         writes (registry/written-by writers))
     (unstack-std-writes name)
-    (doseq (write (registry/written-by writers)) (registry/retract write))
+    ;; the same list, not a second scan of every registry: a retract applies only while the
+    ;; entry is still credited to the write's writer, so one the unstacking gave back to
+    ;; another layer or to its base is left as it now is
+    (doseq (write writes) (registry/retract write))
     (registry/remove! :packages/writers name)
     writes))
 
@@ -410,8 +469,8 @@ name, or an anonymous one by the module it was written in."
 (defn- drop-references (name)
   "Drop every registry row — bedit's and `editor/layers`' — that still names package `name`,
 and answer the buffer types it took away."
-  (let (namespaces (package-modules name)
-        defined (into #{} (registry/lookup :packages/defined name []))
+  (let (namespaces (into (package-modules name) (registry/lookup :packages/modules name #{}))
+        defined (first-defined name)
         ours? (fn (value) (names-package? value namespaces defined))
         bookkeeping #{"ownership" "packages"})
     (doseq ([id table] registry/*registries*)
@@ -428,36 +487,54 @@ and answer the buffer types it took away."
 
 ;; ---- retiring a package -----------------------------------------------------------
 
-(defn- note-loaded (name globals-before settings-before)
-  "Record what package `name`'s load did, against the image `globals-before` it: the globals
-it first defined (`:packages/defined`), the core ones it redefined, the std registry entries
-it wrote with what they held, its settings — and its namespaces, so its commands and hooks
-register for it as they run (`ownership/own-namespace!`)."
-  (let (prefix (str (pkg-dir name) "/"))
-    (registry/put! :packages/defined
-      name
-      (vec (seq/filter (reflect/global-names)
-             (fn (global)
-               (and (not (contains? globals-before global)) (sited-under? global prefix))))))
-    (note-redefinitions name globals-before)
+(defn- first-defined (name)
+  ;; the globals package `name` brought into the image: nothing held them before a package,
+  ;; and its layer is the first
+  (into #{}
+    (seq/keep (registry/entries :packages/definitions)
+      (fn ([global record])
+        (when (and (not (:present? (:base record))) (= (:package (first (:stack record))) name))
+          global)))))
+
+(defn- note-loaded (name before settings-before)
+  "Record what package `name`'s load did, against `before` it ([[values-before]]): the globals
+it bound ([[note-definitions]]), the std registry entries it wrote with what they held, its
+settings, its modules — and its namespaces, so its commands and hooks register for it as they
+run (`ownership/own-namespace!`)."
+  (let (modules (package-modules name))
+    (note-definitions name before)
     (registry/put! :packages/writers name (package-writers name))
-    (note-std-writes name globals-before)
+    (registry/put! :packages/modules
+      name
+      (into (registry/lookup :packages/modules name #{}) modules))
+    (note-std-writes name (:values before))
     (adopt-settings name settings-before)
-    (doseq (module (package-modules name)) (ownership/own-namespace! module (claimant-file name)))))
+    (doseq (module modules) (ownership/own-namespace! module (claimant-file name)))))
+
+(defn- retract-impls (name)
+  ;; the ability impls package `name`'s modules registered, taken back — the tier below each
+  ;; winning again (brood ADR-597); `reflect/undef` retires only the impls of a type it removes
+  (count (seq/filter (registry/impls-by (into #{}
+                                          (map (seq (registry/lookup :packages/modules
+                                                      name
+                                                      (package-modules name)))
+                                            symbol)))
+           registry/retract-impl)))
 
 (defn retire-package (name)
   "Take package `name` out of the live editor, in the one order that leaves nothing pointing
 at a name about to go: its bedit registrations back ([[release-registrations]]), the std
 registry entries its loads wrote directly back ([[retract-std-writes]]), any row still
-naming it dropped ([[drop-references]]), the core names it redefined restored
-([[restore-redefinitions]]), then the globals it first defined removed
+naming it dropped ([[drop-references]]), the ability impls its modules registered taken back
+([[retract-impls]]), then every global it bound given back to the layer below or removed
 ([[retire-definitions]]). The image half of [[remove!]] and [[update-plugin!]], which put
 the open buffers right ([[ed-settle-package-buffers]]) with the buffer types it answers.
-Answers `{:released :restored :retired :types}`."
+Answers `{:released :restored :retired :types}` — `:restored` the impls taken back,
+`:retired` the globals put right."
   (let (released (release-registrations name)
         std-writes (retract-std-writes name)
         dropped-types (drop-references name)
-        restored (restore-redefinitions name)
+        restored (retract-impls name)
         retired (retire-definitions name)
         types (into dropped-types
                 (append (seq/keep released (fn ([kind key]) (when (= kind :modes/type-layers) key)))
@@ -465,7 +542,12 @@ Answers `{:released :restored :retired :types}`."
                     (fn (write)
                       (when (and (= (:global write) 'editor/layers/*type-layers*) (:path write))
                         (first (:path write))))))))
-    (doseq (module (package-modules name)) (ownership/disown-namespace! module))
+    ;; the namespaces its loaded versions declared, not only the files on disk now: an update
+    ;; that renamed a module leaves no entry for the old one
+    (doseq (module (into (package-modules name) (registry/lookup :packages/modules name #{})))
+      (ownership/disown-namespace! module))
+    (registry/remove! :packages/modules name)
+    (registry/remove! :packages/contributions name)
     {:released (count released) :restored restored :retired retired :types types}))
 
 (defn ed-settle-package-buffers (m name types)
@@ -540,17 +622,25 @@ With `reload?` its files are loaded again even when the image has its module —
 update needs after [[update-plugin!]] retired the old version."
   (add-to-load-path! name)
   (let (settings-before (registry/entries config/*settings*)
-        globals-before (global-values)
+        before (values-before name)
         contribution (ownership/with-claimant (claimant-file name)
                        (fn ()
                          (let (loaded (plugin-entry name reload?))
                            (when (not (failure? loaded))
                              (doseq (theme (or (:themes loaded) [])) (register-theme! theme)))
                            loaded))))
-    (note-loaded name globals-before settings-before)
+    (note-loaded name before settings-before)
     (if (failure? contribution)
-      (do (note-status name :broken (error-message contribution)) contribution)
-      (do (note-status name :loaded nil) true))))
+      (do
+        (registry/remove! :packages/contributions name)
+        (note-status name :broken (error-message contribution))
+        contribution)
+      (do
+        ;; kept, so C-h P never calls the entry again: a second call would register its rows
+        ;; outside the package's claim
+        (registry/put! :packages/contributions name contribution)
+        (note-status name :loaded nil)
+        true))))
 
 (defn update-plugin! (m name)
   "`[m' applied]`: package `name`'s loaded version RETIRED and the files now in its directory
@@ -634,16 +724,18 @@ asked for it. It is not dropped in silence either: each installed package's fate
   (error-message value))
 
 (defn- clear-stale-staging (packages-dir)
-  "Remove the staging directories a cancelled or crashed install left behind. Best effort: a
-cancelled install's extraction may still be finishing in one, and a leftover is harmless —
-it holds no manifest at the top, so it is never taken for a package."
+  "Remove the staging directories a cancelled or crashed install left behind. Called by the
+install holding the runtime's one job slot ([[job-slot]]), so no other window's install is
+using one; each is named for its job (`.staging-<id>`), and the caller's own is made after
+this. Best effort, and a leftover is harmless — it holds no manifest at the top, so it is
+never taken for a package."
   (when (file/dir? packages-dir)
     (doseq (entry (file/ls packages-dir))
       (when (string/starts-with? entry ".staging-")
         (check-allow :discarded-catch
           (try (file/rmdir (path/join packages-dir entry)) (catch _ nil)))))))
 
-(defn- staged-install (registry name)
+(defn- staged-install (registry name id)
   "Install `name` through `registry`'s `:install` into a fresh staging directory, and move it
 into place only when it arrived AND enhances this bedit. Answers the install's result map
 (its `:path` the final one), or a failure carrying the reason — the installed copy, if there
@@ -651,7 +743,7 @@ was one, untouched. The signing pins (brood ADR-212) travel into the staging dir
 back, so trust on first use still sees the key it pinned."
   (let (packages-dir (user-package-dir)
         _ (clear-stale-staging packages-dir)
-        staging (path/join packages-dir (str ".staging-" (rand/token 4)))
+        staging (path/join packages-dir (str ".staging-" (or id (rand/token 4))))
         pins (path/join packages-dir ".signing-pins.blsp")
         staged-pins (path/join staging ".signing-pins.blsp"))
     (file/mkdir staging)
@@ -680,13 +772,13 @@ back, so trust on first use still sees the key it pinned."
       ;; nil: a registry answer with no `:packages` — nothing published yet
       else {:kind :list :available []})))
 
-(defn- install-job (registry name)
-  (let (result (staged-install registry name))
+(defn- install-job (registry name id)
+  (let (result (staged-install registry name id))
     (if (failure? result)
       {:kind :install :name name :error (reason-of result)}
       {:kind :install :name name :result result})))
 
-(defn- update-job (registry name)
+(defn- update-job (registry name id)
   ;; newer on the hive: install it; current: say so; the version check failing: say why
   (let (installed (installed-version name)
         latest (try ((:latest-version registry) name) (catch e (failure (error-message e)))))
@@ -696,7 +788,7 @@ back, so trust on first use still sees the key it pinned."
       (and installed (not (version/newer? latest installed)))
         {:kind :update :name name :current true}
       else
-        (let (result (staged-install registry name))
+        (let (result (staged-install registry name id))
           (if (failure? result)
             {:kind :update :name name :error (reason-of result)}
             {:kind :update :name name :result result})))))
@@ -707,11 +799,17 @@ through `registry` (a [[*registry*]] map) and answer its outcome: the job with `
 (a list), `:result` (an install), `:current` (an update with nothing newer) — or `:error`, the
 reason it failed. Never raises. What a package task runs; inline when headless."
   (try
-    (case (:kind job)
-      :list (fetch-list registry)
-      :install (install-job registry (:name job))
-      :update (update-job registry (:name job))
-      {:kind (:kind job) :name (:name job) :error (str "no such package job: " (:kind job))})
+    (cond
+      ;; a name is one path component: what a prompt passes on is typed text, and a path there
+      ;; would make the install replace — delete — a directory outside the package dir
+      (and (includes? [:install :update] (:kind job)) (not (project/valid-dep-name? (:name job))))
+        (assoc job :error (str (pr-str (:name job)) " is not a package name"))
+      else
+        (case (:kind job)
+          :list (fetch-list registry)
+          :install (install-job registry (:name job) (:id job))
+          :update (update-job registry (:name job) (:id job))
+          {:kind (:kind job) :name (:name job) :error (str "no such package job: " (:kind job))}))
     (catch e (assoc job :error (error-message e)))))
 
 ;; ---- running one off the loop ------------------------------------------------
@@ -723,6 +821,33 @@ reason it failed. Never raises. What a package task runs; inline when headless."
     :install (str "installing " (:name job))
     :update (str "updating " (:name job))
     (str (:kind job))))
+
+;; One package job at a time for the whole RUNTIME, not per window: another frame or an
+;; attached client has a model of its own, and two installs at once — or a removal while
+;; another window installs the same package — would race over the package dir. The slot is a
+;; registry entry taken in one locked step (`registry/put-new!`): `{:pid :id :label}`, the
+;; window's loop that runs the job, released when it ends. A slot whose window died is free.
+
+(defn job-slot ()
+  "The package job running in any window — `{:pid :id :label}` — or nil."
+  (let (slot (registry/lookup :packages/job :slot))
+    (cond
+      (nil? slot) nil
+      (proc/alive? (:pid slot)) slot
+      else (do (registry/remove! :packages/job :slot) nil))))
+
+(defn- claim-job-slot! (job)
+  ;; the slot for `job`, from this window: the claim, or nil when a job runs somewhere
+  (let (slot {:pid (self) :id (rand/token 4) :label (job-label job)})
+    (job-slot)
+    (when (registry/put-new! :packages/job :slot slot) slot)))
+
+(defn- release-job-slot! (m)
+  ;; this window's job is over: its slot is free again
+  (let (slot (registry/lookup :packages/job :slot))
+    (when (and slot (= (:id slot) (:package-job-slot m)))
+      (registry/remove! :packages/job :slot))
+    (dissoc m :package-job-slot)))
 
 (defn package-busy (m)
   "What C-x C-c would kill (`model/register-exit-query`): the package job in flight."
@@ -736,23 +861,28 @@ says what is running.
 The two bindings the job reads — `*registry*` and `config/*config-base*` — are captured HERE
 and bound again in the task: a binding does not cross into the task's process, and a test's
 scratch config dir must not turn into the user's own there."
-  (cond
-    (:package-job m) (busy-message m)
-    (ed-headless?)
-      (ed-package-done (assoc m :package-job-info job) (run-package-job *registry* job))
-    else
-      (let (registry *registry*
-            config-base *config-base*
-            handle (task (fn ()
-                           (binding (*registry* registry *config-base* config-base)
-                             (run-package-job registry job)))
-                     {:timeout *package-job-timeout-ms*})
-            label (str (job-label job) "…"))
-        (refresh-packages (message (assoc m
-                                     :package-job handle
-                                     :package-job-info job
-                                     :package-status label)
-                            label)))))
+  (let (slot (when (nil? (:package-job m)) (claim-job-slot! job))
+        job (if slot (assoc job :id (:id slot)) job))
+    (cond
+      (:package-job m) (busy-message m)
+      (nil? slot) (busy-message m)
+      (ed-headless?)
+        (ed-package-done (assoc m :package-job-info job :package-job-slot (:id slot))
+          (run-package-job *registry* job))
+      else
+        (let (registry *registry*
+              config-base *config-base*
+              handle (task (fn ()
+                             (binding (*registry* registry *config-base* config-base)
+                               (run-package-job registry job)))
+                       {:timeout *package-job-timeout-ms*})
+              label (str (job-label job) "…"))
+          (refresh-packages (message (assoc m
+                                       :package-job handle
+                                       :package-job-info job
+                                       :package-job-slot (:id slot)
+                                       :package-status label)
+                              label))))))
 
 (defn- apply-outcome (m outcome)
   "`[m' note]`: a finished install or update applied — an update through [[update-plugin!]],
@@ -790,7 +920,7 @@ applied live and redraws them — and a failure says its reason in the echo area
 *Packages* status line, rather than a bare `install failed`. A nil `outcome` is the task having
 died or timed out, said as such."
     (let (job (or (:package-job-info m) {})
-          m1 (dissoc m :package-job :package-job-info))
+          m1 (release-job-slot! (dissoc m :package-job :package-job-info)))
       (cond
         (nil? outcome)
           (let (note (str (job-label job)
@@ -835,7 +965,9 @@ other prompt, or none, is left alone."
 it stopped, and so does C-g. A cancelled install leaves the installed copy as it was — it never
 left its staging directory."
   (let (note (str (job-label (or (:package-job-info m) {})) " stopped"))
-    (ed-quit-note (refresh-packages (assoc (dissoc m :package-job-info) :package-status note)) note)))
+    (ed-quit-note (refresh-packages (assoc (release-job-slot! (dissoc m :package-job-info))
+                                      :package-status note))
+      note)))
 
 ;; ---- remove (local, so on the loop) ---------------------------------------------
 
@@ -845,13 +977,15 @@ everything it registered taken back, the core names it redefined restored, the g
 first defined removed ([[retire-package]]), so its code stops running without a restart and
 nothing the editor runs names it; and every open buffer in a mode it took away put in
 fundamental mode, said in *Messages* ([[ed-settle-package-buffers]]). `removed?` is false,
-and `m` unchanged, when it was not installed."
-  (if (not (installed? name))
-    [m false]
-    (let (retired (retire-package name))
-      (registry/remove! :packages/status name)
-      (file/rmdir (pkg-dir name))
-      [(ed-settle-package-buffers m name (:types retired)) true])))
+and `m` unchanged, when it is not an installed package ([[removable-dir]]) — checked before
+anything is retired or deleted."
+  (let (dir (removable-dir name))
+    (if (nil? dir)
+      [m false]
+      (let (retired (retire-package name))
+        (registry/remove! :packages/status name)
+        (file/rmdir dir)
+        [(ed-settle-package-buffers m name (:types retired)) true]))))
 
 ;; ---- the *Packages* browser (M-x package-list) -----------------------------
 ;; Rows are 0-indexed to the buffer line (the git-status/dired discipline), nil for the header
@@ -1159,14 +1293,18 @@ plugin contributes as loaded now. An installed package this image could not load
        :themes (if (map? contribution) (map (or (:themes contribution) []) :name) [])})))
 
 (defn- busy-message (m)
-  ;; what a refused request says while a job runs
+  ;; what a refused request says while a job runs — this window's, or another's
   (message m
-    (str "the package manager is busy " (job-label (:package-job-info m)) " — C-g stops it")))
+    (if (:package-job m)
+      (str "the package manager is busy " (job-label (:package-job-info m)) " — C-g stops it")
+      (str "the package manager is busy "
+        (or (:label (job-slot)) "with another job")
+        " in another window"))))
 
 (defn remove-package (m name)
-  "Remove package `name` live and redraw *Packages* — refused while a package job runs, since
-an install or update of it landing afterwards would put it straight back."
-  (if (:package-job m)
+  "Remove package `name` live and redraw *Packages* — refused while a package job runs in any
+window, since an install or update of it landing afterwards would put it straight back."
+  (if (or (:package-job m) (job-slot))
     (busy-message m)
     (let ([removed-model removed?] (remove! (message m (str "removed " name)) name))
       (if removed? (refresh-packages removed-model) (message m (str name " is not installed"))))))
