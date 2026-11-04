@@ -949,6 +949,9 @@ tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may onl
 tools/drive-*.blsp          live drivers: run the real editor over a pty (std/vt reads what it
                             paints) or its own ui-run loop, and assert — the wiring the model
                             tests can't see (`make drive`, tools/README.md)
+tools/ci/platform-smoke.sh  CI's macOS / Windows run (`platform-smoke` in ci.yml): nest check, the
+                            boot check and the test files where the OS shows through — what each
+                            OS proves is docs/platforms.md
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")
