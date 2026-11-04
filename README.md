@@ -75,6 +75,23 @@ follow/mirror — over a Unix socket or authenticated TCP (`--listen`). See
 for the runbook, and [`ROADMAP.md`](ROADMAP.md) for the full status and what's
 next.
 
+## Configuring
+
+`~/.config/bedit/init.blsp` is one `(config …)` form, written with every key documented
+(and commented out) on first launch. It is **data**, read and never evaluated — so it holds
+settings and key bindings, not code; `M-x reload-config` applies an edit without a restart:
+
+```text
+(config
+  :font "JetBrains Mono"                       ; one not installed is said, not silently replaced
+  :keys {"C-c f" project-find-file "C-z" nil}  ; global-set-key: a key, an M-x name (nil unbinds)
+  :mode-keys {markdown {"C-c C-c" markdown-preview}})  ; define-key in one mode's map
+```
+
+A command of your own lives in a package under `~/.config/bedit/packages` (see
+[`packages.md`](docs/packages.md)); [`configurability.md`](docs/configurability.md) has what
+the init file can and cannot say.
+
 ## Layout
 
 ```
@@ -90,7 +107,7 @@ src/commands.blsp           the editing commands, each a (model key) -> model
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
 src/interactive.blsp        the `defcommand` macro + the M-x command registry
 src/modes.blsp              modes as layers: the keymaps (data) + brood-mode services
-src/complete.blsp           completion-at-point (the in-buffer Tab popup)
+src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup)
 src/lsp.blsp                LSP client — completion, goto-def/references, hover, rename, format, imenu
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/completion.blsp         shared fuzzy ranking + vertical-menu renderer (complete + minibuffer)

@@ -1,7 +1,12 @@
 # Packages — an extension ecosystem (design note)
 
-**Status:** design-of-record. Mostly **not built yet**; the editor today loads only its
-own bundled modules at startup. Revised 2026-08-02, when the substrate turned out to be
+**Status:** design-of-record, partly built. The package MANAGER exists (`src/packages.blsp`,
+`M-x package-list`): it installs, updates and removes hive packages that `:enhances bedit`
+into `~/.config/bedit/packages` at runtime and loads them at startup, and a package may
+declare its own settings (`:bedit/settings`) and themes. The registration surfaces this note
+names as `bind-key`, `add-hook` and `defsetting` are, as built, init.blsp's `:keys` /
+`:mode-keys` and std's `settings/define`; named hooks and the `(package …)` form are not
+built ([`configurability.md`](configurability.md) has what is). Revised 2026-08-02, when the substrate turned out to be
 further along than this note assumed: **[hive](../../hive) — Brood's package registry —
 is live and `nest` already speaks it.**
 
@@ -61,10 +66,10 @@ Put those two facts together and the design falls out:
 | `package-refresh-contents` | nothing to refresh — hive is queried live |
 | `package-install` | add the dep + resolve + `require`, **in the running image** |
 | `Package-Requires: ((emacs "29.1"))` | `:enhances {bedit ">= 0.1"}` (the marker *and* the version check) |
-| `defcustom` / `define-key` / `add-hook` / `auto-mode-alist` | the settings / `bind-key` / `add-hook` / `register-file-type` registries ([`configurability.md`](configurability.md)) |
+| `defcustom` / `define-key` / `add-hook` / `auto-mode-alist` | `settings/define` (`:bedit/settings`) / init.blsp's `:keys` and `:mode-keys` / `add-hook` (not built) / `register-file-type` registries ([`configurability.md`](configurability.md)) |
 | `use-package` | a declarative `(package …)` form in `init.blsp` — **data, not code** |
 | autoloads | the `M-x` registry + late-bound command symbols |
-| `M-x list-packages`, `C-h P` | `M-x package-list` (a `*Packages*` buffer), `C-h P` describe-package |
+| `M-x list-packages`, `C-h P` | `M-x package-list` (a `*Packages*` buffer), `C-h P` describe-package (not built) |
 
 So most of "load packages like Emacs" **already exists** — it just isn't pointed at the
 editor yet.

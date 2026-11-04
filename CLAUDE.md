@@ -93,7 +93,10 @@ src/startup.blsp            the ONE startup path the window and `--serve` share:
                             (grammars, slow-turn log, savehist, colours + `:theme`, packages), a
                             model's (init.blsp's model settings, recentf, save-place), a window's
                             (font, inset, text settings, window mode — an attached client's from
-                            ITS machine's init file)
+                            ITS machine's init file). A `:font` that is not installed is SAID
+                            (`font-warning`, from `gui/font-info`'s `:not-found`, brood ADR-442):
+                            the echo area and *Messages* at startup, M-x reload-config, a served
+                            window's console — never a silent DejaVu
 src/model.blsp              the ui-run model: buffer pool, panes, kill ring, minibuffer, *Messages*,
                             the timers — and the REGISTRIES the rest plugs into: idle-beat jobs
                             (`register-idle-job`), off-loop task replies, inbound `[:tag …]`
@@ -203,7 +206,8 @@ src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a fun
                             gave it, per-mode values, a session change, an unloaded edit)
 src/panes.blsp              pane-layout geometry + mouse-event folding (model -> model); the
                             row table every row↔line question reads (`ed-pane-rows`), from the
-                            pane's start row
+                            pane's start row; `ed-visible-windows`, the char ranges a per-window
+                            highlight reads (a long line only over what the pane shows of it)
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
                             feature: a pane body's layers share ONE geometry map, and the
                             mode line's feature chips come from the statusbar registry
@@ -222,6 +226,11 @@ src/winner.blsp             C-c ← / C-c → window-layout undo and redo (Emacs
                             post-step row keeps the layouts the window SHAPE changed from
 src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
                             `:show-whitespace`, per mode through `scroll/ed-mode-setting`)
+src/glyphless.blsp          the invisible format characters SHOWN (Emacs glyphless-char-display):
+                            brood lays a zero width space, a BOM mid-text, a tag character out as
+                            its `<200b>` escape (ADR-556, bound by `conventions/with-cell-layout`
+                            from `:glyphless-chars`); this module gives the escape its face, and a
+                            bidi control (Trojan Source) a hazard face. The minibuffer shows them too
 src/rainbow.blsp             a tree-sitter buffer's brackets coloured by depth (Emacs rainbow-delimiters,
                             `:rainbow-delimiters`): delimiter tokens of the held parse, the window's top
                             depth from the tree; the Lisp modes colour theirs in their own lexer
@@ -372,8 +381,11 @@ src/conventions.blsp        a buffer's INDENT WIDTH, TAB WIDTH, tabs-or-spaces a
                             Emacs's. TAB / RET's indenter, Shift-TAB, M-q, tabify read it; brood's
                             `*tab-width*` (ADR-537) is bound to it once per turn
                             (`input/ed-update`), per pane in the view, and by every `wrap`
-                            function handed a buffer (`with-tab-width`), so a tab SHOWS, moves
-                            and scrolls at the buffer's width, and an indent target is a COLUMN
+                            function handed a buffer (`with-cell-layout`), so a tab SHOWS, moves
+                            and scrolls at the buffer's width — and brood's `*glyphless-display*`
+                            (ADR-556) beside it, from init.blsp's `:glyphless-chars`, so a zero
+                            width space or a bidi control shows, moves and wraps as its `<200b>`
+                            escape (src/glyphless.blsp gives it a face) — and an indent target is a COLUMN
                             at it (a Makefile's tab stays a tab); a save trims
                             and adds the final newline when .editorconfig asks (a new file takes
                             its end_of_line; an existing one's mismatch is said, not converted).
