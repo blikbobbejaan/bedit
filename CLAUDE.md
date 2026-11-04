@@ -598,7 +598,11 @@ src/formatter.blsp          M-x format-buffer + format-on-save: the language's o
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
                             (named to dodge std's `tool/complete`, which shadows a bare `complete`);
                             the card is anchored where the completion STARTS (Corfu's), so it
-                            does not slide as letters are typed into it
+                            does not slide as letters are typed into it. The auto popup is per
+                            mode (`completion-auto-for?`): the user's `:completion-auto` entry
+                            for the mode, else the mode's `:completion-auto` facet — off in
+                            text-mode (prose completes on demand, C-M-i), on in prog-mode and the
+                            line-lexed config formats
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
                             hover, rename, format, imenu, and `publishDiagnostics` folded into
                             the model's diagnostics, so every language gets the underline / ⚠ note
