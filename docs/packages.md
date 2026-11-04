@@ -348,10 +348,17 @@ before the package loaded:
   (`src/ownership.blsp`): at load by `reflect/current-file`, at run time by the namespace of
   the command or hook that ran (`with-symbol-claimant`). Every row a package claimed goes; a
   core row it replaced comes back.
-- **std registries it wrote directly** (`editor/layers`' tables, a `registry/put!` of its own)
-  are found with Brood's `registry/written-by` for its modules, and for a file with no
-  `defmodule` by comparing the registry globals around that file's load; each entry gets back
-  what it held before (`registry/restore`), or is taken back (`registry/retract`).
+- **std registries it wrote directly** (`editor/layers`' tables, faces, abilities, a
+  `registry/put!` of its own) are found with Brood's `registry/written-by` (ADR-582): the
+  kernel credits each write a load made to its module, or to the FILE for a file with no
+  `defmodule`, so the package's writers are its module symbols and its files' absolute paths
+  (`packages/package-writers`). A list member is taken back (`registry/retract`). A map entry
+  keeps a per-entry stack, `:packages/std-layers`: what it held before any package, then each
+  package's write in load order. Retiring the package whose write is live gives the entry to
+  the layer below it — another package's write, credited to that package again — or to what
+  it held before (`registry/restore`), or takes it back; retiring a lower one leaves the live
+  write alone. Both are conditional on the entry still being the package's, checked by the
+  kernel under the registry lock, so an entry something else wrote since is left as it is.
 - **any row still naming the package** — a hook symbol in its namespace, a function defined
   there — is dropped, as a backstop.
 - **core functions it redefined** are restored through a per-function stack, so two packages

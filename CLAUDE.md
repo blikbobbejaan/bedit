@@ -231,10 +231,13 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             registry row it made taken back (`ownership/release-under!` — idle
                             jobs, task replies, handlers, exit queries, chips, commands, modes,
                             file types, settings, themes; a core row it replaced comes back);
-                            every std registry entry its modules' loads wrote DIRECTLY (brood's
-                            `registry/written-by` — editor/layers' tables, a `registry/put!` of
-                            its own; for a file with no `defmodule`, the registry globals compared
-                            around its load) put back as it was before the load or retracted; any row
+                            every std registry entry its loads wrote DIRECTLY (brood's
+                            `registry/written-by` over its modules and, for a file with no
+                            `defmodule`, the file's path — editor/layers' tables, faces, a
+                            `registry/put!` of its own) taken back, a map entry it replaced given
+                            to the layer below it through a per-entry STACK (two packages writing
+                            one entry come off in either order), conditional on the entry still
+                            being the package's (brood ADR-582); any row
                             still NAMING the package (a hook symbol in its namespace, a function
                             defined there) dropped as a backstop; every core global it REDEFINED
                             restored through a per-global STACK (two packages patching one
