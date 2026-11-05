@@ -78,20 +78,50 @@ load, under [[with-symbol-claimant]], is claimed for `file`."
   (let (parts (string/split (->string sym) "/"))
     (when (> (count parts) 1) (string/join (take parts (dec (count parts))) "/"))))
 
+(defn code-namespace (code)
+  "The namespace (a string) code `code` is in: a symbol's ([[symbol-namespace]]), a function's
+module — an anonymous `fn` too (`reflect/fn-module`, brood ADR-596) — else nil.
+
+    (ownership/code-namespace 'git/cmd-status)   ;=> \"git\""
+  (cond
+    (symbol? code) (symbol-namespace code)
+    (fn? code) (let (module (reflect/fn-module code)) (when module (->string module)))
+    else nil))
+
 (defn with-symbol-claimant (sym thunk)
-  "Call `thunk` — running the command or hook `sym` names — with what it registers claimed
-for the package whose namespace `sym` is in, when it is one. With no package namespace
-recorded it is a plain call: the editor without packages pays one map read."
+  "Call `thunk` — running the command or hook `sym` names (a symbol, or the function itself)
+— with what it registers claimed for the package whose namespace it is in, when it is one.
+The package's module is the run's acting writer too (`registry/with-acting-writer`, brood
+ADR-596), so what it writes into std's registries is the package's, and so is everything a
+process it starts registers — a timer's, a worker's. With no package namespace recorded it
+is a plain call: the editor without packages pays one map read."
   (let (owners (registry/entries :ownership/namespaces))
-    (if (or (empty? owners) (not (symbol? sym)))
+    (if (empty? owners)
       (thunk)
-      (let (file (get owners (symbol-namespace sym)))
-        (if (nil? file) (thunk) (binding (*claimant* file) (thunk)))))))
+      (let (namespace (code-namespace sym))
+        (if (nil? namespace)
+          (thunk)
+          (let (file (get owners namespace))
+            (if (nil? file)
+              (thunk)
+              (binding (*claimant* file) (registry/with-acting-writer (symbol namespace) thunk)))))))))
+
+(defn- acting-claimant ()
+  ;; the package whose code started this process — its load, a command, a timer — when the
+  ;; registration comes from a process of its own (brood ADR-596): a module by its recorded
+  ;; namespace, a file without a `defmodule` by its path
+  (let (writer (registry/acting-writer))
+    (cond
+      (symbol? writer) (get (registry/entries :ownership/namespaces) (->string writer))
+      (string? writer) writer
+      else nil)))
 
 (defn current-claimant ()
   "The file a registration made now is claimed for: the one being loaded, else the bound
-[[*claimant*]], else nil (a registration at run time that no file owns)."
-  (or (reflect/current-file) *claimant*))
+[[*claimant*]], else the package whose code started this process (its acting writer, brood
+ADR-596) — a timer or a worker it spawned — else nil (a registration at run time that no
+file owns)."
+  (or (reflect/current-file) *claimant* (acting-claimant)))
 
 (defn- push-claim (kind key entry file)
   "Record that `file` claims `entry` under `[kind key]` — on top of what was there, replacing
@@ -103,7 +133,23 @@ its own earlier claim — without writing the registry."
         others (into [] (seq/reject (:stack record) (fn (layer) (= (:file layer) file)))))
     (registry/put! :ownership/claims
       claim-key
-      (assoc record :stack (conj others {:file file :entry entry})))))
+      (assoc record :stack (conj others {:file file :entry entry})))
+    ;; indexed by file, so taking a package's claims back reads its own, not every claim
+    ;; (a key a claim no longer holds is checked against the record when it is read)
+    (registry/put! :ownership/by-file
+      file
+      (conj (registry/lookup :ownership/by-file file #{}) claim-key))))
+
+(defn- claim-keys-under (prefix)
+  ;; every claim key a file under `prefix` claimed at some point — a superset, from the index
+  (into #{}
+    (mapcat (seq/filter (registry/entries :ownership/by-file) (fn ([file _]) (under? file prefix)))
+      (fn ([_ keys]) (seq keys)))))
+
+(defn- forget-files-under! (prefix)
+  ;; the index entries of the files under `prefix`, once their claims are taken back
+  (doseq ([file _] (registry/entries :ownership/by-file))
+    (when (under? file prefix) (registry/remove! :ownership/by-file file))))
 
 (defn claim! (kind key entry)
   "Register `entry` under `key` in the registry `kind` — replacing what is there — and record
@@ -151,32 +197,42 @@ goes."
   "Every `[kind key]` a file under `directory` claims, sorted — what [[release-under!]] would
 take back."
   (let (prefix (str directory "/"))
-    (vec (sort (seq/keep (registry/entries :ownership/claims)
-                 (fn ([claim-key record])
-                   (when (any? (:stack record) (fn (layer) (under? (:file layer) prefix)))
-                     claim-key)))))))
+    (vec (sort (seq/filter (claim-keys-under prefix)
+                 (fn (claim-key)
+                   (let (record (registry/lookup :ownership/claims claim-key))
+                     (and record (any? (:stack record) (fn (layer) (under? (:file layer) prefix)))))))))))
 
 (defn release-under! (directory)
   "Take back every registry entry a file under `directory` claimed — a package's, before its
 globals are retired — and answer the `[kind key]`s released. Where another claim or the
 entry from before the first one is left, that is what the registry holds again; where none
 is, the entry goes."
-  (let (prefix (str directory "/"))
-    (vec (seq/keep (registry/entries :ownership/claims)
-           (fn ([claim-key record])
-             (let (stack (:stack record)
-                   kept (into [] (seq/reject stack (fn (layer) (under? (:file layer) prefix)))))
-               (when (< (count kept) (count stack))
-                 (let ([kind key] claim-key)
-                   (cond
-                     (not (empty? kept))
-                       (do
-                         (registry/put! :ownership/claims claim-key (assoc record :stack kept))
-                         (when (not (= (last kept) (last stack)))
-                           (kind-write kind key (:entry (last kept)))))
-                     (:base-present? record)
-                       (do
-                         (registry/remove! :ownership/claims claim-key)
-                         (kind-write kind key (:base record)))
-                     else (do (registry/remove! :ownership/claims claim-key) (kind-remove kind key)))
-                   claim-key))))))))
+  (let (prefix (str directory "/")
+        released (vec (seq/keep (claim-keys-under prefix)
+                        (fn (claim-key)
+                          (let (record (or (registry/lookup :ownership/claims claim-key)
+                                         {:stack []})
+                                stack (:stack record)
+                                kept (into []
+                                       (seq/reject stack (fn (layer) (under? (:file layer) prefix)))))
+                            (when (< (count kept) (count stack))
+                              (let ([kind key] claim-key)
+                                (cond
+                                  (not (empty? kept))
+                                    (do
+                                      (registry/put! :ownership/claims
+                                        claim-key
+                                        (assoc record :stack kept))
+                                      (when (not (= (last kept) (last stack)))
+                                        (kind-write kind key (:entry (last kept)))))
+                                  (:base-present? record)
+                                    (do
+                                      (registry/remove! :ownership/claims claim-key)
+                                      (kind-write kind key (:base record)))
+                                  else
+                                    (do
+                                      (registry/remove! :ownership/claims claim-key)
+                                      (kind-remove kind key)))
+                                claim-key)))))))
+    (forget-files-under! prefix)
+    released))

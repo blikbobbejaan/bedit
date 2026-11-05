@@ -1,0 +1,302 @@
+;; What removing, updating and describing a package may touch — and may not. Each case was a
+;; confirmed review finding (2026-11-05): a removal deleting a directory outside the package
+;; dir, a removal undefining another package's live patch or putting back a dead version, an
+;; `impl` outliving its package, C-h P running the plugin entry again, two windows each
+;; running a package job, a renamed module's namespace left owned, a new frame without what
+;; init.blsp said.
+
+(defmodule package-safety-test
+  (:use test)
+  (:use-internals packages)
+  (:use config) ; *config-base* — a scratch config dir, never the user's own packages
+  (:use model) ; ed-init
+  (:use editor/buffer)) ; make-buffer
+
+(purge-stale-temp "bedit-pkgsafe-")
+
+(defn- write-files (dir name files &optional (version "1.0.0"))
+  "Package `name`@`version` under packages `dir`, its src/ holding `files` (file name -> text)."
+  (let (root (path/join dir name))
+    (os/cmd "mkdir" ["-p" (path/join root "src")])
+    (file/spit (path/join root "project.blsp")
+      (str "(project :name \"" name "\" :version \"" version "\" :enhances {bedit \">= 0.1\"})\n"))
+    (doseq ([file text] files) (file/spit (path/join root "src" file) text))))
+
+(def- stub
+  {:enhancers (fn (_app) []) :latest-version (fn (_name) "1.0.0") :install (fn (_name _dir) nil)})
+
+(defn- with-base (base thunk) (binding (*config-base* base *registry* stub) (thunk)))
+
+(defn- apply-from-files (base name) (with-base base (fn () (packages/apply-plugin! name true))))
+
+(defn- remove-package (base name)
+  (with-base base (fn () (packages/remove! (ed-init (make-buffer "")) name))))
+
+(defn- answer-of (sym)
+  (if (bound? sym) (try ((reflect/eval sym)) (catch e (str "raised: " (error-message e)))) :unbound))
+
+(describe "removing never reaches outside the package dir"
+  :isolated (test "a typed path, a `..` and a symbolic link out are each refused, with nothing retired"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          packages-dir (path/join base "bedit" "packages")
+          victim (path/join base "victim-project")
+          linked (path/join base "linked-project"))
+      (os/cmd "mkdir" ["-p" packages-dir victim linked])
+      (file/spit (path/join victim "project.blsp") "(project :name \"victim\")\n")
+      (file/spit (path/join victim "precious.txt") "data")
+      (file/spit (path/join linked "project.blsp") "(project :name \"linked\")\n")
+      (os/cmd "ln" ["-s" linked (path/join packages-dir "linkpkg")])
+      (let (m (ed-init (make-buffer ""))
+            typed (with-base base (fn () (packages/remove-package m victim)))
+            dotted (with-base base (fn () (packages/remove-package m "../../victim-project")))
+            through-link (with-base base (fn () (packages/remove-package m "linkpkg"))))
+        (is (file/exists? (path/join victim "precious.txt")))
+        (is (file/exists? (path/join linked "project.blsp")))
+        (is (includes? (:echo typed) "is not installed"))
+        (is (includes? (:echo dotted) "is not installed"))
+        (is (includes? (:echo through-link) "is not installed"))
+        ;; an install or update of a path is refused before anything touches the disk
+        (is (includes? (:error (with-base base
+                                 (fn ()
+                                   (packages/run-package-job stub {:kind :install :name victim}))))
+              "is not a package name"))
+        (is (file/exists? (path/join victim "precious.txt")))))))
+
+(describe "a global two packages bind keeps a stack of them"
+  :isolated (test "B patches A's function: removing A keeps B's patch, removing B removes the function"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages"))
+      (write-files dir
+        "zzpa"
+        {"zzpa.blsp" "(defmodule zzpa)\n(defn bedit-plugin () {})\n(defn helper () \"A\")\n"})
+      (write-files dir
+        "zzpb"
+        {"zzpb.blsp" "(defmodule zzpb)\n(defn bedit-plugin () {})\n(defn zzpa/helper () \"B\")\n"})
+      (apply-from-files base "zzpa")
+      (apply-from-files base "zzpb")
+      (let (both (answer-of 'zzpa/helper)
+            _ (remove-package base "zzpa")
+            a-gone (answer-of 'zzpa/helper)
+            _ (remove-package base "zzpb")
+            b-gone (answer-of 'zzpa/helper))
+        (assert= [both a-gone b-gone] ["B" "B" :unbound]))))
+  :isolated (test "two loose files defining one root name"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages"))
+      (write-files dir
+        "zzla"
+        {"zzla.blsp" "(defmodule zzla)\n(defn bedit-plugin () {})\n"
+         "loosea.blsp" "(defn zz-shared () \"A\")\n"})
+      (write-files dir
+        "zzlb"
+        {"zzlb.blsp" "(defmodule zzlb)\n(defn bedit-plugin () {})\n"
+         "looseb.blsp" "(defn zz-shared () \"B\")\n"})
+      (apply-from-files base "zzla")
+      (apply-from-files base "zzlb")
+      (let (both (answer-of 'zz-shared)
+            _ (remove-package base "zzla")
+            a-gone (answer-of 'zz-shared)
+            _ (remove-package base "zzlb")
+            b-gone (answer-of 'zz-shared))
+        (assert= [both a-gone b-gone] ["B" "B" :unbound]))))
+  :isolated (test "A updated under B's patch: removing B keeps A's new version, never the old"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages"))
+      (write-files dir
+        "zzua"
+        {"zzua.blsp" "(defmodule zzua)\n(defn bedit-plugin () {})\n(defn helper () \"A1\")\n"})
+      (write-files dir
+        "zzub"
+        {"zzub.blsp" "(defmodule zzub)\n(defn bedit-plugin () {})\n(defn zzua/helper () \"B\")\n"})
+      (apply-from-files base "zzua")
+      (apply-from-files base "zzub")
+      (let (both (answer-of 'zzua/helper)
+            _ (write-files dir
+                "zzua"
+                {"zzua.blsp" "(defmodule zzua)\n(defn bedit-plugin () {})\n(defn helper () \"A2\")\n"}
+                "2.0.0")
+            _ (with-base base (fn () (packages/update-plugin! (ed-init (make-buffer "")) "zzua")))
+            updated (answer-of 'zzua/helper)
+            _ (remove-package base "zzub")
+            b-gone (answer-of 'zzua/helper))
+        (remove-package base "zzua")
+        (assert= [both updated b-gone] ["B" "A2" "A2"])
+        (assert= (answer-of 'zzua/helper) :unbound)))))
+
+(describe "an impl a package registered"
+  :isolated (test "of a core ability for a core type goes with the package"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages"))
+      (write-files dir
+        "zzi"
+        {"zzi.blsp" "(defmodule zzi)\n(defn bedit-plugin () {})\n(defn helper (s) nil)\n(impl Port :keyword (emit (k s) (helper s)))\n"})
+      (let (before (satisfies? 'Port :a)
+            _ (apply-from-files base "zzi")
+            loaded (satisfies? 'Port :a)
+            _ (remove-package base "zzi")
+            after (satisfies? 'Port :a))
+        (assert= [before loaded after] [false true false])))))
+
+(describe "C-h P"
+  :isolated (test "does not call the plugin entry again, so the package's claims stay whole"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages"))
+      (write-files dir
+        "zzc"
+        {"zzc.blsp" (str "(defmodule zzc)\n"
+                      "(defn chip (m pane buf) nil)\n" "(defn bedit-plugin ()\n"
+                      "  (do (statusbar/register-modeline-segment :zzc-chip 98 'zzc/chip)\n"
+                      "      {:themes [{:name \"zzc-theme\" :palette {}}]}))\n")})
+      (apply-from-files base "zzc")
+      (let (package-dir (with-base base (fn () (packages/pkg-dir "zzc")))
+            claimed? (fn ()
+                       (includes? (ownership/claims-under package-dir)
+                         [:statusbar/segments :zzc-chip]))
+            before (claimed?)
+            info (with-base base (fn () (packages/package-info (ed-init (make-buffer "")) "zzc")))
+            after (claimed?))
+        (remove-package base "zzc")
+        (assert= [before after] [true true])
+        (assert= (vec (:themes info)) ["zzc-theme"])
+        (assert= (registry/lookup :statusbar/segments :zzc-chip) nil)))))
+
+(describe "one package job in the whole runtime"
+  :isolated (test "a job another window runs refuses this window's job and its removals"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages")
+          _ (write-files dir
+              "zzjob"
+              {"zzjob.blsp" "(defmodule zzjob)\n(defn bedit-plugin () {})\n"})
+          ;; another window: a live process holding the slot
+          other (spawn (receive (:stop nil)))
+          _ (registry/put! :packages/job :slot {:pid other :id "other" :label "installing zzother"})
+          m (ed-init (make-buffer ""))
+          refused-job (with-base base (fn () (packages/launch-job m {:kind :list})))
+          refused-remove (with-base base (fn () (packages/remove-package m "zzjob")))
+          _ (send other :stop)
+          _ (receive (after 50 nil))
+          ;; the window is gone: its slot is free
+          freed (packages/job-slot))
+      (registry/remove! :packages/job :slot)
+      (is (includes? (:echo refused-job) "installing zzother in another window"))
+      (is (includes? (:echo refused-remove) "installing zzother in another window"))
+      (is (with-base base (fn () (packages/installed? "zzjob"))))
+      (is (nil? freed))
+      ;; and a job this window runs holds the slot only while it runs
+      (with-base base (fn () (packages/launch-job (ed-init (make-buffer "")) {:kind :list})))
+      (is (nil? (packages/job-slot))))))
+
+(describe "what a package's modules were"
+  :isolated (test "an update that renames its module leaves no namespace owned by the old one"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages"))
+      (write-files dir
+        "zzren"
+        {"zzren.blsp" "(defmodule zzren)\n(defn bedit-plugin () {})\n"
+         "zzold.blsp" "(defmodule zzold)\n(defn f () 1)\n"})
+      (apply-from-files base "zzren")
+      (file/rm (path/join dir "zzren" "src" "zzold.blsp"))
+      (write-files dir
+        "zzren"
+        {"zzren.blsp" "(defmodule zzren)\n(defn bedit-plugin () {})\n"
+         "zznew.blsp" "(defmodule zznew)\n(defn f () 2)\n"}
+        "2.0.0")
+      (with-base base (fn () (packages/update-plugin! (ed-init (make-buffer "")) "zzren")))
+      (is (nil? (registry/lookup :ownership/namespaces "zzold")))
+      (is (registry/lookup :ownership/namespaces "zznew"))
+      (remove-package base "zzren")
+      (is (nil? (registry/lookup :ownership/namespaces "zznew"))))))
+
+(describe "a new frame"
+  (test "carries what init.blsp said, so C-h v there can say what it says now"
+    (assert= (:init-config (frames/frames-live-of {:init-config {:font-size 14}})) {:font-size 14})))
+
+(defn- port-keyword-impl ()
+  ;; what `Port`'s `emit` dispatches to for a keyword now, called, or nil
+  (let (f (get (or (get *impls* ['Port 'emit]) {}) :keyword)) (when f (f :k nil))))
+
+(defn- write-impl-package (dir name answer)
+  (write-files dir
+    name
+    {(str name ".blsp") (str "(defmodule "
+                          name ")\n(defn bedit-plugin () {})\n(impl Port :keyword (emit (k s) "
+                          answer "))\n")}))
+
+(describe "two packages implementing one ability for one type, at the same tier"
+  :isolated (test "removing the later gives back the earlier's impl, not an empty slot"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages"))
+      (write-impl-package dir "zzimpa" ":a")
+      (write-impl-package dir "zzimpb" ":b")
+      (let (before (port-keyword-impl)
+            _ (apply-from-files base "zzimpa")
+            _ (apply-from-files base "zzimpb")
+            both (port-keyword-impl)
+            _ (remove-package base "zzimpb")
+            b-gone (port-keyword-impl)
+            _ (remove-package base "zzimpa")
+            a-gone (port-keyword-impl))
+        (assert= [before both b-gone a-gone] [nil :b :a nil]))))
+  :isolated (test "removing the earlier first leaves the later live, and then nothing"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages"))
+      (write-impl-package dir "zzimpc" ":c")
+      (write-impl-package dir "zzimpd" ":d")
+      (apply-from-files base "zzimpc")
+      (apply-from-files base "zzimpd")
+      (remove-package base "zzimpc")
+      (let (c-gone (port-keyword-impl))
+        (remove-package base "zzimpd")
+        (assert= [c-gone (port-keyword-impl)] [:d nil])))))
+
+;; A module named like one of bedit's or a std module would be reached by bedit's own
+;; late-bound `'org/…` symbols: such a package is refused, at install and at load.
+
+(describe "a package module named like one of bedit's or a std module"
+  :isolated (test "an installed one is not loaded: it reads incompatible, naming the module, and bedit's is untouched"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          dir (path/join base "bedit" "packages")
+          core-site (fn () (first (reflect/source-location '/bedit/org/heading-level))))
+      (write-files dir
+        "zzorgpkg"
+        {"zzorgpkg.blsp" "(defmodule zzorgpkg)\n(defn bedit-plugin () {})\n"
+         "org.blsp" "(defmodule org)\n(defn heading-level (line) 99)\n(defn only-mine () :mine)\n"})
+      (write-files dir
+        "zzjsonpkg"
+        {"zzjsonpkg.blsp" "(defmodule zzjsonpkg)\n(defn bedit-plugin () {})\n"
+         "json.blsp" "(defmodule json)\n(defn mine () :mine)\n"})
+      (let (site-before (core-site)
+            applied (apply-from-files base "zzorgpkg")
+            status (with-base base (fn () (packages/package-status "zzorgpkg")))
+            rows (with-base base (fn () (packages/package-rows [])))
+            loaded (with-base base (fn () (packages/load-installed!)))
+            json-status (with-base base (fn () (packages/package-status "zzjsonpkg"))))
+        (is (failure? applied))
+        (assert= (:status status) :incompatible)
+        (is (includes? (:reason status) "`org` has the name of bedit's own `org` module"))
+        (assert= (:status (seq/find rows (fn (row) (= (:name row) "zzorgpkg")))) :incompatible)
+        (assert= loaded [])
+        (assert= (:status json-status) :incompatible)
+        (is (includes? (:reason json-status) "`json` has the name of std's own `json` module"))
+        ;; nothing of it loaded; bedit's org is as it was
+        (refute (includes? (reflect/global-names) 'org/only-mine))
+        (assert= (bedit/org/heading-level "** two") 2)
+        (assert= (core-site) site-before))))
+  :isolated (test "an install of one is refused before it replaces anything"
+    (let (base (temp-dir "bedit-pkgsafe-")
+          registry {:enhancers (fn (_app) [])
+                    :latest-version (fn (_name) "1.0.0")
+                    :install (fn (name dest)
+                               (do
+                                 (write-files dest
+                                   name
+                                   {(str name ".blsp") (str "(defmodule "
+                                                         name ")\n(defn bedit-plugin () {})\n")
+                                    "commands.blsp" "(defmodule commands)\n(defn mine () :mine)\n"})
+                                 {:name name :version "1.0.0"}))}
+          outcome (binding (*config-base* base *registry* registry)
+                    (packages/run-package-job registry {:kind :install :name "zzcmdpkg" :id "test"})))
+      (is (includes? (:error outcome) "`commands` has the name of bedit's own `commands` module"))
+      (is (includes? (:error outcome) "not installed"))
+      (refute (with-base base (fn () (packages/installed? "zzcmdpkg"))))
+      (assert= (packages/module-collisions #{"zzcmdpkg"}) []))))
