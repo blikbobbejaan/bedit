@@ -181,7 +181,8 @@ file in `dir` makes it need none."
                  (let (sidecar (ed-auto-save-path path true))
                    (do
                      (is (string/starts-with? sidecar (path/join dir "bedit" "state" "auto-save")))
-                     (assert= (path/basename sidecar) (str "#" (string/replace path "/" "%2F") "#"))
+                     (assert= (path/basename sidecar)
+                       (str "#%2Fsudo::" (string/replace path "/" "%2F") "#"))
                      (is (not (= (path/dirname sidecar) dir))))))))
   (test "an auto-save round writes it there, owner-only, and recover-session lists it as /sudo::"
     (with-stub
@@ -192,7 +193,7 @@ file in `dir` makes it need none."
                     "#" 80 24)
                 due (ed-auto-save-due m))
             (do
-              (assert= (:sudo due) #{path})
+              (assert= (:sudo due) {path "root"})
               (ed-auto-save-write (:due due) (:sudo due))
               (assert= (file/slurp (ed-auto-save-path path true)) "#127.0.0.1 localhost\n")
               (assert= (math/mod (:mode (file/stat (ed-auto-save-path path true))) 512) 384)
@@ -255,6 +256,21 @@ the job parked."
           (do
             (is (nil? (:minibuffer cancelled)))
             (is (not (any? (:buffers cancelled) :sudo-loading))))))))
+  (test "with another prompt open the password waits for it to close — never takes its keys"
+    (let (path "/etc/sudoedit-test-hosts"
+          busy (commands/cmd-switch-buffer (with-loading (ed-init (make-buffer ""))
+                                             path
+                                             {:kind :open :path path :user "root"})
+                 nil)
+          half (type-text busy "not")
+          asked (ed-apply-sudo half {:needs-password true}))
+      (do
+        ;; the C-x b read is untouched, the half-typed name still in it
+        (is (not (map/get-in asked [:minibuffer :masked])))
+        (is (includes? (pr-str (map/get-in asked [:minibuffer :edit])) "not"))
+        ;; closing it (C-g) asks for the password then
+        (let (closed (ed-update asked :ctrl-g 80 24))
+          (is (map/get-in closed [:minibuffer :masked]))))))
   (test "an open sudo refuses drops Loading… and says sudo's reason"
     (let (path "/etc/sudoedit-test-hosts"
           m (ed-apply-sudo (with-loading (ed-init (make-buffer ""))
@@ -294,6 +310,16 @@ the job parked."
       (do
         (is (not (any? (:buffers stopped) :sudo-loading)))
         (is (includes? (pr-str (:quit-notes stopped)) "stopped")))))
+  (test "a quit's save blocked by another sudo job says the quit was canceled, and goes no further"
+    (let (m0 (ed-update (ed-init (sudo-buffer "/etc/sudoedit-test-hosts" "root" "a\n")) "x" 80 24)
+          busy (assoc m0 :sudo-proc :a-task)
+          blocked (ed-sudo-save-all busy
+                    [["/etc/sudoedit-test-hosts" "root"]]
+                    (fn (m) (assoc m :quit-went-on true))
+                    " — quit canceled"))
+      (is (includes? (:echo blocked) "still running"))
+      (is (includes? (:echo blocked) "quit canceled"))
+      (is (nil? (:quit-went-on blocked)))))
   (test "one job at a time"
     (let (m (assoc (ed-init (make-buffer "")) :sudo-proc :a-task))
       (is (includes? (:echo (ed-sudo-find-file m "/sudo::/etc/hosts")) "still running")))))
@@ -402,21 +428,45 @@ the job parked."
 
 (describe "a private sidecar's name"
   (test "is percent-encoded, so two paths never share one, and reads back"
-    (assert= (private-sidecar-name "/etc/a!b") "#%2Fetc%2Fa!b#")
+    (assert= (private-sidecar-name "/etc/a!b") "#%2Fsudo::%2Fetc%2Fa!b#")
     (is (not (= (private-sidecar-name "/etc/a!b") (private-sidecar-name "/etc/a/b"))))
     ;; the pair Emacs's `!!` / `!` escaping confuses
     (is (not (= (private-sidecar-name "/a/!b") (private-sidecar-name "/a!/b"))))
-    (assert= (private-sidecar-path (private-sidecar-name "/a/!b")) "/a/!b")
-    (assert= (private-sidecar-path (private-sidecar-name "/a!/b")) "/a!/b")
-    (assert= (private-sidecar-path (private-sidecar-name "/x/100%2F/y")) "/x/100%2F/y")
-    (assert= (private-sidecar-path (private-sidecar-name "/etc/a!b")) "/etc/a!b")
-    (assert= (private-sidecar-path (private-sidecar-name "/srv/x!!/y")) "/srv/x!!/y")
-    (assert= (private-sidecar-path "notes.txt") nil))
+    (assert= (private-sidecar-spec (private-sidecar-name "/a/!b")) "/sudo::/a/!b")
+    (assert= (private-sidecar-spec (private-sidecar-name "/a!/b")) "/sudo::/a!/b")
+    (assert= (private-sidecar-spec (private-sidecar-name "/x/100%2F/y")) "/sudo::/x/100%2F/y")
+    (assert= (private-sidecar-spec (private-sidecar-name "/srv/x!!/y")) "/sudo::/srv/x!!/y")
+    (assert= (private-sidecar-spec "notes.txt") nil))
+  (test "names the user: root's and www's sidecars of one file are two"
+    (is (not (= (private-sidecar-name "/srv/x" "root") (private-sidecar-name "/srv/x" "www"))))
+    (assert= (private-sidecar-spec (private-sidecar-name "/srv/x" "www")) "/sudo:www@:/srv/x")
+    (assert= (sidecar-spec-parts "/sudo:www@:/srv/x") ["/srv/x" "www"])
+    (assert= (sidecar-spec-parts "/sudo::/etc/hosts") ["/etc/hosts" "root"]))
+  (test "a path too long to spell out is hashed, kept readable, and recovered through its .spec"
+    (with-stub (fn (dir path)
+                 (let (deep (path/join dir (string/repeat "a-long-directory-name/" 12) "the.conf")
+                       sidecar (ed-auto-save-path deep "www")
+                       name (path/basename sidecar))
+                   (do
+                     (is (<= (count (string/->bytes name)) 255))
+                     (is (string/ends-with? name "the.conf#"))
+                     (file/mkdir (path/dirname deep))
+                     (file/spit deep "old\n")
+                     (os/cmd "touch" ["-t" "202001010000" deep])
+                     (ed-auto-save-write {deep (text/from-string "unsaved\n")} {deep "www"})
+                     (assert= (file/slurp sidecar) "unsaved\n")
+                     (assert= (private-sidecar-spec name (path/dirname sidecar))
+                       (str "/sudo:www@:" deep))
+                     (is (includes? (recover/ed-private-recoverable (path/dirname sidecar))
+                           (str "/sudo:www@:" deep)))
+                     (ed-remove-auto-save deep "www")
+                     (is (not (file/exists? sidecar)))
+                     (is (not (file/exists? (str sidecar ".spec")))))))))
   (test "lives in an owner-only folder"
     (with-stub (fn (dir path)
                  (let (sidecar (ed-auto-save-path path true))
                    (do
-                     (ed-auto-save-write {path (text/from-string "unsaved\n")} #{path})
+                     (ed-auto-save-write {path (text/from-string "unsaved\n")} {path "root"})
                      (assert= (file/slurp sidecar) "unsaved\n")
                      (assert= (math/mod (:mode (file/stat (path/dirname sidecar))) 512) 448)))))))
 
