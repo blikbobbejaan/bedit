@@ -1128,10 +1128,16 @@ third process (the collab registry learning of a `[:down]`) needs waiting, and
 that polls (`ct-await-respawn`) rather than guessing a delay.
 
 **A test never touches the user's own config.** Every file the editor keeps lives under
-`config/config-dir`, which follows `$XDG_CONFIG_HOME` — and `nest test` points that at a
+`config/config-dir`, which follows `$XDG_CONFIG_HOME` — and a test run points that at a
 scratch home of the run's own (brood ADR-602; `test/running?`, `test/scratch-dir`, which
-bedit reads as `config/under-test?`). `persist-write!` and `ensure-init!` also refuse a path
-under the real `~/.config/bedit` while a test runs. A new
+bedit reads as `config/under-test?`). That holds for `nest test` and for C-c t from inside
+the editor: both of its runners start their child with `sandbox/*test-runner-env*`
+(`BROOD_TEST_ARM=1`, brood ADR-608) — the cold runner's `nest run` and the warm test child —
+so the child arms before any test code loads; a new runner that runs tests must do the same
+(`tests/testrun_test.blsp` "a C-c t run gets a scratch home"). The REPL's history
+(`BROOD_HISTORY`) goes to the scratch home too. `persist-write!` and `ensure-init!` also
+refuse a path under the real `~/.config/bedit` while a test runs (compared normalized; a test
+of the guard binds `config/*user-config-base*` to a stand-in). A new
 kind of persisted file goes under `config-dir` (or `editor-state-dir`), never `$HOME`
 directly; a test that wants its own file binds the module's dynvar (`*config-base*`,
 `bshell/*bshell-history-file*`).
