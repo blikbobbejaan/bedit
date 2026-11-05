@@ -1,0 +1,110 @@
+;; Motion (the calm-UI review, 2026-11-05): `:reduce-motion` makes every animation instant
+;; or static, and typing or a held key never starts an animation or waits on one. Model
+;; tests on the timers — what would tick, not what anything looks like.
+(defmodule motion-test
+  (:use test)
+  (:use model)
+  (:use input) ; *key-repeat?* — a held key without a window
+  (:use editor/buffer))
+
+(defn- lines (n) (string/join (map (range n) (fn (i) (str "line " i))) "\n"))
+
+(defn- press (m pressed) (fold pressed m (fn (acc key) (input/ed-update acc key 80 24))))
+
+(defn- held (m key times)
+  ;; `key` pressed, then repeated by the desktop `times` times while held (brood ADR-612's
+  ;; `gui/key-repeat?`, which `*key-repeat?*` stands in for without a window)
+  (let (first-press (press m [key]))
+    (binding (*key-repeat?* true) (press first-press (map (range times) (fn (_) key))))))
+
+;; every timer that animates something — none of them may tick under :reduce-motion
+(def- *animation-timers* #{:pulse :scroll-glide :scrollbar-fade :spinner})
+
+(defn- animating (m)
+  (seq/filter (keys (or (:timers m) {})) (fn (name) (contains? *animation-timers* name))))
+
+(defn- frac (m) (or (:scroll-frac (ed-current-pane m)) 0.0))
+
+(describe "model/ed-reduce-motion? — one switch, or the desktop's"
+  (test ":auto follows the desktop, true and false decide regardless"
+    (is (ed-reduce-motion? {:reduce-motion :auto :os-reduce-motion true}))
+    (is (not (ed-reduce-motion? {:reduce-motion :auto :os-reduce-motion false})))
+    (is (ed-reduce-motion? {:reduce-motion true :os-reduce-motion false}))
+    (is (not (ed-reduce-motion? {:reduce-motion false :os-reduce-motion true})))
+    (is (not (ed-reduce-motion? (ed-init (make-buffer "")))))))
+
+(describe "a held key starts no animation"
+  (test "a held C-v pages down and no pulse follows it; the first press still pulses"
+    (let (m (assoc (ed-init (make-buffer (lines 400))) :pulse-on true)
+          once (press m [:ctrl-n :ctrl-v])
+          holding (held (press m [:ctrl-n]) :ctrl-v 4))
+      (is (not (nil? (:pulse once))))
+      (is (> (buffer-current-line (ed-current-buf holding))
+            (buffer-current-line (ed-current-buf once))))
+      (is (nil? (:pulse holding)))
+      (is (empty? (animating holding)))
+      (is (:key-repeat holding))))
+  (test "the repeat ends the pulse the press started, and a fresh press clears the repeat mark"
+    (let (m (assoc (ed-init (make-buffer (lines 400))) :pulse-on true)
+          pressed (press m [:ctrl-n :ctrl-v])
+          repeated (binding (*key-repeat?* true) (press pressed [:ctrl-v]))
+          again (press repeated [:ctrl-v]))
+      (is (not (nil? (:pulse pressed))))
+      (is (nil? (:pulse repeated)))
+      (is (not (:key-repeat again)))
+      (is (not (nil? (:pulse again))))))
+  (test "a key settles a scroll still easing onto its line, so nothing glides behind it"
+    (let (m (ed-init (make-buffer (lines 60)))
+          resting (input/ed-update m [:mouse :scroll-down nil 5 5 [] 0.7] 80 24)
+          gliding (input/ed-update resting [:timer :scroll-settle] 80 24)
+          typed (press gliding ["x"]))
+      (is (:scroll-gliding gliding))
+      (is (contains? (:timers gliding) :scroll-glide))
+      (assert= (frac typed) 0.0)
+      (is (not (:scroll-gliding typed)))
+      (is (empty? (animating typed)))))
+  (test "typing never pulses and arms no animation"
+    (let (typed (press (assoc (ed-init (make-buffer "")) :pulse-on true)
+                  ["a" :enter "b" :enter "c"]))
+      (is (nil? (:pulse typed)))
+      (is (empty? (animating typed))))))
+
+(describe ":reduce-motion — every animation instant or static, so nothing ticks"
+  (defn calm (text) (assoc (ed-init (make-buffer text)) :pulse-on true :reduce-motion true))
+  (test "the pulse after a jump is a still band with no timer, and the next command clears it"
+    (let (jumped (press (calm (lines 60)) [:ctrl-n :alt->])
+          next (press jumped [:ctrl-p]))
+      (is (:static (:pulse jumped)))
+      (assert= (:level (:pulse jumped)) pulse/*pulse-static-level*)
+      (is (nil? (pulse/timer-spec jumped)))
+      (is (empty? (animating jumped)))
+      (assert= (pulse/fade jumped) jumped)
+      (is (nil? (:pulse next)))))
+  (test "a scroll resting between lines snaps at the settle, with no ease"
+    (let (resting (input/ed-update (calm (lines 60)) [:mouse :scroll-down nil 5 5 [] 0.7] 80 24)
+          settled (input/ed-update resting [:timer :scroll-settle] 80 24))
+      (assert= (frac settled) 0.0)
+      (assert= (ed-current-top settled) 1)
+      (is (not (:scroll-gliding settled)))
+      (is (empty? (animating settled)))))
+  (test "the scrollbar hides when its hold ends, with no fade"
+    (let (woken (ed-scrollbar-wake (calm (lines 200)))
+          hidden (input/ed-update woken [:timer :scrollbar-hold] 80 24))
+      (assert= (ed-scrollbar-opacity hidden) 0.0)
+      (is (not (contains? (:timers hidden) :scrollbar-fade)))
+      (is (empty? (animating hidden)))))
+  (test "the activity spinner stands still while a job runs"
+    shell-command/*shell-command-timeout-ms* ; loads the module that registers :shell-proc
+    (let (busy (ed-sync-timers (assoc (calm "") :shell-proc :a-handle))
+          moving (ed-sync-timers (assoc (ed-init (make-buffer "")) :shell-proc :a-handle)))
+      (is (ed-busy? busy))
+      (is (contains? (:timers moving) :spinner))
+      (is (empty? (animating busy)))))
+  (test "everything at once: a jump, a scroll and a scrollbar arm zero animation timers"
+    (let (m (press (calm (lines 300)) [:ctrl-n :alt->])
+          scrolled (input/ed-update m [:mouse :scroll-up nil 5 5 [] 0.6] 80 24)
+          settled (input/ed-update scrolled [:timer :scroll-settle] 80 24)
+          held-over (input/ed-update settled [:timer :scrollbar-hold] 80 24))
+      (is (empty? (animating m)))
+      (is (empty? (animating scrolled)))
+      (is (empty? (animating held-over))))))

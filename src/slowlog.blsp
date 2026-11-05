@@ -8,10 +8,19 @@ day\" had nothing to be answered from. Once `activate!` has run (`main` calls it
 report is also appended to `slow-turns.blsp` in the editor's state folder, one re-readable
 map per line, the file rotated to `slow-turns.old.blsp` at [[*slow-log-max-bytes*]]. Before
 that nothing is written, so a test that folds a `[:ui-slow …]` event never touches the
-user's file."
+user's file.
+
+The same file keeps KEY-TO-PAINT latency as a distribution (brood ADR-612): the window counts
+every key's input→present time into a histogram, and the idle beat appends what it counted
+since the last record ([[flush-latency]]) as a `{:kind :latency :key h}` line once enough
+keys have come, and quitting appends the rest. M-x slow-turns heads its report with the p50,
+p99 and p99.9 over every session recorded ([[latency-text]]), and M-x latency gives this
+session's. Only the plumbing is tested here, with made-up histograms: measuring is for CI
+or a machine set aside for it, never a desktop someone is working at."
   (:use model) ; ed-append-named, register-event-handler, message
   (:use projects) ; editor-state-dir
   (:use pool) ; ed-display-buffer — the report buffer
+  (:use theme :only [gui-only]) ; the window's latency histogram, nil without a window
   (:use interactive)) ; defcommand
 
 (def *slow-log-max-bytes* 262144) ; one generation is rotated out past this
@@ -98,15 +107,105 @@ stopped by the loop's ceiling rather than finishing.
                (:what row)
                (if (> (:stopped row) 0) (str "   (" (:stopped row) " stopped)") "")))))))
 
+;; ---- key-to-paint latency, as a distribution (brood ADR-612) -----------------------
+;; The window counts every key's input→present time into a histogram (`gui/latency-histogram`).
+;; The idle beat records what it counted since the last record once [[*latency-flush-keys*]]
+;; have come — a line per few hundred keys, never one per key — and quitting records the
+;; rest. The model remembers the reading it last recorded up to (`:latency-recorded`, with
+;; the window it came from, so a new window — another loop after a crash — starts over).
+
+(def *latency-flush-keys* 200) ; keys counted before the idle beat records them
+
+(defn latency-reports (reports)
+  "The key-latency records among `reports` (`{:kind :latency :key h}`)."
+  (seq/filter reports (fn (r) (= (:kind r) :latency))))
+
+(defn slow-reports (reports)
+  "The slow-turn reports among `reports` — everything but the latency records."
+  (seq/reject reports (fn (r) (= (:kind r) :latency))))
+
+(defn recorded-latency (reports)
+  "Every key-latency record in `reports` merged into one histogram (`gui/latency-merge`), or
+nil when there is none."
+  (let (records (latency-reports reports))
+    (when (not (empty? records))
+      (fold records nil (fn (acc r) (gui/latency-merge acc (:key r)))))))
+
+(defn percentile-line (histogram)
+  "One line for `histogram` (`gui/latency-histogram`'s shape): its p50, p99, p99.9 and worst
+in milliseconds, and how many keys it counts.
+
+    (slowlog/percentile-line {:count 1000 :max-us 40000 :buckets {2047 980 8191 15 40959 5}})   ;=> \"p50 2.0 ms · p99 8.2 ms · p99.9 40.0 ms · worst 40.0 ms (1000 keys)\"
+    (slowlog/percentile-line nil)   ;=> \"no keys timed yet\""
+  (let (p (gui/latency-percentiles (or histogram {})))
+    (if (= (:count p) 0)
+      "no keys timed yet"
+      (string/format "p50 %.1f ms · p99 %.1f ms · p99.9 %.1f ms · worst %.1f ms (%d %s)"
+        (:p50 p)
+        (:p99 p)
+        (:p999 p)
+        (:max p)
+        (:count p)
+        (if (= (:count p) 1) "key" "keys")))))
+
+(defn latency-text (reports)
+  "The key-to-paint section of `*Slow turns*`: the distribution over every session `reports`
+recorded, or nothing when none has been."
+  (let (histogram (recorded-latency reports))
+    (if (nil? histogram)
+      ""
+      (str "Key to paint, every session recorded: " (percentile-line histogram) "\n\n"))))
+
+(defn- window-latency (m)
+  ;; this window's key histogram, or nil without a window of our own (a test, a terminal,
+  ;; a served session) or once it has closed
+  (let (window (:window m))
+    (when window
+      (check-allow :discarded-catch
+        (try (:key (gui-only gui/latency-histogram window)) (catch _ nil))))))
+
+(defn latency-due (m now &optional (least *latency-flush-keys*))
+  "What to record of `now` (this window's key histogram): what it counted since the model's
+`:latency-recorded` reading of the same window (all of it after a new window), when that is at
+least `least` keys — else nil.
+
+    (slowlog/latency-due {} {:count 3 :max-us 900 :buckets {911 3}} 2)   ;=> {:count 3 :max-us 900 :buckets {911 3}}
+    (slowlog/latency-due {} {:count 1 :max-us 900 :buckets {911 1}} 2)   ;=> nil"
+  (let ([window before] (or (:latency-recorded m) [nil nil])
+        before (when (and (= window (:window m)) before (<= (:count before) (:count now))) before)
+        fresh (when now (gui/latency-since now before)))
+    (when (and fresh (> (:count fresh) 0) (>= (:count fresh) least)) fresh)))
+
+(defn record-latency (m now &optional (least *latency-flush-keys*))
+  "Record what `now` counted since the last record ([[latency-due]]) as a `{:kind :latency
+:key h}` line ([[record!]]) and remember `now` as recorded; `m` unchanged when too few keys
+have come or the log is off."
+  (let (fresh (when *slow-log-file* (latency-due m now least)))
+    (if (nil? fresh)
+      m
+      (do
+        (record! {:kind :latency :key fresh})
+        (assoc m :latency-recorded [(:window m) now])))))
+
+(defn flush-latency (m &optional (least *latency-flush-keys*))
+  "The idle beat's row, and what quitting calls with `least` 1: record this window's keys
+since the last record ([[record-latency]]). O(1) without a window or with the log off."
+  (if (or (nil? *slow-log-file*) (nil? (:window m))) m (record-latency m (window-latency m) least)))
+
+(register-idle-job :key-latency {:order 140 :run 'slowlog/flush-latency})
+
 (defn report-text (reports)
-  "The `*Slow turns*` buffer's text for `reports`."
-  (if (empty? reports)
-    "No slow turns recorded yet. The watchdog reports a turn of the editor loop that took\nlonger than its threshold; each is kept here across sessions.\n"
-    (str "Slow turns of the editor loop, by what they were folding, costliest first ("
-      (count reports)
-      " recorded):\n\n"
-      (string/join (summary-lines reports) "\n")
-      "\n")))
+  "The `*Slow turns*` buffer's text for `reports` — the key-to-paint distribution
+([[latency-text]]) above the slow turns ranked by cause."
+  (let (slow (slow-reports reports))
+    (str (latency-text reports)
+      (if (empty? slow)
+        "No slow turns recorded yet. The watchdog reports a turn of the editor loop that took\nlonger than its threshold; each is kept here across sessions.\n"
+        (str "Slow turns of the editor loop, by what they were folding, costliest first ("
+          (count slow)
+          " recorded):\n\n"
+          (string/join (summary-lines slow) "\n")
+          "\n")))))
 
 (defn ed-ev-ui-slow (m input textrows cols rows)
   "A slow turn the watchdog reported ([[model/ed-report-slow]]): kept in the log
@@ -147,8 +246,11 @@ ADR-517), so a native call that blocks it is reported as a `[:blocking-call …]
 
 (defcommand cmd-slow-turns
   (m key)
-  "Show `*Slow turns*`: every slow turn of the editor loop kept across sessions, grouped by
-what it was folding (a key, a timer, an event), costliest first (M-x slow-turns)."
-  (ed-display-buffer m
-    "*Slow turns*"
-    (report-text (if *slow-log-file* (read-reports *slow-log-file*) []))))
+  "Show `*Slow turns*`: key-to-paint latency over every session recorded (p50, p99, p99.9,
+worst), then every slow turn of the editor loop kept across sessions, grouped by what it was
+folding (a key, a timer, an event), costliest first (M-x slow-turns). This session's keys
+are recorded first, so the distribution includes them."
+  (let (recorded (flush-latency m 1))
+    (ed-display-buffer recorded
+      "*Slow turns*"
+      (report-text (if *slow-log-file* (read-reports *slow-log-file*) [])))))
