@@ -106,6 +106,14 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
    left the text cramped in it. **Text moves by whole rows and cells** (`ui-space-cells`
    refuses `:half`); the sub-cell steps only decorate inside a row — the mode line's hover
    block, a scrollbar thumb's gap from the edge.
+8. **A floating card keeps its distance from the chrome.** Every card that floats — the
+   transient, the context menu, the completion card and its info card, the mode line's
+   and a diagnostic's tooltip — is placed by ONE helper, `ui-kit/ui-place`, over a STAGE:
+   the text rows between a header line above and a mode line (or the echo area) below,
+   across the window's width (`panes/ed-card-stage`: the pane the card belongs to, or the
+   frame's). It keeps `:card-gap` (1 row : 1 cell) from every side of the stage, gives the
+   gap up only when it cannot fit with it, and leaves the stage only when it is taller than
+   the stage. Plume and which-key are not floating cards: they ARE the echo area, grown.
 
 ## Where each rule lives
 
