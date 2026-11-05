@@ -30,6 +30,10 @@ gives the ride-one-caret pairing view on demand. See `docs/remote-multiplayer-pl
   (:use startup) ; the startup path a served session shares with the window
   (:use editor/buffer-registry) ; registry-start — the shared daemon's file -> process directory
   (:use autosave :only [ed-auto-save-now!]) ; a lost window's buffers written at once
+  (:use lifeline :only [emergency-save!]) ; a dead loop's buffers saved from their processes
+  (:use frames
+    :only [frames-registry-start frames-adopt-registry frames-live-of frames-slot-from-entry]) ; the session's registry
+  (:use hosted :only [hosted-reconcile hosted-key hosted-rebuilt]) ; THE FLIP, at once rather than on the first event
   (:use system)) ; argv — the CLI dispatch reads it
 ;; ---- CLI dispatch (bedit --name ed --serve  /  bedit --attach ed) -----------
 ;; `main` scans `(argv)` for these flags and branches to the daemon / client instead of
@@ -227,9 +231,163 @@ cheap state (`solong/so-long-checked`)."
     (let (buffer (if (nil? file)
                    (make-buffer *served-welcome*)
                    (solong/so-long-checked (find-file-buffer file))))
-      (if (nil? init)
-        (ed-init buffer)
-        (do (slowlog/responsive!) (ed-served-model buffer file init))))))
+      (ed-served-host (ed-served-base buffer file init)))))
+
+(defn- ed-served-base (buffer file init)
+  "A served session's model on `buffer` before its buffers are hosted: the live editor's
+([[ed-served-model]], its loop marked responsive) with the daemon's read `init` file, the
+pure `ed-init` model without one."
+  (if (nil? init)
+    (ed-init buffer)
+    (do (slowlog/responsive!) (ed-served-model buffer file init))))
+
+;; ---- a served session's buffers outlive its loop (brood ADR-593) --------------------
+;; The window's loop runs under `lifeline`: its buffers live in processes named in a
+;; registry, so a loop that dies loses nothing — their sidecars are written and a fresh loop
+;; adopts them. A served session has the same now. Its loop's buffers are hosted as the
+;; window's are (THE FLIP), in a registry of the SESSION's own — owned by the session's
+;; supervisor (brood's `editor/serve/served-session`), so it outlives the loop and goes with
+;; the session, and named nowhere, since there is one per session — and `serve` supervises
+;; the loop: one that dies has every unsaved file buffer's sidecar written from those
+;; processes (`lifeline/emergency-save!`) and is restarted over the same registry, for the
+;; same client, which keeps its window.
+
+(defn ed-served-host (m)
+  "`m`, the model a served session's loop starts from, with its buffers hosted the way the
+window's are: every pool slot backed by a buffer process, named in the session's registry
+(owned by the session, `frames/frames-registry-start`; one `m` already has is kept), and that
+registry handed to the session (`serve-retain`) — what its loop, should it die, is saved
+from and restarted over. Outside a served session (a test building the model) `m` as it is."
+  (let (session (served-session))
+    (if (nil? session)
+      m
+      (let (registered (if (nil? (:buffer-reg m))
+                         (frames-registry-start (assoc m :host-buffers? true) session)
+                         m)
+            hosted (hosted-reconcile registered))
+        (ed-served-retain-from hosted
+          {:registry (:buffer-reg hosted) :live (frames-live-of hosted)})))))
+
+(defn ed-served-retain-from (m base)
+  "`m` keeping, from now on, what its session is handed should its loop die ([[ed-served-retain-step]]):
+`base` (the registry its documents are named in, the live flags) with the buffers it has open
+— handed at once. Outside a served session `m` as it is."
+  (if (nil? (served-session))
+    m
+    (ed-served-retain-step (dissoc (assoc m :served-retain base) :served-snapshot))))
+
+(defn ed-served-snapshot (m)
+  "What a loop restarted after `m`'s died restores beyond the documents themselves, by
+document (`hosted/hosted-key`): every buffer it had open (`:keys`, in pool order), the one it
+showed (`:current`), and each one's point (`:points`)."
+  (let (buffers (:buffers m))
+    {:keys (into [] (map buffers hosted-key))
+     :current (hosted-key (ed-current-buf m))
+     :points (into {} (map buffers (fn (b) [(hosted-key b) (buffer-point b)])))}))
+
+(defn ed-served-retain-step (m)
+  "The post-step that keeps a served session's retained value current (brood ADR-593): when
+the buffers `m` has open, the one it shows or a point changed since it last said, hand the
+session [[ed-served-snapshot]] with the model's `:served-retain` base. A model without one (the
+window, a test) is untouched; an unchanged one costs a compare."
+  (let (base (:served-retain m))
+    (if (nil? base)
+      m
+      (let (snapshot (ed-served-snapshot m))
+        (if (= snapshot (:served-snapshot m))
+          m
+          (do
+            (serve-retain (assoc base :snapshot snapshot))
+            (assoc m :served-snapshot snapshot)))))))
+
+(register-post-step :served-retain {:order 950 :run 'remote/ed-served-retain-step})
+
+(defn- ed-served-fill-slot (m i point)
+  "Pool slot `i` of `m`, linked to a buffer process but empty until its seed push, given the
+process's text and text properties now — read synchronously — and its point `point`, so the
+restarted loop shows the document where its predecessor left it (the seed push then finds
+the same text and changes nothing). A process that does not answer leaves the slot to the
+seed push."
+  (let (proc (map/get-in m [:hosted i :proc])
+        answer (if (nil? proc)
+                 :no-reply (buffer-sync proc (fn (b) [(buffer-text b) (buffer-property-map b)]) 1000)))
+    (if (not (vector? answer))
+      m
+      (let ([text properties] (second answer)
+            filled (ed-stamp (hosted-rebuilt (ed-buf-at m i) text properties)))
+        (ed-set-buf-at m i (if (nil? point) filled (goto-char filled point)))))))
+
+(defn ed-served-restore (m snapshot)
+  "`m`, a restarted loop's model with the documents adopted, as its predecessor left it
+([[ed-served-snapshot]]): each document's text and point filled in now, and the one it
+showed shown — or, with no snapshot, the first file buffer."
+  (let (points (or (:points snapshot) {})
+        filled (fold (range (count (:buffers m)))
+                 m
+                 (fn (acc i)
+                   (ed-served-fill-slot acc i (get points (hosted-key (ed-buf-at acc i))))))
+        current (:current snapshot)
+        current-index (if (nil? current)
+                        -1
+                        (seq/index-where (:buffers filled) (fn (b) (= (hosted-key b) current))))
+        file-index (seq/index-where (:buffers filled) (fn (b) (not (nil? (buffer-file b)))))
+        shown-index (if (>= current-index 0) current-index file-index))
+    (if (< shown-index 0) filled (ed-show-index filled shown-index))))
+
+(defn ed-served-crash (retained death)
+  "A served session's loop died (`serve`'s `:on-crash`): write the sidecar of every file
+buffer in its registry whose text its file does not hold — read from the buffer processes,
+which outlived the loop (`lifeline/emergency-save!`) — and say so on the daemon's console.
+The paths written."
+  (let (registry (:registry (or retained {}))
+        saved (if (pid? registry) (emergency-save! registry) []))
+    (do
+      (io/puts (str "bedit: a served session's loop died ("
+                 (:reason death)
+                 "); auto-saved "
+                 (count saved)
+                 " unsaved file(s)"
+                 (if (empty? saved) "" (str ": " (string/join saved ", ")))
+                 (if (:restarting? death) " — restarting" " — not restarting"))
+        :to (io/stderr-port))
+      saved)))
+
+(defn ed-served-restart (init)
+  "A served session's `:restart`: the model a loop started after the last one died begins
+from — the session's model as a fresh one is made (`init`, the daemon's read init file),
+the dead loop's live flags carried over, every buffer in the session's registry adopted
+(their processes outlived the loop, so the text is all there), each where its point was and
+the one it showed shown ([[ed-served-restore]]), and the client's identity applied before
+its first key (a guest's session stays one). Its window layout (one pane now), minibuffer and
+transient state are gone; the echo area says what happened ([[ed-ev-session-restarted]])."
+  (fn (retained death)
+    (let (registry (:registry (or retained {}))
+          base (merge (ed-served-base (make-buffer "" "*scratch*") nil init)
+                 (or (:live retained) {}))
+          adopted (if (pid? registry)
+                    (frames-adopt-registry base registry)
+                    base)
+          shown (ed-served-restore adopted (:snapshot retained)))
+      (ed-served-host (ed-apply-client-identity shown (or (:identity death) {}))))))
+
+(defn ed-served-supervision (init)
+  "What a served session does when its loop dies — `serve`'s `:supervise` (brood ADR-593):
+auto-save from the buffer processes ([[ed-served-crash]]) and restart over them
+([[ed-served-restart]]), within `serve`'s budget."
+  {:on-crash ed-served-crash :restart (ed-served-restart init)})
+
+(defn ed-ev-session-restarted (m input textrows cols rows)
+  "`[:session-restarted death]`: this session's loop died and was restarted over its
+buffers — said in the echo area, with what was auto-saved."
+  (let (death (or (second input) {})
+        saved (or (:saved death) []))
+    (message m
+      (str "the session's loop died ("
+        (:reason death)
+        ") and was restarted — every buffer is here"
+        (if (empty? saved) "" (str "; auto-saved " (count saved) " file(s)"))))))
+
+(register-event-handler :session-restarted 'remote/ed-ev-session-restarted)
 
 ;; ---- a private session outlives its window (brood ADR-519) ------------------------
 ;; A private session's buffers live in its own model, so when the window went the work
@@ -342,7 +500,10 @@ sessions are prepared from its init file as the window is (`ed-serve-prepare`,
         init (read-init))
     (let (guests (remote-ensure-node name))
       (ed-serve-prepare init file)
-      (serve (ed-serve-model file init) ed-view ed-served-update {:resume-ms *served-resume-ms*})
+      (serve (ed-serve-model file init)
+        ed-view
+        ed-served-update
+        {:resume-ms *served-resume-ms* :supervise (ed-served-supervision init)})
       (io/puts (str "bedit daemon '"
                  name
                  "' serving"
@@ -392,10 +553,50 @@ content, per-participant everything else. With the daemon's read `init` file the
 is prepared as a private one is ([[ed-served-model]]); without one it is the pure model."
   (fn ()
     (let (buffer (ed-collab-buffer file)
-          base (if (nil? init)
-                 (ed-init buffer)
-                 (do (slowlog/responsive!) (ed-served-model buffer file init))))
-      (collab-share-slot (assoc base :collab-reg reg) 0 proc))))
+          base (ed-served-base buffer file init))
+      ;; what its session is handed should its loop die: the collab registry, and the
+      ;; documents it has open ([[ed-served-retain-step]])
+      (ed-served-retain-from (collab-share-slot (assoc base :collab-reg reg) 0 proc)
+        {:registry reg}))))
+
+(defn- ed-collab-reopen (m reg snapshot)
+  "`m`, a restarted shared session's model, with every document its predecessor had open
+(the `:keys` of its `snapshot`) that the collab registry `reg` holds and `m` does not,
+appended as a SHARED slot linked to the document's process (`collab-share-slot`, as a visit
+shares one) — the same documents, still everyone's."
+  (let (entries (registry-entries reg)
+        by-key (if (vector? entries) (into {} (map entries (fn (e) [(:key e) e]))) {}))
+    (fold (or (:keys snapshot) [])
+      m
+      (fn (acc key)
+        (let (entry (get by-key key)
+              open? (>= (seq/index-where (:buffers acc) (fn (b) (= (hosted-key b) key))) 0))
+          (if (or (nil? entry) open?)
+            acc
+            (let (buffers (conj (:buffers acc)
+                            (frames-slot-from-entry (:name entry)
+                              (:proc entry)
+                              (or (:meta entry) {})
+                              (:dir (ed-current-buf acc))))
+                  i (dec (count buffers)))
+              (collab-share-slot (assoc acc :buffers buffers) i (:proc entry)))))))))
+
+(defn ed-collab-supervision (file proc reg init)
+  "What a SHARED session does when its loop dies (brood ADR-593): its documents already live
+in the daemon's collab registry `reg` — slot 0 in `proc`, every other file it visited shared
+there — so their sidecars are written from it ([[ed-served-crash]]), and the loop restarts
+as a joining session does ([[ed-serve-collab-model]]) with every document its predecessor
+had open linked again ([[ed-collab-reopen]]), each where its point was and the one it showed
+shown ([[ed-served-restore]]), the client's identity applied before its first key."
+  {:on-crash (fn (retained death) (ed-served-crash {:registry reg} death))
+   :restart (fn (retained death)
+              (let (snapshot (:snapshot retained)
+                    reopened (ed-collab-reopen ((ed-serve-collab-model file proc reg init))
+                               reg snapshot))
+                (ed-served-retain-from (ed-apply-client-identity (ed-served-restore reopened
+                                                                   snapshot)
+                                         (or (:identity death) {}))
+                  {:registry reg})))})
 
 (defn ed-serve-collab (&optional file)
   "Run bedit as the SHARED (collaborative) daemon: spawn ONE buffer process owning
@@ -418,7 +619,10 @@ see `src/collab.blsp`). Blocks."
             proc (if (nil? (buffer-file buf))
                    (spawn-buffer buf) ; the scratch welcome — not registry-tracked
                    (collab-registry-share reg buf)))
-        (serve (ed-serve-collab-model file proc reg init) ed-view ed-update)
+        (serve (ed-serve-collab-model file proc reg init)
+          ed-view
+          ed-update
+          {:supervise (ed-collab-supervision file proc reg init)})
         (io/puts (str "bedit daemon '"
                    name
                    "' serving"
