@@ -230,7 +230,12 @@ src/slowlog.blsp            the SLOW-TURN LOG: every turn of the loop the watchd
                             and M-x slow-turns ranking them by what they were folding; on only once
                             `main` activates it, so a test never writes the user's file. The loop runs
                             `(proc/flag :responsive true)` (brood ADR-517), so every `os/cmd` it makes
-                            arrives as `[:blocking-call …]` and is logged here too, phase `blocking`
+                            arrives as `[:blocking-call …]` and is logged here too, phase `blocking`.
+                            And KEY-TO-PAINT latency as a distribution (brood ADR-612): the idle
+                            beat records the window's key histogram (`gui/latency-histogram`) every
+                            few hundred keys, quitting records the rest, and M-x slow-turns heads
+                            with p50 / p99 / p99.9 over every session (M-x latency: this one).
+                            Measuring is for CI or the other machine: tests feed made-up histograms
 src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role;
                             the TEXT-EMPHASIS TIERS chrome names (`*fg-code*` · `*fg-chrome*` ·
                             `*fg-chrome-dim*` · `*fg-tertiary*` · `*fg-decor*`, APCA Lc 75 / 60 / 45 /
@@ -331,6 +336,12 @@ src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mo
 src/pulse.blsp              a flash on the line after a JUMP (Emacs pulsar, `:pulse`): a post-step row tells a
                             key command's jump (another window or buffer, 5+ lines) from typing and
                             the mouse by `:command-count`, a timer fades the band the view lays over it
+                            (280 ms). A held key (an OS repeat, `:key-repeat` from brood's
+                            `gui/key-repeat?`) starts none; under `:reduce-motion` the band is still
+                            and the next command clears it. `:reduce-motion` (`:auto` follows the
+                            desktop, brood's `gui/reduce-motion?`) also snaps the scroll settle, hides
+                            the scrollbar without a fade and stills the spinner
+                            (`model/ed-reduce-motion?`); a key settles a scroll ease at once
 src/winner.blsp             C-c ← / C-c → window-layout undo and redo (Emacs winner-mode, `:winner`): a
                             post-step row keeps the layouts the window SHAPE changed from, carried
                             with their buffers' text (`model/register-layout-keeper`)
