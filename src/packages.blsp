@@ -204,12 +204,15 @@ standard library, sorted, each as `[name owner]` — owner `\"bedit\"` or `\"std
 (defn- global-value (global)
   (check-allow :discarded-catch (try (reflect/eval (exact global)) (catch _ nil))))
 
-(defn- define-global (global value)
+(defn- define-global (global value site)
   ;; `global` bound to `value` again, by exactly that name: its module apart from bedit's of
-  ;; the same short name (brood ADR-604), so a package's `org/f` is never bedit's `bedit/org/f`
+  ;; the same short name (brood ADR-604), so a package's `org/f` is never bedit's `bedit/org/f`;
+  ;; and read as defined at `site` again (`[file line col]`, nil for none — brood ADR-606), so
+  ;; C-h f and M-. on a restored core function go to bedit's source, not the package's
   (let (namespace (global-namespace global))
     (reflect/with-modules-apart (if namespace [namespace] [])
-      (fn () (reflect/eval (list 'def (exact global) (list 'quote value)))))))
+      (fn () (reflect/eval (list 'def (exact global) (list 'quote value)))))
+    (reflect/set-source-location (exact global) site)))
 
 (defn- undefine-global (global)
   ;; `global` removed (`reflect/undef`, brood ADR-391); false when it cannot be
@@ -217,66 +220,36 @@ standard library, sorted, each as `[name owner]` — owner `\"bedit\"` or `\"std
 
 ;; ---- the globals a package's code defined ------------------------------------------
 ;; A package's load binds names: its own functions, and maybe a name the editor or another
-;; package already had — a core function it patches (`(defn bedit/keyhelp/ed-key-label …)`),
+;; package already had — a core function it patches (`(defn bedit/keyhelp/ed-key-label …)`, or
+;; `(defn keyhelp/ed-key-label …)`, which roots to the same global inside project bedit),
 ;; another package's function, a root name a second package's loose file defines too. So each
 ;; global a package's load bound keeps a STACK, as a registry row does (`ownership`):
-;; `:packages/definitions` global -> `{:base {:present? :known? :value} :stack [{:package
-;; :value} …]}` — what the global held before any package, then each package's binding in load
-;; order, the live one last. A package updated pushes its new binding on top. Retiring a
-;; package splices its layer out: the live one gives the global back to the layer below it,
-;; else to the base, else removes it; a lower one leaves the live binding alone. So removing A
-;; while B's patch of A's function is live keeps B's, and removing B then removes the function
-;; (A's is gone) — never A's old body. Emacs's `unload-feature` restores a function the same
-;; way.
+;; `:packages/definitions` global -> `{:base {:present? :value :site} :stack [{:package :value
+;; :site} …]}` — what the global held before any package, then each package's binding in load order, the
+;; live one last. A package updated pushes its new binding on top. Retiring a package splices
+;; its layer out: the live one gives the global back to the layer below it, else to the base,
+;; else removes it; a lower one leaves the live binding alone. So removing A while B's patch of
+;; A's function is live keeps B's, and removing B then removes the function (A's is gone) —
+;; never A's old body. Emacs's `unload-feature` restores a function the same way.
 ;;
-;; What a load bound is read from the runtime (`reflect/rebound-since`, brood ADR-603), not from
-;; every global's value: the value a name had BEFORE the load is kept only for the names the
-;; package's sources spell ([[source-names]]) and the registries — what it can rebind.
+;; What a load bound is read from the runtime (`reflect/rebound-since`, brood ADR-603), and what
+;; each of those globals held before it from the table as it stood before the load
+;; (`reflect/global-values`, `reflect/source-locations`, brood ADR-606) — by the exact global,
+;; however the package spelled the name or whichever macro generated it. A global put back
+;; reads as defined where its value was again.
 
-(defn- file-names (forms module)
-  "Every symbol `forms` spell, at any depth — and, in a file of `module`, each bare one as
-`module/name` too: the names a load of them could bind."
-  (letrec (walk (fn (stack found)
-                  (if (empty? stack)
-                    found
-                    (let (form (first stack)
-                          more (rest stack))
-                      (cond
-                        (symbol? form)
-                          (walk more
-                            (if (and module (nil? (global-namespace form)))
-                              (conj (conj found form) (symbol (str module "/" form)))
-                              (conj found form)))
-                        (or (list? form) (vector? form)) (walk (append (vec form) more) found)
-                        (map? form) (walk (append (keys form) (vals form) more) found)
-                        else (walk more found))))))
-    (walk forms #{})))
-
-(defn- source-names (name)
-  "The names package `name`'s sources spell, module-qualified where they are bare in a module
-file — a superset of the globals its load can bind outside a macro's expansion."
-  (fold (source-files name)
-    #{}
-    (fn (names file)
-      (let (forms (check-allow :discarded-catch
-                    (try (reflect/read-all (file/slurp file)) (catch _ ())))
-            head (first forms)
-            module (when (and (list? head) (= (first head) 'defmodule) (symbol? (second head)))
-                     (->string (second head))))
-        (into names (file-names forms module))))))
-
-(defn- values-before (name)
-  "What package `name`'s load is compared against: `{:generation :names :values}` — the
-runtime's generation, every bound global's name, and the values of the ones its sources spell
-and of every registry."
-  (let (spelled (source-names name)
-        bound (into #{} (reflect/global-names)))
+(defn- values-before ()
+  "What a package's load is compared against: `{:generation :values :sites}` — the runtime's
+generation, and every global a load can rebind with its value and where it was defined (std's reserved names are not
+among them: a `def` of one is refused). The registries a package may write directly are std's
+and bedit's, read off the same table where they are rebindable, else by name."
+  (let (values (reflect/global-values))
     {:generation (reflect/generation)
-     :names bound
-     :values (fold (append (seq spelled) (%registry-names))
-               {}
+     :sites (reflect/source-locations)
+     :values (fold (%registry-names)
+               values
                (fn (acc global)
-                 (if (contains? bound global) (assoc acc global (global-value global)) acc)))}))
+                 (if (contains? acc global) acc (assoc acc global (global-value global)))))}))
 
 (defn- note-definitions (name before)
   ;; each global the load bound in the package's files gets this package's layer on top (its
@@ -285,18 +258,22 @@ and of every registry."
     (doseq (global (reflect/rebound-since (:generation before)))
       ;; `bound?` asks the global table by exactly this name
       (when (and (bound? global) (sited-under? global prefix))
-        (let (present? (contains? (:names before) global)
-              known? (contains? (:values before) global)
+        (let (present? (contains? (:values before) global)
               record (registry/lookup :packages/definitions
                        global
                        {:base {:present? present?
-                               :known? (or known? (not present?))
-                               :value (get (:values before) global)}
+                               :value (get (:values before) global)
+                               :site (get (:sites before) global)}
                         :stack []})
               others (into [] (seq/reject (:stack record) (fn (layer) (= (:package layer) name)))))
           (registry/put! :packages/definitions
             global
-            (assoc record :stack (conj others {:package name :value (global-value global)}))))))))
+            (assoc record
+              :stack
+                (conj others
+                  {:package name
+                   :value (global-value global)
+                   :site (reflect/source-location (exact global))}))))))))
 
 (defn plugin-definitions (name)
   "Every global package `name`'s code bound that it still has a layer in — its own functions,
@@ -317,10 +294,8 @@ its binding changed."
       (registry/put! :packages/definitions global (assoc record :stack kept)))
     (cond
       (not live?) false
-      (not (empty? kept)) (do (define-global global (:value (last kept))) true)
-      (and (:present? base) (:known? base)) (do (define-global global (:value base)) true)
-      ;; bound before by something the load could not see coming: left as it is
-      (:present? base) false
+      (not (empty? kept)) (do (define-global global (:value (last kept)) (:site (last kept))) true)
+      (:present? base) (do (define-global global (:value base) (:site base)) true)
       else (= true (undefine-global global)))))
 
 (defn- retire-definitions (name)
@@ -688,7 +663,7 @@ A package whose module has the name of one of bedit's or a std module is not loa
   ;; [[apply-plugin!]] for a package whose modules are its own
   (add-to-load-path! name)
   (let (settings-before (registry/entries config/*settings*)
-        before (values-before name)
+        before (values-before)
         contribution (ownership/with-claimant (claimant-file name)
                        (fn ()
                          ;; its modules load as ITS, apart from bedit's of the same short name
