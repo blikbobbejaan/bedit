@@ -125,6 +125,27 @@ It also fixed a whole class of green lies. Every check in the Python `drive_mspc
 on the pty's own echo rather than on anything the editor painted, because nothing knew when
 the editor had taken the terminal over. The emulator knows.
 
+## Looking at the window: `screenshot.blsp`
+
+The drivers above read a terminal's cells or a model; neither shows where the window's pixels
+land — the gap above the header line, the margin under the last row, a glyph sitting low in its
+cell. `screenshot.blsp` writes a PNG of what the real editor paints, with no display:
+
+    nest run tools/screenshot.blsp -- src/model.blsp /tmp/editor.png 1000 600 --header-line --zoom 120 3
+
+It starts the editor through `main` in a CHILD runtime with a throwaway `HOME` and XDG config
+(a default `init.blsp`, plus `:header-line true` for `--header-line`), so nothing of the
+user's is read or written and two runs paint the same picture. The child runs under
+`BROOD_GUI_HEADLESS=paint` (brood ADR-609): its window opens offscreen at the size given
+(default 1000×600), is painted by brood's own window painter, and lays out on the grid the
+real cell metrics give. Once two captures 400 ms apart agree (and the editor has had two
+seconds to finish starting) it writes `gui/capture`'s picture to the PNG and prints the
+geometry (`cell`, `grid`, `origin`). `--zoom TOP SCALE` also writes `<out>-zoom.png`: the top
+`TOP` pixels enlarged `SCALE` times by repeating pixels, for counting a few of them.
+
+Open the PNG with anything that shows images — an agent's file reader does. For an assertion
+rather than a look, write a test over `gui/render-frame` instead (`tests/window_paint_test.blsp`).
+
 ## Measuring, not asserting
 
 `profile-turn.blsp` and `../bench/keystrokes.blsp` time one turn of `ed-update` / `ed-view`

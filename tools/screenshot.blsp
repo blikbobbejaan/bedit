@@ -1,0 +1,138 @@
+;; tools/screenshot.blsp — a PNG of what the REAL editor paints, with no display.
+;;
+;;     nest run tools/screenshot.blsp -- FILE OUT.png [WIDTH HEIGHT] [--header-line]
+;;                                       [--zoom TOP-PX SCALE]
+;;
+;; Opens bedit on FILE through `main` — its startup, init file, fonts, timers and loop, the
+;; editor a user runs — in a window WIDTH×HEIGHT (default 1000×600) that brood paints
+;; offscreen (`BROOD_GUI_HEADLESS=paint`, brood ADR-609), waits for the frames to settle,
+;; and writes what the window last painted to OUT.png (`gui/capture`). `--header-line`
+;; turns the header line on; `--zoom 120 3` also writes OUT-zoom.png, the top 120 pixels
+;; enlarged three times — for looking at a few pixels of spacing.
+;;
+;; The editor runs in a CHILD runtime with a throwaway HOME and XDG config: a default
+;; init.blsp (plus the flags' settings), and nothing of the user's read or written —
+;; recent files, save-place, savehist and the slow-turn log land in the throwaway home.
+;; So two runs of the same file paint the same picture, wherever they run.
+(require-one 'project)
+
+(def *child?* (= (os/env "BEDIT_SCREENSHOT_CHILD") "1"))
+
+(def *args* (let (a (system/argv) i (index-of a "--")) (if (>= i 0) (vec (drop a (inc i))) [])))
+
+(defn- usage ()
+  (io/puts "usage: nest run tools/screenshot.blsp -- FILE OUT.png [WIDTH HEIGHT] [--header-line] [--zoom TOP-PX SCALE]"
+    :to *err*)
+  (system/halt 2))
+
+(defn- options (args)
+  "The command line as a map: `:file` `:out` `:width` `:height` `:header-line` `:zoom`."
+  (letrec (walk (fn (rest-args positional acc)
+                  (cond
+                    (empty? rest-args)
+                    (let ([file out width height] positional)
+                      (assoc acc
+                        :file file
+                        :out out
+                        :width (if width (string/->number width) 1000)
+                        :height (if height (string/->number height) 600)))
+                    (= (first rest-args) "--header-line")
+                    (walk (rest rest-args) positional (assoc acc :header-line true))
+                    (= (first rest-args) "--zoom")
+                    (walk (drop rest-args 3)
+                      positional
+                      (assoc acc
+                        :zoom [(string/->number (nth rest-args 1)) (string/->number (nth rest-args 2))]))
+                    else (walk (rest rest-args) (conj positional (first rest-args)) acc))))
+    (walk args [] {})))
+
+(def *options* (options *args*))
+
+(when (or (nil? (:file *options*)) (nil? (:out *options*))) (usage))
+
+(defn- nap (ms) (receive (:never nil) (after ms nil)))
+
+;; ---- the parent: a throwaway home, then the editor in a child runtime -------------
+
+(defn- run-child ()
+  "Start this script again as the child, in a throwaway home whose init.blsp carries the
+flags' settings, and wait for it. Its output is passed through."
+  (let (home (str (path/temp "bedit-screenshot-"))
+        config (path/join home ".config")
+        _ (file/mkdir (path/join config "bedit"))
+        _ (when (:header-line *options*)
+            (file/spit (path/join config "bedit" "init.blsp") "(config :header-line true)\n"))
+        root (or (project/find-root (file/cwd)) (file/cwd))
+        script (path/join root "tools" "screenshot.blsp")
+        child (os/spawn (os/exe-path)
+                (into ["run" script "--"] *args*)
+                {:cwd root
+                 :env {"BEDIT_SCREENSHOT_CHILD" "1"
+                       "BROOD_GUI_HEADLESS" "paint"
+                       "HOME" home
+                       "XDG_CONFIG_HOME" config
+                       "XDG_STATE_HOME" (path/join home ".local" "state")
+                       "XDG_DATA_HOME" (path/join home ".local" "share")
+                       ;; brood's own caches (the std image) are the user's: a fresh one costs a
+                       ;; rebuild of the image on every run and holds nothing of theirs
+                       "XDG_CACHE_HOME" (or (os/env "XDG_CACHE_HOME") (path/join (path/home) ".cache"))}}))
+    (letrec (pump (fn ()
+                    (receive
+                      ([:proc ^child data] (do (io/write data) (pump)))
+                      ([:proc-err ^child data] (do (io/write data :to *err*) (pump)))
+                      ([:proc-closed ^child code] code))))
+      (let (code (pump))
+        (os/cmd "rm" ["-rf" home])
+        (system/halt (or code 1))))))
+
+;; ---- the child: the real editor, then its picture ---------------------------------
+
+(defn- await-window (deadline)
+  "The id of the window the editor opened, waiting for it until `deadline` (os/now ms)."
+  (let (ids (gui/windows))
+    (cond
+      (not (empty? ids)) (first ids)
+      (> (os/now) deadline) nil
+      else (do (nap 100) (await-window deadline)))))
+
+(defn- settled (window previous since deadline)
+  "The window's picture once two captures 400 ms apart are the same and the editor has had
+two seconds since `since` to finish starting (its idle beat, the first eldoc and diff-hl
+passes) — or the last capture at `deadline`."
+  (do
+    (nap 400)
+    (let (image (gui/capture window)
+          now (os/now))
+      (if (or (> now deadline)
+            (and previous (> (- now since) 2000) (= (:rgba image) (:rgba previous))))
+        image
+        (settled window image since deadline)))))
+
+(defn- shoot ()
+  (let ({:keys [file out width height zoom]} *options*
+        file (path/absolute file)
+        out (path/absolute out))
+    (do
+      ;; the window's size: what `gui/open` is given, through bedit's own window options
+      (reflect/eval
+        `(def config/*window-options* ~(assoc config/*window-options* :width width :height height)))
+      (spawn (main/main file))
+      (let (started (os/now)
+            window (await-window (+ started 30000)))
+        (if (nil? window)
+          (do (io/puts "screenshot: the editor opened no window in 30 s" :to *err*) (system/halt 1))
+          (let (image (settled window nil (os/now) (+ (os/now) 20000)))
+            (do
+              (gui/write-png image out)
+              (io/puts (str "wrote " out " (" (:width image) "x" (:height image) ", cell "
+                         (string/join (:cell image) "x") ", grid " (string/join (:grid image) "x")
+                         ", origin " (string/join (:origin image) ",") ")"))
+              (when zoom
+                (let ([top scale] zoom
+                      zoom-out (str (if (string/ends-with? out ".png") (string/substring out 0 (- (string/length out) 4)) out) "-zoom.png"))
+                  (do
+                    (gui/write-png image zoom-out {:crop [0 0 (:width image) top] :scale scale})
+                    (io/puts (str "wrote " zoom-out)))))
+              (system/halt 0))))))))
+
+(if *child?* (shoot) (run-child))

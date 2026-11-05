@@ -1072,12 +1072,20 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             again (`ed-collab-reopen`)
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
+tests/window_paint_test     what the window PAINTS, read from pixels: the real view for a model
+                            painted by brood's window painter into memory (`gui/render-frame`,
+                            brood ADR-609) at a real size with bedit's font, inset and background —
+                            the header line from y = 0, its text centred, the inset a margin
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
                             a new function that adds a finding declares its contract instead
 tools/drive-*.blsp          live drivers: run the real editor over a pty (std/vt reads what it
                             paints) or its own ui-run loop, and assert — the wiring the model
                             tests can't see (`make drive`, tools/README.md); `term-main.blsp` runs
                             the REAL `main` with $BEDIT_DRIVE_ARGS, which `drive-nw` drives in -nw
+tools/screenshot.blsp       a PNG of what the REAL editor paints, no display: `main` in a child
+                            runtime with a throwaway home, its window painted offscreen
+                            (`BROOD_GUI_HEADLESS=paint`, brood ADR-609) and captured once it
+                            settles (`gui/capture`) — so an agent can look at a layout change
 tools/ci/platform-smoke.sh  CI's macOS / Windows run (`platform-smoke` in ci.yml): nest check, the
                             boot check and the test files where the OS shows through — what each
                             OS proves is docs/platforms.md
