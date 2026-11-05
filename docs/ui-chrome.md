@@ -47,7 +47,7 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
 
 ## Rules
 
-1. **Borders are hairlines.** `*hairline*` = `0.05` cell (a crisp sub-px rule), drawn as a
+1. **Borders are hairlines.** `*hairline*` = the `:hairline` step, `0.05` cell (a crisp sub-px rule), drawn as a
    thin `frect` in `face-border`. Never a full-cell solid block, never box-drawing glyphs
    (`│ ─ ┌ ┐`), never reverse-video. Keep it thin — a hairline reads as an edge, a fat one
    reads as a block.
@@ -75,6 +75,17 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
 
 6. **One system, applied uniformly.** Same border token, same hairline thickness, same
    corner radius everywhere. Consistency is what makes it read as "designed".
+
+7. **Spacing comes from one table.** `ui-kit/ui-spacing` holds the steps — `:none`,
+   `:hairline`, `:half`, `:one`, `:two`, `:three`, in ROWS vertically and CELLS
+   horizontally — and the semantic tokens over them (`:card` = 1 row : 2 cells, `:popup`,
+   `:row-inset`, `:key-gap`, `:menu-key-gap`, `:hover-pad`, …). A widget style's `:pad` /
+   `:inset` / `:gap` names a token; `ui-space` raises on a raw number, and
+   `tests/spacing_ratchet_test.blsp` fails on one in a spacing position anywhere in src/.
+   A card pads 1 row to 2 cells because a cell is about half as wide as a row is tall, so
+   that is what looks equal. **Text moves by whole rows and cells** (`ui-space-cells`
+   refuses `:half`); the sub-cell steps only decorate inside a row — the mode line's hover
+   block, a scrollbar thumb's gap from the edge.
 
 ## Where each rule lives
 

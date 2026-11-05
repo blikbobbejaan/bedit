@@ -378,7 +378,11 @@ src/statusbar.blsp          the mode line as extensible segments (render ops + c
                             node (attach) — ordered by rank
 src/ui-kit.blsp             the widget kit over editor/display: a widget is `(area ctx) ->
                             {:ops :zones}` — paint and hit-test in ONE pass, styled by semantic
-                            role. The shared shape behind the context menu, popup, plume, which-key
+                            role. The shared shape behind the context menu, popup, plume, which-key.
+                            And the ONE SPACING TABLE (`ui-spacing`: rows vertically, cells
+                            horizontally, half the only fraction, a card 1 row : 2 cells): a
+                            style's `:pad` / `:inset` / `:gap` names a token, `ui-space` raises on
+                            a raw number, tests/spacing_ratchet_test fails on one in src/
 src/input.blsp              dispatch: fold a key/mouse/tick event into the next model; and the
                             keyboard-macro REPLAY (`ed-run-macro`): N passes (C-u N C-x e), or
                             until one fails (C-u 0), each stopping at the first key whose
