@@ -12,7 +12,8 @@
   - A password, when sudo wants one, is read with the masked prompt (`passwd/ed-read-passwd`)
     and handed to sudo for one validation — never kept: sudo's own timestamp lets the next
     open or save go without asking, as a `sudo` in a shell does.
-  - Every sudo call runs OFF the loop, one at a time (`:sudo-proc`): an open shows a
+  - Every sudo call runs OFF the loop, one at a time (`:sudo-proc`; a password typed or a
+    job launched while another runs waits its turn on `:sudo-waiting`, never dropped): an open shows a
     `Loading…` buffer at once, a save leaves the buffer modified until its write lands, C-g
     stops either, and C-x C-c asks about one still running. C-x C-c and C-x s save the root
     files they were told to after their questions, password and all, and quit (or report)
@@ -103,11 +104,29 @@ or the failure).
 (defn- job-doing (job)
   (str (if (= (:kind job) :open) "opening " "saving ") (:path job) " as " (:user job)))
 
+(defn- sudo-wait (m step job note)
+  "`job` put on the queue (`:sudo-waiting`) to `step` — `:launch` it, or `:ask` for its
+password — once the sudo command running has finished and the prompt is free
+([[ed-sudo-run-waiting]]), and `note` said. A job is never dropped for the slot being taken:
+it waits its turn, its `Loading…` buffer kept. Queued once: a job already waiting is not added
+again."
+  (let (waiting (or (:sudo-waiting m) [])
+        same? (fn (entry)
+                (= (map/select-keys (:job entry) [:kind :path :user])
+                  (map/select-keys job [:kind :path :user]))))
+    (message (if (any? waiting same?)
+               m
+               (assoc m :sudo-waiting (conj waiting {:step step :job job})))
+      note)))
+
 (defn- sudo-launch (m job password)
   "Run `job` off the loop with `password` (nil: ask sudo whether one is needed). Headless —
-the tests — it runs inline. A second job while one runs is refused, as every off-loop job is."
+the tests — it runs inline. While another job runs it WAITS its turn on the queue
+([[sudo-wait]]) — never refused and lost: a password typed for it is not kept, so sudo is
+asked again when its turn comes, and the prompt opens again only if sudo still wants one."
   (cond
-    (:sudo-proc m) (message m "sudo: another sudo command is still running")
+    (:sudo-proc m)
+      (sudo-wait m :launch job (str (job-doing job) " waits for the sudo command running"))
     (ed-headless?) (ed-apply-sudo (assoc m :sudo-job job) (sudo-work job password))
     else
       (assoc (message m (str (job-doing job) "… (C-g stops)"))
@@ -143,30 +162,48 @@ anyone otherwise — or nil. A file is one buffer per user it is edited as: `/su
 
 (defn- sudo-ask (m job)
   "The masked prompt for the password `job` needs; RET runs it again with it, C-g gives it up.
-Only when the prompt is free (`passwd/ed-prompt-free?`): over an open minibuffer — a C-x b
-half typed — it would take that read's keys, and RET would send them to sudo as a failed
-attempt that pam_faillock counts. Then the job WAITS on the model (`:sudo-asking`) and
-[[ed-sudo-ask-when-free]] opens the prompt once that read has closed."
-  (if (ed-prompt-free? m)
-    (map/assoc-in (ed-read-passwd (dissoc m :sudo-asking)
-                    (password-prompt)
-                    (fn (mm password) (sudo-launch mm job password)))
-      [:minibuffer :on-abort]
-      (fn (mm) (sudo-abandon mm job)))
-    (message (assoc m :sudo-asking job)
-      "sudo needs a password — asked when this prompt closes")))
+Only when the prompt is free (`passwd/ed-prompt-free?`) and no sudo command is running: over an
+open minibuffer — a C-x b half typed — it would take that read's keys, and RET would send them
+to sudo as a failed attempt that pam_faillock counts; while another job runs, the RET would
+find the slot taken. Otherwise the job WAITS on the queue ([[sudo-wait]]) and
+[[ed-sudo-run-waiting]] opens the prompt once both are free."
+  (cond
+    (not (ed-prompt-free? m))
+      (sudo-wait m :ask job "sudo needs a password — asked when this prompt closes")
+    (:sudo-proc m)
+      (sudo-wait m
+        :ask job
+        (str "sudo needs a password for "
+          (job-doing job)
+          " — asked when the running sudo command is done"))
+    else
+      (map/assoc-in (ed-read-passwd m
+                      (password-prompt)
+                      (fn (mm password) (sudo-launch mm job password)))
+        [:minibuffer :on-abort]
+        (fn (mm) (sudo-abandon mm job)))))
 
-(defn ed-sudo-ask-when-free (m)
-  "A post-step: the sudo password a job is waiting to ask for ([[sudo-ask]]), asked now that
-the prompt is free."
-  (let (job (:sudo-asking m))
-    (cond
-      (or (nil? job) (not (ed-prompt-free? m))) m
-      ;; an open whose `Loading…` buffer was killed meanwhile asks for nothing
-      (and (= (:kind job) :open) (nil? (placeholder-index m (:path job)))) (dissoc m :sudo-asking)
-      else (sudo-ask m job))))
+(defn ed-sudo-run-waiting (m)
+  "A post-step: the first job on the sudo queue ([[sudo-wait]]) taken up once no sudo command
+runs — launched, or its password asked for once the prompt is free too. An open whose
+`Loading…` buffer was killed meanwhile is dropped from the queue, wanting nothing."
+  (let (waiting (or (:sudo-waiting m) []))
+    (if (or (empty? waiting) (:sudo-proc m))
+      m
+      (let (entry (first waiting)
+            job (:job entry)
+            rest-m (if (= 1 (count waiting))
+                     (dissoc m :sudo-waiting)
+                     (assoc m :sudo-waiting (vec (rest waiting)))))
+        (cond
+          (and (= (:kind job) :open) (nil? (placeholder-index m (:path job))))
+            (ed-sudo-run-waiting rest-m)
+          ;; launched: headless it ran inline, so the next may follow at once
+          (= (:step entry) :launch) (ed-sudo-run-waiting (sudo-launch rest-m job nil))
+          (ed-prompt-free? m) (sudo-ask rest-m job)
+          else m)))))
 
-(register-post-step :sudo-ask {:order 80 :run 'sudoedit/ed-sudo-ask-when-free})
+(register-post-step :sudo-ask {:order 80 :run 'sudoedit/ed-sudo-run-waiting})
 
 ;; ---- opening ----------------------------------------------------------------------
 
@@ -365,8 +402,11 @@ a save's buffer stays modified, and C-g says what stopped."
         (str (job-doing job) " stopped" (or (:abandon-note job) ""))))))
 
 (defn ed-sudo-live (m)
-  "The sudo job C-x C-c would stop (`model/register-exit-query`), while one runs."
-  (if (:sudo-proc m) [(str "sudo: " (job-doing (or (:sudo-job m) {})))] []))
+  "The sudo jobs C-x C-c would stop (`model/register-exit-query`): the one running, and those
+waiting their turn ([[sudo-wait]])."
+  (into (if (:sudo-proc m) [(str "sudo: " (job-doing (or (:sudo-job m) {})))] [])
+    (map (or (:sudo-waiting m) [])
+      (fn (entry) (str "sudo: " (job-doing (:job entry)) " (waiting)")))))
 
 (register-task-reply :sudo-proc
   'sudoedit/ed-apply-sudo
