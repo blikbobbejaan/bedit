@@ -340,7 +340,9 @@ src/embark.blsp             C-. act on the thing at point or the selected candid
                             existing commands, C-; its default, C-h B every binding as a prompt
 src/spell.blsp              spell checking (Emacs jinx, `:spell-check`): the visible prose, and the
                             comments and strings of code, checked off the loop by a long-lived
-                            `enchant-2 -a` (else aspell); M-$ correct, C-M-$ the dictionary
+                            `enchant-2 -a` (else aspell); M-$ correct, C-M-$ the dictionary. The
+                            word being typed (point at its end) is not underlined until point
+                            leaves it, as flyspell judges a word
 src/cape.blsp               completion sources beside the mode's (Emacs cape): file paths, and words
                             from other open buffers, ranked after this buffer's
 src/savehist.blsp           minibuffer answers kept per prompt across sessions (Emacs savehist,
@@ -595,7 +597,13 @@ src/formatter.blsp          M-x format-buffer + format-on-save: the language's o
                             (named to dodge std's `format`: a release resolves a std name
                             first, so a project module called `format` never ran)
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
-                            (named to dodge std's `tool/complete`, which shadows a bare `complete`)
+                            (named to dodge std's `tool/complete`, which shadows a bare `complete`);
+                            the card is anchored where the completion STARTS (Corfu's), so it
+                            does not slide as letters are typed into it. The auto popup is per
+                            mode (`completion-auto-for?`): the user's `:completion-auto` entry
+                            for the mode, else the mode's `:completion-auto` facet — off in
+                            text-mode (prose completes on demand, C-M-i), on in prog-mode and the
+                            line-lexed config formats
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
                             hover, rename, format, imenu, and `publishDiagnostics` folded into
                             the model's diagnostics, so every language gets the underline / ⚠ note
@@ -775,18 +783,24 @@ elixir/bedit_agent.exs      bedit's agent ON the BEAM: a session (binding + modu
 src/tutor.blsp              the interactive Brood tutorial (C-h t): playground boxes that
                             eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard;
                             the third client of playground-core
-src/aside.blsp              the ASIDE pane: a named buffer shown beside the page, refreshed in
-                            place, latched closed once the reader closes it, reopened only by
-                            asking — the discipline under every preview pane (workings, mdpreview)
+src/aside.blsp              the PREVIEW PANE mechanism every side pane is a small spec over
+                            (`{:key :buffer :type}`): shown beside the page, refreshed in place,
+                            latched closed once the reader closes it, its key a `toggle`, a
+                            follower on a clock re-showing it only when a staleness key moved
+                            (`sync`), data riding onto its buffer (`:fields`), taken with its
+                            source (`close-with`), scrolled to a line or level with the source
+                            (`scroll-to-line`, `scroll-top-to`). Clients: mdpreview, diagnostics,
+                            the time machine's commit pane, and workings'. Where and how wide:
+                            the `:display-buffer` rules
 src/workings.blsp           the "show me how it actually ran" pane over `aside`: the per-region
                             report cache and the rule for what earns a split — the tutorial's
-                            *Workings* and the playground's *Playground Spy* are its two clients
+                            *Workings* (`tutor/*workings-spec*`) and the two playgrounds' spy
+                            panes are its clients
 src/mdpreview.blsp          C-c C-p in a .md buffer: the document rendered beside it
                             (std's `markdown-render`, faces as data on the buffer), following
-                            the cursor per key and re-rendering on the idle beat (`:on-idle`)
-src/tutor-workings.blsp     the tutorial's *Workings* pane: the per-box cascade cache, its body
-                            text, and its open/follow/close (knows a pane + a box INDEX; the
-                            tutorial owns the box parser and passes the index — acyclic)
+                            the cursor per key, level with the source's scroll (a post-step),
+                            re-rendering on the idle beat off the loop (`:on-idle`), and opening
+                            on its own with init.blsp's `:markdown-preview`
 src/tutor-lessons.blsp      the tutorial's CONTENT only — the lessons vector (grow the course here)
 src/toolchain.blsp          the project TYPE as data: marker file -> which commands compile,
                             test, run and REPL here (mix / nest / cargo / npm / go /
