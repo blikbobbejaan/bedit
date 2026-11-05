@@ -38,9 +38,17 @@
 (defn bshell-input (m)
   (let (t (bshell-text m)) (string/substring t (bshell-istart m) (string/length t))))
 (defn set-field (m k v) (ed-set-buf m (assoc (ed-current-buf m) k v))) ; set a field on the current buffer
+(defn with-mark (m position) (ed-set-buf m (bshell/with-process-mark (ed-current-buf m) position))) ; the process mark on the current buffer
 (defn bshell-point (m) (buffer-point (ed-current-buf m)))
 (defn type-into (m s) (fold (string/->list s) m (fn (acc k) (ed-update acc k 80 24))))
 (defn at-point (m p) (ed-set-buf m (goto-char (ed-current-buf m) p)))
+
+;; RET remembers the line in the shell's history FILE. This suite once ran it against the
+;; user's real ~/.config/bedit/state/bshell-history.blsp and overwrote it; every RET here
+;; goes through `send-line`, which names a scratch file of the test's own.
+(def scratch-history (str (path/temp "bedit-bshell-history-") ".blsp"))
+(defn send-line (m key)
+  (binding (*bshell-history-file* scratch-history) (cmd-bshell-send m key)))
 
 ;; A model 'in' /tmp (no project marker there) so `ed-project-root` resolves to /tmp.
 (defn tmp-project-model ()
@@ -129,8 +137,8 @@ folded as the loop folds them."
   ;; the output lands at the process mark (comint's), before what was typed ahead — so no
   ;; later edit of that input can shift the output's colour spans off their text
   (test "output goes before it, coloured where it lands; the new prompt keeps it as input"
-    (let (running (set-field (set-field (bshell-model) :bshell-running true)
-                    :bshell-output-at (string/length (bshell-text (bshell-model))))
+    (let (running (with-mark (set-field (bshell-model) :bshell-running true)
+                    (string/length (bshell-text (bshell-model))))
           mark (string/length (bshell-text running))
           typed (type-into running "next")
           m1 (bshell-stream-into typed ["\e[31mre" "d\e[0m\n"])
@@ -143,6 +151,81 @@ folded as the loop folds them."
       (is (string/ends-with? (bshell-text m2) "red\n/tmp $ next"))
       (assert= (bshell-input m2) "next")
       (refute (bshell-running m2)))))
+
+(defn- sent-and-running (line)
+  "A shell that has just sent `line` (RET), its run message taken back off this mailbox."
+  (let (m (send-line (type-into (set-field (bshell-model) :bshell-proc (self)) line) nil))
+    (receive ([:bshell-run _] m) (after 1000 m))))
+
+(describe "bshell: the process mark is a marker every edit carries"
+  :isolated ; RET sends the run to this test's mailbox
+  (test "C-a then typing while a command runs never splits the next chunk mid-word"
+    ;; the mark used to be a plain offset: text typed before it left it behind, and the
+    ;; next chunk landed inside the typing (`/tmp $ XYls\nontwo\ne\n`)
+    (let (m1 (bshell-stream-into (sent-and-running "ls") ["one\n"])
+          typed (type-into (ed-update m1 :ctrl-a 80 24) "XY")
+          m2 (bshell-stream-into typed ["two\n"]))
+      (assert= (bshell-text m2) "/tmp $ ls\none\ntwo\nXY")))
+  (test "text inserted before the mark carries it along"
+    (let (m1 (bshell-stream-into (sent-and-running "ls") ["one\n"])
+          b (ed-current-buf m1)
+          mark (bshell/process-mark-at b)
+          edited (insert (goto-char b 0) "AB"))
+      (assert= mark (string/length "/tmp $ ls\none\n"))
+      (assert= (bshell/process-mark-at edited) (+ (string/length "/tmp $ ls\none\n") 2))))
+  (test "while a command runs, the input region starts at the mark, not the old prompt"
+    (let (m1 (bshell-stream-into (sent-and-running "ls") ["one\n"]))
+      (assert= (first (bshell/input-region (bshell-buf m1))) (string/length "/tmp $ ls\none\n"))))
+  (test "the mark goes when the command ends"
+    (let (m1 (bshell/ed-ev-bshell-done (sent-and-running "ls")
+               (bshell/bshell-done-event bshell-name 0)
+               24
+               80
+               24))
+      (is (nil? (bshell/process-mark-at (ed-current-buf m1)))))))
+
+(defn- longest-line (text)
+  (reduce (string/split text "\n") 0 (fn (longest line) (math/max longest (string/length line)))))
+
+(describe "bshell: output with no newline stays bounded"
+  ;; every chunk used to run the password regex over the whole current line, so a command
+  ;; writing one long line cost O(n²); the line now ends at `*bshell-line-max*`, and the
+  ;; password watch reads only a line short enough to be a prompt
+  :isolated (test "a long single line is ended at the line limit, its text all kept"
+    (let (chunk (string/join (seq/repeat 1000 "x") "")
+          m (bshell-stream-into (sent-and-running "dump") (into [] (seq/repeat 70 chunk)))
+          output (string/substring (bshell-text m) (string/length "/tmp $ dump\n")))
+      (is (<= (longest-line output) (+ *bshell-line-max* 1000)))
+      (assert= (string/length (string/replace output "\n" "")) 70000)
+      (assert= (bshell-point m) (string/length (bshell-text m)))))
+  (test "a line longer than any prompt is not read as one"
+    (let (m (bshell-stream-into (sent-and-running "dump")
+              [(str (string/join (seq/repeat 300 "y") "") " password: ")]))
+      (assert= (bshell/last-line (bshell-buf m)) "")
+      (refute (:bshell-secret (bshell-buf m)))))
+  (test "a real prompt after the long output is still seen"
+    (let (m (bshell-stream-into (sent-and-running "sudo -S x")
+              [(string/join (seq/repeat 3000 "z") "") "\n[sudo] password for me: "]))
+      (assert= (bshell/last-line (bshell-buf m)) "[sudo] password for me: ")
+      (is (:bshell-secret (bshell-buf m))))))
+
+(describe "bshell: only a pane at the process mark follows the output"
+  :isolated (test "a reader up in the running command's own output stays where they are"
+    (let (m1 (bshell-stream-into (sent-and-running "make") ["error: one\nline2\n"])
+          at (index-of (bshell-text m1) "error")
+          reading (at-point m1 at)
+          m2 (bshell-stream-into reading ["more\n" "and more\n"]))
+      (assert= (bshell-point m2) at)))
+  (test "a pane at the end follows it"
+    (let (m1 (bshell-stream-into (sent-and-running "make") ["one\n" "two\n"]))
+      (assert= (bshell-point m1) (string/length (bshell-text m1)))))
+  (test "a pane in the input typed ahead keeps its place in that input"
+    (let (m1 (bshell-stream-into (sent-and-running "make") ["one\n"])
+          typed (at-point (type-into m1 "abc")
+                  (- (string/length (bshell-text (type-into m1 "abc"))) 1))
+          m2 (bshell-stream-into typed ["two\n"]))
+      (assert= (bshell-text m2) "/tmp $ make\none\ntwo\nabc")
+      (assert= (bshell-point m2) (- (string/length (bshell-text m2)) 1)))))
 
 (describe "ed-ev-bshell-done"
   (test "a clean exit (0) is silent — no [exit] line, but a fresh prompt and idle shell"
@@ -273,7 +356,7 @@ folded as the loop folds them."
       (assert= (:bshell-draft (bshell-buf m1)) "")))
   (test "submitting a command records it in this buffer's history"
     (let (typed (type-into (set-field (bshell-model) :bshell-proc (self)) "echo hi")
-          m (cmd-bshell-send typed nil))
+          m (send-line typed nil))
       (is (includes? (:bshell-history (bshell-buf m)) "echo hi")))))
 
 ;; ---- completion: filenames for a command, Brood globals for a form ----------
@@ -303,21 +386,21 @@ folded as the loop folds them."
   :isolated ; sends to a process (here, the test itself, via :bshell-proc = self)
   (test "slices the input line and sends it to the shell process, marking :running"
     (let (typed (type-into (set-field (bshell-model) :bshell-proc (self)) "pwd")
-          m (cmd-bshell-send typed nil))
+          m (send-line typed nil))
       (let (got (receive ([:bshell-run line] line) (after 2000 :timeout)))
         (assert= got "pwd"))
       (is (string/ends-with? (bshell-text m) "tmp $ pwd\n"))
       (assert= (bshell-running m) true)))
 
   (test "an empty input line just emits a fresh prompt — nothing is sent, not running"
-    (let (m (cmd-bshell-send (set-field (bshell-model) :bshell-proc (self)) nil))
+    (let (m (send-line (set-field (bshell-model) :bshell-proc (self)) nil))
       (assert= (bshell-running m) false)
       (assert= (bshell-istart m) (string/length (bshell-text m)))
       (is (nil? (receive ([:bshell-run line] line) (after 200 nil))))))
 
   (test "RET is ignored while a command is already running"
     (let (m0 (set-field (bshell-model) :bshell-running true)
-          m (cmd-bshell-send m0 nil))
+          m (send-line m0 nil))
       (assert= m m0))))
 
 ;; ---- multi-line input (an incomplete Brood form keeps editing) --------------
@@ -340,7 +423,7 @@ folded as the loop folds them."
     (let (typed (type-into (assoc (set-field (bshell-model) :bshell-proc (self))
                              :electric-pair? false)
                   "(+ 1")
-          m (cmd-bshell-send typed nil))
+          m (send-line typed nil))
       (is (string/ends-with? (bshell-text m) "(+ 1\n"))
       (assert= (bshell-running m) false))))
 
@@ -360,7 +443,17 @@ folded as the loop folds them."
       (projects/persist-write! f ["a" "b"])
       (assert= (projects/persist-read f) ["a" "b"])))
   (test "loading a missing file yields an empty history (never errors)"
-    (is (vector? (bshell/bshell-load-history)))))
+    (is (vector? (bshell/bshell-load-history))))
+  (test "RET writes the history to the file the test named, nowhere else"
+    (let (file (str (path/temp "bedit-bshell-own-history-") ".blsp"))
+      (binding (*bshell-history-file* file)
+        (cmd-bshell-send (type-into (set-field (bshell-model) :bshell-proc (self)) "echo mine") nil))
+      (receive ([:bshell-run _] nil) (after 1000 nil))
+      (assert= (projects/persist-read file) ["echo mine"])))
+  (test "under the test runner the default history is in the run's scratch config, not $HOME's"
+    (let (path (bshell/bshell-history-path))
+      (when-let (scratch (test/scratch-dir)) (is (string/starts-with? path scratch)))
+      (refute (config/test-forbidden-path? path)))))
 
 ;; ---- per-project: each project gets its own shell buffer --------------------
 
@@ -402,7 +495,7 @@ folded as the loop folds them."
     ;; typing first: `ed-set-buf` caches the pane point, which is exactly what left it stale
     (let (m0 (ed-update (set-field (bshell-model) :bshell-proc (self)) "l" 80 24)
           m1 (ed-update m0 "s" 80 24)
-          m2 (cmd-bshell-send m1 :enter)
+          m2 (send-line m1 :enter)
           m3 (bshell/ed-ev-bshell-output m2
                (bshell/bshell-output-event bshell-name "a.txt\n" [])
                24

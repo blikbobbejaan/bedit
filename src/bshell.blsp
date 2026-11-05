@@ -94,11 +94,18 @@ shell, or a terminal in line mode. What the boundary and history commands serve.
 ;; ---- persistent command history (across sessions, like the REPL) ------------
 
 (def *bshell-history-max* 1000) ; most-recent entries kept on disk
+(defdyn *bshell-history-file* nil)
+;; A history file that wins over everything — a test's own (no process can set its own
+;; environment). nil, the default, asks `$BSHELL_HISTORY` and then the state dir.
+
 (defn- bshell-history-path ()
-  "The history file: `$BSHELL_HISTORY`, else `bshell-history.blsp` under the editor's shared
-state dir — a re-readable vector, persisted through the same `persist-*` layer as every other
-generated file (not a loose dotfile in `$HOME`)."
-  (or (os/env "BSHELL_HISTORY") (path/join (editor-state-dir) "bshell-history.blsp")))
+  "The history file: [[*bshell-history-file*]] when bound, else `$BSHELL_HISTORY` (not under
+the test runner, where an exported one would be the user's own), else `bshell-history.blsp`
+under the editor's shared state dir — a re-readable vector, persisted through the same
+`persist-*` layer as every other generated file (not a loose dotfile in `$HOME`)."
+  (or *bshell-history-file*
+    (when (not (config/under-test?)) (os/env "BSHELL_HISTORY"))
+    (path/join (editor-state-dir) "bshell-history.blsp")))
 
 (defn- bshell-history-trim (history)
   "Keep the most recent `*bshell-history-max*` entries (oldest first). Pure — the testable
@@ -246,22 +253,25 @@ for a mode that spawned something."
 ;; only a saved default, so a write that leaves the pooled point at the new end moves no
 ;; cursor anyone can see. That was the bug — type a command, RET, and the cursor stayed on
 ;; the line you typed while the output and the next prompt appeared below it. The rule is
-;; comint's: a pane whose point was in the INPUT region (at or past `:input-start`)
-;; follows the write to the new end; a pane up in the scrollback, reading, stays put.
+;; comint's: a pane whose point was at or past the PROCESS MARK (where the output goes)
+;; moves with the text after it; a pane up in the scrollback, reading — even the running
+;; command's own output — stays put.
 
 (defn- bshell-write (m nm f)
-  "Buffer `nm` (which must exist) replaced by `(f buffer)` — a write that leaves the
-buffer's point where typing continues — with every pane on it that was at or past the
-input region moved to that point."
+  "Buffer `nm` (which must exist) replaced by `(f buffer)` — a write of output at the
+process mark (`bshell-output-point`) — with every pane on it that was AT or past the mark
+carried along with the text after it, as comint's windows at the process mark follow: a
+pane at the end stays at the end, one in the input typed ahead keeps its place in it. A
+pane up in the scrollback — the running command's own output included — stays put."
   (let (idx (ed-buffer-index-by-name! m nm)
         before (ed-buf-at m idx)
-        istart (or (:input-start before) 0)
+        at (bshell-output-point before)
         after (f before)
-        end (buffer-point after))
+        grown (- (buffer-length after) (buffer-length before)))
     (ed-map-panes (ed-set-buf-at m idx after)
       (fn (w)
-        (if (and (= (:buffer w) idx) (int? (:point w)) (>= (:point w) istart))
-          (assoc w :point end)
+        (if (and (= (:buffer w) idx) (int? (:point w)) (>= (:point w) at))
+          (assoc w :point (math/max 0 (math/min (buffer-length after) (+ (:point w) grown))))
           w)))))
 
 (defn- bshell-append (m nm s)
@@ -271,16 +281,31 @@ stream chunk isn't line-aligned, so a forced newline would split mid-line output
 preserves the buffer's other fields (`:bshell-*`), so its per-buffer state survives."
   (bshell-append-output m nm s nil))
 
-;; While a command runs, its output lands at the PROCESS MARK (`:bshell-output-at`, comint's
-;; `process-mark`), not at the end: anything typed ahead stays after it, below the output and,
-;; once the command ends, after the new prompt as input waiting to be sent. That is also what
-;; keeps the output's colour spans true — every edit the user makes is after them.
+;; While a command runs, its output lands at the PROCESS MARK (comint's `process-mark`), not
+;; at the end: anything typed ahead stays after it, below the output and, once the command
+;; ends, after the new prompt as input waiting to be sent. That is also what keeps the
+;; output's colour spans true — every edit the user makes is after them. The mark is a real
+;; buffer MARKER (`editor/buffer`'s, left gravity), so every edit carries it: text typed
+;; BEFORE it — C-a back onto the command line, a click up into the output — moves it
+;; along, and the next chunk still lands after the output, never mid-word. While the
+;; command runs, the input region starts there too (`input-region`).
+
+(def- process-mark :bshell-process-mark) ; the marker id
+
+(defn process-mark-at (b)
+  "Shell buffer `b`'s process mark — where a running command's output lands — or nil when
+none is set."
+  (buffer-marker b process-mark))
+
+(defn with-process-mark (b position)
+  "Shell buffer `b` with its process mark at `position`."
+  (buffer-marker-set b process-mark position))
 
 (defn- bshell-output-point (b)
   "Where output lands in shell buffer `b`: while a command runs, its process mark — before
 anything typed ahead — else the buffer's end."
   (let (end (buffer-length b)
-        at (:bshell-output-at b))
+        at (process-mark-at b))
     (if (and (:bshell-running b) (int? at)) (math/min at end) end)))
 
 (defn- bshell-append-output (m nm s spans)
@@ -298,9 +323,26 @@ cursor move with the text, and the colours belong to it."
                    (bshell-write m
                      nm
                      (fn (b)
-                       (let ([written end] (insert-output b (bshell-output-point b) s spans))
-                         (end-of-buffer (assoc written :bshell-output-at end))))))
+                       (let ([written end] (insert-output b (bshell-output-point b) s spans)
+                             [broken mark] (bshell-break-long-line written end))
+                         (end-of-buffer (with-process-mark broken mark))))))
     nm))
+
+(defdyn *bshell-line-max* 65536)
+;; The longest output line a shell lets a command grow before it ends it, as procstream hands
+;; a partial line over at the same size: a command that writes without a newline (a progress
+;; bar, a minified dump) would otherwise grow one line without end, and every chunk would pay
+;; for the line so far (the password watch, the carriage return, the view).
+
+(defn- bshell-break-long-line (b end)
+  "`[b' end']`: shell buffer `b`, output just written up to `end`, with a newline added there
+when the line `end` is on has grown past [[*bshell-line-max*]] chars — the next chunk then
+starts a fresh line."
+  (let (rope (buffer-rope b)
+        line-start (text/line->char rope (text/char->line rope end)))
+    (if (> (- end line-start) *bshell-line-max*)
+      [(first (insert-output b end "\n" [])) (inc end)]
+      [b end])))
 
 (defn- bshell-buffer-end (m nm)
   "The char length of buffer `nm` — where freshly-emitted input begins."
@@ -355,11 +397,15 @@ leaves the running command at a password prompt reads the password (`bshell-watc
 
 (defn- last-line (b)
   "The text of the line a command's output ends on, up to where its next output would land
-(`bshell-output-point`) — its prompt, without anything typed ahead after it."
+(`bshell-output-point`) — its prompt, without anything typed ahead after it. A line longer
+than [[*bshell-prompt-max*]] is no prompt and reads as \"\": the password watch runs on
+every chunk, and must not pay for a long line of output again on each one."
   (let (rope (buffer-rope b)
         at (bshell-output-point b)
         line-start (text/line->char rope (text/char->line rope at)))
-    (text/slice rope line-start at)))
+    (if (> (- at line-start) *bshell-prompt-max*) "" (text/slice rope line-start at))))
+
+(defdyn *bshell-prompt-max* 256) ; the longest line the password watch reads as a prompt
 
 (defn bshell-read-secret (m nm &optional (seed nil))
   "Read a line masked and send it to the command shell `nm` is running — the answer to a
@@ -446,7 +492,11 @@ shell idle and start *its* input region where the prompt ends (all per-buffer)."
              else (bshell-append m0 nm (str "[exit " code "]\n")))
         m2 (bshell-append m1 nm (bshell-prompt-for m1 nm))
         prompt-end (bshell-output-point (nth (:buffers m2) (ed-buffer-index-by-name! m2 nm)))
-        m3 (bshell-bufset (bshell-bufset m2 nm :bshell-running false) nm :bshell-secret false))
+        m3 (ed-update-named m2
+             nm
+             (fn (b)
+               (buffer-marker-delete (assoc b :bshell-running false :bshell-secret false)
+                 process-mark))))
     (ed-scroll (bshell-bufset m3 nm :input-start prompt-end) textrows)))
 
 ;; ---- syntax highlighting (the :fontify mode service) ------------------------
@@ -642,10 +692,14 @@ persist that history to the shell's history file."
   "`[start end]` of buffer `b`'s input region — CLAMPED into the buffer. A kill that
 reached above `:input-start` (click up into the scrollback, then C-k: the layers bind
 Backspace, not every kill) leaves the field past the end of the rope, and indexing off it
-would throw. With no `:input-start` the region is empty, at the end. The one reader of the
-field, for the shell and a line-mode terminal alike."
-  (let (end (buffer-length b))
-    [(math/min (or (:input-start b) end) end) end]))
+would throw. With no `:input-start` the region is empty, at the end. While a shell's
+command runs the region starts at its PROCESS MARK instead (`process-mark-at`), as
+comint's does: the line it was started with is sent, and what is typed now is input for
+later. The one reader of the field, for the shell and a line-mode terminal alike."
+  (let (end (buffer-length b)
+        mark (process-mark-at b)
+        start (if (and (:bshell-running b) (int? mark)) mark (:input-start b)))
+    [(math/min (or start end) end) end]))
 (sig input-region (buffer -> (tuple int int)))
 
 (defn input-text (b)
@@ -826,10 +880,8 @@ holding what was typed since the prompt appeared, moved out of the buffer."
                   nm
                   ;; the process mark starts after the command line: its output goes there
                   (fn (buf)
-                    (assoc buf
-                      :bshell-running true
-                      :bshell-command line
-                      :bshell-output-at (buffer-length buf))))))))))
+                    (with-process-mark (assoc buf :bshell-running true :bshell-command line)
+                      (buffer-length buf))))))))))
 
 ;; Turn the completion source on: highest precedence, but inert outside a bshell buffer.
 (complete-add-source! 'bshell/bshell-complete-source)

@@ -21,6 +21,13 @@ seconds=${SECONDS_PER_FILE:-6}
 if [ "${HEADLESS:-1}" != 0 ]; then export BROOD_GUI_HEADLESS=1; fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# The editor under test keeps its state (recent files, places, the slow-turn log) in a config
+# directory of this run's own, as tools/drive.blsp's do — with the reader's own, every file
+# below landed in their recent files. The grammars are the one thing borrowed, read-only.
+real_config=${XDG_CONFIG_HOME:-$HOME/.config}/bedit
+mkdir -p "$work/config/bedit"
+if [ -d "$real_config/grammars" ]; then ln -s "$real_config/grammars" "$work/config/bedit/grammars"; fi
+export XDG_CONFIG_HOME="$work/config"
 
 printf 'export A=1 # c\nif [ -n "$A" ]; then echo ok; fi\nf() { :; }\n' > "$work/.bashrc"
 printf 'FOO=bar\n# c\n' > "$work/.env"
