@@ -78,12 +78,16 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
 
 7. **Spacing comes from one table.** `ui-kit/ui-spacing` holds the steps — `:none`,
    `:hairline`, `:half`, `:one`, `:two`, `:three`, in ROWS vertically and CELLS
-   horizontally — and the semantic tokens over them (`:card` = 1 row : 2 cells, `:popup`,
+   horizontally — and the semantic tokens over them (`:card` = 1 row : 2 cells, `:menu` = 1
+   row : 1 cell with `:menu-row-inset` 2 inside the pill, `:popup`,
    `:row-inset`, `:key-gap`, `:menu-key-gap`, `:hover-pad`, …). A widget style's `:pad` /
    `:inset` / `:gap` names a token; `ui-space` raises on a raw number, and
    `tests/spacing_ratchet_test.blsp` fails on one in a spacing position anywhere in src/.
    A card pads 1 row to 2 cells because a cell is about half as wide as a row is tall, so
-   that is what looks equal. **Text moves by whole rows and cells** (`ui-space-cells`
+   that is what looks equal — a DEFAULT for cards, not a law: a menu card frames a
+   full-width selection pill, so its card is 1 row : 1 cell and the room goes inside the
+   pill (2 cells), the label 3 cells from the border; 2 cells of card outside the pill
+   left the text cramped in it. **Text moves by whole rows and cells** (`ui-space-cells`
    refuses `:half`); the sub-cell steps only decorate inside a row — the mode line's hover
    block, a scrollbar thumb's gap from the edge.
 
