@@ -231,10 +231,19 @@ src/slowlog.blsp            the SLOW-TURN LOG: every turn of the loop the watchd
                             `main` activates it, so a test never writes the user's file. The loop runs
                             `(proc/flag :responsive true)` (brood ADR-517), so every `os/cmd` it makes
                             arrives as `[:blocking-call …]` and is logged here too, phase `blocking`
-src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role
+src/theme.blsp              every colour the editor paints (Catppuccin Mocha), referenced by role;
+                            the TEXT-EMPHASIS TIERS chrome names (`*fg-code*` · `*fg-chrome*` ·
+                            `*fg-chrome-dim*` · `*fg-tertiary*` · `*fg-decor*`, APCA Lc 75 / 60 / 45 /
+                            30 / 15), so quieter chrome is one edit; `apca-lc` / `wcag-ratio`, with
+                            which tests/theme_test.blsp holds every registered theme to them. The
+                            mode line is recessed (the mantle, secondary text; colour only for a
+                            state: modified `●`, `Def`, a failing check); the gutter is the base, its
+                            current number lavender
 src/themes.blsp             the theme registry (M-x theme-select): a live picker that swaps the
                             whole palette AND the window font — a theme is a plain map, so
-                            adding one is data (theme.blsp is the palette; this is the registry)
+                            adding one is data (theme.blsp is the palette; this is the registry).
+                            Each names the whole ladder (subtext1, overlay2, lavender); `Catppuccin
+                            Mocha Calm` is the restrained-syntax option (Tonsky's Alabaster rules)
 src/ownership.blsp          WHO registered each registry row: every `register-*` (model's idle jobs,
                             task replies, event / down / timer handlers, exit queries, post-steps,
                             layout keepers; statusbar chips; M-x commands; keymap profiles;

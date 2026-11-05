@@ -33,11 +33,26 @@ Reference chrome by **role**, never by raw colour, so a re-theme is one edit
 
 | token       | hex       | role                                             |
 |-------------|-----------|--------------------------------------------------|
-| `*base*`    | `#1e1e2e` | editor background (level 0)                      |
-| `*surface0*`| `#313244` | raised chrome: status bar, popup cards (level 1) |
+| `*mantle*`  | `#181825` | recessed chrome: the mode line, the header line   |
+| `*base*`    | `#1e1e2e` | editor background (level 0), the gutter included |
+| `*surface0*`| `#313244` | raised chrome: popup cards (level 1)             |
 | `*surface1*`| `#45475a` | **borders** + the current-line band              |
-| `*overlay0*`| `#6c7086` | dim furniture: line numbers, scrollbar track     |
 | `*overlay1*`| `#7f849c` | scrollbar thumb                                  |
+
+**Text** is drawn in five tiers, never a raw grey (`src/theme.blsp`; APCA lightness contrast
+against the background, [APCA in a Nutshell](https://git.apcacontrast.com/documentation/APCA_in_a_Nutshell.html)).
+`tests/theme_test.blsp` holds every registered theme to the floors:
+
+| tier             | Mocha      | floor  | for                                          |
+|------------------|------------|--------|----------------------------------------------|
+| `*fg-code*`      | text       | Lc 75  | the buffer                                   |
+| `*fg-chrome*`    | subtext1   | Lc 60  | chrome you read: a name, a state             |
+| `*fg-chrome-dim*`| subtext0   | Lc 45  | the mode line and header line                |
+| `*fg-tertiary*`  | overlay1   | Lc 30  | line numbers, an unselected pane's mode line |
+| `*fg-decor*`     | overlay0   | Lc 15  | a truncation mark, a separator               |
+
+Tints keep three things apart: the region is overlay2 at 25% over the background, the
+search's other matches a teal tint, the current match the solid yellow fill.
 
 **Border** — one token, `face-border` = `{:bg *surface1*}`. `*surface1*` is our
 "step-6" divider colour (the level most token systems reserve for borders — Radix uses
@@ -52,17 +67,18 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
    (`│ ─ ┌ ┐`), never reverse-video. Keep it thin — a hairline reads as an edge, a fat one
    reads as a block.
 
-2. **Anchor chrome to content with a border, not a gap.** A bar floating with no
-   separator reads as "hanging". The **status bar** is framed by a **top *and* bottom**
-   hairline — a distinct band ruled off from the buffer above and the echo area below
-   (VS Code likewise borders the status bar off from the editor,
-   [VS Code theme colors](https://code.visualstudio.com/api/references/theme-color)).
-   Rules sit **flush on the row's edges**, never over the text, so the label keeps its
-   full height. **Pane seams** are a hairline divider. **Popups** are a raised surface
+2. **Anchor chrome to content with a surface step, not a loud line.** The **status bar**
+   is recessed: the mantle, a step darker than the code (VS Code's chrome step is 1.08:1),
+   with its top and bottom rules in its own colour (`face-modeline-rule`), so they vanish —
+   Modus's recipe; a theme that boxes its mode line (Modus) names a colour for them. Rules
+   sit **flush on the row's edges**, never over the text, so the label keeps its full height. **Pane seams** are a hairline divider. **Popups** are a raised surface
    (rounded).
 
-3. **Chrome is a distinct surface.** Status bar and popups fill `*surface0*` (one step up
-   from `*base*`); the hairline is the crisp edge on top of that step.
+3. **Chrome is a distinct surface; floating chrome is raised, fixed chrome recessed.** Popups
+   fill `*surface0*` (one step up from `*base*`), the hairline the crisp edge on that step.
+   The mode line and header line sit on `*mantle*` in the secondary text tier, no bold;
+   brightness and colour on the bar are for what it must say — the buffer's name, a state
+   (modified `●`, `Def`, a failing check).
 
 4. **Floating things are rounded.** Popup cards + the selection pill use a rounded
    `frect` (macOS/modern-dropdown feel), radius ~0.35–0.5 cell. Flat, grid-aligned
@@ -96,8 +112,8 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
 | element        | code                              | GUI                          | terminal / tests |
 |----------------|-----------------------------------|------------------------------|------------------|
 | pane divider   | `view/ed-divider-ops`             | centred hairline `frect`     | solid `rect` bar |
-| status bar     | `view/ed-pane-modeline` → `statusbar/statusbar-layout` | `surface0` fill + segments + top/bottom rules | `surface0` fill + segments |
-| segment hover  | `statusbar/sb--hover-block`       | bordered inset `frect` block (surface1 fill + surface2 rim, Emacs `mouse-face`) | solid highlight band |
+| status bar     | `view/ed-pane-modeline` → `statusbar/statusbar-layout` | `mantle` fill + segments (+ rules in the bar's colour) | `mantle` fill + segments |
+| segment hover  | `statusbar/sb--hover-block`       | bordered inset `frect` block (surface0 fill + surface1 rim, Emacs `mouse-face`) | solid highlight band |
 | completion card| `completion/completion-menu-ops` → `display/card-surface`+`card-pill` | rounded `frect` + pill | flat `rect` card |
 | tooltip        | `statusbar/statusbar-tooltip-ops` → `display/tooltip` | rounded bordered card | flat bordered card |
 | scrollbar      | `view/ed-scrollbar-ops`           | rounded `frect` pill         | (none)           |
@@ -117,8 +133,8 @@ the idle beat by `gitbar/git-statusbar-segments`) and rendered for the selected 
 a plain `{:rect :id :cursor}` the *model* hit-tests on pointer-move / click (so it can react —
 hover highlight, tooltip, run a command), where `cursor-zone` only asks the *frontend* for a
 pointer shape. A hovered interactive segment gets a **bordered, inset block** behind it
-(`sb--hover-block`) — Emacs `mouse-face` with a crisp edge: a `surface1` fill ringed by a
-`surface2` hairline, floated within the bar with vertical margin + horizontal padding (the
+(`sb--hover-block`) — Emacs `mouse-face` with a crisp edge: a `surface0` fill ringed by a
+`surface1` hairline, floated within the bar with vertical margin + horizontal padding (the
 terminal falls back to a flat bg band). A click runs the segment's late-bound `:on-click`.
 
 **Floating cards + tooltips** share one surface primitive — `display/card-surface` (a rounded

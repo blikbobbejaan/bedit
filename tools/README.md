@@ -134,7 +134,8 @@ cell. `screenshot.blsp` writes a PNG of what the real editor paints, with no dis
     nest run tools/screenshot.blsp -- src/model.blsp /tmp/editor.png 1000 600 --header-line --zoom 120 3
 
 It starts the editor through `main` in a CHILD runtime with a throwaway `HOME` and XDG config
-(a default `init.blsp`, plus `:header-line true` for `--header-line`), so nothing of the
+(a default `init.blsp`, plus `:header-line true` for `--header-line` and `:theme NAME` for
+`--theme NAME`), so nothing of the
 user's is read or written and two runs paint the same picture. The child runs under
 `BROOD_GUI_HEADLESS=paint` (brood ADR-609): its window opens offscreen at the size given
 (default 1000×600), is painted by brood's own window painter, and lays out on the grid the
