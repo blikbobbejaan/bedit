@@ -324,7 +324,11 @@ src/panes.blsp              pane-layout geometry + mouse-event folding (model ->
                             yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`)
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
                             feature: a pane body's layers share ONE geometry map, and the
-                            mode line's feature chips come from the statusbar registry
+                            mode line's feature chips come from the statusbar registry. The
+                            frame names the bottom mode line as its SEAM (`ed-seam-op`, brood
+                            ADR-610): the window anchors it and the echo area to its bottom edge
+                            and puts the leftover pixels above it; row 0 is a band (no top
+                            margin) only under a header line
 src/hittest.blsp            the mouse side of the view: every hit-test / hover fold that takes
                             a model and returns one (:hover, :diag-hover, :link-hover, a chip
                             click, the context menu's hit) — recomputed from the same widget /
