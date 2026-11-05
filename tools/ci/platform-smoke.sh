@@ -10,7 +10,7 @@
 # window all answer as they do with none. The shell history goes to a temp file
 # (BSHELL_HISTORY): a test's commands never land in a real history.
 #
-# Every step is a GATE: `nest check` exits non-zero on any warning, and `set -e` stops the
+# Every step is a GATE: `nest check` (weekly, see below) exits non-zero on any warning, and `set -e` stops the
 # run there — the platforms differ in what the checker sees (an OS-gated branch), so a
 # finding only one OS reports fails that OS's job.
 set -euo pipefail
@@ -57,8 +57,16 @@ smoke=(
   tests/recover_test.blsp
 )
 
-echo "== nest check"
-"$nest" check
+# The whole-project checker on this OS: in the weekly full run (and on dispatch) only, when
+# the caller sets PLATFORM_CHECK=1. It is most of this script's time on Windows (~90 s of a
+# debug-built nest), and Linux runs the same check on every push; what only another OS's
+# checker would report (an OS-gated branch) is rare enough for once a week.
+if [ "${PLATFORM_CHECK:-0}" = 1 ]; then
+  echo "== nest check"
+  "$nest" check
+else
+  echo "== nest check: skipped (per push; the weekly run has PLATFORM_CHECK=1)"
+fi
 
 echo "== nest run --check-boot"
 "$nest" run --check-boot
