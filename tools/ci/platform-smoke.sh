@@ -7,11 +7,18 @@
 #   tools/ci/platform-smoke.sh path/to/nest
 #
 # Headless (BROOD_GUI_HEADLESS=1): a runner has no display, and the clipboard, fonts and
-# window all answer as they do with none.
+# window all answer as they do with none. The shell history goes to a temp file
+# (BSHELL_HISTORY): a test's commands never land in a real history.
+#
+# Every step is a GATE: `nest check` exits non-zero on any warning, and `set -e` stops the
+# run there — the platforms differ in what the checker sees (an OS-gated branch), so a
+# finding only one OS reports fails that OS's job.
 set -euo pipefail
 
 nest="${1:?usage: platform-smoke.sh NEST}"
 export BROOD_GUI_HEADLESS=1
+BSHELL_HISTORY="$(mktemp -d)/bshell-history.blsp"
+export BSHELL_HISTORY
 
 smoke=(
   # find-file / save: CRLF kept, a byte-order mark kept, .editorconfig's end_of_line and
@@ -29,6 +36,14 @@ smoke=(
   # password reads: by the pty's echo mode on Unix; on Windows ConPTY knows none, so the
   # screen says nil and the prompt's text decides (brood ADR-570, ADR-597).
   tests/passwd_test.blsp
+  # the project shell: a line through the platform's shell, C-c C-c ending it (a signal
+  # on Unix, the process tree stopped on Windows).
+  tests/bshell_test.blsp
+  # M-x compile and every results buffer: error locations, a Windows drive's included.
+  tests/compile_test.blsp
+  # LSP file URIs (a drive, a UNC share, VS Code's c%3A), the walk up to a project root
+  # ending at the filesystem's top, and a URL handed to the desktop's opener (stubbed).
+  tests/platform_test.blsp
   # the kill ring over the OS clipboard seam, including a clipboard that never answers.
   tests/clipboard_test.blsp
   # keys: the emacs / vim profiles, and init.blsp's key strings parsed onto the layers.
@@ -37,8 +52,8 @@ smoke=(
   # startup: a font that is not installed is said (with this OS's way to list fonts),
   # and a theme's font files are not read by a daemon.
   tests/startup_test.blsp
-  # auto-save sidecars: where they go, owner-only (not asserted on Windows: KI-365), and
-  # put back by M-x recover-this-file.
+  # auto-save sidecars: where they go, owner-only (0600; on Windows the one-entry DACL,
+  # read back with icacls), and put back by M-x recover-this-file.
   tests/recover_test.blsp
 )
 
