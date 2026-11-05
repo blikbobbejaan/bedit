@@ -140,8 +140,9 @@ user's is read or written and two runs paint the same picture. The child runs un
 (default 1000×600), is painted by brood's own window painter, and lays out on the grid the
 real cell metrics give. Once two captures 400 ms apart agree (and the editor has had two
 seconds to finish starting) it writes `gui/capture`'s picture to the PNG and prints the
-geometry (`cell`, `grid`, `origin`). `--zoom TOP SCALE` also writes `<out>-zoom.png`: the top
-`TOP` pixels enlarged `SCALE` times by repeating pixels, for counting a few of them.
+geometry (`cell`, `grid`, `origin`). `--zoom PX SCALE` also writes `<out>-zoom.png` and `<out>-bottom-zoom.png`: the top and the
+bottom `PX` pixels enlarged `SCALE` times by repeating pixels, for counting a few of them (the
+header line's edge, and the echo area's against the bottom inset — brood ADR-610).
 
 Open the PNG with anything that shows images — an agent's file reader does. For an assertion
 rather than a look, write a test over `gui/render-frame` instead (`tests/window_paint_test.blsp`).
