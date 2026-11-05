@@ -38,7 +38,7 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | missing-font warning | ✅ (names Font Book) | ✅ (names the Fonts settings) |
 | auto-save sidecars: location, recovery | ✅ | ✅ |
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; brood's smoke test reads the ACL back) |
-| terminal buffers (C-x p t, M-x claude) | not in the set | ❌ no pty on Windows (brood KI-369, ConPTY); the command says so instead of failing |
+| terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
 | a real window, font discovery, file watching (auto-revert) | not run — headless | not run — headless |
 
 ## Fixed on the way
@@ -61,7 +61,7 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
   now (on Windows the URL protocol handler), started detached.
 - M-!, M-|, compile and the project shell named `sh`; they run through brood's platform shell
   now (`cmd.exe` on Windows, the line passed raw).
-
-## Not fixed
-- Terminal buffers and the line-mode REPL need a pty; Windows has none in brood (KI-369: ConPTY
-  needs a second child type in brood's subprocess registry). bedit says so when one is asked for.
+- Terminal buffers and the line-mode REPL need a pty, which Windows lacked in brood (KI-369);
+  brood drives ConPTY now (ADR-597), and the terminal runs its command through the platform
+  shell (`os/shell-spawn-pty`). A Windows older than 10 1809 has no ConPTY: the buffer says
+  the program cannot start, on its screen.

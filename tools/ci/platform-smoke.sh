@@ -23,6 +23,12 @@ smoke=(
   tests/filename_test.blsp
   # M-! / M-| spawn a shell command off the loop, and C-g stops it.
   tests/shell_command_test.blsp
+  # terminal buffers: a real shell under a pty (ConPTY on Windows, brood KI-369) answers
+  # keys on its screen, and a program that cannot start is said there.
+  tests/terminal_test.blsp
+  # password reads: by the pty's echo mode on Unix; on Windows ConPTY knows none, so the
+  # screen says nil and the prompt's text decides (brood ADR-570, ADR-597).
+  tests/passwd_test.blsp
   # the kill ring over the OS clipboard seam, including a clipboard that never answers.
   tests/clipboard_test.blsp
   # keys: the emacs / vim profiles, and init.blsp's key strings parsed onto the layers.
