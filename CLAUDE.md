@@ -900,9 +900,13 @@ elixir/bedit_agent.exs      bedit's agent ON the BEAM: a session (binding + modu
                             because a release bundle carries code and no assets (ADR-038).
                             Needs Elixir 1.14+ (`dbg/2`'s `:dbg_callback`); below that it
                             still evaluates and says so once (`elixir-sandbox/version-notice`)
-src/tutor.blsp              the interactive Brood tutorial (C-h t): playground boxes that
-                            eval-on-type in the sandbox — ✓/✗ gutter, ghost results, prose guard;
-                            the third client of playground-core
+src/tutor.blsp              the interactive Brood tutorial (C-h t): the *Tutorial* buffer, its pages,
+                            commands and mode; the prose guard
+src/tutor-course.blsp       the course as text: the keys asked of the live keymaps, the sections, a
+                            lesson rendered, the contents page, the box syntax (`tutor-regions`)
+src/tutor-live.blsp         the boxes as they run: eval-on-type in the sandbox, ✓/✗ gutter, ghost
+                            results, progress on disk, the checker's warnings; the third client of
+                            playground-core
 src/aside.blsp              the PREVIEW PANE mechanism every side pane is a small spec over
                             (`{:key :buffer :type}`): shown beside the page, refreshed in place,
                             latched closed once the reader closes it, its key a `toggle`, a
@@ -914,7 +918,7 @@ src/aside.blsp              the PREVIEW PANE mechanism every side pane is a smal
                             the `:display-buffer` rules
 src/workings.blsp           the "show me how it actually ran" pane over `aside`: the per-region
                             report cache and the rule for what earns a split — the tutorial's
-                            *Workings* (`tutor/*workings-spec*`) and the two playgrounds' spy
+                            *Workings* (`tutor-live/*workings-spec*`) and the two playgrounds' spy
                             panes are its clients
 src/mdpreview.blsp          C-c C-p in a .md buffer: the document rendered beside it
                             (std's `markdown-render`, faces as data on the buffer), following

@@ -1,0 +1,544 @@
+(defmodule tutor-live
+  "The tutorial's boxes as they run (a client of `playground-core`): a box is a form, evaluated
+as you settle in the sandbox, never in the editor's image. The verdict on an exercise, the
+margin marks and ghost text, which names a box traces, the reader's progress on disk, the
+checker's warnings, the *Workings* pane's spec, and the sandbox's events."
+  (:use editor/buffer)
+  (:use model)
+  (:use tutor-lessons) ; the content: a lesson's playgrounds
+  (:use tutor-course) ; the box regions, the lessons' playgrounds for the active keys
+  (:use sandbox)) ; the eval sandbox client + its event records
+;; workings, liveeval, playground-core, sexp, eval-server and sandbox-events are referenced
+;; qualified below.
+
+(def *workings-buffer-name* "*Workings*")
+
+(defn workings-report (reply src)
+  "The *Workings* pane's `:report`: everything a box's reply said (`liveeval/report-text`),
+with no derived type beside the value even when the box's source is at hand — a lesson's
+subject is the value, and a type under every box would be noise."
+  (liveeval/report-text reply))
+
+;; The tutorial's *Workings* pane, as a `workings` spec — the pane that shows the box the
+;; cursor is IN: its value, what it printed, and the call/return cascade a traced box left,
+;; following from box to box with no re-evaluation. The behaviour is `workings`' (and the
+;; pane discipline under it `aside`'s); this names where its state lives (`:tutor`, beside
+;; the tutorial's own), what it is called, and what a region is in prose.
+(def *workings-spec*
+  {:key :tutor
+   :buffer *workings-buffer-name*
+   :type :tutor-workings
+   :noun "box"
+   :heading "The workings"
+   :report 'tutor-live/workings-report})
+(def *tutor-eval-timeout-ms* 2000)
+;; ---- feedback notes -----------------------------------------------------------
+;; One annotation drives all three feedback channels: `:eol-notes` (see
+;; `results/eol-notes`) is `{region-idx -> {:line n :kind … :text …}}` — the gutter
+;; draws the kind at `:line`, the view ghosts the text past that line's end, and the
+;; echo shows it in full when point is there. Keyed by REGION, not by line: every
+;; launch rebuilds the map, so an edit that shifts lines can never strand an entry at
+;; a wrong line. `playground-core` stamps and re-anchors them; what is the tutorial's is
+;; the LINE a box's note sits on ([[tutor-note-line]]) and what the verdict says.
+
+(defn- tutor-note-anchor (rope region)
+  "The 0-based line to hang `region`'s note on: for a code box the last line of its
+last top-level form (via `sexp/top-level-forms` — error-tolerant), for a prose box
+simply its last line.
+
+Prose is not parsed to find this. Reading English through the s-expression reader to
+decide where a note goes happens to work while the sentences contain no brackets or
+quotes, and stops being predictable the moment the reader types one — and readers type
+whatever they like into a prose box. There are no forms in there to anchor to anyway."
+  (let (last-in-region (math/max (:start region) (dec (:end region))))
+    (if (= (:kind region) :text)
+      (results/line-of rope last-in-region)
+      (let (src (text/slice rope (:start region) (:end region))
+            forms (sexp/top-level-forms src)
+            pos (if (empty? forms)
+                  last-in-region
+                  (math/min last-in-region
+                    (+ (:start region) (math/max 0 (dec (get (last forms) :end)))))))
+        (results/line-of rope pos)))))
+
+(defn- tutor-box-kind (rope start)
+  ;; `:text` or `:code` for the box whose content starts at `start`, read off the rule of
+  ;; its opening line — the line just above, as [[tutor-regions]] reads it off the text.
+  (let (open (results/line-text rope (dec (results/line-of rope start))))
+    (if (string/starts-with? open (str tutor-course/*tutor-open* tutor-course/*tutor-rule-text*))
+      :text :code)))
+
+(defn tutor-note-line (rope lo hi)
+  "The spec's `:note-line`: a box's note sits on the line of its last form
+([[tutor-note-anchor]]), not under the box — the line under it is the box's closing border."
+  (tutor-note-anchor rope {:start lo :end hi :kind (tutor-box-kind rope lo)}))
+
+(defn- tutor-normalize-answer (s)
+  ;; Compare what the reader SEES. The box margin, a stray double space left behind by
+  ;; a deleted word, trailing whitespace — none of those are part of a prose answer, so
+  ;; each line collapses to its words. Line breaks stay significant: removing a line is
+  ;; a real edit and an exercise may ask for it.
+  (string/trim (string/join (map (string/split (or s "") "\n")
+                              (fn (line)
+                                (string/join (seq/filter (string/split line " ")
+                                               (fn (w) (not (= w ""))))
+                                  " ")))
+                 "\n")))
+
+(defn- tutor-hint-suffix (pg)
+  ;; a miss earns the lesson's hint, in one voice for both kinds of box
+  (if (:hint pg) (str "   — hint: " (:hint pg)) ""))
+
+(defn- tutor-text-verdict (pg src)
+  "The note for a TEXT box, or nil for a practice box with nothing to check.
+
+A prose box has no value to evaluate, so its exercise is checked against the text
+itself (`:expect {:text …}`) — which makes the check pure and instant: no sandbox
+round trip, the ✓ lands on the same keystroke."
+  (let (want (map/get-in pg [:expect :text])
+        hint (tutor-hint-suffix pg))
+    (cond
+      (nil? want) nil
+      (= (tutor-normalize-answer src) (tutor-normalize-answer want)) {:kind :pass :text "that's it"}
+      else {:kind :fail :text (str "not yet" hint)})))
+
+(defn- tutor-verdict (pg reply)
+  "The note for playground data `pg` answered by `reply` (a decoded eval-server
+reply map): plain result `·`, exercise `✓`/`✗` (with the hint on a miss), error /
+timeout `✗`. A slow evaluation carries its duration and one that left processes
+running says so — the two things a value alone can't tell you."
+  (let (expect (map/get-in pg [:expect :value])
+        hint (tutor-hint-suffix pg)
+        extra (str (liveeval/slow-note reply) (liveeval/proc-note reply)))
+    (cond
+      ;; `:error?` marks "the code ran and blew up" as opposed to "it ran fine but gave
+      ;; the wrong answer" — the checker's advisory is redundant on the former (it would
+      ;; repeat the error) and useful on the latter (it may explain the wrong answer).
+      (get reply :timeout)
+        {:kind :fail
+         :error? true
+         :text "timed out — still running? (C-c C-k restarts the sandbox)"}
+      (not (get reply :ok)) {:kind :fail :error? true :text (get reply :error "error")}
+      ;; a box with no expected answer is just a result — the same line the playground
+      ;; shows, from the same place (`liveeval/result-note`). No `src`, so no type: a
+      ;; lesson's subject is the value, and a type beside every box would be noise.
+      (nil? expect) (liveeval/result-note reply)
+      (= expect (get reply :value)) {:kind :pass :text (str (get reply :value) extra)}
+      else {:kind :fail :text (str "expected " expect ", got " (get reply :value) hint extra)})))
+
+;; ---- eval-on-type: a client of playground-core ----------------------------------
+;; The boxes evaluate as you settle typing through the same mechanism as both playgrounds
+;; (`playground-core`): the launch plan, the request book, the reply fold, the notes that
+;; ride edits as markers. It used to be a second copy of all of it, and the two drifted —
+;; every fix one side found (the per-form source check, keeping `:pending` across a ready,
+;; unpending a straggler) had to be found again on the other. What is left here is what is
+;; the TUTORIAL's, as a spec:
+;;
+;;   - a form is a whole ╭─ box (`tutor-regions`), so the prose between boxes is never sent;
+;;   - there are no dependency facts (`tutor-no-deps`), so the plan is the suffix rule: an
+;;     edited box and every box below it re-run, top to bottom, because definitions flow
+;;     downward through the one sandbox session;
+;;   - each box carries lesson DATA (`:form-data`): the expected answer a verdict grades
+;;     against, the hint a miss earns, the names a send traces;
+;;   - a PROSE box is graded on its text, here and now (`[:answered note]`), and never sent;
+;;   - a box's note sits on its last form, not under it (`tutor-note-line`) — under it is the
+;;     box's closing border;
+;;   - a verdict that passes is remembered (`:on-verdict`), and the checker's warnings and
+;;     the pane are re-derived after a launch and a reply.
+
+(def *spec*
+  {:key :tutor
+   :buffer tutor-course/*tutor-buffer-name*
+   :spy *workings-spec*
+   :timeout-ms *tutor-eval-timeout-ms*
+   :restart "C-c C-k restarts it"
+   :forms-of 'tutor-course/tutor-regions
+   :deps-of 'tutor-live/tutor-no-deps
+   :form-data 'tutor-live/tutor-playgrounds
+   :parse-state 'tutor-live/tutor-parse-state
+   :note-of 'tutor-live/tutor-note-of
+   :note-line 'tutor-live/tutor-note-line
+   :eval 'tutor-live/tutor-send-eval
+   :in-image 'tutor-live/tutor-eval-in-image
+   ;; a box that would write, delete or run something outside the sandbox is not run as
+   ;; you type — an electric pair closes `(file/spit "f" "")` before the text is in
+   ;; (issues.md S5). No lesson needs one.
+   :held? 'liveeval/held-reason
+   :held-how "the tutorial does not run it — try it in M-x brood-playground"
+   :on-verdict 'tutor-live/tutor-remember-pass
+   :after-launch 'tutor-live/tutor-launch-finish
+   :after-reply 'tutor-live/tutor-with-warnings
+   :start 'tutor-live/tutor-start-session
+   :running? 'sandbox/sandbox-running?
+   :reset 'sandbox/sandbox-reset
+   :restart-message "restarting the tutorial sandbox…"
+   :down-says {:gave-up "tutorial sandbox keeps dying — C-c C-k retries, *Messages* may say why"
+               :spawn-failed "could not start the tutorial sandbox (is `nest` on PATH?) — C-c C-k retries"
+               :restarting "tutorial sandbox restarting…"}})
+
+;; the tutorial's boxes evaluate as you type — its three hooks, on the idle debounce
+(model/register-live-eval-client {:timer :tutor-eval
+                                  :stale? 'tutor-live/ed-tutor-stale?
+                                  :launch 'tutor-live/ed-tutor-launch
+                                  :reanchor 'tutor-live/ed-tutor-reanchor})
+(defn ed-tutor-stale? (m) (playground-core/ed-stale? *spec* m))
+(defn ed-tutor-launch (m) (playground-core/ed-launch *spec* m))
+(defn ed-tutor-reanchor (m) (playground-core/ed-reanchor *spec* m))
+
+(defn tutor-live? () (not (ed-headless?))) ; a `ui-run` loop to deliver a reply to
+(defn tutor-playgrounds (m)
+  "The current lesson's playgrounds, template-rendered for the active profile —
+titles, code templates and hints all speak the user's keys. The spec's `:form-data`: box
+`i`'s entry is what its verdict grades against and what its send traces."
+  (tutor-rendered-playgrounds (nth tutor-lessons (map/get-in m [:tutor :lesson] 0))
+    (tutor-keyset (:profile m :emacs) (:user-keys m))))
+
+;; ---- which names a box traces ---------------------------------------------------
+;; The pane shows the workings of the box you are IN, so every box has to be traced,
+;; not just the ones a lesson thought to name. The list is derived from the box's own
+;; source: what it DEFINES (`(defn double …)`) and what it CALLS (`(double 21)` — the
+;; interesting case, where the function came from a box further up). A lesson's own
+;; `:trace` still rides along, for a name the source never mentions.
+;;
+;; Over-naming is free and deliberate: the sandbox installs each trace inside a `try`
+;; and skips whatever it cannot wrap (`eval-server-try-traces`) — a builtin, a macro,
+;; a reserved prelude name (ADR-166), a name that isn't defined yet. So the rule is
+;; "offer everything plausible and let the tracer choose", not "predict what is
+;; traceable" — the editor would only ever be guessing at the sandbox's global table.
+
+(defn- tutor-call-heads (form)
+  "Every symbol used as a call head anywhere in `form`, outermost first.
+
+Structurally, not semantically: a `let`'s binding list and a QUOTED form contribute their
+heads too (`'(secret-fn 1)` offers `secret-fn`), because this walks shape and does not
+evaluate. Harmless by design — the tracer skips a name it cannot wrap, and a name that IS
+a live function is one the box mentions, so tracing it tells the reader something true.
+Not worth a resolver here: only the sandbox knows its own global table."
+  (if (not (pair? form))
+    '()
+    (let (head (first form)
+          inner (fold (rest form) '() (fn (acc f) (append acc (tutor-call-heads f)))))
+      (if (symbol? head) (cons head inner) inner))))
+
+(defn- tutor-defined-names (src)
+  "The names `src`'s top-level definitions bind — `(defn f …)` / `(def f …)` → `\"f\"` — as
+the reader's own `reflect/source-deps` `:defines` says, rather than a list of heads kept
+here that drifts from it. A box's own function is the one thing it is guaranteed to be
+worth tracing."
+  (check-allow :discarded-catch
+    (try
+      (mapcat (reflect/source-deps src) (fn (deps) (or (:defines deps) '())))
+      (catch _ '()))))
+
+(defn- tutor-trace-names (pg src)
+  "The fn-name strings to boundary-trace for one box: what `src` defines, what it
+calls, and the lesson's explicit `:trace` — deduped, special forms dropped (they are
+syntax, never functions). `src` that doesn't parse contributes nothing; the box is
+mid-typing and has no verdict yet either."
+  (let (forms (try (reflect/read-all src) (catch _ '()))
+        ;; nothing when `src` does not read: a box mid-typing has no verdict yet either
+        defined (if (empty? forms) '() (tutor-defined-names src))
+        called (fold forms '() (fn (acc f) (append acc (tutor-call-heads f))))
+        specials (reflect/special-forms)
+        names (seq/filter (map (append defined called) ->string)
+                (fn (s) (not (includes? specials s)))))
+    (into [] (seq/distinct (append (into [] (or (:trace pg) [])) names)))))
+
+(defn- tutor-progress-file ()
+  "Where solved exercises are remembered between sessions:
+`~/.config/bedit/tutor-progress.blsp` (XDG-aware, via `config-paths/config-dir`).
+
+Beside `init.blsp` rather than in a cache: this is the reader's own record of what
+they worked through, small, and worth surviving a reinstall. It is DATA — a printed
+map — never eval'd, exactly as `init.blsp` is read rather than executed."
+  (path/join (config-paths/config-dir) "tutor-progress.blsp"))
+
+(defn- tutor-persist? (m)
+  "Whether this model may touch the reader's progress file on disk: the `:recent-files`
+flag, which only `main` sets — the same gate recentf, bookmarks and the project cache use.
+
+NOT `tutor-live?` (a `:editor` process exists). That is a PROCESS-global fact, and a
+full `nest test` run is one image: the first suite that registers `:editor` for its own
+reasons (sandbox, diffhl, web-logging tests all do) leaves it registered, and from then
+on every tutor test that evaluates a passing answer wrote into
+`~/.config/bedit/tutor-progress.blsp` — silently rewriting the developer's real
+record with whatever the suite had just solved. A MODEL flag cannot leak that way: a test
+model comes from `ed-init` and simply doesn't have it."
+  (:recent-files m))
+
+(defn tutor-load-progress (m &optional (file (tutor-progress-file)))
+  "The saved `:passed` set, or an empty one. Any failure — no file, unreadable,
+corrupt — is an empty set: progress is a nicety and must never stop the tutorial
+opening.
+
+Reads nothing unless `m` is the live editor's model (`tutor-persist?`): a test must
+never inherit a developer's real progress, and the first version of this did exactly
+that. `file` is a parameter for the same reason `config`'s read/ensure take one — so a
+test drives the real code against a temp path instead of asserting things about the
+developer's home directory (an assertion that is false the moment they use the tutorial)."
+  (if (not (tutor-persist? m))
+    #{}
+    ;; `projects/persist-read-value` is the editor's one reader for its own state files:
+    ;; never throws, `default` on anything unreadable, and the counterpart of the ATOMIC
+    ;; write below. Rolling its own `slurp` + `read-all` here was the same code minus the
+    ;; care.
+    (let (data (projects/persist-read-value file {}))
+      (if (map? data) (into #{} (or (:passed data) [])) #{}))))
+
+(defn- tutor-save-progress (m &optional (file (tutor-progress-file)))
+  "Write the session's solved set out, best-effort. Returns `m` untouched — saving is a
+side effect of making progress, never something that can fail the command that caused
+it, so a read-only home directory costs you persistence and nothing else.
+
+Writes only for the live editor's model (`tutor-persist?`) — see there for why the
+gate is a model flag and not the `:editor` process. `file` is a parameter so a test can
+drive the real write against a temp path (the `config` idiom)."
+  (do
+    (when (tutor-persist? m)
+      ;; ATOMIC, via the shared layer (`projects/persist-write!`): a plain `spit` can leave a
+      ;; truncated file if the editor dies mid-write, and the next read would take that as
+      ;; "nothing solved" and then overwrite it. Progress is small and cheap to write; losing
+      ;; it to a crash is not cheap for the reader who earned it.
+      (projects/persist-write! file
+        {:passed (into [] (or (map/get-in m [:tutor :passed]) #{}))}
+        "bedit — tutorial progress. Data, not code: safe to delete."))
+    m))
+
+(defn tutor-remember-pass (m region-idx note pg)
+  "The spec's `:on-verdict`: a solved exercise is remembered on the MODEL as `[lesson-idx
+region-idx]`, so the contents page can show real progress after you leave the lesson (the
+notes live on the buffer and are rebuilt every eval). Passes only ever accumulate."
+  (if (and (:expect pg) (= (:kind note) :pass))
+    (tutor-save-progress (update m
+                           :tutor update
+                           :passed (fn (st)
+                             (conj (or st #{}) [(map/get-in m [:tutor :lesson] 0) region-idx]))))
+    m))
+
+(defn- tutor-box-spans (rope text regions)
+  "Per box: `{:src :from-line :buffer-line :lines}` — its source, where it starts in the
+combined session source, where it starts in the BUFFER, and how many lines it has. The
+map a warning uses to travel from the combined source back to the page."
+  (let (r (fold regions
+            [1 '()]
+            (fn (acc region)
+              (let ([from spans] acc
+                    src (string/substring text (:start region) (:end region))
+                    n (count (string/split src "\n")))
+                [(+ from n)
+                  (cons {:src src
+                         :from-line from
+                         :buffer-line (results/line-of rope (:start region))
+                         :lines n}
+                    spans)])))
+        [_ spans] r)
+    (reverse spans)))
+
+(defn- tutor-warning-line (spans wline)
+  ;; the buffer line a combined-source warning line belongs to, or nil
+  (let (hit (seq/find spans
+              (fn (sp)
+                (and (>= wline (:from-line sp))
+                  (< wline (+ (:from-line sp) (:lines sp)))))))
+    (when hit (+ (:buffer-line hit) (- wline (:from-line hit))))))
+
+(defn- tutor-session-warnings (rope text regions)
+  "The advisory type-checker's warnings for the lesson, as notes anchored on the line
+each warning is ABOUT — `{[:warn line] {:line :kind :text}}`.
+
+Checked over the boxes JOINED IN ORDER, because that is the session the sandbox builds:
+box 2's `(double 21)` is correct precisely because box 1 defined `double`, and checking
+each box alone reported `unbound symbol: double` on working code. A warning that cries
+wolf is worse than no warning at all, so the checker gets the same context the evaluator
+has, and the result is mapped back to the box it came from.
+
+This is what a runtime error cannot tell you: `(defn f (x) (* 2 x \"d\"))` stays silent
+until something calls `f`, while the checker knows at the definition. Pure and in-image
+(`check-string-structured`, the service brood-mode already uses) — no sandbox round-trip."
+  (let (spans (tutor-box-spans rope text regions)
+        combined (string/join (map spans :src) "\n")
+        ;; the boxes hold the learner's in-progress text — unreadable text has no diagnostics to place
+        warns (or (check-allow :discarded-catch
+                    (try (reflect/check-string-structured combined) (catch _ nil)))
+                ()))
+    (fold warns
+      {}
+      (fn (acc w)
+        ;; A diagnostic with no :line cannot be placed, and `(or … 1)` placed it on
+        ;; line 1 anyway — which is the FIRST box, so `fac: recursive call in
+        ;; non-tail position` was painted on a `countdown` four lines above where
+        ;; `fac` is defined. A warning pointing at innocent code is worse than a
+        ;; warning you never saw. (`check-string-structured` returns nil :line for
+        ;; some diagnostics, and returns this one three times over — both are
+        ;; Brood-side bugs; this only stops the editor from lying about them.)
+        (let (line (when (:line w) (tutor-warning-line spans (:line w))))
+          (if (nil? line)
+            acc
+            (assoc acc
+              [:warn line] {:line line :kind :warn :text (str "⚠ " (:message w))})))))))
+
+(defn- tutor-message-of (text)
+  "The MESSAGE inside a note's text, with the leading verdict glyph and any `=> ` value
+prefix stripped, so two notes that say the same thing in different voices compare equal.
+`\"✗ unbound symbol: asfd\"` and `\"⚠ unbound symbol: asfd\"` both reduce to
+`\"unbound symbol: asfd\"`."
+  (string/trim (fold ["⚠" "✗" "✓" "•" "⋯" "=>"]
+                 (or text "")
+                 (fn (s glyph) (string/replace s glyph "")))))
+
+(defn- tutor-warning-echoes? (note w)
+  "True when `w` (a checker warning) would only repeat what `note` (the runtime's verdict)
+already says on that line — either message containing the other, once both are reduced to
+their `tutor-message-of` text. Containment rather than equality because the two sides
+word the same fault at different lengths: the runtime says `unbound symbol: asfd`, the
+checker `unbound symbol: asfd (did you mean …)`. An empty message never echoes."
+  (let (a (tutor-message-of (:text note))
+        b (tutor-message-of (:text w)))
+    (and (not (empty? a))
+      (not (empty? b))
+      (or (includes? a b) (includes? b a)))))
+
+(defn- tutor-merge-warning (notes w)
+  "Place one warning, or decide it has nothing to add.
+
+**The runtime outranks the checker.** The runtime is ground truth — it says what this
+code actually did — while the checker only predicts. So an advisory earns its space
+only when it tells you something the result doesn't, and it is dropped in two cases:
+
+  - the line reports a runtime **error** (`:error?`) — the code got as far as failing,
+    so whatever the checker predicted about it is now history. `✗ unbound symbol: asfd`
+    beside `⚠ unbound symbol: asfd` is noise, and noise beside an error is the worst
+    place for it.
+  - the note **already says it** (`tutor-warning-echoes?`) — same complaint, different
+    glyph, regardless of whether the note was an error.
+
+The case worth keeping is the inverse: a line that *succeeded* but whose checker
+warning is about code that hasn't run yet — `(defn dbl (x) (* 2 x \"d\"))` evaluates
+fine and reports `=> dbl`, and the ⚠ is the only thing telling you the call below will
+blow up. Prediction is exactly what the checker is for when there is no runtime answer.
+
+A surviving warning goes in as a FIELD (`:warn`) on the line's note, composed by the
+renderers at paint time — a field rather than appended text because re-running the
+checker must overwrite, not accumulate (appending added another identical ⚠ every
+debounce beat). A line with no note at all gets a standalone warning."
+  (let (hit (seq/find notes (fn (kv) (= (:line (second kv)) (:line w)))))
+    (cond
+      (nil? hit) (assoc notes [:warn (:line w)] w)
+      (:error? (second hit)) notes ; the runtime already failed here
+      (tutor-warning-echoes? (second hit) w) notes ; …or already said this exact thing
+      else (let ([k note] hit) (assoc notes k (assoc note :warn (:text w)))))))
+
+(defn- tutor-without-warnings (notes)
+  ;; Last round's warnings dropped — both the standalone ones and the `:warn` fields
+  ;; attached to results — since they are recomputed from the current text.
+  (fold notes
+    {}
+    (fn (acc kv)
+      (let ([k v] kv) (if (and (vector? k) (= (first k) :warn)) acc (assoc acc k (dissoc v :warn)))))))
+
+(defn- tutor-with-warnings (m)
+  "Add the checker's warnings for every box to the buffer's notes — beside a result on
+the same line, on their own line otherwise."
+  (let (b (tutor-buf m))
+    (if (nil? b)
+      m
+      (let (text (buffer-text b)
+            warns (tutor-session-warnings (buffer-rope b)
+                    text
+                    (seq/filter (tutor-regions text) (fn (r) (= (:kind r) :code))))
+            merged (fold warns
+                     (tutor-without-warnings (or (results/eol-notes-any b) {}))
+                     (fn (acc kv) (tutor-merge-warning acc (second kv)))))
+        (tutor-bufset-buf m (fn (bb) (editor/buffer/annotate bb :eol-notes merged)))))))
+
+;; ---- the language services the spec names ----------------------------------------
+
+(defn tutor-no-deps (text)
+  "The spec's `:deps-of`: nothing, deliberately. Without dependency facts the launch plan
+re-sends every box from the first changed one down — which IS the tutorial's rule, and the
+one a reader can predict: a box cannot depend on text below it, and every box below an edit
+may depend on it.
+
+The one thing this gives up: a box that depends on a LATER box (writing `(f 1)` above `f`'s
+definition) does not re-resolve on its own — touch it and it will. Reading order is
+dependency order here, which is what a tutorial should teach."
+  '())
+
+(defn tutor-parse-state (src pg)
+  "The spec's `:parse-state`, with the box's lesson data: a PROSE box is graded on its text
+here and now (`[:answered note]`, nil for a practice box with nothing to check) and never
+sent; a code box is whatever the reader says (`liveeval/parse-state`)."
+  (if (= (:kind pg) :text) [:answered (tutor-text-verdict pg src)] (liveeval/parse-state src)))
+
+(defn tutor-note-of (reply src pg)
+  "The spec's `:note-of`: the box's verdict against its lesson data ([[tutor-verdict]])."
+  (tutor-verdict pg reply))
+
+(defn tutor-send-eval (id src timeout-ms pg)
+  "The spec's `:eval`: put one box on the sandbox's wire, boundary-tracing what it defines,
+what it calls and what the lesson names ([[tutor-trace-names]]). Sent, it shows as in flight
+straight away: with a `receive` in the box a reply can be hundreds of ms away, and a stale
+verdict sitting there looking current is the wrong thing to show."
+  (sandbox-eval id src timeout-ms (tutor-trace-names pg src)))
+
+(defn tutor-eval-in-image (src)
+  "The spec's `:in-image`, for HEADLESS runs (tests, batch): the box evaluates in this image,
+and installs NO traces — not the derived list, not even the lesson's own `:trace`.
+Instrumentation rebinds globals, and here the globals are the running editor's, shared by
+every test process in the run: a `trace-fn` here shows up as `[reload] arity changed` churn,
+and two tests evaluating the same lesson concurrently are the \"concurrent writers\" case
+wholesale global rebinding is documented not to survive (ADR-017). Tracing belongs to the
+sandbox, a throwaway image built for it. So the headless path yields verdicts (values, ✓/✗)
+but no cascade — the pane's own behaviour is tested from synthetic replies, and end to end by
+the pty drive."
+  (eval-server/eval-capturing src nil))
+
+(defn tutor-start-session (m)
+  "The spec's `:start` — the sandbox, wherever it is rooted: the tutorial is projectless."
+  (sandbox-start))
+
+(defn tutor-launch-finish (m)
+  "The spec's `:after-launch`: the checker's warnings, then the pane re-rendered for the box
+at point (the stale cascades of the re-sent boxes are already gone), so it says `⋯ has not
+run yet` until the reply lands rather than showing the version you just edited away.
+
+A lesson where ANY box has workings gets the pane opened, even when the box you happen to be
+in has none: on a lesson built around watching code run, the pane has to be there to be
+noticed. It still shows the box at point — the reader moves and it follows — rather than
+whichever box traced last.
+
+Only ONCE per page, though: `:workings-region` unset means the pane has not been shown on
+this page yet (`tutor-install-page` clears it), so a pane the reader closed is not dragged
+back by the next thing they type. C-c C-w is the way back after that, which is the point of
+having the command."
+  (let (m1 (tutor-with-warnings m))
+    (workings/refresh *workings-spec*
+      m1
+      (tutor-box-at-point m1)
+      (and (nil? (map/get-in m1 [:tutor :workings-region]))
+        (workings/on-page? *workings-spec* m1)))))
+
+;; ---- the sandbox events fold in here (the records live consumer-blind in sandbox) --
+;; `sandbox-events` owns the impls and fans each event to every client; these are what it
+;; calls for this one — `playground-core`'s, with the tutorial's spec. Registering is also
+;; what loads `sandbox-events`, so its impls are in place before the tutorial can have
+;; started a sandbox.
+(sandbox-events/register-client {:session :sandbox
+                                 :live? 'tutor-live/tutor-live-buffer?
+                                 :ready 'tutor-live/tutor-sandbox-ready
+                                 :reply 'tutor-live/tutor-sandbox-reply
+                                 :down 'tutor-live/tutor-sandbox-down})
+
+(defn tutor-live-buffer? (m)
+  "Is the *Tutorial* buffer still on screen — i.e. does the tutorial still want a sandbox?
+`sandbox-events` asks every client this before letting a dead child go."
+  (playground-core/live-buffer? *spec* m))
+
+(defn tutor-sandbox-ready (m gen banner) (playground-core/sandbox-ready *spec* m gen))
+(defn tutor-sandbox-reply (m reply gen) (playground-core/sandbox-reply *spec* m reply gen))
+(defn tutor-sandbox-down (m code) (playground-core/sandbox-down *spec* m code))
+
+(defn tutor-apply-reply (m reply)
+  "Fold one sandbox reply into the model as though the session's current child sent it —
+[[tutor-sandbox-reply]] under the generation the tutorial already trusts."
+  (tutor-sandbox-reply m reply (map/get-in m [:tutor :sandbox-gen])))

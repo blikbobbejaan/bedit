@@ -1,0 +1,418 @@
+(defmodule tutor-course
+  "The tutorial's course as text (`C-h t`): the key vocabulary asked of the live keymaps, the
+sections a reader walks, a lesson rendered to buffer text ([[tutor-lesson-text]]), the contents
+page, and the box syntax every other part reads (`tutor-regions`). Renders and parses; it
+evaluates nothing. `tutor-live` runs the boxes, `tutor` is the buffer and its commands."
+  (:use editor/buffer)
+  (:use keyhelp) ; key / command labels, where-is, docstrings
+  (:use model)
+  (:use editor/keymap)
+  (:use tutor-lessons)) ; the content: the `tutor-lessons` vector
+;; formbuf, template and keymaps are referenced qualified below.
+
+(def *tutor-buffer-name* "*Tutorial*")
+(def *tutor-box-width* 66)
+(def *tutor-box-margin* "  ") ; breathing room between a box's edge and its code
+;; ---- the key vocabulary: ASKED, not hardcoded ---------------------------------
+;; Lesson prose/titles/hints are TEMPLATES ({{kf}}, {{kill-line}} … — std/template)
+;; rendered against a vocabulary. The KEY entries are derived from the live keymaps
+;; (`keyhelp/ed-command-keys` over `keymaps/profile-keymap` → std's `keymap-where-is`),
+;; so the tutorial teaches what the user's editor actually does — including their own
+;; rebindings from `init.blsp`, not just emacs-vs-vim. Each spec carries a fallback
+;; for a key a profile expresses as *grammar* rather than a binding: vim routes
+;; h/j/k/l/w/b through ONE command (`cmd-vim-motion`), so there is no per-key command
+;; to look up and the literal is the honest answer.
+;;
+;; The PROSE entries below are what genuinely differs in shape between the two
+;; models (vim's counts and operators vs Emacs's kill ring), which no amount of
+;; key lookup can derive — that difference is editorial, so it stays written out.
+
+(def- tutor-emacs-key-specs
+  {:kf ['commands/cmd-forward-char "C-f"]
+   :kb ['commands/cmd-backward-char "C-b"]
+   :kn ['commands/cmd-next-line "C-n"]
+   :kp ['commands/cmd-previous-line "C-p"]
+   :kbol ['commands/cmd-beginning-of-line "C-a"]
+   :keol ['commands/cmd-end-of-line "C-e"]
+   :kwf ['commands/cmd-forward-word "M-f"]
+   :kwb ['commands/cmd-backward-word "M-b"]
+   :kbs ['commands/cmd-beginning-of-buffer "M-<"]
+   :kbe ['commands/cmd-end-of-buffer "M->"]
+   :kundo ['commands/cmd-undo "C-/"]
+   :ksearch ['commands/cmd-isearch-forward "C-s"]
+   :krsearch ['commands/cmd-isearch-backward "C-r"]
+   ;; the command prompt is a binding too — M-x here, `:` under vim (which has no
+   ;; M-x at all). Deriving it is what keeps "how do I switch back" truthful.
+   :kcmd ['commands/cmd-execute-extended-command "M-x"]})
+
+;; vim expresses motion as grammar (one `cmd-vim-motion` for every motion key), so
+;; these are literals by nature — the lookup would be ambiguous, not stale.
+(def- tutor-vim-key-specs
+  {:kf [nil "l"]
+   :kb [nil "h"]
+   :kn [nil "j"]
+   :kp [nil "k"]
+   :kbol [nil "0"]
+   :keol [nil "$"]
+   :kwf [nil "w"]
+   :kwb [nil "b"]
+   :kbs ['vim/cmd-vim-goto-first-line "gg"]
+   :kbe ['vim/cmd-vim-goto-last-line "G"]
+   :kundo ['commands/cmd-undo "u"]
+   :ksearch ['commands/cmd-isearch-forward "/"]
+   :krsearch ['commands/cmd-isearch-backward "?"]
+   :kcmd ['commands/cmd-execute-extended-command ":"]})
+
+;; The tutorial's OWN keys (box hops, lesson nav) are looked up in its buffer keymap
+;; — one place binds them, and the footer/prose can't drift from it.
+(def- tutor-own-key-specs
+  {:next-box ['tutor/cmd-tutorial-next-playground "M-n"]
+   :prev-box ['tutor/cmd-tutorial-prev-playground "M-p"]
+   :reset-box ['tutor/cmd-tutorial-reset-playground "C-c C-r"]
+   :next-lesson ['tutor/cmd-tutorial-next "C-c C-n"]
+   :prev-lesson ['tutor/cmd-tutorial-prev "C-c C-p"]
+   :up ['tutor/cmd-tutorial-up "C-c C-u"]
+   :last-page ['tutor/cmd-tutorial-last "C-c C-l"]
+   :contents ['tutor/cmd-tutorial-contents "C-c C-t"]
+   :answer-key ['tutor/cmd-tutorial-show-answer "C-c C-a"]
+   ;; the workings pane follows the cursor on its own; this is how you get it back
+   ;; after closing it (and how to open it on a box that has not run yet)
+   :workings ['tutor/cmd-tutorial-workings "C-c C-w"]})
+
+(defn- tutor-prose (profile)
+  ;; the editorially-different half: shapes, not keys
+  (if (= profile :vim)
+    {:profile-name "vim"
+     :insert-hint "Vim note: a box is edited in INSERT mode — i enters it, ESC leaves."
+     :move-line "{{kb}} / {{kf}} back and forward a character, {{kn}} / {{kp}} down and up a line"
+     :paging-line "and a COUNT multiplies any motion: 10{{kn}} leaps ten lines down,"
+     :paging-line2 "5{{kwf}} five words forward. Home row all the way."
+     :kill-line "dd deletes the whole line (into the register), p puts it back,"
+     :kill-line2 "y is the copy operator (yy copies the line), and {{kundo}} undoes —"
+     :practice-kill "Practice — dd this line, p it back, {{kundo}} until it's pristine"
+     :kill-hint "dd on that line removes it whole — line and newline together"
+     :motion-keys ":h :j :k :l"}
+    {:profile-name "emacs"
+     :insert-hint ""
+     :move-line "{{kf}} / {{kb}} forward and back a character, {{kn}} / {{kp}} next and previous line"
+     :paging-line "and C-v / M-v page down and up. C-l recenters the view on the"
+     :paging-line2 "cursor. Home row all the way."
+     :kill-line "C-k kills to the end of the line (into the kill ring), C-y yanks it"
+     :kill-line2 "back, M-w copies a C-SPC-marked region, and {{kundo}} undoes —"
+     :practice-kill "Practice — C-k this line, C-y it back, {{kundo}} until it's pristine"
+     :kill-hint "{{kn}} to that line, {{kbol}}, then C-k twice — the text, then the newline"
+     :motion-keys ":ctrl-f :ctrl-b :ctrl-n :ctrl-p"}))
+
+(defn tutor-keyset (profile &optional user-keys)
+  "The render vocabulary for `profile`: keys ASKED of the live keymaps (so a
+rebinding shows through — init.blsp's own `user-keys`, a model's `:user-keys`, included),
+the tutorial's own keys asked of its buffer keymap, and the editorially-different prose.
+Prose entries may themselves carry `{{key}}` holes — they're rendered against the derived
+keys first, so one key name is written in exactly one place."
+  (let (keys (merge (ed-command-keys (userkeys/profile-keymap-with profile user-keys)
+                      (if (= profile :vim) tutor-vim-key-specs tutor-emacs-key-specs))
+               (ed-command-keys tutor-keymap tutor-own-key-specs))
+        prose (tutor-prose profile))
+    ;; resolve keys inside the prose entries, then hand the union to the lessons
+    (merge keys
+      (fold prose
+        {}
+        (fn (acc kv) (let ([k v] kv) (assoc acc k (if (string? v) (template/render v keys) v))))))))
+
+(defn- tutor-render-str (s keyset)
+  (if (string? s) (template/render s keyset) s))
+
+;; ---- sections & subsections: the course is walked one GROUP at a time ---------
+;; A lesson carries `:section` and optionally `:subsection`; `tutor-sections`
+;; (content) is the ordered registry. The unit the user actually walks is a GROUP —
+;; a subsection when the section has them, the section otherwise — and numbering,
+;; "what's next", the hub and progress all derive from that one notion, so a long
+;; topic reads as a few short walks without any special-casing.
+
+(defn tutor-group-of (idx)
+  "The group a lesson belongs to: `[section-id subsection-id]` (subsection nil when
+the section isn't split)."
+  (let (l (nth tutor-lessons idx)) [(:section l) (:subsection l)]))
+
+(defn tutor-group-indices (group)
+  "The global lesson indices in `group`, in order."
+  (let ([sid sub] group)
+    (seq/keep (seq/enumerate tutor-lessons)
+      (fn (kv) (let ([i l] kv) (when (and (= (:section l) sid) (= (:subsection l) sub)) i))))))
+
+(defn- tutor-section (sid)
+  (or (seq/find tutor-sections (fn (s) (= (:id s) sid))) {:id sid :title (str sid)}))
+
+(defn- tutor-subsection (sid sub)
+  (when sub
+    (seq/find (or (:subsections (tutor-section sid)) []) (fn (x) (= (:id x) sub)))))
+
+(defn tutor-group-title (group)
+  "The name of the walk the user is on — the subsection's title when there is one."
+  (let ([sid sub] group
+        x (tutor-subsection sid sub))
+    (if x (:title x) (:title (tutor-section sid)))))
+
+(defn tutor-group-position (idx)
+  "`[position count]` of lesson `idx` within its own group (1-based)."
+  (let (idxs (tutor-group-indices (tutor-group-of idx)))
+    [(inc (index-of idxs idx)) (count idxs)]))
+
+(defn tutor-group-last? (idx)
+  (let ([pos n] (tutor-group-position idx)) (= pos n)))
+
+(defn- tutor-groups ()
+  "Every walkable group, in course order, as hub entries: `{:group :title :blurb
+:sub?}` — plus a `:header?` entry for a section that is split (its own line names
+the topic; its subsections are the entries beneath it). The ONE source of truth
+shared by the hub renderer and the line→group resolver."
+  (mapcat tutor-sections
+    (fn (sec)
+      (let (subs (or (:subsections sec) []))
+        (if (empty? subs)
+          (list {:group [(:id sec) nil] :title (:title sec) :blurb (:blurb sec) :sub? false})
+          (cons {:header? true :title (:title sec) :blurb (:blurb sec)}
+            (map subs
+              (fn (x)
+                {:group [(:id sec) (:id x)]
+                 :title (:title x)
+                 :blurb (:blurb x)
+                 :sub? true}))))))))
+
+(defn tutor-group-passed (m group)
+  "`[passed total]` exercises for `group` — `passed` from the session's remembered
+solves (`:tutor-passed`), so hub progress survives leaving a lesson."
+  (let (idxs (tutor-group-indices group)
+        total (fold idxs
+                0
+                (fn (acc i)
+                  (+ acc (count (seq/filter (or (:playgrounds (nth tutor-lessons i)) []) :expect)))))
+        passed (count (seq/filter (or (map/get-in m [:tutor :passed]) [])
+                        (fn (key) (includes? idxs (first key))))))
+    [passed total]))
+
+;; ---- the lesson render (pure: lesson index -> buffer text) -------------------
+
+(defn- tutor-heading (idx title)
+  ;; the product name, then the breadcrumb: a lesson should say what it belongs to, not
+  ;; just where it sits ("Brood Tutorial · Navigation — 1/3: Moving around")
+  (let ([pos n] (tutor-group-position idx)
+        [sid sub] (tutor-group-of idx)
+        crumb (if sub
+                (str (:title (tutor-section sid)) " › " (tutor-group-title [sid sub]))
+                (:title (tutor-section sid)))
+        label (str "━━ Brood Tutorial · " crumb " — " pos "/" n ": " title " "))
+    (str label (string/repeat "━" (math/max 2 (- *tutor-box-width* (string/display-width label)))))))
+
+;; A box's RULE character says what is inside it: a solid `─` for Brood code, a dashed
+;; `┄` for plain text. That distinction has to be legible from the buffer text alone,
+;; because `:fontify` is a text-only service and the region parser has no lesson data —
+;; so it rides on the rule rather than on a field only the model can see. Both still
+;; open with `╭` and close with `╰`, so region parsing is untouched.
+(def *tutor-rule-code* "─")
+(def *tutor-rule-text* "┄")
+
+(defn- tutor-rule (kind) (if (= kind :text) *tutor-rule-text* *tutor-rule-code*))
+
+(defn- tutor-open-line (title &optional (kind :code))
+  (let (rule (tutor-rule kind)
+        head (str "╭" rule " " title " "))
+    (str head (string/repeat rule (math/max 2 (- *tutor-box-width* (string/display-width head)))))))
+
+(defn- tutor-close-line (&optional (kind :code))
+  (str "╰" (string/repeat (tutor-rule kind) (dec *tutor-box-width*))))
+
+(def- tutor-footer-template
+  ;; `{{contents}}` is not listed: `{{up}}` already lands on the contents page, and the
+  ;; line has to stay inside the box width
+  "  [ {{next-box}}/{{prev-box}} box · {{next-lesson}}/{{prev-lesson}} lesson · {{up}} up · {{last-page}} back · {{answer-key}} answer ]")
+
+(defn tutor-margined (code)
+  "Box code with the left margin on every line — the code is still ordinary,
+editable, evaluable Brood (the reader ignores leading whitespace)."
+  (string/join (map (string/split code "\n") (fn (l) (str *tutor-box-margin* l))) "\n"))
+
+(defn- tutor-playground-lines (pg)
+  (let (kind (:kind pg :code))
+    (append (list (tutor-open-line (:title pg "Try it") kind))
+      (append (string/split (tutor-margined (:code pg)) "\n")
+        (list (tutor-close-line kind) "")))))
+
+(defn tutor-rendered-playgrounds (lesson keyset)
+  ;; the lesson's playgrounds with every templated string rendered for the profile
+  (map (or (:playgrounds lesson) [])
+    (fn (pg)
+      (-> pg
+        (assoc :title (tutor-render-str (:title pg "Try it") keyset))
+        (assoc :code (tutor-render-str (:code pg) keyset))
+        (assoc :hint (tutor-render-str (:hint pg) keyset))
+        (assoc :answer (tutor-render-str (:answer pg) keyset))
+        (assoc :kind (:kind pg :code))
+        ;; a prose ANSWER may name a key or the profile too ("my keys are emacs"),
+        ;; so the expectation renders with everything else — an unrendered `{{…}}`
+        ;; here would be an exercise that can never be solved
+        (assoc :expect
+          (if (map/get-in pg [:expect :text])
+            (assoc (:expect pg)
+              :text (tutor-render-str (map/get-in pg [:expect :text]) keyset))
+            (:expect pg)))))))
+
+(defn tutor-lesson-text (idx profile &optional user-keys)
+  "The full *Tutorial* buffer text for lesson `idx` under keybinding `profile` —
+prose indented two spaces (so no prose line can imitate a box delimiter at column
+0), playground code margined inside its ╭─/╰ box, every `{{key}}` hole rendered
+for the profile's real bindings, init.blsp's `user-keys` (a model's `:user-keys`) in."
+  (let (lesson (nth tutor-lessons idx)
+        keyset (tutor-keyset profile user-keys))
+    (string/join (append (list (tutor-heading idx (:title lesson)) "")
+                   (append (map (:body lesson)
+                             (fn (l) (if (= l "") "" (str "  " (tutor-render-str l keyset)))))
+                     (append (cons ""
+                               (mapcat (tutor-rendered-playgrounds lesson keyset)
+                                 tutor-playground-lines))
+                       (list (template/render tutor-footer-template keyset) ""))))
+      "\n")))
+
+;; ---- the contents page: the hub between sections -------------------------------
+;; Rendered into the SAME *Tutorial* buffer — it simply has no ╭─ boxes, so the box
+;; parser finds nothing, the guard makes the whole page read-only for free, and the
+;; evaluator has nothing to run. Each section line is a link: the `:line-loc`
+;; service gives it the pointer cursor + hover underline (the affordance the results
+;; buffers use), RET and click enter that section.
+
+(def *tutor-contents-marker* "▸ ") ; marks a clickable entry (indent varies by depth)
+(defn- tutor-contents-entry-lines (m e)
+  ;; one hub entry: a split section's own header (names the topic, enters nothing),
+  ;; else a clickable ▸ line with its lesson count and progress, plus its blurb
+  (if (:header? e)
+    (list (str "  " (:title e)) (str "      " (:blurb e)) "")
+    (let ([passed total] (tutor-group-passed m (:group e))
+          done (and (> total 0) (= passed total))
+          tick (cond done " ✓" (> passed 0) (str " " passed "/" total) else "")
+          n (count (tutor-group-indices (:group e)))
+          pad (if (:sub? e) "    " "  "))
+      (list (str pad
+              *tutor-contents-marker*
+              (:title e)
+              "  ("
+              n
+              (if (= n 1) " lesson" " lessons")
+              ")"
+              tick)
+        (str pad "    " (:blurb e))
+        ""))))
+
+(defn tutor-contents-text (m banner)
+  (let (lines (mapcat (tutor-groups) (fn (e) (tutor-contents-entry-lines m e))))
+    (string/join (append (list (str "━━ Brood Tutorial — contents "
+                                 (string/repeat "━" (math/max 2 (- *tutor-box-width* 28))))
+                           "")
+                   (append (if (= banner "") (list) (list (str "  " banner) ""))
+                     (append (list "  Pick where to go next — RET (or click) on a ▸ entry:" "")
+                       (append lines
+                         (list "  [ RET enter · C-c C-t back to contents any time ]" "")))))
+      "\n")))
+
+(sig tutor-contents-title-at (buffer int -> any))
+(defn- tutor-contents-title-at (buf line0)
+  ;; the GROUP whose ▸ entry line this exactly is, or nil — matched by title against
+  ;; the same `tutor-groups` list the renderer used, so the two can't disagree
+  (let (text (editor/buffer/buffer-line-at buf line0)
+        at (index-of text *tutor-contents-marker*))
+    (when (>= at 0)
+      (let (after (string/substring text
+                    (+ at (string/length *tutor-contents-marker*))
+                    (string/length text))
+            title (string/trim (first (string/split after "  (")))
+            hit (seq/find (tutor-groups) (fn (e) (and (:group e) (= (:title e) title)))))
+        (:group hit)))))
+
+(sig tutor-contents-section-at (buffer int -> any))
+(defn tutor-contents-section-at (buf line0)
+  "The GROUP a contents-page line belongs to — `[section subsection]`, or nil. The
+`:line-loc` service behind the pointer cursor, hover underline, RET and click. An
+entry is two lines tall on screen (▸ title + blurb), so landing anywhere in it
+works (`results/line-link-loc` walks up for the same reason); a split section's own
+header line names no group — you enter its subsections, not the section."
+  (or (tutor-contents-title-at buf line0)
+    (when (> line0 0) (tutor-contents-title-at buf (dec line0)))))
+
+;; ---- the box syntax: ONE place names the delimiters ---------------------------
+;; The region algebra itself is `formbuf` (form buffers: generated text
+;; with editable regions — a shell's input line, a commit message's help block, a
+;; rebase todo). All this module owns is the delimiter choice and the two accessors
+;; the guard needs.
+
+(def *tutor-open* "╭") ; a box opens on a line starting with this…
+(def *tutor-close* "╰") ; …and closes on the next line starting with this
+(sig tutor-regions (string -> (or nil (list region))))
+(defn tutor-regions (text)
+  "The playground regions of `text` — `{:start :end :open-line :close-line :kind}` per
+box, in order (`formbuf/delimited-regions`, plus the kind read off each opening line's
+rule character).
+
+The kind is attached HERE rather than offered as a `(text region)` lookup so that no
+consumer can forget to ask and none pays to ask twice: the fontifier, the indenter and
+the checker filter all need it, and each was re-splitting the whole buffer per box to
+get it. One split per parse, and a region now carries everything about itself."
+  (let (lines (string/split text "\n")
+        text-rule (str *tutor-open* *tutor-rule-text*))
+    (map (formbuf/delimited-regions text *tutor-open* *tutor-close*)
+      (fn (r)
+        (assoc r
+          :kind (if (string/starts-with? (nth lines (:open-line r 0) "") text-rule) :text :code))))))
+
+(defn tutor-skeleton (text)
+  "Everything of `text` OUTSIDE the boxes — what the render stashes and the guard
+compares against (`formbuf/skeleton`)."
+  (formbuf/skeleton text (tutor-regions text)))
+
+(defn tutor-region-at (regions pos)
+  "The box whose content span contains `pos` (boundaries inclusive), or nil."
+  (formbuf/region-at regions pos))
+
+(defn tutor-box-at-point (m)
+  "The index of the box the cursor is in, or nil (prose, or another buffer). The tutorial owns
+the box parser, so it answers this and hands the index to `workings` — that is the
+boundary that keeps the pane module from needing anything back."
+  (let (b (ed-current-buf m))
+    (when (tutor-buffer? b)
+      (formbuf/region-index (tutor-regions (buffer-text b)) (buffer-point b)))))
+
+;; ---- buffer plumbing ----------------------------------------------------------
+
+(defn tutor-buffer? (b) (= (buffer-name b) *tutor-buffer-name*))
+
+(defn tutor-buf (m)
+  "The *Tutorial* pool buffer wherever it lives, or nil when it is not open."
+  (let (i (ed-buffer-index-by-name m *tutor-buffer-name*)) (when i (ed-buf-at m i))))
+
+(defn tutor-bufset-buf (m f)
+  "Apply `f` to the *Tutorial* pool buffer (wherever it lives) — the buffer-shaped
+sibling of `tutor-bufset`, for the std buffer API (`annotate`)."
+  (ed-update-named m *tutor-buffer-name* f))
+
+(defn tutor-bufset (m kvs)
+  "Merge fields `kvs` onto the *Tutorial* pool buffer (wherever it lives)."
+  (tutor-bufset-buf m (fn (bb) (merge bb kvs))))
+
+(def tutor-keymap
+  (-> {}
+    (keymap-bind [:ctrl-c :ctrl-n] 'tutor/cmd-tutorial-next)
+    (keymap-bind [:ctrl-c :ctrl-p] 'tutor/cmd-tutorial-prev)
+    (keymap-bind [:ctrl-c :ctrl-u] 'tutor/cmd-tutorial-up) ; Info's `u` — up a level
+    (keymap-bind [:ctrl-c :ctrl-l] 'tutor/cmd-tutorial-last) ; Info's `l` — where you were
+    (keymap-bind [:ctrl-c :ctrl-a] 'tutor/cmd-tutorial-show-answer) ; the worked answer
+    (keymap-bind [:ctrl-c :ctrl-r] 'tutor/cmd-tutorial-reset-playground)
+    (keymap-bind [:ctrl-c :ctrl-k] 'tutor/cmd-tutorial-restart-sandbox)
+    (keymap-bind [:tab] 'tutor/cmd-tutorial-tab) ; indent in a box, like every .blsp buffer
+    (keymap-bind [:alt-n] 'tutor/cmd-tutorial-next-playground) ; M-n — next box
+    (keymap-bind [:alt-p] 'tutor/cmd-tutorial-prev-playground) ; M-p — previous box
+    (keymap-bind [:back-tab] 'tutor/cmd-tutorial-prev-playground) ; S-TAB — previous box too
+    (keymap-bind [:ctrl-c :ctrl-t] 'tutor/cmd-tutorial-contents) ; the section hub
+    (keymap-bind [:ctrl-c :ctrl-w] 'tutor/cmd-tutorial-workings) ; the workings pane, back
+    ;; structural motion scoped to the box (the prose around it isn't Brood)
+    (keymap-bind [:ctrl-meta-f] 'tutor/cmd-tutorial-forward-sexp)
+    (keymap-bind [:ctrl-meta-b] 'tutor/cmd-tutorial-backward-sexp)
+    ;; RET: enter a section on the contents page, else an auto-indenting newline
+    (keymap-bind [:enter] 'tutor/cmd-tutorial-newline)))
