@@ -1132,6 +1132,9 @@ tests/window_paint_test     what the window PAINTS, read from pixels: the real v
                             painted by brood's window painter into memory (`gui/render-frame`,
                             brood ADR-609) at a real size with bedit's font, inset and background —
                             the header line from y = 0, its text centred, the inset a margin
+tests/guards_test         what a move must not lose: every keymap and mode symbol still bound, and a
+                            guest's session running exactly tests/guest_allowed.txt, by M-x name and
+                            by key (a line added there is a security decision)
 tests/strict_ratchet_test   the `nest check --strict` ceiling: the count may only shrink —
                             a new function that adds a finding declares its contract instead
 tools/drive-*.blsp          live drivers: run the real editor over a pty (std/vt reads what it
