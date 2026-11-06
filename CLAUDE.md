@@ -353,6 +353,8 @@ src/hittest.blsp            the mouse side of the view: every hit-test / hover f
                             a model and returns one (:hover, :diag-hover, :link-hover, a chip
                             click, the context menu's hit) — recomputed from the same widget /
                             segments / layout the view drew, so input never imports the renderer
+src/echoarea.blsp           the echo area under the bottom mode line as render ops: the message or eldoc
+                            line, the minibuffer's prompt and candidate list (Plume), the which-key grid
 src/modeline.blsp           a pane's mode line: its segments (`ed-statusbar-segments`, the registered
                             chips included), the bar painted from them, the pointer's layout and the
                             hover tooltips. What `hittest` asks again, so `input` never imports the view

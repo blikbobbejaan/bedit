@@ -1,0 +1,356 @@
+(defmodule echoarea
+  "The echo area under the bottom mode line, as render ops: the message or eldoc line, the
+minibuffer's prompt and candidate list (Plume), and the which-key grid."
+  (:use editor/buffer)
+  (:use keyhelp) ; key / command labels
+  (:use minibuffer)
+  (:use model)
+  (:use completion) ; the shared vertical-menu renderer + faces
+  (:use plume) ; marginalia annotations + the N/M counter
+  (:use theme)
+  (:use ui-kit)
+  (:use editor/ui :only [ui-memo])
+  (:use editor/display)) ; text / frect render ops
+
+;; ---- the minibuffer / echo area + the cursor --------------------------------
+
+(defn ed-mb-candidates (mb)
+  "A ` {a b c}` label of the matching candidates for a minibuffer that carries a candidate
+source (`:rank-source` or `:candidates-fn`), narrowing live as you type; `\"\"` for a
+prompt without one. Shown after the input so you see what completion will offer."
+  (if (not (mb-source? mb))
+    ""
+    (let (cs (mb-candidates mb))
+      ; memoized on the input text (minibuffer/mb-candidates)
+      (if (empty? cs) "   {no match}" (str "   {" (string/join cs " ") "}")))))
+
+(defn ed-diagnostic-on-line (m buf)
+  "The `\"warning: …\"` text of the first cached diagnostic on `buf`'s current line
+(a diagnostic's 1-based `:line` maps to the 0-based buffer line), or nil."
+  (let (hit (first (get (or (:diag-by-line m) {}) (buffer-current-line buf) '())))
+    (when hit (str "warning: " (:message hit)))))
+
+(defn ed-eol-note-on-line (buf)
+  "The end-of-line note on `buf`'s current line, in full — the echo-row seat of the
+feedback (the gutter shows the glyph, the ghost text may be clipped; here the whole
+text fits). Silent once the note is stale: an edited line's old result shouldn't
+keep talking."
+  (when (not (results/eol-notes-stale? buf))
+    (results/eol-note-at buf (buffer-current-line buf))))
+
+(defn ed-echo-or-eldoc (m)
+  "The echo-row text when no minibuffer is open, by precedence: the latest explicit
+`message`; else a **diagnostic on the current line**; else the tutorial note on the
+current line (the full verdict/hint for the box at point); else the model's cached
+`:eldoc` hint (the current buffer mode's signature for point, e.g. `(map coll f)`,
+refreshed by `input/ed-post-step` once per event); else `\"\"`.
+
+A standing one-key QUESTION (a y/n read, a query-replace's y/n/!/./q —
+`model/ed-standing-question`) comes before all of them: its prompt stays on the row until
+it is answered, with any message that arrived meanwhile after it in brackets."
+  (let (question (ed-standing-question m)
+        echo (:echo m))
+    (cond
+      question (ed-with-question-message (:prompt question) (:message question))
+      (not (= echo "")) echo
+      else
+        (let (buf (ed-current-buf m)
+              diag (ed-diagnostic-on-line m buf))
+          ;; the eldoc hint is cached on the model by `ed-post-step` (computed once per
+          ;; event, not re-derived here every frame) — just paint it.
+          (or diag (ed-eol-note-on-line buf) (:eldoc m) "")))))
+
+(defn ed-echo-line (m cols rows)
+  "The bottom row (`rows-1`): the active minibuffer prompt + input if one is open,
+else the latest `message` — or, when idle, the current mode's eldoc hint. A Vertico
+prompt shows its candidates as the vertical list above (`ed-mb-candidates-ops`); a
+plain prompt (find-file) keeps the inline ` {a b c}` here."
+  ;; The prompt sits just below the mode line, at the top of the minibuffer region; the
+  ;; Plume candidate list (if any) fills the rows below it (`ed-mb-candidates-ops`). With no
+  ;; list the region is one row, so this lands on the last row as before.
+  (let (mb (:minibuffer m))
+    (text (- rows (ed-echo-rows m rows))
+      0
+      (if (nil? mb)
+        (ed-fit (ed-echo-or-eldoc m) cols)
+        ;; clipped by CELLS: the input is laid out (`ed-mb-shown`), a CJK name two cells a glyph
+        (ed-fit-cells
+          (let (sel? (:accept-selection mb)
+                ;; a Plume prompt leads with the `N/M` candidate counter
+                counter (if sel? (plume-count-label (mb-sel mb) (count (mb-candidates mb))) ""))
+            (str counter
+              (mb-prompt mb)
+              (ed-mb-shown (mb-shown-text mb) (ed-mb-input-col mb))
+              (if sel? "" (ed-mb-candidates mb))
+              ;; what the prompt is waiting on (`:status`, its candidates still coming — M-x
+              ;; package-install fetching the list), shown until the prompt clears it
+              (if (:status mb) (str " [" (:status mb) "]") "")
+              ;; a message said while the prompt is open shows after it until the next key
+              ;; (`model/message`, Emacs's minibuffer message) rather than replacing it
+              (if (:message mb) (str " [" (:message mb) "]") "")))
+          cols)))))
+
+(sig ed-mb-shown (string &optional int -> string))
+;; check-allow: `binding` runs its body in a thunk whose result the checker does not carry;
+;; the body is `string/expand-tabs`, which answers a string
+(check-allow :trusted
+  (defn ed-mb-shown (input &optional (col 0))
+    "Minibuffer `input` LAID OUT as the echo line shows it, from echo column `col` (where the
+input begins, [[ed-mb-input-col]]): each tab spanning to its next stop at the tab width in
+force (`*tab-width*`), each glyphless character — a zero width space, a bidi control pasted
+into a prompt — as its `<200b>` escape (brood ADR-556) unless the editor hides them
+(`*glyphless-chars*`), as a buffer shows them. What comes back has no tab or invisible
+character left, so its DISPLAY WIDTH is its cells — a CJK glyph two. The echo line, its
+caret and its shadow all measure this, so they agree on where the input's characters are.
+
+    (echoarea/ed-mb-shown \"a\\u{200b}b\")   ;=> \"a<200b>b\"
+    (echoarea/ed-mb-shown \"a\\tb\")   ;=> \"a       b\""
+    (binding (*glyphless-display* *glyphless-chars*) (string/expand-tabs input col))))
+
+(sig ed-mb-input-col (any -> int))
+(defn ed-mb-input-col (mb)
+  "The echo-row column where minibuffer `mb`'s INPUT begins: after the `N/M ` counter (a
+selection prompt) and the prompt, in display cells — where `ed-echo-line` puts it, the caret
+and the shadow measure from."
+  (+ (if (:accept-selection mb)
+       (string/display-width (plume-count-label (mb-sel mb) (count (mb-candidates mb))))
+       0)
+    (string/display-width (mb-prompt mb))))
+
+(sig ed-mb-shadow-ops (map int int -> any))
+(defn ed-mb-shadow-ops (m cols rows)
+  "The prompt's SHADOW: the part of its input that no longer counts, painted dim over the
+echo line (Emacs `file-name-shadow-mode`). A prompt declares it with `:shadow-fn`, `(text)
+-> index` where the live part begins — a path prompt's `filename/shadow-end`, so in
+`~/src//etc/` the `~/src/` dims as soon as the second `/` is typed. `[]` when nothing is
+shadowed."
+  (let (mb (:minibuffer m)
+        end (if (and mb (:shadow-fn mb)) ((:shadow-fn mb) (mb-text mb)) 0))
+    (if (= end 0)
+      []
+      (let (col (ed-mb-input-col mb))
+        (if (>= col cols)
+          []
+          [(text (- rows (ed-echo-rows m rows))
+             col
+             (ed-fit-cells (ed-mb-shown (string/substring (mb-text mb) 0 end) col) (- cols col))
+             face-minibuffer-shadow)])))))
+
+(def ed-plume-style
+  ;; the minibuffer list rows: painted by role (ui-ctx palette), the same ui-list widget as
+  ;; the popup + menu — but as Vertico draws them: the text flush with the prompt above it
+  ;; (no inset) and the selection a flat full-width bar, not a pill floating in the row
+  {:fg :on-surface :bg :surface :inset :flush :selection :bar})
+
+(defn- ed-plume-rows (mb values cols width)
+  "The `ui-list` rows for the visible candidate `values` in a `width`-wide list: each
+labelled by the prompt's `:label-fn` (find-file shows a path's basename, not its full path —
+the *value* is what accept opens) and clipped to fit before the right-aligned marginalia
+(the column and the gap before it). Plume marginalia: a per-category annotation for each
+value, laid out as columns across the rows (`plume-columns`) so the widget's right-aligned
+`:key` slot puts EVERY row's marginalia at the same left column and each field under its
+own kind (perms / size / mtime; key / doc); nil (no `:key`) when a row has none.
+
+A fuzzy-ranked prompt (`:rank-source`) also marks what the query matched in each label,
+one colour per space-separated term (`plume-marks`, carried to the widget as `:marks`), so
+`lim ex` shows which word found which part of the path. A prompt that computes its own
+candidates is left plain: its text is not necessarily a fuzzy query over them."
+  (let (label-of (or (:label-fn mb) (fn (c) c))
+        query (if (:rank-source mb) (mb-text mb) "")
+        annotations (plume-columns (map values (fn (v) (plume-annotation mb v)))
+                      (plume-annot-room cols))
+        annotation-width (if (empty? annotations) 0 (string/display-width (first annotations)))
+        label-width (math/max 1
+                      (- width (if (= annotation-width 0) 0 (+ annotation-width 2)))))
+    (map (seq/zip values annotations)
+      (fn ([value annotation])
+        (let (label (label-of value))
+          {:label (plume-clip label label-width)
+           :marks (if (= query "")
+                    []
+                    (plume-clip-marks label
+                      label-width
+                      (plume-marks query value label (mb-rank-options mb))))
+           :key (if (string/blank? annotation) nil annotation)
+           :enabled true})))))
+
+(sig ed-mb-candidates-ops (map int int -> any))
+(defn ed-mb-candidates-ops (m cols rows)
+  "Plume's vertical candidate list for a minibuffer with `:accept-selection`: the fuzzy
+candidates drawn in the rows just above the prompt as a windowed `ui-list` (src/ui-kit.blsp)
+INSET by `*plume-inset*`, the `:sel` row a rounded selection pill, each row carrying its
+category's marginalia (`plume-annotation`) in the widget's right-aligned `:key` slot when
+the prompt declares one (`ed-plume-rows`). `[]` for no minibuffer, a plain prompt, or no
+candidates."
+  (let (mb (:minibuffer m)
+        candidates (if (and mb (:accept-selection mb)) (mb-candidates mb) '()))
+    (if (empty? candidates)
+      []
+      (let (visible (dec (ed-echo-rows m rows)) ; reserved rows minus the prompt
+            selected (mb-sel mb)
+            start (completion-window-start (count candidates) selected visible)
+            width (math/max 1 (- cols (* 2 *plume-inset*)))
+            window (take (drop candidates start) visible))
+        ;; One memoised fragment (ADR-336) on what the rows read: the shown candidates, the
+        ;; selection, the size, the query the marks come from, and the prompt's annotation
+        ;; context. A row's marginalia is I/O (`file/stat`, the clock) or a reflection
+        ;; (`reflect/declared-signature`), and its marks a fuzzy match — per row, so per
+        ;; frame they cost a blink frame or a pointer move as much as a keystroke. Asked only
+        ;; when the window of candidates moves, a file's age reads as of then.
+        ;; check-allow: the thunk's effects are READS (a file's stat, the clock, an annotator
+        ;; resolved by name) — skipping them on a turn whose deps are unchanged is the point
+        (check-allow :pure
+          (ui-memo [:plume]
+            [window
+              selected
+              start
+              visible
+              rows
+              cols
+              (if (:rank-source mb) (mb-text mb) "")
+              (:category mb)
+              (:anno-base mb)
+              (:anno-keys mb)
+              (:anno-keymap mb)
+              (:label-fn mb)
+              (:path-of mb)
+              (:gui m)
+              (ed-palette-token)]
+            (fn ()
+              (let (widget (ui-list {:items (ed-plume-rows mb window cols width)
+                                     :selected selected
+                                     :base start
+                                     :row (fn (it i sel?) it)
+                                     :tag :plume-pick
+                                     :style ed-plume-style}))
+                ;; the list fills the bottom `visible` rows, inset, just below the prompt
+                (:ops (widget [*plume-inset* (- rows visible) width visible] (ui-ctx (:gui m))))))))))))
+
+;; `ed-selected-pane` lives in `panes` (this module `(:use panes)`).
+
+(defn ed-mb-caret-text (m mb cols)
+  "The text in the minibuffer caret's cell, which a block caret draws over its fill
+(brood ADR-515): an input method's composition when one is open (it is painted there), the
+input's character at point otherwise, and nil past its end or when the caret was held on
+the screen's last column, where the cell shows something else."
+  (let (input (mb-shown-text mb)
+        input-point (mb-point mb))
+    (cond
+      ;; a masked read paints no composition: it is the password, half typed
+      (and (:preedit m) (:masked mb)) nil
+      (:preedit m) (map/get-in m [:preedit :text])
+      (>= (ed-mb-point-column mb) cols) nil
+      ;; a glyphless character's cell is its escape's first, `<`; a tab's a space; a wide
+      ;; glyph is itself
+      (< input-point (string/length input))
+        (string/substring (ed-mb-shown (string/substring input input-point (inc input-point)))
+          0 1)
+      else nil)))
+
+(defn ed-mb-row (m rows)
+  "The prompt's row: the first of the echo area, just below the mode line."
+  (- rows (ed-echo-rows m rows)))
+
+(sig ed-mb-point-column (any -> int))
+(defn- ed-mb-point-column (mb)
+  "The echo-row column of minibuffer `mb`'s point: after the counter and the prompt, and the
+CELLS of the input before point as it is laid out ([[ed-mb-shown]] from the input's column — a
+CJK glyph two, a tab to its stop, a glyphless character's escape its six), so the caret lands
+after the character the echo line painted before it: `Find file: ./日本` puts it after `本`."
+  (let (col (ed-mb-input-col mb))
+    (+ col
+      (string/display-width (ed-mb-shown (string/substring (mb-shown-text mb) 0 (mb-point mb)) col)))))
+
+(sig ed-mb-caret-column (any int -> int))
+(defn ed-mb-caret-column (mb cols)
+  "The column of minibuffer `mb`'s caret: [[ed-mb-point-column]], kept on the screen."
+  (math/min (dec cols) (ed-mb-point-column mb)))
+
+(sig ed-mb-preedit-ops (model int int -> any))
+(defn ed-mb-preedit-ops (m cols rows)
+  "An input method's composition while a prompt is open, at the prompt's caret — where the
+desktop puts the candidate window too (it follows the frame's first caret). Nil without a
+prompt or a composition: a buffer pane paints its own at point (`ed-preedit-op`)."
+  (let (mb (:minibuffer m))
+    (when (and mb (:preedit m) (not (:masked mb)))
+      (let (column (ed-mb-caret-column mb cols))
+        (list (ed-preedit-op m (ed-mb-row m rows) column (- cols column)))))))
+
+(defn- ed-which-key-rows (km)
+  "Sorted `\"<key>   <command>\"` rows for the entries of pending sub-keymap `km`, the key
+column padded to a common width so the command column lines up across rows."
+  (let (pairs (%map-pairs km)
+        kw (fold pairs 0 (fn (w p) (math/max w (string/display-width (ed-key-label (first p)))))))
+    (sort (map pairs
+            (fn (p)
+              (str (string/pad-right-cells (ed-key-label (first p)) kw)
+                "   "
+                (ed-cmd-label (second p))))))))
+
+(defn- ed-grid-columns (columns cols)
+  "The leading `columns` (each a vector of cells) that fit side by side in `cols`, each as
+`{:cells :width :used :gap}` — its widest cell, the width of the columns before it and the
+gap that separates it from them. The first always fits; the first that does not ends the
+grid."
+  (reverse
+    (second
+      (seq/reduce-while columns
+        [0 '()]
+        (fn (state cells)
+          (let ([used placed] state
+                width (fold cells 0 (fn (widest s) (math/max widest (string/display-width s))))
+                gap (if (empty? placed) 0 3)
+                end (+ used gap width))
+            (if (and (not (empty? placed)) (> end cols))
+              [:halt state] ; no room for another column
+              [:cont [end (cons {:cells cells :width width :used used :gap gap} placed)]])))))))
+
+(defn- ed-grid-row (grid i)
+  "Row `i` of the laid-out `grid` (`ed-grid-columns`): each column's `i`th cell (blank past
+its end) padded to the column's width, after its gap — the row so far padded to the width
+of the columns before it."
+  (fold grid
+    ""
+    (fn (row column)
+      (str (string/pad-right-cells row (:used column))
+        (string/pad-right "" (:gap column))
+        (string/pad-right-cells (nth (:cells column) i "") (:width column))))))
+
+(defn- ed-which-key-columns (items vis cols)
+  "`items` laid out down-then-across in columns of `vis` rows, as `vis` (or fewer) row
+strings — each column padded to its widest entry plus a gap, columns added while they
+fit in `cols` (Emacs which-key's grid, `ed-grid-columns`). A prefix with more continuations
+than one column holds (`C-x` has 30+) shows them all instead of the first `vis`."
+  (let (vis (math/max 1 vis)
+        grid (ed-grid-columns (seq/chunk-every items vis) cols))
+    (map (range (math/min vis (count items))) (fn (i) (string/trimr (ed-grid-row grid i))))))
+
+(defn ed-which-key-ops (m cols rows)
+  "When a prefix chord has been pending past the which-key delay (`:which-key` set by
+`model/ed-which-key-reveal`) and no minibuffer/menu is open, the bottom echo area shows
+the available next keys and the command each runs (Emacs which-key) — a full-width grid
+(`ed-which-key-columns`: down, then across) below the mode line + the pending-chord echo
+row, the same shape as Plume's candidate list. `[]` otherwise, so a fast chord (C-x C-f) completes before the panel ever shows."
+  (let (km (:pending m)
+        visible (dec (ed-echo-rows m rows)) ; reserved rows minus the echo row
+        window (if (or (nil? km) (not (:which-key m)) (:minibuffer m) (:menu m))
+                 '()
+                 (ed-which-key-columns (ed-which-key-rows km) visible cols)))
+    (if (empty? window)
+      []
+      ;; the same `ui-list` widget as Plume, full-width with NO selection (`:selected nil`
+      ;; ⇒ no pill) — each row is a whole `"<key>   <command>"` label, no marginalia —
+      ;; filling the bottom rows, below the echo row
+      (let (widget (ui-list {:items window
+                             :selected nil
+                             :row (fn (s i sel?) {:label s :enabled true})
+                             :tag :which-key
+                             :style ed-plume-style}))
+        (:ops (widget [0 (- rows visible) cols visible] (ui-ctx (:gui m))))))))
+
+(defn ed-preedit-op (m row col avail)
+  "The input method's composition in progress (`:preedit`, brood ADR-441's `[:preedit …]`)
+at the cursor's cell, underlined over a raised surface the way a desktop text field shows
+one, or nil when there is no room."
+  (when (> avail 0)
+    (text row col (ui-clip (map/get-in m [:preedit :text]) avail) face-preedit)))
