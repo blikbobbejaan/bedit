@@ -1,0 +1,277 @@
+(defmodule project-commands
+  "The project commands: C-x p f over a file list cached per root and refreshed off the loop,
+C-x p p to pick a project and say what to do in it, C-x p k to close one."
+  (:use editor/buffer)
+  (:use interactive) ; defcommand
+  (:use model)
+  (:use minibuffer)
+  (:use keyhelp :only [ed-key-label])
+  (:use mincomplete :only [complete-prefix])
+  (:use pool)
+  (:use projects) ; project-root / project-files
+  (:use task)) ; task — the project file walk
+
+;; ---- the project file list, cached per root -----------------------------------
+;; `C-x p f` used to wait for `git ls-files` every time — 35 ms on a 27k-file project before
+;; the prompt could list anything. The list is now kept on the model per root
+;; (`:project-files`, `{root {:files :stamp :at}}`): the prompt opens on it at once and the
+;; walk runs behind it only when the list may have moved — git's index changed (`:stamp`,
+;; its mtime), a file was created by saving it (`ed-project-files-forget`), or it is older
+;; than `*project-files-fresh-ms*` (files made outside the editor touch neither). When the
+;; walk lands with a different list, the open prompt is rebuilt around it in place, keeping
+;; what was typed and handing the new list to its ranking session rather than starting one.
+
+(def *project-files-fresh-ms* 30000)
+
+(defn project-index-stamp (root)
+  "The mtime of `root`'s git index, or nil when it has none — what changes when files are
+added, removed or staged, so a cached list stamped with another value may be stale."
+  (let (index (path/join (path/join root ".git") "index"))
+    (if (file/exists? index) (:mtime (file/stat index)) nil)))
+
+(defn project-files-fresh? (entry stamp now)
+  "Whether cached list `entry` can be trusted without a walk: the index `stamp` it was made
+under still holds, and it is younger than `*project-files-fresh-ms*`."
+  (and (not (nil? entry))
+    (not (:stale entry))
+    (= (:stamp entry) stamp)
+    (< (- now (:at entry)) *project-files-fresh-ms*)))
+
+(defn- project-scan-job (root)
+  "The off-loop walk of `root`: its files and the index stamp they were listed under."
+  (task (fn () {:root root :files (project-files root) :stamp (project-index-stamp root)})))
+
+(defn ed-find-file-in-project (m root)
+  "Open the find-file-in-project minibuffer over the files under `root` (recursive,
+root-relative; Tab narrows, Enter opens the first match). The shared core of `C-x p f`
+(root = the *current* project) and `C-x p p` (root = the *chosen* project) — so a switch
+lists the files of the project it switched to, not wherever the current buffer sits.
+Opens on the cached list when there is one, walking again behind it only when that may be
+stale (`project-files-fresh?`)."
+  (if (nil? root)
+    (message m "not in a project (no project.blsp found)")
+    ;; Recording the project writes the on-disk cache, so it is gated on `:recent-files` —
+    ;; the live-editor flag `main` sets, exactly as recentf, bookmarks and the tutorial's
+    ;; progress are. Ungated, ANY model reached this: a pure model test would rewrite the
+    ;; developer's real `~/.config/bedit/state/projects.blsp` with its /tmp fixtures,
+    ;; which is why `panes_projects_test` used to save and restore that file by hand.
+    (let (_ (when (:recent-files m) (remember-project! root))
+          boost (if (:recent-files m) (project-file-boost root) nil))
+      (if (ed-headless?)
+        (assoc m :minibuffer (ed-project-prompt root (project-files root) boost))
+        (let (entry (map/get-in m [:project-files root])
+              prompt (ed-project-prompt root (if (nil? entry) '() (:files entry)) boost))
+          (if (project-files-fresh? entry (project-index-stamp root) (os/now))
+            (assoc m :minibuffer prompt)
+            ;; The prompt opens NOW, on whatever list is cached, and the walk lands behind it.
+            (assoc m
+              :minibuffer (assoc prompt :scanning root)
+              :project-scan (project-scan-job root))))))))
+
+;; the project file walk, off the loop (`model/register-task-reply`)
+(register-task-reply :project-scan 'project-commands/ed-apply-project-scan nil "scanning")
+(defn ed-apply-project-scan (m scan)
+  "Fold a finished walk (`{:root :files :stamp}`, nil when it failed) in: cache the list for
+its root, and — when a prompt is still open on that root and waiting (`:scanning`) — rebuild
+it around the new list if the list changed, keeping what the reader typed. A prompt with a
+ranking session keeps it: the session is handed the new candidates (`fuzzy/ranker-candidates`)
+and its answer marked stale, so the next event asks again over the new set while the old
+answer stays on screen. Closing the prompt, or opening another, is never overwritten by a
+walk that was already running."
+  (let (mb (:minibuffer m)
+        m1 (dissoc m :project-scan)
+        root (:root scan)
+        files (:files scan)
+        cached (if (nil? scan)
+                 m1
+                 (map/assoc-in m1
+                   [:project-files root]
+                   {:files files :stamp (:stamp scan) :at (os/now)})))
+    (cond
+      (or (nil? mb) (nil? (:scanning mb))) cached
+      (or (nil? scan) (not (= (:scanning mb) root)))
+        (assoc cached :minibuffer (dissoc mb :scanning))
+      (= files (:project-files mb)) (assoc cached :minibuffer (dissoc mb :scanning))
+      else
+        (let (rebuilt (assoc (ed-project-prompt root files (:rank-boost mb))
+                        :edit (:edit mb)
+                        :sel 0
+                        :ranker (:ranker mb))
+              session (:ranker mb))
+          (assoc cached
+            :minibuffer
+              (if (nil? session)
+                rebuilt
+                (do
+                  (fuzzy/ranker-candidates session (:rank-source rebuilt))
+                  ;; still shown (a session prompt shows its last answer), but no longer
+                  ;; for the typed text — so the next event, or the idle beat, re-asks
+                  (assoc rebuilt :cand-cache (assoc (or (:cand-cache mb) {:cands (list)}) :for nil)))))))))
+
+(defcommand cmd-project-find-file
+  (m key)
+  "Find a file anywhere in the current project (C-x p f): a minibuffer completing over every
+file under the project you're in. Reports when not in a project."
+  (ed-find-file-in-project m (ed-project-root m)))
+
+;; ---- C-x p p: pick a project, then say what to DO in it ---------------------
+;; Emacs `project-switch-project` is two steps, and the second one is the part that makes it
+;; a project switcher rather than a find-file with extra keys: having chosen a project it
+;; shows `project-switch-commands` — a menu of what you might want to do there — and one
+;; keystroke picks. bedit used to skip it and force find-file, which is only ever right when
+;; find-file is what you wanted.
+
+(def *project-switch-commands*
+  ;; `[key label command-symbol]` per row — Emacs's `project-switch-commands` as DATA. The
+  ;; symbol is resolved at the keystroke (`reflect/eval`), exactly like a keymap binding, so
+  ;; a redefined command hot-swaps and a deferred module (git, bshell, compile) loads when
+  ;; its row is chosen rather than at startup. Adding an entry is a row.
+  [["f" "Find file" 'project-commands/cmd-project-find-file]
+    ["g" "Find regexp" 'project-search/cmd-project-find-regexp]
+    ["d" "Dired" 'dired/cmd-project-dired]
+    ["v" "VCS status" 'vcscore/cmd-vcs-status]
+    ["e" "Shell" 'bshell/cmd-project-bshell]
+    ["r" "REPL" 'terminal/cmd-project-repl]
+    ["t" "Terminal" 'terminal/cmd-term]
+    ["c" "Compile" 'compile/cmd-compile]])
+
+(defn project-switch-label ()
+  "The dispatch menu as one echo-area line — `[f] Find file  [g] Find regexp  …`. Built from
+`*project-switch-commands*`, so the menu can never disagree with what the keys do."
+  (string/join (map *project-switch-commands* (fn ([key label _]) (str "[" key "] " label))) "  "))
+
+(defn ed-project-switch-to (m root)
+  "The model moved INTO project `root`: the current buffer's directory becomes the root and
+`:project-root` is set, so every project command — which resolves the project live from the
+buffer's directory (`ed-project-root`) — acts on the project just switched to rather than on
+the one the buffer still sits in. Emacs binds `default-directory` around the dispatched
+command for the same reason. Also records `root` as most-recently-used, gated on
+`:recent-files` like every other on-disk cache write."
+  (let (m1 (assoc m :project-root (if (:recent-files m) (remember-project! root) root)))
+    (ed-set-buf m1 (assoc (ed-current-buf m1) :dir root))))
+
+(defn ed-project-switch-dispatch (m root)
+  "Show the `project-switch-commands` menu for `root` and route the next key through it: a
+listed key runs its command with `root` in force, anything else (Esc, C-g, a key with no
+row) cancels. One keystroke, no minibuffer — the Emacs shape."
+  (ed-read-char (ed-project-switch-to m root)
+    (str (path/basename root) " — " (project-switch-label))
+    (fn (mm key)
+      (let (row (seq/find *project-switch-commands* (fn ([k _ _]) (= k key))))
+        (if (nil? row)
+          (message mm (str "not a project command: " (ed-key-label key)))
+          ((reflect/eval (nth row 2)) mm key))))))
+
+(defcommand cmd-project-switch
+  (m key)
+  "Switch to a known project (C-x p p) — Emacs `project-switch-project`: pick a project root
+(a Vertico list of every remembered one, most-recently-used first; Tab completes, and a
+directory you type that is not on the list yet is accepted and remembered), then choose what
+to do there from the dispatch menu — find file, find regexp, dired, VC status, shell, REPL,
+compile. Projects are remembered as you open them."
+  (assoc m
+    :minibuffer
+    ;; the roots shown as `~/…`; a typed one (Tab completes it from the disk) is read
+    ;; as every path prompt reads one
+      (ed-path-list-prompt "Switch to project: "
+        (known-projects)
+        (fn (mm dir)
+          (if (file/dir? dir)
+            (ed-project-switch-dispatch mm dir)
+            (message mm (str "no such directory: " (path/abbreviate dir)))))
+        (ed-default-dir m))))
+
+;; ---- C-x p k: close the project ----------------------------------------------
+;; Emacs `project-kill-buffers`. Finishing with a project means closing everything it
+;; opened, and doing that one `C-x k` at a time over fifteen buffers is how you end up
+;; with three projects' files in the pool and a switch-buffer list you cannot read.
+
+(defn project-owns-buffer? (root buf)
+  "Whether `buf` belongs to project `root` — its file is the root or sits under it.
+
+Compared with a separator appended, which is the whole of the care needed here: a plain
+prefix test makes `/src/app` own `/src/app-legacy/lib.ex`, and the buffer you did not mean
+to kill is the one from the project you are still working in."
+  (let (f (buffer-file buf))
+    (and (string? f)
+      (string? root)
+      (or (= f root)
+        (string/starts-with? f (if (string/ends-with? root "/") root (str root "/")))))))
+
+(sig project-buffer-names (model string -> seqable))
+(defn project-buffer-names (m root)
+  "The names of every pool buffer belonging to project `root`, in pool order.
+
+NAMES, not indices: killing shifts every index above the one killed, so a list of indices
+is stale after the first kill. `ed-kill-buffer-named` looks its index up again each time."
+  (into []
+    (seq/keep (:buffers m)
+      (fn (b) (if (project-owns-buffer? root b) (buffer-name b) nil)))))
+
+(defn project-kill-named (m names)
+  "Kill each of `names` in turn (`ed-kill-buffer-named`, so each `:on-close` runs and the
+panes showing it are re-pointed). Tail-recursive over the list; a name already gone is a
+no-op, which is what makes killing companions along the way safe."
+  (fold names m (fn (acc nm) (ed-kill-buffer-named acc nm))))
+
+(defcommand cmd-project-kill-buffers
+  (m key)
+  "Close every buffer belonging to the current project (C-x p k, Emacs
+`project-kill-buffers`) — after asking, with the count of unsaved ones in the question.
+
+One prompt, not one per buffer. Emacs asks again for each modified buffer, which for a
+project you have finished with is fifteen keystrokes to say the same thing once; saying
+how many are modified up front is the same consent, informed, in one key."
+  (let (root (ed-project-root m))
+    (if (nil? root)
+      (message m "not in a project")
+      (let (names (project-buffer-names m root)
+            dirty (count (seq/filter (:buffers m)
+                           (fn (b) (and (project-owns-buffer? root b) (buffer-modified? b)))))
+            label (path/basename root))
+        (if (empty? names)
+          (message m (str "no open buffers in " label))
+          (ed-read-char m
+            (str "Kill "
+              (count names)
+              " buffer"
+              (if (= (count names) 1) "" "s")
+              " in "
+              label
+              (if (> dirty 0) (str " (" dirty " unsaved)") "")
+              "? (y or n) ")
+            (fn (mm k)
+              (if (ed-yes-key? k)
+                (message (project-kill-named mm names)
+                  (str "killed " (count names) " buffer" (if (= (count names) 1) "" "s")))
+                (message mm "kill canceled")))))))))
+
+(defn- ed-project-prompt (root files &optional (boost nil))
+  "The find-file-in-project minibuffer spec over `files` (root-relative paths). Separate from
+the command because the file list can arrive LATE: the prompt opens over the cached list (or
+`()`) and this same shape is rebuilt around the real list when the walk lands
+(`ed-apply-project-scan`), so the two can never describe different things. `boost` is the
+project's frecency (`projects/project-file-boost`), ranked in as the fuzzy `:boost`."
+  {:edit (assoc (ed-mb-edit "Find file in project: " "") :word-mode :path) ; M-b/M-f by folder
+   :on-complete (fn (mm t)
+                  ;; a Vertico selection is a real project file → open it; a
+                  ;; typed string with no selection falls back to a prefix match.
+                  (if (includes? files t)
+                    (ed-visit-file mm (path/join root t))
+                    (let (ms (project-matches t files))
+                      (if (empty? ms)
+                        (message mm (str "no project file matching \"" t "\""))
+                        (ed-visit-file mm (path/join root (first ms)))))))
+   ;; Tab completes the typed path one component at a time — the identical
+   ;; `complete-prefix` action as find-file's Tab, over the project files that
+   ;; start with what's typed (prefix, so Tab only ever extends, never shrinks).
+   :complete-fn (fn (t) (complete-prefix t (project-matches t files)))
+   ;; default order: most-recently-visited (per project) first, then by last-written
+   :rank-source (sort-project-files root files) ; narrowed incrementally as you type
+   :rank-cap 20
+   ;; once something is typed: the fuzzy score plus what you open often and lately
+   :rank-boost boost
+   :project-files files ; what the prompt was built from — a refresh compares against it
+   :category :file ; marginalia per row, and paths ranked by their file name …
+   :anno-base root ; … the candidate is project-root-relative, so resolve from here
+   :accept-selection true})

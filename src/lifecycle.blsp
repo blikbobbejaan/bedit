@@ -1,0 +1,323 @@
+(defmodule lifecycle
+  "The file and session commands: writing and reverting a file, reloading the config, and
+quitting, with its questions: each unsaved buffer (`map-y-or-n-p`, Emacs's) and what is still
+running (`model/register-exit-query`)."
+  (:use editor/buffer)
+  (:use interactive) ; defcommand
+  (:use model)
+  (:use minibuffer)
+  (:use autosave :only [buffer-sudo-user ed-remove-auto-save ed-revert-at])
+  (:use projects :only [file-display-name recent-files])
+  (:use pool)) ; find-file, saving, the path prompt
+
+(defn ed-no-write-refusal (buf verb)
+  "Why `buf` must not be written to its file, as the echo-area line — or nil when it may be.
+Asks the buffer's MODE (its `:no-write` facet, `{:what :why}`), so a buffer whose text is a
+RENDERING of the file rather than the file — a hex view of a binary — refuses C-x C-s and
+C-x C-w alike without either command naming it. `verb` is the refused action (`saved` /
+`written`)."
+  (let (refusal (ed-mode-service buf :no-write))
+    (when refusal (str (:what refusal) " is not " verb " (" (:why refusal) ")"))))
+
+(defcommand cmd-write-file
+  (m key)
+  "Write the buffer to a path read in the minibuffer (C-x C-w); the buffer is then backed
+by that path (future C-x C-s saves there). Uses the same shared path prompt as find-file /
+dired (`ed-path-prompt`) — prefilled with the current file's path (else the current dir).
+A buffer whose mode refuses writing (`ed-no-write-refusal` — a hex view) is refused."
+  (if-let (refusal (ed-no-write-refusal (ed-current-buf m) "written"))
+    (message m refusal)
+    (assoc m
+      :minibuffer
+        (ed-path-prompt "Write file: "
+          (or (buffer-file (ed-current-buf m)) (str (ed-default-dir m) "/"))
+          (if (:recent-files m) (recent-files) [])
+          (fn (mm path)
+            (if (string/starts-with? path "/sudo:")
+              (ed-write-file-as-root mm path)
+              (ed-write-file-to mm path)))))))
+
+(defn- ed-write-file-as-root (m spec)
+  "C-x C-w to a TRAMP sudo path (`/sudo::/etc/motd`): the buffer becomes a sudo buffer
+backed by that file (`sudoedit`) and is saved through sudo — the password asked for when
+sudo wants one."
+  (let (parts (sudoedit/parse-sudo-path spec))
+    (if (or (nil? parts) (not (sudoedit/local-host? (:host parts))) (string/blank? (:path parts)))
+      (message m (str "write failed: not a sudo path on this machine: " spec " (/sudo::PATH)"))
+      (let (path (path/normalize (path/absolute (:path parts)))
+            old (ed-current-buf m)
+            old-key (hosted/hosted-key old)
+            b (assoc old
+                :file path
+                :sudo true
+                :sudo-user (:user parts)
+                :name (file-display-name path (ed-project-root m)))
+            index (ed-current-index m)
+            m2 (hosted/hosted-rekey-slot (dissoc (ed-set-buf m b) :status) index old-key))
+        (do
+          (ed-remove-auto-save (buffer-file old) (buffer-sudo-user old))
+          (ed-save-buf-at m2 index))))))
+
+(defn- ed-write-file-to (mm path)
+  "C-x C-w to plain `path`: the buffer written there and backed by it — no longer edited as
+root, if it was."
+  (let (old-file (buffer-file (ed-current-buf mm))
+        old-sudo (buffer-sudo-user (ed-current-buf mm))
+        old-key (hosted/hosted-key (ed-current-buf mm)))
+    (try
+      (let (b (assoc (dissoc (ed-current-buf mm) :sudo :sudo-user)
+                :file path
+                :name (file-display-name path (ed-project-root mm))))
+        ;; keep what save-buffer returns: it is unmodified AND stamped with the
+        ;; new file's mtime (dropping it left a stale stamp -> a false
+        ;; "changed on disk" on the next save)
+        (let (b2 (charset/save b)
+              ;; a shared buffer is now a different document: the registry
+              ;; entry (and every other frame's copy) follows it
+              m2 (hosted/hosted-rekey-slot (dissoc (ed-set-buf mm b2) :status)
+                   (ed-current-index mm)
+                   old-key))
+          (ed-remove-auto-save old-file old-sudo)
+          (message m2 (str "wrote " path))))
+      (catch e (message mm (str "write failed: " (error-message e)))))))
+
+(defcommand cmd-revert-buffer
+  (m key)
+  "Re-read the current buffer from its file on disk, discarding unsaved changes
+(M-x revert-buffer). Point stays on its line; the revert is one undoable edit, so C-/
+brings back what was discarded."
+  (let (b (ed-current-buf m) f (buffer-file b))
+    (if (nil? f)
+      (message m "no file to revert")
+      (if (= true (:sudo b))
+        (ed-revert-as-root m (ed-current-index m) nil)
+        (try
+          (message (ed-revert-at m (ed-current-index m)) (str "reverted " f))
+          (catch e (message m (str "revert failed: " (error-message e)))))))))
+
+;; ---- reload the user config (M-x reload-config) -----------------------------
+;; `~/.config/bedit/init.blsp` is read as DATA at startup (config/init-config),
+;; not eval'd — so eval-buffer on it reports "unbound symbol: config" (the `(config …)`
+;; form is a DSL, not a call). This command is the live way to apply edits to it without
+;; restarting: re-read the file and re-seed the model-level settings via the same
+;; `config/apply-to-model` `main` uses, surfacing any value typo in the echo area.
+
+(defcommand cmd-reload-config
+  (m key)
+  "Re-read ~/.config/bedit/init.blsp and apply it to the running editor (M-x
+reload-config). The live alternative to restarting — init.blsp is data (read, not eval'd),
+so it can't be applied with eval-buffer. The window's text settings and its `:font` are
+applied too; a font that is not installed, or a theme that does not exist, is said in the
+echo area and *Messages*."
+  (let (cfg (config/init-config)
+        warns (config/init-warnings cfg)
+        m1 (config/apply-to-model m cfg)
+        ;; the window-side keys too (:text-aa / :line-height), so a reload re-skins the window
+        _ (config/apply-window! cfg)
+        ;; and the font, which says when the one named is not installed
+        font-warning (startup/register-font (config/setting cfg :font))
+        theme-warning (themes/theme-from-config! cfg))
+    (doseq (warning (seq/reject [font-warning theme-warning] nil?)) (log/warn warning))
+    (message m1
+      (let (problem (or (first warns) font-warning theme-warning))
+        (if (nil? problem) "config reloaded" (str "config reloaded (" problem ")"))))))
+
+;; ---- files + quit -----------------------------------------------------------
+
+(defn- ed-quit-now (m)
+  "End the loop — and, on the primary, every open frame with it (`frames/frames-close-all`;
+a frame's own quit is just its loop, see `frames/cmd-delete-frame`)."
+  (assoc (if (or (:frame? m) (empty? (or (:frames m) [])))
+           m
+           ((reflect/eval 'frames/frames-close-all) m))
+    :done true))
+
+;; ---- map-y-or-n-p: ask about each of a list, y / n / ! / q ------------------
+;; Emacs's `map-y-or-n-p`, and the loop three commands here want. It existed already,
+;; spelled out inside `ed-quit-ask`; `save-some-buffers` needed the same thing and that is
+;; the moment to pull it up rather than write it twice.
+;;
+;; Not a modal overlay: each answer is an `ed-read-char` continuation, so the loop stays
+;; LIVE between questions — the editor still repaints, timers still fire, and a long list
+;; does not freeze anything. It also means the recursion costs no stack: each step returns
+;; to the loop and the next is entered from the keypress.
+
+;; check-allow: `on-yes` and `on-done` are caller-supplied, so the checker cannot see what
+;; the last step returns (ADR-341's `:trusted`, as `git-launch-op`).
+(check-allow :trusted
+  (sig ed-map-y-or-n (model seqable fn fn fn -> model))
+  (defn ed-map-y-or-n (m items label on-yes on-done)
+    "Ask about each of `items` in turn — `y` yes, `n` no, `!` yes to this and all the rest,
+`q` stop asking — then hand the model and the number accepted to `on-done`.
+
+`label` is `(item) -> string`, the question without its key hint. `on-yes` is
+`(model item) -> model`, applied only to the accepted ones. `C-g`/Esc abandons the whole
+run (`ed-read-char` catches them before the continuation), which is what a reader pressing
+it means and why they are not listed as answers."
+    (ed-map-y-or-n-step m (vec items) 0 0 label on-yes on-done)))
+
+(defn- ed-map-y-or-n-step (m items i accepted label on-yes on-done)
+  (if (>= i (count items))
+    (on-done m accepted)
+    (let (item (nth items i)
+          next (fn (mm acc) (ed-map-y-or-n-step mm items (inc i) acc label on-yes on-done)))
+      (ed-read-char m
+        (str (label item) " (y, n, !, q)")
+        (fn (mm k)
+          (cond
+            (or (ed-yes-key? k) (= k " ")) (next (on-yes mm item) (inc accepted))
+            ;; `!` — this one and every one after, without asking again. Folded rather
+            ;; than looped through the prompt, so it is one step however many remain.
+            (= k "!")
+              (let (rest-items (drop items i))
+                (on-done (fold rest-items mm (fn (acc it) (on-yes acc it)))
+                  (+ accepted (count rest-items))))
+            (= k "q") (on-done mm accepted)
+            ;; anything else is "no" — Emacs treats an unrecognised key as no rather than
+            ;; re-asking, and re-asking is how you get stuck in a prompt you cannot leave
+            else (next mm accepted)))))))
+
+(defcommand cmd-save-some-buffers
+  (m key)
+  "Save each modified file buffer, asking about each (C-x s, Emacs `save-some-buffers`)."
+  (let (pending (ed-modified-file-indices m))
+    (if (empty? pending)
+      (message m "(no changes need saving)")
+      ;; a run starts with an empty queue: one abandoned (C-g) must not be saved by this one
+      (ed-map-y-or-n (dissoc m :quit-sudo-saves)
+        pending
+        (fn (i) (str "Save file " (buffer-file (ed-buf-at m i)) "?"))
+        (fn (mm i) (ed-save-or-queue mm i))
+        (fn (mm n)
+          (let (said (message (dissoc mm :quit-sudo-saves)
+                       (if (= n 0)
+                         "(no buffers saved)"
+                         (str "saved " n " buffer" (if (= n 1) "" "s"))))
+                queued (or (:quit-sudo-saves mm) []))
+            ;; the ones edited as root go after, one sudo job at a time
+            (if (empty? queued) said (sudoedit/ed-sudo-save-all said queued identity))))))))
+
+(defn ed-live-processes-prompt (live)
+  "The question C-x C-c asks when `live` (lines from `model/ed-live-processes`) is not
+empty: Emacs's `Active processes exist; kill them and exit anyway?`, naming them — the
+first two, and how many more — since a prompt that does not say WHICH is answered blind."
+  (let (shown (take live 2)
+        more (- (count live) (count shown)))
+    (str (if (= (count live) 1) "Still running: " "Still running — ")
+      (string/join shown "; ")
+      (if (> more 0) (str "; and " more " more") "")
+      ". Kill and exit anyway? (y or n)")))
+
+(defn- ed-quit-confirm-processes (m)
+  "The last question before quitting: when a feature has work running that quitting kills
+(`model/ed-live-processes` — a compile, a test run, the app, a terminal's program, a push),
+ask; with none, quit."
+  (let (live (ed-live-processes m))
+    (if (empty? live)
+      (ed-quit-now m)
+      (ed-read-char m
+        (ed-live-processes-prompt live)
+        (fn (mm k) (if (ed-yes-key? k) (ed-quit-now mm) (message mm "quit canceled")))))))
+
+(defn- ed-quit-ask (m pending save-all?)
+  "Emacs `save-buffers-kill-terminal`: ask about each modified file buffer
+(`ed-map-y-or-n`), then — if anything is still modified — `Modified buffers exist; exit
+anyway?`, then — if anything is still running — whether to kill it
+(`ed-quit-confirm-processes`). `C-g` / Esc at any prompt cancels the quit.
+
+`save-all?` skips the asking about buffers (the `!` answer, and the caller that already
+knows); the running processes are still asked about."
+  (let (after-saves (fn (mm)
+                      (if (empty? (ed-modified-file-indices mm))
+                        (ed-quit-confirm-processes mm)
+                        (ed-read-char mm
+                          "Modified buffers exist; exit anyway? (y or n)"
+                          (fn (m2 k)
+                            (if (ed-yes-key? k)
+                              (ed-quit-confirm-processes m2)
+                              (message m2 "quit canceled"))))))
+        ;; a file edited AS ROOT is written off the loop, after its password when sudo wants
+        ;; one (sudoedit): its saves wait until every question is answered, and the quit goes
+        ;; on when the last has landed — or stops, saying why, when one fails or is cancelled
+        finish (fn (mm _)
+                 (let (queued (or (:quit-sudo-saves mm) []))
+                   (if (empty? queued)
+                     (after-saves mm)
+                     (sudoedit/ed-sudo-save-all (dissoc mm :quit-sudo-saves)
+                       queued after-saves " — quit canceled"))))
+        save (fn (mm i) (ed-save-or-queue mm i)))
+    (if save-all?
+      (finish (fold pending m save) 0)
+      (ed-map-y-or-n m
+        pending
+        (fn (i) (str "Save file " (buffer-file (ed-buf-at m i)) "?"))
+        save
+        finish))))
+
+(defn- ed-save-or-queue (m i)
+  "Save pool buffer `i` now — or, edited as root (sudoedit), queue it on `:quit-sudo-saves`
+for after the questions: its save asks for a password and lands later, and a masked prompt
+must not open between two y-or-n questions."
+  (let (b (ed-buf-at m i))
+    (if (= true (:sudo b))
+      (assoc m
+        :quit-sudo-saves
+          (conj (or (:quit-sudo-saves m) []) [(buffer-file b) (or (:sudo-user b) "root")]))
+      (ed-save-buf-at m i))))
+
+(defcommand cmd-quit
+  (m key)
+  "Quit the editor (C-x C-c, and the window's X button, delivered as `:close` — the
+model claims it with `:close-is-input?` so it lands here rather than quitting the loop
+outright). With unsaved changes to a file it asks first, buffer by buffer, the way Emacs's
+`save-buffers-kill-terminal` does (`ed-quit-ask`); then, with a compile, a test run, the
+app, a terminal's program or a push still running, whether to kill them (Emacs's \"Active
+processes exist\"); with neither it quits at once — and the primary takes every open frame
+with it. In a FRAME (`:frame?`) this is `delete-frame`: the
+frame closes, the editor and its buffers stay (Emacs closes an emacsclient frame the same
+way). ESC is *not* quit (it's `keyboard-escape-quit`; see `modes`)."
+  ;; save-place: every file's point, for the next session (live editor only; a secondary
+  ;; frame closing leaves the buffers open, so it has nothing to remember yet)
+  (when (and (:save-place m) (not (:frame? m))) (saveplace/remember-places! (:buffers m)))
+  ;; the keys this window timed since the slow-turn log last recorded them (brood ADR-612)
+  (let (m (slowlog/flush-latency m 1))
+    (if (:frame? m)
+      (assoc m :done true)
+      (ed-quit-ask (dissoc m :quit-sudo-saves) (ed-modified-file-indices m) false))))
+
+(defcommand cmd-save
+  (m key)
+  "Write the current buffer to its file (C-x C-s); report the outcome in the echo
+area. Leaves the buffer unmodified and deletes the `#filename#` auto-save
+sidecar on success (`ed-save-buf-at`). A no-op-with-message if the buffer has no
+backing file.
+
+With format-on-save on (and a formatter for this language) the write is a format
+(`formatter/on-save`, which saves first itself) — but only once the file is known to be
+ours to write: the \"changed on disk\" question comes FIRST. It used to come after, so
+with format-on-save on, a save silently overwrote another writer's changes."
+  (let (buf (ed-current-buf m)
+        write (fn (mm) (or (formatter/on-save mm) (ed-save-buf-at mm (ed-current-index mm))))
+        ;; a hex view names its file so the mode line and C-x C-j know it, but its TEXT
+        ;; is a rendering of the bytes: writing it would replace the binary with a dump.
+        ;; The mode says so (`:no-write`), so this command never names one.
+        refusal (ed-no-write-refusal buf "saved"))
+    (cond
+      refusal (message m refusal)
+      (nil? (buffer-file buf))
+        (message m "no file to save (C-x C-f to open one, or run: nest run -- <path>)")
+      ;; another writer changed the file since this buffer last agreed with it: saving
+      ;; would overwrite their work, so ask (Emacs: \"has changed since visited or saved\")
+      (buffer-file-changed? buf)
+        (ed-read-char m
+          (str (buffer-file buf) " has changed since visited or saved. Save anyway? (y or n)")
+          (fn (mm k)
+            (if (ed-yes-key? k)
+              (write mm)
+              (message mm "save canceled (M-x revert-buffer to reload the disk version)"))))
+      else (write m))))
+
+;; a guest may run these (src/guest.blsp)
+(interactive/declare-trait :guest
+  '(lifecycle/cmd-quit lifecycle/cmd-revert-buffer
+     lifecycle/cmd-save lifecycle/cmd-save-some-buffers))

@@ -452,6 +452,10 @@ src/commands.blsp           the GENERAL editing commands, each a (model key) -> 
                             window movers are Emacs's windmove-swap-states-* (C-S-arrows and
                             Emacs's s-S-arrows) and window-swap-states; a side window's `:side`
                             mark stays with its PLACE (`ed-keep-sides`)
+src/lifecycle.blsp          the file and session commands: write and revert a file, reload the config,
+                            quit with its questions (`ed-map-y-or-n`, what is still running)
+src/project-commands.blsp   C-x p f over a file list cached per root, refreshed off the loop; C-x p p
+                            picks a project and what to do in it; C-x p k closes one
 src/electric.blsp           electric pairs (Emacs electric-pair-mode) as POLICY: the pairs are the
                             MODE's — a layer's `:electric-pairs` (a `deflanguage`'s `:pairs`: `'`
                             where it opens a string, a backtick in Markdown / JS / Go / shell,
