@@ -1,0 +1,399 @@
+(defmodule bufferops
+  "Pure buffer -> buffer text operations the editor's commands are built on: paragraph and
+sentence motion, whitespace around point, joining lines, rectangles. Each takes a buffer and
+answers a fresh one, so the commands over them stay thin. Moved from brood's
+`std/editor/buffer` (brood ADR-417, ADR-630): only an editor calls them."
+  (:use editor/buffer))
+
+;; ---- paragraph motion (M-{ / M-}) -------------------------------------------
+;; A paragraph is a run of non-blank lines bounded by blank (empty / whitespace-only)
+;; lines. Forward motion skips any blank lines then the paragraph, landing at the next
+;; blank separator (or end of buffer); backward is the mirror, landing at the
+;; paragraph's first line. Pure line scans over the rope.
+
+(defn- line-blank? (buffer line)
+  "True if buffer `line` is empty or whitespace-only (a paragraph separator)."
+  (string/blank? (buffer-line-at buffer line)))
+
+(defn- scan-lines (buffer:any line:int line-count:int step:int want-blank?:bool -> int)
+  "First line index walking from `line` by `step` (±1, within `[0, line-count)`) whose
+blankness differs from `want-blank?`; stops at the buffer edge."
+  (if (or (< line 0) (>= line line-count) (not (= (line-blank? buffer line) want-blank?)))
+    line
+    (scan-lines buffer (+ line step) line-count step want-blank?)))
+
+(defn forward-paragraph (buffer)
+  "Point moved to the start of the next blank line after the current paragraph (end of
+buffer if none) — Emacs `forward-paragraph` (M-}).
+
+    (editor/buffer/buffer-point (bufferops/forward-paragraph (editor/buffer/make-buffer \"one\\ntwo\\n\\nthree\")))   ;=> 8"
+  (let (rope (get buffer :rope)
+        line-count (text/line-count rope)
+        line (text/char->line rope (get buffer :point))
+        ;; skip leading blank lines, then the paragraph
+        after-blank (scan-lines buffer line line-count 1 true)
+        boundary (scan-lines buffer after-blank line-count 1 false))
+    (goto-char buffer
+      (if (>= boundary line-count) (buffer-length buffer) (text/line->char rope boundary)))))
+
+(defn backward-paragraph (buffer)
+  "Point moved to the start of the current/previous paragraph (start of buffer if none)
+— Emacs `backward-paragraph` (M-{).
+
+    (editor/buffer/buffer-point (bufferops/backward-paragraph (editor/buffer/end-of-buffer (editor/buffer/make-buffer \"one\\n\\ntwo three\"))))   ;=> 0"
+  (let (rope (get buffer :rope)
+        line-count (text/line-count rope)
+        line (text/char->line rope (get buffer :point))
+        ;; step back over blank lines directly above, then over the paragraph's lines.
+        after-blank (scan-lines buffer (dec line) line-count -1 true)
+        start (scan-lines buffer after-blank line-count -1 false))
+    (goto-char buffer (text/line->char rope (math/max 0 (if (< start 0) 0 (inc start)))))))
+
+;; ---- sentence motion (M-a / M-e) --------------------------------------------
+;; A sentence ends at `.`/`?`/`!`, any closing quotes/brackets, then whitespace or the
+;; end of the text — ONE space is enough (Emacs' `sentence-end-double-space` off, which
+;; is what people set it to). Both motions are bounded by the enclosing paragraph, so
+;; they read only that paragraph's text.
+
+(def- sentence-enders (list "." "?" "!"))
+(def- sentence-closers (list "\"" "'" ")" "]" "}"))
+
+(defn- sentence-space? (character) (or (= character " ") (= character "\t") (= character "\n")))
+
+(defn- skip-sentence-spaces (text:string index:int limit:int -> int)
+  "Smallest index ≥ `index` (up to `limit`) whose char is not sentence whitespace."
+  (if (or (>= index limit) (not (sentence-space? (string/char-at text index))))
+    index
+    (skip-sentence-spaces text (inc index) limit)))
+
+(defn- sentence-closers-end (text:string index:int limit:int -> int)
+  "Index past any closing quotes/brackets starting at `index` — what may sit between a
+sentence's terminator and the whitespace after it (`he said \"stop.\"`)."
+  (if (or (>= index limit) (not (includes? sentence-closers (string/char-at text index))))
+    index
+    (sentence-closers-end text (inc index) limit)))
+
+(defn- sentence-end-at (text:string index:int limit:int -> (or int nil))
+  "Index just past a sentence ending AT `index` — a terminator, its closing quotes/brackets,
+then whitespace or `limit` — or nil when `index` doesn't end a sentence."
+  (if (not (includes? sentence-enders (string/char-at text index)))
+    nil
+    (let (after-closers (sentence-closers-end text (inc index) limit))
+      (if (or (>= after-closers limit) (sentence-space? (string/char-at text after-closers)))
+        after-closers
+        nil))))
+
+(defn- scan-sentence-forward (text index limit)
+  "Index just past the first sentence end at or after `index`, capped at `limit` (the
+paragraph's end); `limit` when the paragraph holds no further sentence end."
+  (if (>= index limit)
+    limit
+    (let (end (sentence-end-at text index limit))
+      (if (nil? end) (scan-sentence-forward text (inc index) limit) (math/min end limit)))))
+
+(defn- sentence-start-before (text:string index:int limit:int best:int -> int)
+  "The greatest sentence start `< limit`, scanning forward from `index` and carrying `best`
+(seeded with the paragraph start). A sentence start is the paragraph start, or the index
+just past a sentence end with the whitespace after it skipped."
+  (let (end (if (>= index limit) nil (sentence-end-at text index limit)))
+    (cond
+      (>= index limit) best
+      (nil? end) (sentence-start-before text (inc index) limit best)
+      else
+        (let (start (skip-sentence-spaces text end limit))
+          (if (>= start limit) best (sentence-start-before text start limit start))))))
+
+(defn forward-sentence (buffer:buffer -> buffer)
+  "Point moved just past the end of the current sentence — the paragraph's end when it
+holds no further sentence terminator (Emacs `forward-sentence`, M-e).
+
+    (editor/buffer/buffer-point (bufferops/forward-sentence (editor/buffer/make-buffer \"One. Two.\")))   ;=> 4"
+  (let (point (get buffer :point)
+        limit (math/max point (get (forward-paragraph buffer) :point)))
+    ;; only the paragraph is read: a sentence never reaches past it
+    (goto-char buffer
+      (+ point
+        (scan-sentence-forward (text/slice (get buffer :rope) point limit) 0 (- limit point))))))
+
+(defn backward-sentence (buffer:buffer -> buffer)
+  "Point moved to the start of the current sentence — the previous sentence's start when
+point already sits at one, the paragraph's start when there is no earlier sentence
+(Emacs `backward-sentence`, M-a).
+
+    (editor/buffer/buffer-point (bufferops/backward-sentence (editor/buffer/end-of-buffer (editor/buffer/make-buffer \"One. Two.\"))))   ;=> 5"
+  (let (point (get buffer :point)
+        floor (math/min point (get (backward-paragraph buffer) :point)))
+    ;; only the paragraph up to point is read, for the same reason
+    (goto-char buffer
+      (+ floor
+        (sentence-start-before (text/slice (get buffer :rope) floor point) 0 (- point floor) 0)))))
+
+;; ---- whitespace around point and joining lines (M-SPC / M-\ / M-^) -----------
+
+(def- *horizontal-space*
+  ;; horizontal only: a newline is a line boundary, never whitespace to squeeze
+  " \t")
+
+(defn whitespace-run-at (buffer:buffer -> (tuple int int))
+  "The span of spaces/tabs SURROUNDING point, as `[low high]` (`high` exclusive; `[p p]` when
+point is not in or beside one). Scans both directions but never across a newline, so it
+is the gap you are standing in — line structure is somebody else's business.
+
+Public because the span, not just its collapse, is what callers need: `collapse-whitespace`
+replaces it, `fixup-whitespace` decides what to leave in it, and a cycling command
+(Emacs 29's `cycle-spacing`, which walks one-space → none → *what was there*) has to read
+the original text out of it before touching anything.
+
+    (bufferops/whitespace-run-at (editor/buffer/goto-char (editor/buffer/make-buffer \"a   b\") 2))   ;=> [1 4]"
+  (let (rope (get buffer :rope)
+        point (buffer-point buffer))
+    [(text/skip-backward rope point *horizontal-space* true)
+      (text/skip-forward rope point *horizontal-space* true)]))
+
+(defn collapse-whitespace (buffer replacement)
+  "The run of spaces/tabs SURROUNDING point replaced by `replacement` — `\" \"` for Emacs's
+`just-one-space` (M-SPC), `\"\"` for `delete-horizontal-space` (M-\\), and the squeeze
+step of `fixup-whitespace`. Scans both directions from point but never across a
+newline, so it collapses the gap you are standing in and leaves the line structure
+alone. Point lands just after `replacement`.
+
+    (editor/buffer/buffer-text (bufferops/collapse-whitespace (editor/buffer/goto-char (editor/buffer/make-buffer \"a   b\") 2) \" \"))   ;=> \"a b\""
+  (let ([low high] (whitespace-run-at buffer))
+    (replace-region buffer low high replacement)))
+
+(def- close-delimiters [")" "]" "}"])
+(def- open-delimiters ["(" "[" "{"])
+
+(defn fixup-whitespace (buffer)
+  "Emacs `fixup-whitespace`: squeeze the horizontal whitespace around point to exactly
+ONE space — or to none in the places a space would be wrong. Point does not move (it
+stays at the join, ahead of any space inserted), so this composes under `join-line`.
+
+No space is left when point is at the start or end of a line, before a closing
+delimiter, or after an opening one: joining `(foo` to `bar)` gives `(foo bar)`, but
+joining `(foo bar` to `)` gives `(foo bar)` rather than `(foo bar )`. That rule is what
+makes the operation usable on Lisp — which is to say, on Brood source.
+
+    (editor/buffer/buffer-text (bufferops/fixup-whitespace (editor/buffer/goto-char (editor/buffer/make-buffer \"a   b\") 2)))   ;=> \"a b\""
+  (let (squeezed (collapse-whitespace buffer "")
+        at (buffer-point squeezed)
+        before (buffer-char-before squeezed)
+        after (buffer-char-after squeezed))
+    (if (or (nil? before)
+          (= before "\n") ; start of line
+          (nil? after)
+          (= after "\n") ; end of line
+          (includes? close-delimiters after)
+          (includes? open-delimiters before))
+      squeezed
+      (goto-char (insert squeezed " ") at))))
+
+(defn join-line (buffer)
+  "Emacs `delete-indentation` / `join-line` (M-^): pull THIS line up onto the previous
+one — delete the newline before it and `fixup-whitespace` at the seam, so the joined
+line's indentation collapses to a single space (or none, next to a delimiter). Point
+ends at the join. On the first line there is nothing above to join to, so the buffer
+comes back untouched.
+
+Note the direction: it joins the current line to the one ABOVE (Emacs), not the next
+line onto this one (Vim's `J`). Joining upward is what makes repeated presses walk a
+wrapped paragraph together from the bottom.
+
+    (editor/buffer/buffer-text (bufferops/join-line (editor/buffer/goto-char (editor/buffer/make-buffer \"a\\n   b\") 3)))   ;=> \"a b\""
+  (let (line-start (beginning-of-line buffer)
+        start (buffer-point line-start))
+    (if (= start 0)
+      buffer
+      (fixup-whitespace (delete-char (goto-char line-start (dec start)) 1)))))
+
+;; ---- rectangles: column-block ops (Emacs C-x r r/k/d/o/c/t/y) ---------------
+;; A RECTANGLE is the character grid between two corners — point and mark taken as
+;; (line, column) rather than as a linear span. Every op is pure and line-wise: it acts
+;; on `[left, right)` of each line in `[top, bottom]`. Edits run BOTTOM-TO-TOP so an
+;; earlier splice never invalidates a lower line's offsets. Short lines (content shorter
+;; than a column) are handled per op — `extract` pads to width so a kill round-trips, the
+;; blanking ops pad to `left` where Emacs does, `delete` simply takes what is there.
+;;
+;; The kernel has no rectangle primitive and needs none: this is `replace-region` over a
+;; computed set of per-line spans. The commands wire the keys and hold the killed rows (a
+;; rectangle kill is a LIST of rows, not a flat string — that is what makes a rectangle
+;; yank rebuild the block).
+
+(defn rectangle-bounds (buffer:buffer -> (or nil (tuple int int int int)))
+  "`[top bottom left right]` — the rectangle point↔mark spans as line/column corners
+(`top <= bottom`, `left <= right`), or nil when no mark is set. `left`/`right` are columns
+(0-based char offsets within a line); the block on each line is `[left, right)`.
+
+    (bufferops/rectangle-bounds (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8))   ;=> [0 1 1 3]"
+  (let (mark (get buffer :mark))
+    (if (nil? mark)
+      nil
+      (let (rope (get buffer :rope)
+            point (get buffer :point)
+            point-line (text/char->line rope point)
+            mark-line (text/char->line rope mark)
+            point-column (- point (text/line->char rope point-line))
+            mark-column (- mark (text/line->char rope mark-line)))
+        [(math/min point-line mark-line)
+          (math/max point-line mark-line)
+          (math/min point-column mark-column)
+          (math/max point-column mark-column)]))))
+
+(defn- line-content-length (rope:any line:int -> int)
+  ;; the line's length excluding any trailing newline
+  (let (line-text (text/line rope line))
+    (if (string/ends-with? line-text "\n")
+      (dec (string/length line-text))
+      (string/length line-text))))
+
+(defn- rectangle-spans (buffer)
+  ;; per line top..bottom, `[start low high]`: absolute line-start char, and the block's
+  ;; column offsets clamped to the line's content. nil when there is no rectangle.
+  (let (bounds (rectangle-bounds buffer))
+    (if (nil? bounds)
+      nil
+      (let ([top bottom left right] bounds
+            rope (get buffer :rope))
+        (map (range top (inc bottom))
+          (fn (line)
+            (let (start (text/line->char rope line)
+                  content (line-content-length rope line))
+              [start (math/min left content) (math/min right content)])))))))
+
+(defn extract-rectangle (buffer:buffer -> list)
+  "The rectangle's rows as a list of strings, one per line top..bottom, each right-padded
+with spaces to the rectangle's full width — so a kill round-trips through
+[[insert-rectangle]]. `()` when no mark is set.
+
+    (bufferops/extract-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8))   ;=> (\"bc\" \"fg\")"
+  (let (bounds (rectangle-bounds buffer))
+    (if (nil? bounds)
+      '()
+      (let ([top bottom left right] bounds
+            rope (get buffer :rope)
+            width (- right left))
+        (map (range top (inc bottom))
+          (fn (line)
+            (let (start (text/line->char rope line)
+                  content (line-content-length rope line)
+                  low (math/min left content)
+                  high (math/min right content)
+                  piece (text/slice rope (+ start low) (+ start high)))
+              (str piece (string/repeat " " (- width (string/length piece)))))))))))
+
+(defn- fold-rectangle-lines
+  (buffer:buffer
+    spans:
+      (len (list (tuple int int int)) 1 _)
+    edit:
+      (buffer int int int -> buffer)
+      ->
+      buffer)
+  ;; apply `(edit buffer start low high)` to each span, BOTTOM-TO-TOP so offsets above the
+  ;; edit stay valid, then park point at the rectangle's top-left. `spans` is
+  ;; `rectangle-spans`' output.
+  (let (edited (fold (reverse spans)
+                 buffer
+                 (fn (acc span) (let ([start low high] span) (edit acc start low high)))))
+    (goto-char edited (+ (first (first spans)) (second (first spans))))))
+;; A NON-EMPTY list of spans: `(first spans)` is what point parks at, so an empty
+;; rectangle is the caller's to refuse (`rectangle-spans` never yields one).
+
+(defn delete-rectangle (buffer)
+  "Delete `[left, right)` of every line the rectangle spans, closing the gap; point lands
+at the top-left. A no-op when no mark is set. Throws if the text is read-only.
+
+    (editor/buffer/buffer-text (bufferops/delete-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8)))   ;=> \"ad\\neh\""
+  (let (spans (rectangle-spans buffer))
+    (if (nil? spans)
+      buffer
+      (fold-rectangle-lines buffer
+        spans
+        (fn (acc start low high) (replace-region acc (+ start low) (+ start high) ""))))))
+
+(defn clear-rectangle (buffer)
+  "Blank the rectangle in place — replace `[left, right)` of each line with spaces, keeping
+every following column where it was. A no-op when no mark is set. Throws if read-only.
+
+    (editor/buffer/buffer-text (bufferops/clear-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8)))   ;=> \"a  d\\ne  h\""
+  (let (spans (rectangle-spans buffer))
+    (if (nil? spans)
+      buffer
+      (fold-rectangle-lines buffer
+        spans
+        (fn (acc start low high)
+          (replace-region acc (+ start low) (+ start high) (string/repeat " " (- high low))))))))
+
+(defn open-rectangle (buffer)
+  "Shift the rectangle's text to the right — insert the rectangle's width in spaces at its
+left column on every line, so the block becomes blank and what was there moves over. Short
+lines are padded to the left column first. A no-op when no mark is set; throws if read-only.
+
+    (editor/buffer/buffer-text (bufferops/open-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8)))   ;=> \"a  bcd\\ne  fgh\""
+  (let (bounds (rectangle-bounds buffer))
+    (if (nil? bounds)
+      buffer
+      (let ([top bottom left right] bounds
+            width (- right left)
+            spans (rectangle-spans buffer))
+        (fold-rectangle-lines buffer
+          spans
+          (fn (acc start low high)
+            ;; low is the content-clamped left; pad a short line out to `left`, then the width
+            (let (padding (- left low))
+              (replace-region acc
+                (+ start low)
+                (+ start low)
+                (string/repeat " " (+ padding width))))))))))
+
+(defn string-rectangle (buffer:buffer replacement:string -> buffer)
+  "Replace `[left, right)` of every line the rectangle spans with the string `replacement`
+(the same on each line) — Emacs `string-rectangle`. Short lines are padded to the left column
+first. A no-op when no mark is set; throws if read-only.
+
+    (editor/buffer/buffer-text (bufferops/string-rectangle (editor/buffer/goto-char (editor/buffer/set-mark (editor/buffer/goto-char (editor/buffer/make-buffer \"abcd\\nefgh\") 1)) 8) \"-\"))   ;=> \"a-d\\ne-h\""
+  (let (bounds (rectangle-bounds buffer))
+    (if (nil? bounds)
+      buffer
+      (let ([top bottom left right] bounds
+            spans (rectangle-spans buffer))
+        (fold-rectangle-lines buffer
+          spans
+          (fn (acc start low high)
+            (let (padding (- left low))
+              (replace-region acc
+                (+ start low)
+                (+ start high)
+                (str (string/repeat " " padding) replacement)))))))))
+
+(defn insert-rectangle (buffer:buffer rows:list -> buffer)
+  "Insert `rows` (a list of strings — an [[extract-rectangle]] result) as a column block at
+point: the first row at point, each later row on the next line at point's column, padding a
+short line (or a missing one at end of buffer) with spaces so the block stays aligned. Point
+returns to where it started. `rows` empty leaves `buffer` unchanged. Throws if read-only.
+
+    (editor/buffer/buffer-text (bufferops/insert-rectangle (editor/buffer/goto-char (editor/buffer/make-buffer \"ab\\ncd\") 1) (list \"X\" \"Y\")))   ;=> \"aXb\\ncYd\""
+  (if (empty? rows)
+    buffer
+    (let (rope (get buffer :rope)
+          start-point (get buffer :point)
+          start-line (text/char->line rope start-point)
+          column (- start-point (text/line->char rope start-line)))
+      (goto-char
+        (fold (seq/enumerate rows)
+          buffer
+          (fn (acc pair)
+            (let ([index row] pair
+                  line (+ start-line index)
+                  rope (get acc :rope)
+                  line-count (text/line-count rope))
+              (if (>= line line-count)
+                ;; past the end: a fresh line at `column`, made by padding after the last char
+                (let (end (buffer-length acc))
+                  (insert (goto-char acc end) (str "\n" (string/repeat " " column) row)))
+                (let (line-start (text/line->char rope line)
+                      content (line-content-length rope line)
+                      at (+ line-start (math/min column content))
+                      padding (math/max 0 (- column content)))
+                  (insert (goto-char acc at) (str (string/repeat " " padding) row)))))))
+        start-point))))
