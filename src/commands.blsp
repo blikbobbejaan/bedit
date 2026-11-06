@@ -408,17 +408,6 @@ a tree-sitter node."
 ;; leading whitespace, preserving point. Emacs feel: TAB indents-or-completes, and
 ;; (in brood-mode) RET indents the new line.
 
-(sig ed-rope-leading-ws (any int -> int))
-(defn- ed-rope-leading-ws (rope bol)
-  "The count of leading spaces/tabs on the line starting at offset `bol` of `rope`."
-  ;; WHY the rope and not a string: every caller used to pass `(buffer-text buf)`, which
-  ;; copies the WHOLE buffer into a fresh string (~1 ms on a 2 MB file) and then pays that
-  ;; string's first char-index build on `string/char-at` (another ~2-3 ms, O(buffer)
-  ;; whatever the offset) — to count a few spaces. `text/skip-forward` reads only the run.
-  ;; Same answer as the char-at walk it replaced: both stop at the first char that is
-  ;; neither a space nor a tab, or at the end of the text.
-  (- (text/skip-forward rope bol " \t" true) bol))
-
 (sig ed-fallback-indent (any int -> int))
 (defn- ed-fallback-indent (rope bol)
   "The simple, mode-less indent for the line at `bol`: the COLUMN the previous non-blank
@@ -426,7 +415,7 @@ line's text starts at — its leading whitespace's display width, a tab reaching
 of `*tab-width*` (bound by [[ed-indent-target]]) — or 0 at the top. Tail-recursive over
 blank lines. A count of characters was read as a column: after `\\tgcc x.c` in a Makefile,
 TAB wrote one space where make needs the tab."
-  ;; Over the rope for the reason `ed-rope-leading-ws` is: this walks a line or two, and
+  ;; Over the rope for the reason `rope-leading-whitespace` is: this walks a line or two, and
   ;; the string form paid O(buffer) to do it. The previous line's start is the rope's own
   ;; line index (`text/line->char` of the line holding `bol - 1`) — the offset just past
   ;; the previous newline that the backward char-at scan found.
@@ -434,7 +423,7 @@ TAB wrote one space where make needs the tab."
     0
     (let (prev-bol (text/line->char rope (text/char->line rope (dec bol)))
           content-len (- (dec bol) prev-bol)
-          ws (ed-rope-leading-ws rope prev-bol))
+          ws (rope-leading-whitespace rope prev-bol))
       (if (>= ws content-len)
         ; previous line is empty / all whitespace — skip it
         (ed-fallback-indent rope prev-bol)
@@ -488,9 +477,9 @@ indentation point moves to the first non-blank char; from the body it shifts by 
 indent delta."
   (let (p (buffer-point buf)
         bol (buffer-point (beginning-of-line buf))
-        ;; from the rope, not `(buffer-text buf)` — see `ed-rope-leading-ws`: RET and TAB
+        ;; from the rope, not `(buffer-text buf)` — see `rope-leading-whitespace`: RET and TAB
         ;; both land here, and the string copy was a third of RET's cost on a large file
-        cur (ed-rope-leading-ws (buffer-rope buf) bol)
+        cur (rope-leading-whitespace (buffer-rope buf) bol)
         within (<= (- p bol) cur)
         indentation (ed-indentation buf target)
         length (string/length indentation)
@@ -606,7 +595,7 @@ column that leaves (`ed-indentation`: tabs where the buffer indents with them), 
 counts as the columns it spans rather than one; a no-op on a line with none."
   (let (rope (buffer-rope buf)
         bol (text/line->char rope ln)
-        length (ed-rope-leading-ws rope bol)
+        length (rope-leading-whitespace rope bol)
         leading (text/slice rope bol (+ bol length))
         column (string/display-width leading 0 (tab-width buf))
         indentation (ed-indentation buf (math/max 0 (- column width))))
@@ -706,7 +695,7 @@ right indent and point sits on a symbol, complete instead (Emacs `tab-always-ind
         ;; here was a second whole-buffer string per TAB beside `ed-indent-target`'s; `p > 0`
         ;; there (it exceeds `bol + cur`), so the one-char slice before it is that same char
         (let (bol (buffer-point (beginning-of-line buf))
-              cur (ed-rope-leading-ws (buffer-rope buf) bol)
+              cur (rope-leading-whitespace (buffer-rope buf) bol)
               p (buffer-point buf)
               target (ed-indent-target buf held))
           (if (and (= cur target)
@@ -1071,14 +1060,12 @@ the fill column is broken first when the buffer auto-fills (`fill/ed-auto-fill`)
 (defcommand cmd-delete-char (m key) (ed-edit m (deleting-selection m delete-char)))
 (defcommand cmd-delete-backward (m key) (ed-edit m (deleting-selection m delete-backward-char)))
 
-;; ---- line / word editing (open-line, kill-line/word, transpose, case) -------
-
-;; ---- the kill ring (Emacs-style: coalesce consecutive kills; M-y yank-pops) --
+;; ---- killing (Emacs-style: consecutive kills coalesce; M-y yank-pops) --------
 ;; The model tracks `:last-command`/`:this-command` (set by the dispatch loop, see
 ;; `input`) so a kill knows whether the *previous* command was also a kill (then it
 ;; appends to the head entry rather than starting a new one), and so M-y
 ;; (`cmd-yank-pop`) only fires right after a yank. The ring itself — `ed-push-kill`, the
-;; coalescing rule and `ed-drag-select` — lives in `model`, beside the kill-ring state.
+;; coalescing rule and `ed-drag-select` — lives in `clipboard`, beside what it shares text with.
 (def- ed-yank-commands '(commands/cmd-yank commands/cmd-yank-pop))
 (defn- ed-yank-command? (sym) (includes? ed-yank-commands sym))
 
@@ -1113,6 +1100,8 @@ after it (M-u / M-l / M-c)."
     (if (or (nil? word) (= word ""))
       m
       (ed-edit m (fn (bb) (replace-region bb p e (f word)))))))
+
+;; ---- line / word editing (open-line, transpose, duplicate, join, case) ------
 
 ;; open lines — C-o keeps point, M-o opens below, M-O opens above
 (defcommand cmd-open-line
@@ -1271,110 +1260,6 @@ rule (one space, but none next to a delimiter) lives in `bufferops/join-line`."
     (assoc (ed-set-buf m (set-read-only b (not (read-only? b))))
       :echo (if (read-only? b) "writable" "read-only")))) ; report the NEW state
 
-;; ---- keyboard macros (C-x ( / C-x ) / C-x e) --------------------------------
-;; Recording captures raw input events into `:macro-recording` (the capture happens in
-;; `input/ed-update`, which sees every event); `:macro-last` holds the finished macro and
-;; `:run-macro {:count N}` asks `ed-update` to replay it N times by re-feeding the events
-;; (`input/ed-run-macro`) — N = 0 meaning until a key fails. A replay stops at the first key
-;; whose command fails (`model/ed-ding`, or a thrown error), as Emacs's does, or at C-g: it
-;; runs in slices, between the user's input. Emacs C-x (/)/e.
-
-(defcommand cmd-start-kbd-macro
-  (m key)
-  "Start recording a keyboard macro (C-x (): subsequent keys are captured until C-x )."
-  (assoc m :macro-recording [] :echo "Recording keyboard macro…"))
-
-(def- ed-prefix-starters
-  ;; the keys that begin a prefix argument (C-u, and the negative-argument bindings)
-  #{:ctrl-u :alt-- :ctrl-- :ctrl-meta--})
-
-(defn- ed-prefix-continues-key? (key)
-  "Whether `key` can follow the start of a prefix argument: another C-u, a digit or `-`."
-  (or (= key :ctrl-u)
-    (= key "-")
-    (and (string? key) (= (string/length key) 1) (>= (index-of "0123456789" key) 0))))
-
-(defn ed-macro-prefix-start (keys)
-  "Where the prefix argument that ends `keys` begins — the index of its C-u (or negative
-argument) — or `(count keys)` when they do not end in one. The keys a `C-u 3` typed before
-`C-x )` or `C-x e` were recorded too, and belong to that command, not the macro.
-
-    (commands/ed-macro-prefix-start [\"a\" \"5\" :ctrl-u \"3\"])   ;=> 2"
-  (letrec (back (fn (index start)
-                  (if (< index 0)
-                    start
-                    (let (key (nth keys index))
-                      (cond
-                        (contains? ed-prefix-starters key) (back (dec index) index)
-                        (and (ed-prefix-continues-key? key) (= start (count keys)))
-                          (back (dec index) start)
-                        ;; a digit before the C-u that started the argument is typed text
-                        else start)))))
-    (back (dec (count keys)) (count keys))))
-
-(defn- ed-macro-body (m)
-  "The keys of the macro being recorded: the keys that invoked the command ending it — the
-chord (`:chord` holds its keys before the last) and a prefix argument typed before it —
-dropped, since they were recorded before dispatch."
-  (let (recorded (:macro-recording m)
-        chord (inc (count (or (:chord m) [])))
-        body (take recorded (math/max 0 (- (count recorded) chord))))
-    (if (nil? (current-prefix-arg m)) body (take body (ed-macro-prefix-start body)))))
-
-(defn- ed-macro-finish (m)
-  "`m` with recording ended and the macro recorded made the last macro, said in the echo
-area — unless nothing was recorded: then the last macro is KEPT, as Emacs's \"Ignore empty
-macro\" keeps it, so a stray `C-x ( C-x )` never loses the macro you had."
-  (let (body (ed-macro-body m)
-        stopped (dissoc m :macro-recording))
-    (if (empty? body)
-      (message stopped "Ignore empty macro")
-      (message (assoc stopped :macro-last body) "Keyboard macro defined"))))
-
-(defn- ed-macro-run (m repeats)
-  "Ask the loop to replay the last macro `repeats` times (0: until a key fails) — or say why it
-cannot: none recorded, a negative count, or a macro already running (a macro that ran
-itself would never end)."
-  (cond
-    (nil? (:macro-last m))
-      (ed-ding (message m "no keyboard macro defined (record one with C-x ( … C-x ))"))
-    (:macro-executing m) (ed-ding m "a keyboard macro cannot run itself")
-    (< repeats 0)
-      (ed-ding m "a keyboard macro runs a positive number of times, or 0: until it fails")
-    else (assoc m :run-macro {:count repeats})))
-
-(defcommand cmd-end-kbd-macro
-  (m key)
-  "Finish recording the keyboard macro (C-x )); it becomes the last macro for C-x e. With a
-prefix argument N, run it N-1 more times (Emacs's `kmacro-end-macro`); `C-u 0 C-x )` runs it
-again until a key fails."
-  (cond
-    (nil? (:macro-recording m)) (ed-ding (message m "not currently defining a keyboard macro"))
-    (or (nil? (current-prefix-arg m)) (empty? (ed-macro-body m))) (ed-macro-finish m)
-    else
-      (let (repeats (current-prefix-arg m)
-            finished (ed-macro-finish m))
-        (cond
-          (= repeats 0) (ed-macro-run finished 0)
-          (> repeats 1) (ed-macro-run finished (dec repeats))
-          else finished))))
-
-(defcommand cmd-execute-kbd-macro
-  (m key)
-  "Execute the last keyboard macro (C-x e); `ed-update` replays its events. With a prefix
-argument N it runs N times, and `C-u 0 C-x e` runs it until a key fails — a search that
-finds nothing, a motion at the end of the buffer (Emacs's `call-last-kbd-macro`). Any run
-stops at the first key whose command fails. Pressed while recording, it ends the recording
-first and then runs the macro (Emacs's `kmacro-end-and-call-macro`)."
-  (let (repeats (or (current-prefix-arg m) 1))
-    (if (nil? (:macro-recording m))
-      (ed-macro-run m repeats)
-      (ed-macro-run (ed-macro-finish m) repeats))))
-
-;; both read the prefix argument as their repeat count, so they run once under it
-(register-prefix-consuming 'commands/cmd-end-kbd-macro)
-(register-prefix-consuming 'commands/cmd-execute-kbd-macro)
-
 ;; ---- zap-to-char (M-z) ------------------------------------------------------
 
 (defcommand cmd-zap-to-char
@@ -1496,134 +1381,6 @@ like find-file's (`ed-path-list-prompt`). A no-op-with-message when empty."
   "Open a recently-visited file (C-x C-r): pick from the recentf list (most-recent
 first, fuzzy-narrowed). The list is the persisted ~/.cache/brood/recent-files cache."
   (ed-recentf-prompt m (into [] (recent-files))))
-
-;; ---- comment / uncomment (M-;) ----------------------------------------------
-;; Language-neutral: the comment token comes from the buffer mode's `:comment-syntax`
-;; service (brood-mode → `";; "`); a mode without one can't comment. DWIM toggle: if
-;; every non-blank line in range is already commented, uncomment; else comment. Edits
-;; are computed per line from the *current* buffer (commenting never adds/removes a
-;; newline, so line numbers stay stable), so order doesn't matter.
-
-(defn- ed-line-blank? (buf l) (string/blank? (buffer-line-at buf l)))
-
-;; Every per-line reader below works on the ROPE. They each took `(buffer-text buf)` — a
-;; copy of the whole buffer — per line, and the commented-test then copied the REST of the
-;; buffer again (`string/substring text at`) just to ask whether it starts with `;;`: M-; on
-;; one line of a 2 MB file was several whole-buffer copies, and a region was that per line.
-
-(defn- ed-indent-at (buf l)
-  "The offset of line `l`'s first non-indent character (its start plus its leading
-spaces/tabs)."
-  (let (rope (buffer-rope buf) bol (text/line->char rope l)) (+ bol (ed-rope-leading-ws rope bol))))
-
-(defn- ed-rope-starts-with? (buf at s)
-  "True if the text of `buf` from offset `at` begins with `s`."
-  ;; the slice is exactly as long as `s` (or what is left, when less is): equal to `s`
-  ;; precisely when the text from `at` starts with it — what `string/starts-with?` asked of
-  ;; the substring to the END of the buffer
-  (= (text/slice (buffer-rope buf) at (math/min (buffer-length buf) (+ at (string/length s)))) s))
-
-(defn- ed-line-commented? (buf l trimmed)
-  "True if line `l` (after its indent) starts with the trimmed comment token."
-  (ed-rope-starts-with? buf (ed-indent-at buf l) trimmed))
-
-(defn- ed-comment-line (buf l tok)
-  "Insert comment token `tok` at the indent column of line `l`."
-  (insert (goto-char buf (ed-indent-at buf l)) tok))
-
-(defn- ed-uncomment-line (buf l tok trimmed)
-  "Strip a leading comment token from line `l` — the full `tok` (with its space) when
-present, else the trimmed token; a no-op if the line isn't commented."
-  (let (at (ed-indent-at buf l)
-        n (cond
-            (ed-rope-starts-with? buf at tok) (string/length tok)
-            (ed-rope-starts-with? buf at trimmed) (string/length trimmed)
-            else 0))
-    (if (= n 0) buf (replace-region buf at (+ at n) ""))))
-
-(defn- ed-toggle-comment (buf tok)
-  "Comment or uncomment the buffer's `region-line-range` with token `tok`, leaving
-point at the start line's indent. DWIM: uncomment iff every non-blank line in range
-is already commented, else comment. The per-line edit folds over `map-region-lines`."
-  (let (trimmed (string/trimr tok)
-        [sl el] (region-line-range buf)
-        nonblank (seq/reject (range sl (inc el)) (fn (l) (ed-line-blank? buf l)))
-        all-commented? (and (not (empty? nonblank))
-                         (every? nonblank (fn (l) (ed-line-commented? buf l trimmed))))
-        edited (map-region-lines buf
-                 (fn (b l)
-                   (cond
-                     (ed-line-blank? b l) b
-                     all-commented? (ed-uncomment-line b l tok trimmed)
-                     else (ed-comment-line b l tok)))))
-    (goto-char edited (ed-indent-at edited sl))))
-
-;; A language with only BLOCK comments (CSS's `/* */`, HTML's `<!-- -->`, the mode's
-;; `:comment-block` pair) comments a line by wrapping what follows its indent in the pair,
-;; so each line stays a comment on its own and uncommenting one never strands the rest.
-
-(defn- ed-line-parts (buf l)
-  ;; `[bol indent body]`: where line `l` starts, its leading whitespace, and the rest with
-  ;; trailing whitespace dropped
-  (let (rope (buffer-rope buf)
-        bol (text/line->char rope l)
-        text (wrap/rope-line-text rope l)
-        indent (ed-rope-leading-ws rope bol))
-    [bol (string/substring text 0 indent) (string/trimr (string/substring text indent))]))
-
-(defn- ed-block-commented? (body open close)
-  (and (string/starts-with? body (string/trimr open)) (string/ends-with? body (string/triml close))))
-
-(defn- ed-block-strip (body open close)
-  ;; `body` without its pair — the spaced form when it has it, else the bare tokens
-  (let (start (if (string/starts-with? body open)
-                (string/length open)
-                (string/length (string/trimr open)))
-        end (- (string/length body)
-              (if (string/ends-with? body close)
-                (string/length close)
-                (string/length (string/triml close)))))
-    (string/substring body start (math/max start end))))
-
-(defn- ed-toggle-block-comment (buf pair)
-  "`ed-toggle-comment` for a block-comment `pair` (`[open close]`): every non-blank line in
-range wrapped in it, or — when each already is — unwrapped. Point at the first line's indent."
-  (let ([open close] pair
-        [sl el] (region-line-range buf)
-        nonblank (seq/reject (range sl (inc el)) (fn (l) (ed-line-blank? buf l)))
-        all-commented? (and (not (empty? nonblank))
-                         (every? nonblank
-                           (fn (l) (ed-block-commented? (nth (ed-line-parts buf l) 2) open close))))
-        edited (map-region-lines buf
-                 (fn (b l)
-                   (if (ed-line-blank? b l)
-                     b
-                     (let ([bol indent body] (ed-line-parts b l)
-                           eol (+ bol (string/length (wrap/rope-line-text (buffer-rope b) l))))
-                       (replace-region b
-                         bol
-                         eol
-                         (str indent
-                           (if all-commented?
-                             (ed-block-strip body open close)
-                             (str open body close)))))))))
-    (goto-char edited (ed-indent-at edited sl))))
-
-(defcommand cmd-comment-dwim
-  (m key)
-  "Comment or uncomment the region's lines (or the current line) — M-;. Toggles by
-whether every non-blank line in range is already commented. The comment token comes
-from the buffer mode's `:comment-syntax` service (brood-mode → `\";; \"`), or, for a language
-with only block comments, its `:comment-block` pair wrapped round each line
-(`ed-toggle-block-comment`); a mode that defines neither (plain text) reports that it can't
-comment."
-  (let (buf (ed-current-buf m)
-        tok (ed-mode-service buf :comment-syntax)
-        pair (ed-mode-service buf :comment-block))
-    (cond
-      tok (ed-edit m (fn (b) (ed-toggle-comment b tok)))
-      (and (vector? pair) (= (count pair) 2)) (ed-edit m (fn (b) (ed-toggle-block-comment b pair)))
-      else (message m "no comment syntax for this mode"))))
 
 ;; ---- incremental search (C-s / C-r) -----------------------------------------
 ;; Open the modal isearch loop; `input/ed-update` then routes keys to it (see
@@ -1767,7 +1524,7 @@ so `z` re-invokes the original rather than recursing."
       (let (result ((reflect/eval to-repeat) m key))
         (assoc result :this-command to-repeat)))))
 
-;; ---- region / kill ring (C-SPC set mark · C-w kill · M-w copy · C-y yank) ----
+;; ---- the prefix argument and the mark (C-u · M-- · C-SPC · C-x C-x · M-@) ----
 
 (defcommand cmd-universal-argument
   (m key)
@@ -1944,6 +1701,8 @@ a plain motion afterwards collapses it (`input/ed-shift-deactivate`)."
 motion (Emacs shift-select). Bound to every `:shift-*` key; `key` picks the motion."
     (let (move (get ed-shift-motion-for key))
       (if (nil? move) m (ed-shift-move m move key)))))
+
+;; ---- kill, copy and yank the region (C-w · M-w · C-y) -------------------------
 
 (defcommand cmd-kill-region
   (m key)
@@ -2132,76 +1891,6 @@ works on that yank once it is in."
           (if swapped?
             (assoc m2 :yank {:start (:start y) :end (buffer-point (ed-current-buf m2)) :index idx})
             m2)))))
-
-;; ---- the kill ring, browsable (M-x browse-kill-ring) ---------------------------
-;; M-y walks the ring one entry at a time, blind. *Kill Ring* shows all of it — every entry,
-;; newest first, between separator lines — and RET on one inserts it where you were, and
-;; moves it to the front of the ring (Emacs's `browse-kill-ring` package).
-
-(def ed-kill-ring-separator "────────────────────────────────────────")
-(def- ed-kill-ring-entry-lines 12) ; an entry longer than this shows its first lines and a count
-
-(defn- ed-kill-ring-entry-text (entry)
-  "How one ring entry shows: its text, cut to its first lines when it is long."
-  (let (lines (string/split entry "\n"))
-    (if (<= (count lines) ed-kill-ring-entry-lines)
-      entry
-      (str (string/join (take lines ed-kill-ring-entry-lines) "\n")
-        "\n… "
-        (- (count lines) ed-kill-ring-entry-lines)
-        " more lines"))))
-
-(defn ed-kill-ring-text (ring)
-  "The *Kill Ring* listing: each entry of `ring`, newest first, under a separator line."
-  (if (empty? ring)
-    "The kill ring is empty.\n"
-    (str (string/join (map ring
-                        (fn (entry)
-                          (str ed-kill-ring-separator "\n" (ed-kill-ring-entry-text entry))))
-           "\n")
-      "\n")))
-
-(sig ed-kill-ring-index-at (buffer -> int))
-(defn ed-kill-ring-index-at (buf)
-  "Which entry the line at point belongs to: the separators at or above it, less one — -1
-above the first."
-  (let (line (buffer-current-line buf))
-    (dec (count (seq/filter (range (inc line))
-                  (fn (i) (string/starts-with? (buffer-line-at buf i) ed-kill-ring-separator)))))))
-
-(defcommand cmd-browse-kill-ring
-  (m key)
-  "Show every entry of the kill ring in `*Kill Ring*`, newest first (M-x browse-kill-ring).
-RET on an entry inserts it in the buffer you came from and moves it to the front of the
-ring; `g` refreshes, `q` quits."
-  (let (adopted (ed-adopt-shared-ring m)
-        origin (buffer-name (ed-current-buf adopted)))
-    (assoc (ed-show-named adopted "*Kill Ring*" (ed-kill-ring-text (:kill-ring adopted)) :kill-ring)
-      :kill-ring-origin origin)))
-
-(defcommand cmd-kill-ring-insert
-  (m key)
-  "RET in `*Kill Ring*`: insert the entry at point in the buffer the listing was opened
-from, and make it the newest entry, so C-y repeats it."
-  (let (index (ed-kill-ring-index-at (ed-current-buf m))
-        ring (:kill-ring m)
-        origin (:kill-ring-origin m))
-    (cond
-      (or (< index 0) (>= index (count ring))) (message m "not on a kill-ring entry")
-      (nil? (ed-buffer-index-by-name m origin))
-        (message m (str "the buffer it came from is gone: " origin))
-      else
-        (let (entry (nth ring index)
-              front (cons entry (seq/remove-nth ring index))
-              back (ed-switch-to-named m origin)
-              [inserted ok?] (ed-try-edit back (fn (b) (insert b entry))))
-          (if ok? (ed-set-kill-ring inserted front) inserted)))))
-
-(defcommand cmd-kill-ring-refresh
-  (m key)
-  "g in `*Kill Ring*`: rebuild the listing — another frame may have killed since."
-  (let (adopted (ed-adopt-shared-ring m))
-    (ed-show-named adopted "*Kill Ring*" (ed-kill-ring-text (:kill-ring adopted)) :kill-ring)))
 
 ;; ---- multiple buffers -------------------------------------------------------
 
@@ -2689,8 +2378,8 @@ up), `line` itself when it is not blank or the run ends there."
   (let (n (buffer-line-count buf)
         step (fn (l)
                (let (next (+ l dir))
-                 (if (and (>= next 0) (< next n) (ed-line-blank? buf next)) (step next) l))))
-    (if (ed-line-blank? buf line) (step line) line)))
+                 (if (and (>= next 0) (< next n) (line-blank? buf next)) (step next) l))))
+    (if (line-blank? buf line) (step line) line)))
 
 (defn- ed-delete-lines (buf from to)
   "Delete buffer lines `[from, to]` inclusive, with their newlines."
@@ -2708,7 +2397,7 @@ blank line, delete it; on a non-blank line, delete every blank line that follows
   (ed-edit m
     (fn (b)
       (let (line (buffer-current-line b))
-        (if (ed-line-blank? b line)
+        (if (line-blank? b line)
           (let (first (ed-blank-run b line -1)
                 last (ed-blank-run b line 1))
             (if (= first last)
@@ -2718,7 +2407,7 @@ blank line, delete it; on a non-blank line, delete every blank line that follows
                 (text/line->char (buffer-rope b) first))))
           (let (n (buffer-line-count b)
                 next (inc line))
-            (if (and (< next n) (ed-line-blank? b next))
+            (if (and (< next n) (line-blank? b next))
               (let (last (ed-blank-run b next 1)
                     p (buffer-point b))
                 (goto-char (ed-delete-lines b next last) p))
@@ -2804,33 +2493,31 @@ text and the mark after it, so the inserted text is the region."
      commands/cmd-backward-sentence commands/cmd-backward-sexp commands/cmd-backward-up-list
      commands/cmd-backward-word commands/cmd-barf-backward commands/cmd-barf-forward
      commands/cmd-beginning-of-buffer commands/cmd-beginning-of-defun commands/cmd-beginning-of-line
-     commands/cmd-brood-mode commands/cmd-browse-kill-ring commands/cmd-buffer-menu-refresh
-     commands/cmd-buffer-menu-select commands/cmd-capitalize-word commands/cmd-clear-rectangle
-     commands/cmd-close-delimiter commands/cmd-comment-dwim commands/cmd-copy-rectangle-as-kill
-     commands/cmd-copy-region commands/cmd-count-words commands/cmd-dabbrev-expand
-     commands/cmd-dedent commands/cmd-delete-backward commands/cmd-delete-blank-lines
-     commands/cmd-delete-char commands/cmd-delete-rectangle commands/cmd-delete-trailing-whitespace
-     commands/cmd-describe-indentation commands/cmd-downcase-word commands/cmd-down-list
-     commands/cmd-duplicate-line commands/cmd-electric-backspace commands/cmd-electric-close
-     commands/cmd-emacs-mode commands/cmd-end-kbd-macro commands/cmd-end-of-buffer
-     commands/cmd-end-of-defun commands/cmd-end-of-line commands/cmd-exchange-point-and-mark
-     commands/cmd-execute-extended-command commands/cmd-execute-kbd-macro commands/cmd-forward-char
-     commands/cmd-forward-list commands/cmd-forward-paragraph commands/cmd-forward-sentence
-     commands/cmd-forward-sexp commands/cmd-forward-word commands/cmd-fuzzy-find-line
-     commands/cmd-goto-char commands/cmd-goto-line commands/cmd-indent-line
-     commands/cmd-indent-or-complete commands/cmd-indent-sexp commands/cmd-isearch-backward
-     commands/cmd-isearch-backward-regexp commands/cmd-isearch-forward
+     commands/cmd-brood-mode commands/cmd-buffer-menu-refresh commands/cmd-buffer-menu-select
+     commands/cmd-capitalize-word commands/cmd-clear-rectangle commands/cmd-close-delimiter
+     commands/cmd-copy-rectangle-as-kill commands/cmd-copy-region commands/cmd-count-words
+     commands/cmd-dabbrev-expand commands/cmd-dedent commands/cmd-delete-backward
+     commands/cmd-delete-blank-lines commands/cmd-delete-char commands/cmd-delete-rectangle
+     commands/cmd-delete-trailing-whitespace commands/cmd-describe-indentation
+     commands/cmd-downcase-word commands/cmd-down-list commands/cmd-duplicate-line
+     commands/cmd-electric-backspace commands/cmd-electric-close commands/cmd-emacs-mode
+     commands/cmd-end-of-buffer commands/cmd-end-of-defun commands/cmd-end-of-line
+     commands/cmd-exchange-point-and-mark commands/cmd-execute-extended-command
+     commands/cmd-forward-char commands/cmd-forward-list commands/cmd-forward-paragraph
+     commands/cmd-forward-sentence commands/cmd-forward-sexp commands/cmd-forward-word
+     commands/cmd-fuzzy-find-line commands/cmd-goto-char commands/cmd-goto-line
+     commands/cmd-indent-line commands/cmd-indent-or-complete commands/cmd-indent-sexp
+     commands/cmd-isearch-backward commands/cmd-isearch-backward-regexp commands/cmd-isearch-forward
      commands/cmd-isearch-forward-regexp commands/cmd-isearch-forward-word commands/cmd-join-line
      commands/cmd-keyboard-quit commands/cmd-kill-line commands/cmd-kill-rectangle
-     commands/cmd-kill-region commands/cmd-kill-ring-insert commands/cmd-kill-ring-refresh
-     commands/cmd-kill-sentence commands/cmd-kill-sexp commands/cmd-kill-whole-line
-     commands/cmd-kill-word commands/cmd-list-buffers commands/cmd-mark-defun
-     commands/cmd-mark-paragraph commands/cmd-mark-sexp commands/cmd-mark-sexp-backward
-     commands/cmd-mark-whole-buffer commands/cmd-mark-word commands/cmd-mark-word-backward
-     commands/cmd-move-to-window-line commands/cmd-narrow-to-defun commands/cmd-narrow-to-paragraph
-     commands/cmd-narrow-to-region commands/cmd-negative-argument commands/cmd-newline
-     commands/cmd-newline-and-indent commands/cmd-next-buffer commands/cmd-next-line
-     commands/cmd-occur commands/cmd-open-delimiter commands/cmd-open-line
+     commands/cmd-kill-region commands/cmd-kill-sentence commands/cmd-kill-sexp
+     commands/cmd-kill-whole-line commands/cmd-kill-word commands/cmd-list-buffers
+     commands/cmd-mark-defun commands/cmd-mark-paragraph commands/cmd-mark-sexp
+     commands/cmd-mark-sexp-backward commands/cmd-mark-whole-buffer commands/cmd-mark-word
+     commands/cmd-mark-word-backward commands/cmd-move-to-window-line commands/cmd-narrow-to-defun
+     commands/cmd-narrow-to-paragraph commands/cmd-narrow-to-region commands/cmd-negative-argument
+     commands/cmd-newline commands/cmd-newline-and-indent commands/cmd-next-buffer
+     commands/cmd-next-line commands/cmd-occur commands/cmd-open-delimiter commands/cmd-open-line
      commands/cmd-open-line-above commands/cmd-open-line-below commands/cmd-open-rectangle
      commands/cmd-pop-jump commands/cmd-previous-buffer commands/cmd-previous-line
      commands/cmd-project-switch-buffer commands/cmd-query-replace commands/cmd-query-replace-regexp
@@ -2838,13 +2525,13 @@ text and the mark after it, so the inserted text is the region."
      commands/cmd-scroll-down commands/cmd-scroll-up commands/cmd-self-insert
      commands/cmd-set-fill-column commands/cmd-set-mark commands/cmd-sexp-kill
      commands/cmd-shift-motion commands/cmd-slurp-backward commands/cmd-slurp-forward
-     commands/cmd-sort-lines commands/cmd-splice-sexp commands/cmd-start-kbd-macro
-     commands/cmd-string-rectangle commands/cmd-switch-buffer commands/cmd-text-mode
-     commands/cmd-toggle-read-only commands/cmd-transpose-chars commands/cmd-transpose-lines
-     commands/cmd-transpose-sexps commands/cmd-transpose-words commands/cmd-undo
-     commands/cmd-universal-argument commands/cmd-upcase-word commands/cmd-up-list
-     commands/cmd-vim-mode commands/cmd-widen commands/cmd-wrap-round commands/cmd-yank
-     commands/cmd-yank-pop commands/cmd-yank-rectangle commands/cmd-zap-to-char))
+     commands/cmd-sort-lines commands/cmd-splice-sexp commands/cmd-string-rectangle
+     commands/cmd-switch-buffer commands/cmd-text-mode commands/cmd-toggle-read-only
+     commands/cmd-transpose-chars commands/cmd-transpose-lines commands/cmd-transpose-sexps
+     commands/cmd-transpose-words commands/cmd-undo commands/cmd-universal-argument
+     commands/cmd-upcase-word commands/cmd-up-list commands/cmd-vim-mode commands/cmd-widen
+     commands/cmd-wrap-round commands/cmd-yank commands/cmd-yank-pop commands/cmd-yank-rectangle
+     commands/cmd-zap-to-char))
 
 ;; ---- what the core must know of these commands (`interactive/declare-trait`) ------------
 ;; a typing run: consecutive repeats amalgamate into one undo step, and their settling arms

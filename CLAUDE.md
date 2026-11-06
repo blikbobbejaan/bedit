@@ -500,6 +500,12 @@ src/commands.blsp           the GENERAL editing commands, each a (model key) -> 
                             editing, kill ring, buffers, prompts. A feature's commands
                             live in its own module (dired, help, vim, registers, hexl,
                             eval-commands, shell-command), bound by qualified symbol
+src/comment.blsp            M-; comment-dwim (Emacs newcomment): the mode's `:comment-syntax` token,
+                            or a block-only language's `:comment-block` pair round each line
+src/kmacro.blsp             C-x ( · C-x ) · C-x e, the keyboard-macro commands (Emacs kmacro);
+                            the recording and the replay are `input`'s
+src/browse-kill-ring.blsp   M-x browse-kill-ring: *Kill Ring*, newest first, RET inserts the
+                            entry where it was opened from (the ring is `clipboard`'s)
 src/window-commands.blsp    the window commands: tiled splits, windmove and Emacs's
                             windmove-swap-states-* (C-S-arrows and s-S-arrows), window-swap-states,
                             the C-x 4 prefix; a side window's `:side` mark stays with its PLACE

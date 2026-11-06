@@ -1,0 +1,140 @@
+(defmodule comment
+  "M-; — comment or uncomment the region's lines or the current line (Emacs's
+`comment-dwim`, newcomment.el). Language-neutral: the token is the mode's `:comment-syntax`
+service, or a block-only language's `:comment-block` pair."
+  (:use editor/buffer) ; the rope the per-line readers walk
+  (:use bufferops :only [line-blank? rope-leading-whitespace]) ; a blank line is left alone; the indent kept
+  (:use interactive) ; defcommand
+  (:use model)) ; ed-current-buf / ed-mode-service / ed-edit / message
+
+;; Language-neutral: the comment token comes from the buffer mode's `:comment-syntax`
+;; service (brood-mode → `";; "`); a mode without one can't comment. DWIM toggle: if
+;; every non-blank line in range is already commented, uncomment; else comment. Edits
+;; are computed per line from the *current* buffer (commenting never adds/removes a
+;; newline, so line numbers stay stable), so order doesn't matter.
+
+;; Every per-line reader below works on the ROPE. They each took `(buffer-text buf)` — a
+;; copy of the whole buffer — per line, and the commented-test then copied the REST of the
+;; buffer again (`string/substring text at`) just to ask whether it starts with `;;`: M-; on
+;; one line of a 2 MB file was several whole-buffer copies, and a region was that per line.
+
+(defn- ed-indent-at (buf line)
+  "The offset of line `l`'s first non-indent character (its start plus its leading
+spaces/tabs)."
+  (let (rope (buffer-rope buf) line-start (text/line->char rope line))
+    (+ line-start (rope-leading-whitespace rope line-start))))
+
+(defn- ed-rope-starts-with? (buf at prefix)
+  "True if the text of `buf` from offset `at` begins with `s`."
+  ;; the slice is exactly as long as `s` (or what is left, when less is): equal to `s`
+  ;; precisely when the text from `at` starts with it — what `string/starts-with?` asked of
+  ;; the substring to the END of the buffer
+  (= (text/slice (buffer-rope buf) at (math/min (buffer-length buf) (+ at (string/length prefix))))
+    prefix))
+
+(defn- ed-line-commented? (buf line trimmed)
+  "True if line `l` (after its indent) starts with the trimmed comment token."
+  (ed-rope-starts-with? buf (ed-indent-at buf line) trimmed))
+
+(defn- ed-comment-line (buf line token)
+  "Insert comment token `tok` at the indent column of line `l`."
+  (insert (goto-char buf (ed-indent-at buf line)) token))
+
+(defn- ed-uncomment-line (buf line token trimmed)
+  "Strip a leading comment token from line `l` — the full `tok` (with its space) when
+present, else the trimmed token; a no-op if the line isn't commented."
+  (let (at (ed-indent-at buf line)
+        strip (cond
+                (ed-rope-starts-with? buf at token) (string/length token)
+                (ed-rope-starts-with? buf at trimmed) (string/length trimmed)
+                else 0))
+    (if (= strip 0) buf (replace-region buf at (+ at strip) ""))))
+
+(defn- ed-toggle-comment (buf token)
+  "Comment or uncomment the buffer's `region-line-range` with `token`, leaving
+point at the start line's indent. DWIM: uncomment iff every non-blank line in range
+is already commented, else comment. The per-line edit folds over `map-region-lines`."
+  (let (trimmed (string/trimr token)
+        [start-line end-line] (region-line-range buf)
+        nonblank (seq/reject (range start-line (inc end-line)) (fn (line) (line-blank? buf line)))
+        all-commented? (and (not (empty? nonblank))
+                         (every? nonblank (fn (line) (ed-line-commented? buf line trimmed))))
+        edited (map-region-lines buf
+                 (fn (edited line)
+                   (cond
+                     (line-blank? edited line) edited
+                     all-commented? (ed-uncomment-line edited line token trimmed)
+                     else (ed-comment-line edited line token)))))
+    (goto-char edited (ed-indent-at edited start-line))))
+
+;; A language with only BLOCK comments (CSS's `/* */`, HTML's `<!-- -->`, the mode's
+;; `:comment-block` pair) comments a line by wrapping what follows its indent in the pair,
+;; so each line stays a comment on its own and uncommenting one never strands the rest.
+
+(defn- ed-line-parts (buf line)
+  ;; `[bol indent body]`: where line `l` starts, its leading whitespace, and the rest with
+  ;; trailing whitespace dropped
+  (let (rope (buffer-rope buf)
+        line-start (text/line->char rope line)
+        text (wrap/rope-line-text rope line)
+        indent (rope-leading-whitespace rope line-start))
+    [line-start (string/substring text 0 indent) (string/trimr (string/substring text indent))]))
+
+(defn- ed-block-commented? (body open close)
+  (and (string/starts-with? body (string/trimr open)) (string/ends-with? body (string/triml close))))
+
+(defn- ed-block-strip (body open close)
+  ;; `body` without its pair — the spaced form when it has it, else the bare tokens
+  (let (start (if (string/starts-with? body open)
+                (string/length open)
+                (string/length (string/trimr open)))
+        end (- (string/length body)
+              (if (string/ends-with? body close)
+                (string/length close)
+                (string/length (string/triml close)))))
+    (string/substring body start (math/max start end))))
+
+(defn- ed-toggle-block-comment (buf pair)
+  "`ed-toggle-comment` for a block-comment `pair` (`[open close]`): every non-blank line in
+range wrapped in it, or — when each already is — unwrapped. Point at the first line's indent."
+  (let ([open close] pair
+        [start-line end-line] (region-line-range buf)
+        nonblank (seq/reject (range start-line (inc end-line)) (fn (line) (line-blank? buf line)))
+        all-commented? (and (not (empty? nonblank))
+                         (every? nonblank
+                           (fn (line)
+                             (ed-block-commented? (nth (ed-line-parts buf line) 2) open close))))
+        edited (map-region-lines buf
+                 (fn (edited line)
+                   (if (line-blank? edited line)
+                     edited
+                     (let ([line-start indent body] (ed-line-parts edited line)
+                           line-end (+ line-start
+                                      (string/length (wrap/rope-line-text (buffer-rope edited) line))))
+                       (replace-region edited
+                         line-start
+                         line-end
+                         (str indent
+                           (if all-commented?
+                             (ed-block-strip body open close)
+                             (str open body close)))))))))
+    (goto-char edited (ed-indent-at edited start-line))))
+
+(defcommand cmd-comment-dwim
+  (m key)
+  "Comment or uncomment the region's lines (or the current line) — M-;. Toggles by
+whether every non-blank line in range is already commented. The comment token comes
+from the buffer mode's `:comment-syntax` service (brood-mode → `\";; \"`), or, for a language
+with only block comments, its `:comment-block` pair wrapped round each line
+(`ed-toggle-block-comment`); a mode that defines neither (plain text) reports that it can't
+comment."
+  (let (buf (ed-current-buf m)
+        token (ed-mode-service buf :comment-syntax)
+        pair (ed-mode-service buf :comment-block))
+    (cond
+      token (ed-edit m (fn (edited) (ed-toggle-comment edited token)))
+      (and (vector? pair) (= (count pair) 2))
+        (ed-edit m (fn (edited) (ed-toggle-block-comment edited pair)))
+      else (message m "no comment syntax for this mode"))))
+
+(interactive/declare-trait :guest '(comment/cmd-comment-dwim))
