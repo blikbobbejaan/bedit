@@ -1,0 +1,326 @@
+(defmodule stringlex
+  "The LINE LEXER a string syntax becomes (a mode's `:string-syntax`, `stringstate`): what a line
+leaves the next one inside, and the fast path that answers it with one regex miss on a line
+with no quote or comment. Pure: text and states in, states out. No buffer, no model, so the
+warm task, the line cache and M-q's marker check share it.")
+
+;; ---- the line lexer -----------------------------------------------------------------------
+;; A state is `[inside stack]`: `inside` nil in code, `[:string open multiline? raw?]` in a
+;; string, `[:block close]` in a block comment; `stack` the open brackets, a string of their
+;; openers, innermost last. Small values, compared with `=`, as the line cache wants.
+
+(defn lexer-data (syntax brackets)
+  "What lexing a line needs, built once per syntax: the token pattern (block-comment openers,
+string openers longest first, line comments, the char-literal quote, the brackets), and lookups."
+  (let (strings (seq/sort-by (or (:strings syntax) [])
+                  (fn (entry) (- 0 (string/length (:open entry)))))
+        blocks (or (:block-comments syntax) [])
+        comments (or (:comments syntax) [])
+        char-quote (:char-literal syntax)
+        tokens (append (map blocks first)
+                 (map strings :open)
+                 comments
+                 (if (string? char-quote) [char-quote] [])
+                 (map brackets first)
+                 (map brackets second)))
+    {:pattern (string/join (map tokens regex/escape) "|")
+     :fast (fast-pattern syntax)
+     :bracket-pattern (string/join (map (append (map brackets first) (map brackets second))
+                                     regex/escape)
+                        "|")
+     :strings strings
+     :blocks blocks
+     :comments comments
+     :word-start? (= true (:comment-word-start syntax))
+     :char-quote char-quote
+     :openers (into {} (map brackets (fn (pair) [(first pair) (second pair)])))
+     :closers (into {} (map brackets (fn (pair) [(second pair) (first pair)])))}))
+
+(sig escaped? (string int -> bool))
+(defn- escaped? (line at)
+  ;; whether the character at `at` follows an odd run of backslashes
+  (letrec (back (fn (i n)
+                  (if (and (>= i 0) (= (string/char-at line i) "\\")) (back (dec i) (inc n)) n)))
+    (math/odd? (back (dec at) 0))))
+
+(sig closer-at (string int string any -> int))
+(defn- closer-at (line from close raw?)
+  ;; the offset of the first `close` at or after `from` that no backslash escapes, or -1
+  (let (at (index-of line close from))
+    (cond
+      (< at 0) -1
+      (and (not raw?) (escaped? line at)) (closer-at line (inc at) close raw?)
+      else at)))
+
+(sig word-start? (string int -> bool))
+(defn- word-start? (line at)
+  ;; whether `at` begins a word, as the shell reads a `#`: the line's start, or after
+  ;; whitespace or an operator
+  (or (= at 0) (includes? [" " "\t" ";" "|" "&" "(" "`"] (string/char-at line (dec at)))))
+
+(sig next-token (any string int -> (or nil (tuple int string))))
+(defn- next-token (data line from)
+  ;; `[start text]` of the next token at or after `from`, or nil
+  (let (found (regex/find (:pattern data) (string/substring line from (string/length line))))
+    (when found
+      (let (start (:start found)
+            text (:text found))
+        (when (and (int? start) (string? text)) [(+ from start) text])))))
+
+(defn lex-line (data line state)
+  "One line through the lexer: `{:tokens :open :end :low :excess}` — the `[start end kind]`
+string (`[:string open closed?]`), char-literal and `:comment` tokens; the state at the line's
+end with a one-line string still open (`:open`, what a prefix of a line ends in) and after the
+line's end has closed it (`:end`, what the next line starts in); the fewest open brackets the
+line reached (`:low`, 0 when what was open at its start all closed); and the first closer that
+closed nothing, `[offset closer]` (`:excess`)."
+  (let (n (string/length line))
+    (letrec (go (fn (i inside stack tokens low excess)
+                  (let (finish (fn (inside-end tokens)
+                                 {:tokens tokens
+                                  :open [inside stack]
+                                  :end [inside-end stack]
+                                  :low low
+                                  :excess excess}))
+                    (cond
+                      ;; in a string: to its closer, or across the line's end
+                      (and inside (= (first inside) :string))
+                        (let ([_ open multiline? raw?] inside
+                              at (closer-at line i open raw?))
+                          (if (< at 0)
+                            (let (token [i n [:string open false]])
+                              (assoc (finish (if multiline? inside nil) (conj tokens token))
+                                :open [inside stack]))
+                            (go (+ at (string/length open))
+                              nil
+                              stack
+                              (conj tokens [i (+ at (string/length open)) [:string open true]])
+                              low
+                              excess)))
+                      ;; in a block comment: to its closer
+                      inside
+                        (let (close (second inside)
+                              at (index-of line close i))
+                          (if (< at 0)
+                            (finish inside (conj tokens [i n :comment]))
+                            (go (+ at (string/length close))
+                              nil
+                              stack
+                              (conj tokens [i (+ at (string/length close)) :comment])
+                              low
+                              excess)))
+                      else
+                        (let (token (next-token data line i))
+                          (if (nil? token)
+                            (finish nil tokens)
+                            (let ([at text] token
+                                  after (+ at (string/length text))
+                                  string (seq/find (:strings data)
+                                           (fn (entry) (= (:open entry) text)))
+                                  block (seq/find (:blocks data) (fn (pair) (= (first pair) text))))
+                              (cond
+                                block (go after [:block (second block)] stack tokens low excess)
+                                ;; a char literal, when a quote closes it; a lifetime otherwise
+                                (and (= text (:char-quote data)) (nil? string))
+                                  (let (literal (regex/find (str "^"
+                                                              (regex/escape text)
+                                                              "(?:\\\\.[^"
+                                                              (regex/escape text)
+                                                              "]*|[^\\\\"
+                                                              (regex/escape text)
+                                                              "])"
+                                                              (regex/escape text))
+                                                  (string/substring line at n)))
+                                    (if literal
+                                      (go (+ at (string/length (:text literal)))
+                                        nil
+                                        stack
+                                        (conj tokens
+                                          [at (+ at (string/length (:text literal))) :char])
+                                        low
+                                        excess)
+                                      (go after nil stack tokens low excess)))
+                                string
+                                  (let (entry [:string
+                                                text
+                                                (= true (:multiline string))
+                                                (= true (:raw string))]
+                                        at-close (closer-at line after text (= true (:raw string))))
+                                    (if (< at-close 0)
+                                      (assoc (finish (if (nth entry 2) entry nil)
+                                               (conj tokens [at n [:string text false]]))
+                                        :open [entry stack])
+                                      (go (+ at-close (string/length text))
+                                        nil
+                                        stack
+                                        (conj tokens
+                                          [at (+ at-close (string/length text)) [:string text true]])
+                                        low
+                                        excess)))
+                                (includes? (:comments data) text)
+                                  (if (and (:word-start? data) (not (word-start? line at)))
+                                    (go after nil stack tokens low excess)
+                                    (finish nil (conj tokens [at n :comment])))
+                                (contains? (:openers data) text)
+                                  (go after nil (str stack text) tokens low excess)
+                                ;; a closer: closes the innermost open bracket, or nothing
+                                (= stack "") (go after nil stack tokens low (or excess [at text]))
+                                else
+                                  (let (popped (string/substring stack
+                                                 0
+                                                 (dec (string/length stack))))
+                                    (go after
+                                      nil
+                                      popped
+                                      tokens
+                                      (math/min low (string/length popped))
+                                      excess))))))))))
+      (let ([inside stack] state) (go 0 inside stack [] (string/length stack) nil)))))
+
+;; ---- the fast path: what a line leaves the next one inside -----------------------------------
+;; The cache asks only what each line ENDS inside, for every line of the file the first time —
+;; so that answer is one native regex pass over the line: each string with its body, each
+;; comment, a char literal, as whole matches, leftmost first. Only the last match can be open.
+
+(defn- body-alternative (entry)
+  ;; one string as a whole match: opener, lazy body (escapes skipped unless raw), closer — or
+  ;; the line's end
+  (let (open (regex/escape (:open entry))
+        body (if (:raw entry) "." "(?:\\\\.|[^\\\\])"))
+    (str open body "*?(?:" open "|$)")))
+
+(defn fast-pattern (syntax)
+  "The regex whose leftmost matches over ONE line are `syntax`'s whole tokens: block comments
+(to their close or the line's end), char literals, strings (to their closer or the line's end),
+line comments (only at a word's start under `:comment-word-start`)."
+  (let (strings (seq/sort-by (or (:strings syntax) [])
+                  (fn (entry) (- 0 (string/length (:open entry)))))
+        blocks (map (or (:block-comments syntax) [])
+                 (fn (pair)
+                   (str (regex/escape (first pair)) ".*?(?:" (regex/escape (second pair)) "|$)")))
+        quote (:char-literal syntax)
+        chars (if (string? quote)
+                (let (q (regex/escape quote)) [(str q "(?:\\\\.[^" q "]*|[^\\\\" q "])" q)])
+                [])
+        word-start? (= true (:comment-word-start syntax))
+        lines (map (or (:comments syntax) [])
+                (fn (token)
+                  (str (if word-start? "(?:^|[ \t;|&(`])" "") (regex/escape token) ".*"))))
+    (string/join (append blocks chars (map strings body-alternative) lines) "|")))
+
+(defn- open-match (data line found)
+  ;; what the line's LAST token match leaves open: a multi-line string or a block comment
+  ;; that did not reach its closer, else nil
+  (let (text (:text found)
+        end (:end found)
+        string (seq/find (:strings data) (fn (entry) (string/starts-with? text (:open entry))))
+        block (seq/find (:blocks data) (fn (pair) (string/starts-with? text (first pair)))))
+    (cond
+      string
+        (let (open (:open string)
+              closed? (and (>= (string/length text) (* 2 (string/length open)))
+                        (string/ends-with? text open)
+                        (or (:raw string)
+                          (not (int? end))
+                          (not (escaped? line (- end (string/length open)))))))
+          (when (and (not closed?) (:multiline string))
+            [:string open true (= true (:raw string))]))
+      block
+        (when (not (and (> (string/length text) (string/length (first block)))
+                     (string/ends-with? text (second block))))
+          [:block (second block)])
+      else nil)))
+
+(sig bracket-step (any string string -> string))
+(defn- bracket-step (data stack text)
+  ;; `stack` after the brackets of `text`, a stretch of code: an opener pushes, a closer pops
+  ;; the innermost, a closer with nothing open closes nothing — as `lex-line` counts them
+  (if (or (= (:bracket-pattern data) "") (= text ""))
+    stack
+    (fold (regex/find-all (:bracket-pattern data) text)
+      stack
+      (fn (acc found)
+        (let (bracket (:text found))
+          (cond
+            (contains? (:openers data) bracket) (str acc bracket)
+            (= acc "") acc
+            else (string/substring acc 0 (dec (string/length acc)))))))))
+
+(sig code-prefix (any string -> string))
+(defn- code-prefix (data text)
+  ;; the code a fast-pattern match begins with: the character before a word-start line
+  ;; comment (`(?:^|[ \t;|&(`])#` matches the `(` of `$(# x`), else nothing
+  (if (and (:word-start? data)
+        (> (string/length text) 1)
+        (not (any? (:comments data) (fn (token) (string/starts-with? text token))))
+        (any? (:comments data) (fn (token) (string/starts-with? (string/substring text 1) token))))
+    (string/substring text 0 1)
+    ""))
+
+(defn start-state (data text state)
+  "The state a line whose text is `text` starts in, from `state` — what the line above left
+it: a line in code that begins a top-level form by its look (`top-level-line?`) starts with no
+bracket open, as Emacs's `open-paren-in-column-0-is-defun-start` reads one. So a bracket left
+open while you type counts only to the next top-level form, never to the end of the file."
+  (let ([inside _] state) (if (and (nil? inside) (top-level-line? data text)) [nil ""] state)))
+
+(defn state-after (data line state)
+  "The state the line after `line` starts in, given the `state` (`[inside stack]`) `line`
+starts in — the line cache's question: what the line ends INSIDE, answered with one native pass
+(`fast-pattern`) after the closer of a string or block comment it opens inside of, and the
+brackets its code leaves open, counted in the stretches of code between that pass's matches.
+
+    (stringlex/state-after (stringlex/lexer-data {:strings [{:open \"'\"}]} [[\"(\" \")\"]]) \"  f(a, ')'\" [nil \"\"])   ;=> [nil \"(\"]"
+  (let ([inside stack] (start-state data line state)
+        n (string/length line)
+        from (cond
+               (nil? inside) 0
+               (= (first inside) :string)
+                 (let ([_ open _ raw?] inside
+                       at (closer-at line 0 open raw?))
+                   (if (< at 0) nil (+ at (string/length open))))
+               else
+                 (let (at (index-of line (second inside) 0))
+                   (if (< at 0) nil (+ at (string/length (second inside)))))))
+    (if (nil? from)
+      [inside stack]
+      (let (rest (string/substring line from n)
+            found (if (= (:fast data) "") [] (regex/find-all (:fast data) rest))
+            [cursor carried] (fold found
+                               [0 stack]
+                               (fn (acc match)
+                                 (let ([at open-brackets] acc
+                                       start (:start match)
+                                       end (:end match)
+                                       text (:text match))
+                                   (if (and (int? start) (int? end) (string? text))
+                                     [end
+                                       (bracket-step data
+                                         open-brackets
+                                         (str (string/substring rest at start)
+                                           (code-prefix data text)))]
+                                     acc)))))
+        [(if (empty? found) nil (open-match data rest (last found)))
+          (bracket-step data carried (string/substring rest cursor (string/length rest)))]))))
+
+(defn inside-after (data line inside)
+  "What the line after `line` starts inside, given what `line` starts inside — the inside half
+of [[state-after]]."
+  (first (state-after data line [inside ""])))
+
+(defn line-lexer-of (data)
+  "`data`'s lexer as an `editor/highlight` line lexer whose state is what a line starts in,
+`[inside stack]` ([[state-after]]): inside which string or block comment, and the brackets open.
+A bracket left open changes the states below it only to the next top-level form
+([[start-state]]), where the cache comes back in step. A line's spans are none: the cache
+serves states (`editor/highlight/line-cache-state`), and the tokens of point's line come from
+`lex-line`."
+  (editor/highlight/line-lexer (fn (line state) [[] (state-after data line state)]) [nil ""]))
+
+(defn top-level-line? (data text)
+  "Whether a line begins a top-level form by its look: something at column 0 that is not
+whitespace and not a closer — `def`, `(defn`, `fn main`, a key — as Emacs's
+`open-paren-in-column-0-is-defun-start` reads one."
+  (and (> (string/length text) 0)
+    (let (c (string/char-at text 0))
+      (and (not (string/blank? c)) (not (contains? (:closers data) c))))))

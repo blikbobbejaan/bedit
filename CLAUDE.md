@@ -494,11 +494,14 @@ src/stringstate.blsp        where a buffer's strings and comments are (Emacs's s
                             splice log, so a key lexes its own line (~5 ms at the end of a 1 MB
                             file). A key never walks a cold region: it lexes at most `*key-lines*`
                             (`line-cache-state-within`) and past that guesses from the nearest
-                            top-level form; a large buffer's cache is built off the loop at once
-                            on its visit or a guess (a post-step) and on the idle beat.
+                            top-level form; a large buffer's cache is built off the loop (stringwarm).
                             The held tree-sitter parse answers first when it is current and whole.
                             Brackets are counted from point's top-level form forward until they
                             close; electric pairs ask it to open, close or skip, M-q for the string
+src/stringlex.blsp          the line lexer a string syntax becomes: what a line leaves the next one
+                            inside, its fast path. Pure, so the warm task shares it
+src/stringwarm.blsp         stringstate's cache built off the loop: at once on a large visit or a
+                            guess (a post-step, order 60), and on the idle beat (order 95)
 src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string/fill-prefixes`
                             (brood ADR-589, Emacs's adaptive fill): the first line keeps its
                             prefix, the rest the paragraph's continuation — a list item HANGS under

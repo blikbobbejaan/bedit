@@ -1,0 +1,110 @@
+(defmodule stringwarm
+  "`stringstate`'s cache built off the loop, so a key never walks a cold region: on the idle
+beat, and at once when a large buffer is visited or a key had to guess."
+  (:use editor/buffer) ; buffer-rope
+  (:use task) ; task — the cache warmed off the loop
+  (:use stringstate :only [ed-line-state]) ; the loop's cache, moved onto the text first
+  (:use model)) ; ed-current-buf / ed-current-index / the registries
+
+;; The first question in a large file reads every line above point once (~1 s for a 1 MB file),
+;; and an edit that turns the rest of a file into a string re-reads what follows it. Neither may
+;; land on a keypress: on the idle beat a task brings the current buffer's cache down to its last
+;; line, and the loop takes it back. A rope cannot cross a message, so the task returns the cache
+;; without its rope, and the loop restores the rope it captured.
+
+(def *warm-lines*
+  ;; a buffer this long (lines) has its cache warmed off the loop; a shorter one is read on the
+  ;; key in a few milliseconds
+  1000)
+
+(defn ed-string-warm-stale? (m)
+  "True when the current buffer is long enough to warm (`*warm-lines*`), no warm is in flight,
+and its string cache is missing or behind its text — and a warm did not already fail on this
+text (else the beat would fire again after every beat)."
+  (let (buf (ed-current-buf m)
+        rope (buffer-rope buf)
+        entry (get (or (:string-caches m) {}) (ed-current-index m)))
+    (and (not (:string-warm-proc m))
+      (not (= rope (:string-warm-failed m)))
+      (> (text/line-count rope) *warm-lines*)
+      (or (nil? entry) (not (= (:rope (:cache entry)) rope))))))
+
+(defn warm-cache (cache lexer rope)
+  "`cache` brought down to `rope`'s last line by `lexer`, without its rope — what a warm task
+returns (a rope cannot cross a message)."
+  (dissoc (first (editor/highlight/line-cache-state cache lexer rope (text/line-count rope) nil))
+    :rope))
+
+(defn ed-launch-string-warm (m)
+  "Bring the current buffer's string cache down to its last line in a spawned task, when it
+needs it ([[ed-string-warm-stale?]]). What the loop holds for it moves onto the text first —
+its edits taken from the splice log, cheap — so the task starts from an exact cache."
+  (if (or (not (or (ed-string-warm-stale? m) (ed-string-warm-urgent? m))) (ed-headless?))
+    m
+    (let (buf (ed-current-buf m)
+          idx (ed-current-index m)
+          rope (buffer-rope buf)
+          [m2 _] (ed-line-state m idx buf 0)
+          entry (get (:string-caches m2) idx)
+          cache (:cache entry)
+          lexer (:lexer entry)
+          job (task (fn ()
+                      (check-allow :discarded-catch
+                        (try
+                          {:cache (warm-cache cache lexer rope)}
+                          (catch _ :failed))))))
+      (assoc m2
+        :string-warm-proc job
+        :string-warm-index idx
+        :string-warm-rope rope
+        :string-warm-stamp (:stamp entry)))))
+
+(sig ed-apply-string-warm (model any -> model))
+(defn ed-apply-string-warm (m result)
+  "A finished warm: its cache becomes that pool buffer's, with the rope it was warmed over —
+unless the buffer's syntax changed meanwhile. Edits made since it was launched move it on the
+next question, from the buffer's splice log."
+  (let (idx (:string-warm-index m)
+        rope (:string-warm-rope m)
+        warmed (when (map? result) (:cache result))
+        cleared (assoc m
+                  :string-warm-proc nil
+                  :string-warm-index nil
+                  :string-warm-rope nil
+                  :string-warm-stamp nil)
+        entry (when (int? idx) (get (or (:string-caches cleared) {}) idx)))
+    (cond
+      (nil? warmed) (assoc cleared :string-warm-failed rope)
+      (or (nil? entry) (not (= (:stamp entry) (:string-warm-stamp m)))) cleared
+      else
+        (assoc cleared
+          :string-caches
+            (assoc (:string-caches cleared)
+              idx (dissoc (assoc entry :cache (assoc warmed :rope rope)) :guessed))))))
+
+(register-task-reply :string-warm-proc 'stringwarm/ed-apply-string-warm nil nil)
+
+;; `:stale?` ARMS the beat: a large file opened and only read has no edit to arm one
+(register-idle-job :string-warm
+  {:order 95 :run 'stringwarm/ed-launch-string-warm :stale? 'stringwarm/ed-string-warm-stale?})
+
+(defn ed-string-warm-urgent? (m)
+  "True when the current buffer's cache must not wait for the idle beat: a large buffer has
+none — it was just created or visited — or a key had to GUESS its line's state because the
+cache did not reach it (`guess-line-state`: a cold region, or the tail after an edit that
+changed what every line below it starts inside), in a buffer of any size. O(1), asked after
+every event."
+  (let (buf (ed-current-buf m)
+        rope (buffer-rope buf)
+        entry (get (or (:string-caches m) {}) (ed-current-index m)))
+    (and (not (:string-warm-proc m))
+      (not (= rope (:string-warm-failed m)))
+      (or (and (nil? entry) (> (text/line-count rope) *warm-lines*)) (= true (:guessed entry))))))
+
+(defn ed-warm-now (m)
+  "The post-step that starts the background build at once when it is urgent
+([[ed-string-warm-urgent?]]) — on a large buffer's visit, and after an edit that invalidated a
+large tail — rather than on the next idle beat."
+  (if (ed-string-warm-urgent? m) (ed-launch-string-warm m) m))
+
+(register-post-step :string-warm-now {:order 60 :run 'stringwarm/ed-warm-now})
