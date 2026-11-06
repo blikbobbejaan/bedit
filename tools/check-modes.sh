@@ -9,7 +9,7 @@
 # button dead behind it. Only the released binary, opened on a file of that mode with no
 # project around it, shows the gap. `ed-view` prints every such failure to stdout.
 #
-#     make check-modes             # ~6 s per mode
+#     make check-modes             # a few seconds per mode
 #     BEDIT=./bedit tools/check-modes.sh
 #     HEADLESS=0 tools/check-modes.sh   # open the real window for each file
 #
@@ -17,7 +17,12 @@
 # failures, but no window is opened over whatever you are working in.
 set -u
 bedit=${BEDIT:-$HOME/.local/bin/bedit}
-seconds=${SECONDS_PER_FILE:-6}
+# Each editor gets up to STARTUP_SECONDS to say `bedit started`, then is watched for
+# SETTLE_SECONDS more before it is stopped. The start is waited for rather than timed: a fixed
+# 6 s budget for start AND paint failed a slow start as "the editor never started" on a loaded
+# machine (a test suite running beside it), and left a later frame unwatched on a fast one.
+startup=${STARTUP_SECONDS:-60}
+settle=${SETTLE_SECONDS:-${SECONDS_PER_FILE:-3}}
 if [ "${HEADLESS:-1}" != 0 ]; then export BROOD_GUI_HEADLESS=1; fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -52,7 +57,16 @@ printf '#+TITLE: t\n* TODO Heading :tag:\n- [ ] item with *bold*\n' > "$work/x.o
 
 fail=0
 for f in .bashrc .env Dockerfile x.json x.yaml x.toml Makefile x.ini COMMIT_EDITMSG x.md x.blsp x.mbox x.eml x.rs x.js x.ts x.tsx x.go x.c x.org; do
-  ( cd "$HOME" && timeout "$seconds" "$bedit" "$work/$f" > "$work/$f.log" 2>&1 )
+  ( cd "$HOME" && exec "$bedit" "$work/$f" ) > "$work/$f.log" 2>&1 &
+  pid=$!
+  waited=0
+  while ! grep -q 'bedit started' "$work/$f.log" && kill -0 "$pid" 2>/dev/null && [ "$waited" -lt $((startup * 10)) ]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  if grep -q 'bedit started' "$work/$f.log"; then sleep "$settle"; fi
+  kill "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null
   n=$(grep -c 'render error' "$work/$f.log")
   if [ "$n" -gt 0 ]; then
     echo "FAIL $f: $n render errors — $(grep -m1 'render error' "$work/$f.log")"
