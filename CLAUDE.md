@@ -369,9 +369,19 @@ src/mouse.blsp              `[:mouse …]` folded into the model: a click, a dra
                             pointer. A middle click places point (`ed-mouse-set-point`) and commands
                             yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`)
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
-                            feature: a pane body's layers share ONE geometry map, and the
-                            mode line's feature chips come from the statusbar registry. The
-                            frame names the bottom mode line as its SEAM (`ed-seam-op`, brood
+                            feature: a pane body's layers share ONE geometry map, the mode
+                            line's feature chips come from the statusbar registry, and what
+                            else paints is a row in `model`: `register-highlight-source`
+                            (`{:rank :run :deps}`, a pane's ranges: rainbow, glyphless,
+                            whitespace, spell, isearch; `:deps` is every input off the buffer,
+                            in the pane's memo key, or paint goes stale —
+                            tests/view_memo_test), `register-pane-layer` (`{:rank :slot :run}`:
+                            the pulse, the header line) and `register-frame-overlay`
+                            (`{:rank :run}`: the minibuffer list, avy, which-key, the popup, the
+                            transient, the menu, the tooltips). A row's module is `:use`d from
+                            `main`: an unloaded row paints nothing (tests/registries_test
+                            pins the lists). A `:line-services-off` buffer (so-long) gets no
+                            bracket match. The frame names the bottom mode line as its SEAM (`ed-seam-op`, brood
                             ADR-610): the window anchors it and the echo area to its bottom edge
                             and puts the leftover pixels above it; row 0 is a band (no top
                             margin) only under a header line
