@@ -740,6 +740,10 @@ src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, g
                             when it says it can and both pin the same toolchain
                             (`ed-lsp-identity`). `:lsp-servers` files them; M-x lsp-servers
                             lists them
+src/lsp-servers.blsp        the servers as the model holds them: where each starts, which projects
+                            share one, filing them under `:lsp-servers`, a server dying or merged,
+                            the document push, what they published, asking one. lsp-commands is the
+                            commands and the folds of their answers
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
                             lsp-commands can register fold impls while lsp stays deferred
