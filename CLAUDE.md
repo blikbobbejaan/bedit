@@ -763,10 +763,13 @@ src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d sess
                             stream, *Debug* paused-process queue with resume/eval-in-scope,
                             trace-fn/break-fn by name — the collector process speaks std/debug's
                             wire protocol and forwards UiEvent records to the loop
-src/testrun.blsp            native test runs (C-c t): a dedicated nest subprocess streams per-test
-                            JSON (std's test/*report-sink*) into the *Tests* buffer — never
-                            in-image (%isolate would revert the editor's globals + kill its pids).
-                            A project with a WARM test session uses it instead (`*warm-backends*`,
+src/testrun.blsp            native test runs (C-c t): the commands and the *Tests* mode; a run goes to
+                            a warm session when one is ready, else the cold runner
+src/testrun-cold.blsp       a dedicated nest subprocess streams per-test JSON (std's
+                            test/*report-sink*) into the *Tests* buffer — never in-image (%isolate
+                            would revert the editor's globals + kill its pids). The folds every
+                            runner fills *Tests* with
+src/testrun-warm.blsp       a project with a WARM test session uses it instead (`*warm-backends*`,
                             one row per language: Elixir's `MIX_ENV=test` node, Brood's
                             eval-server child) — same rows, same marks, without the runtime
                             start. A warm run RECOMPILES / RELOADS what changed first, so it
