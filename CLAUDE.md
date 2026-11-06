@@ -1102,12 +1102,14 @@ src/gitpick.blsp            asking for ONE thing — a remote, ref, commit, name
 src/gitstatus.blsp          C-x g *git-status*, a section tree: in-progress line,
                             Head:/Merge:/Push:/Tag:, Unmerged / Untracked / Unstaged / Staged
                             files (TAB fetches a file's hunks), unpushed, unpulled, stashes,
-                            recent commits — collected in a task. s/u/k act on what is at
-                            point: a REGION of a hunk's lines (std/diff `hunk-select`), a
-                            hunk, a file, several files, a whole list, a stash; k on a
-                            conflict offers ours/theirs, e opens it at its first marker
-                            (smerge). RET goes to the line a diff line became. The background
-                            fetch that says when the upstream moved
+                            recent commits — collected in a task. RET goes to the line a diff
+                            line became
+src/gitstage.blsp           s/u/k in *git-status*, on what is at point: a REGION of a hunk's lines
+                            (std/diff `hunk-select`), a hunk, a file, several files, a whole
+                            list, a stash; k on a conflict offers ours/theirs, e opens it at
+                            its first marker (smerge). Below the status, which it refreshes
+                            by name
+src/gitfetch.blsp           the background fetch that says when the upstream moved
 src/gitremote.blsp          P push (where it pushes / upstream / elsewhere / another branch /
                             tags; a branch with nowhere to go is asked and remembers) · F
                             pull · f fetch · M remotes — each a transient, all off the loop

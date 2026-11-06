@@ -1,0 +1,121 @@
+(defmodule gitfetch
+  "The repo watches itself: a background fetch on a timer, and a message when the upstream
+moved, so a reader hears of it without asking (f asks now)."
+  (:use model) ; message / register-task-reply / register-timer-client
+  (:use interactive) ; defcommand
+  (:use task) ; task — the fetch, off the loop
+  (:use gitcore))
+
+;; ---- the repo watches itself: a background fetch, and being TOLD ------------
+;; Magit shows you the truth as of the last time you asked it to fetch. You find out the
+;; remote moved by pressing `f f` and looking — which means in practice you find out when
+;; you try to push and are told no.
+;;
+;; bedit fetches on a timer, in a task, and SAYS SO when the answer changes: "origin/main:
+;; 3 new commits (F to pull)". It costs nothing on the loop and it is the difference
+;; between a status buffer you interrogate and a repo that tells you about itself. That is
+;; the whole "better than magit" claim, and it is only possible because the fetch is a
+;; process rather than something you have to stop and wait for.
+;;
+;; `git fetch` is network and can hang; it rides `task` with the same timeout as a pull,
+;; and a fetch already in flight is never started twice.
+
+(def *git-fetch-every-ms* 180000)
+;; How often to fetch in the background (3 minutes). Long enough that a laptop on a phone
+;; tether is not fetching constantly, short enough that "someone pushed" reaches you while
+;; it still matters. `nil` turns the watch off entirely.
+
+(defn git-fetch-timer (m)
+  "The background upstream watch's timer while it is switched on, else nil — a repeating
+timer, not an idle one-shot: it fires while you work, so a remote that moved reaches you
+without your asking (`model/register-timer-client`)."
+  (when (int? *git-fetch-every-ms*) {:every *git-fetch-every-ms*}))
+
+(register-timer-client :git-fetch 'gitfetch/git-fetch-timer 'gitfetch/git-launch-fetch)
+
+(defn git-fetch-key (m)
+  "What a background fetch would be ABOUT — the repo root, or nil when there is no repo to
+watch. Compared on the reply so an answer about a repo you have since left is dropped."
+  (or (:git-root m)
+    (let (summary (:vcs-summary m)) (if (= (:kind summary) :git) (:root summary) nil))))
+
+(defn git-fetch-upstream (root)
+  "Fetch quietly and report the upstream's position afterwards: `{:root :upstream :behind
+:ahead}`, or nil when there is no upstream to watch. Runs in a task — three subprocesses,
+one of them a network round trip."
+  (if (nil? root)
+    nil
+    (let (upstream (git-upstream root))
+      (if (nil? upstream)
+        nil
+        (do
+          ;; the fetch itself; its exit code does not matter here — offline just means the
+          ;; counts below are unchanged, which is exactly the right thing to report
+          (git-git root
+            ["fetch" "--quiet"]
+            {:env *git-background-env* :timeout-ms *git-op-timeout-ms*})
+          (let (ab (git-ahead-behind root))
+            {:root root
+             :upstream upstream
+             :behind (get ab :behind "0")
+             :ahead (get ab :ahead "0")}))))))
+
+(defn git-launch-fetch (m)
+  "Start the background fetch OFF the loop, unless one is in flight, the watch is off, or
+there is no repo. Never runs headless — a test or a daemon has no business reaching the
+network on a timer."
+  (let (root (git-fetch-key m))
+    (cond
+      (not (int? *git-fetch-every-ms*)) m ; the watch switched off (set it to nil)
+      (:git-fetch-proc m) m
+      (nil? root) m
+      (model/ed-headless?) m
+      else
+        (assoc m
+          :git-fetch-proc
+            (task (fn () (git-fetch-upstream root))
+              {:timeout *git-op-timeout-ms*})))))
+
+(defn git-upstream-news (before after)
+  "What to say about the upstream having moved, or nil when there is nothing to say.
+
+Only an INCREASE in `behind` is news. Reporting the count every time would announce the
+same three commits every three minutes until you pulled them, which is how a notification
+becomes something you learn to ignore."
+  (let (was (string/->number (get before :behind "0"))
+        now (string/->number (get after :behind "0"))
+        was (if (int? was) was 0)
+        now (if (int? now) now 0))
+    (if (or (<= now 0) (<= now was))
+      nil
+      (str (:upstream after)
+        ": "
+        (- now was)
+        " new commit"
+        (if (= (- now was) 1) "" "s")
+        (if (> was 0) (str " (" now " behind)") "")
+        " — F to pull"))))
+
+;; the background upstream watch — network, therefore a task
+(register-task-reply :git-fetch-proc 'gitfetch/git-apply-fetch nil "fetching")
+(defn git-apply-fetch (m result)
+  "Fold a finished background fetch: free the slot, remember the upstream position, and say
+so if the remote moved. An answer about a repo the reader has since left is dropped."
+  (let (m1 (dissoc m :git-fetch-proc))
+    (cond
+      (nil? result) m1
+      (not (= (:root result) (git-fetch-key m1))) m1
+      else
+        (let (news (git-upstream-news (:git-upstream-seen m1) result)
+              m2 (assoc m1 :git-upstream-seen result)
+              ;; a moved upstream also makes the *git-status* Unpulled section stale
+              m3 (if news (git-refresh-if-open m2 nil) m2))
+          (if (nil? news) m3 (message m3 news))))))
+
+(defcommand cmd-git-fetch
+  (m key)
+  "Fetch from the remote now (f) — off the loop. The background watch does this on a timer;
+this is for when you know something landed and do not want to wait for it."
+  (if (nil? (git-fetch-key m))
+    (message m "not in a git repository")
+    (message (git-launch-fetch (dissoc m :git-fetch-proc)) "fetching…")))

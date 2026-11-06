@@ -1,0 +1,341 @@
+(defmodule gitstage
+  "What `s` / `u` / `k` do in *git-status*: stage, unstage and discard what is at point — a
+REGION of a hunk's lines, a hunk, a file, several files, or a whole list — the patches cut by
+`std/diff` (`diff/hunk-select`) and piped to `git apply`. `k` on a conflict offers ours or
+theirs, `e` opens it at its first marker, `k` on an untracked file asks first. Below the
+status buffer: every action ends in `git-do`, which refreshes it by name."
+  (:use model) ; ed-current-buf / message / ed-read-char / ed-apply
+  (:use interactive) ; defcommand
+  (:use editor/buffer) ; clear-mark
+  (:use smerge) ; cmd-smerge-next — `e` on a conflicted file lands on its first conflict
+  (:use gitcore)
+  (:use gitsection))
+
+(defn- git-list-files (m section)
+  "Every file value in list `section` of the current status tree — what `s` on the
+`Untracked files` heading stages, or `k` there deletes."
+  (let (tree (:section-tree (ed-current-buf m))
+        lst (if (nil? tree)
+              nil
+              (seq/find (:children tree) (fn (s) (and (map? s) (= (:type s) section))))))
+    (if (nil? lst) '() (map (:children lst) :value))))
+
+(defn- git-region-hunk (m reverse?)
+  "When the region lies inside ONE hunk's body, that hunk cut down to the region's lines
+(`diff/hunk-select`, `reverse?` for a patch applied in reverse) as `[value patch]`, else
+nil. Magit's line-level staging: select the lines, press `s`."
+  (let (rows (sectionbuf/sb-region-rows m))
+    (cond
+      (or (nil? rows) (empty? rows) (any? rows nil?)) nil
+      (or (not (= (count (into #{} (map rows :id))) 1)) (not (= (:type (first rows)) :hunk))) nil
+      else
+        (let (value (:value (first rows))
+              patch (git-lines-patch value (seq/reject (map rows :line) nil?) reverse?))
+          (if (nil? patch) nil [value patch])))))
+
+(defn- git-region-files (m)
+  "The file values whose headings the region covers, or nil when there is no region or it
+covers none — `s` over three files stages three files."
+  (let (rows (sectionbuf/sb-region-rows m))
+    (if (nil? rows)
+      nil
+      (let (files (map (seq/filter rows (fn (r) (and r (:heading? r) (= (:type r) :file)))) :value))
+        (if (empty? files) nil files)))))
+
+(defn- git-unmark (m)
+  "The model with the region dropped — after acting on it, as every region command does."
+  (ed-apply m clear-mark))
+
+;; ---- commands: open / stage / unstage / discard / visit / refresh / quit ------
+;; `s`, `u` and `k` do what Magit's do, by what is at point: a REGION inside one hunk acts
+;; on those lines; a hunk on the hunk; a file (its heading or anywhere in its diff when no
+;; hunk is under point) on the file; a region over several files on each; a list's heading
+;; on the whole list. Which list decides the direction — there is nothing to unstage in
+;; `Unstaged changes`, and saying so beats doing nothing.
+
+;; ---- what `s` / `u` / `k` act on --------------------------------------------------
+;; The three commands look at point for the same KINDS of thing — a region inside one
+;; hunk, a region over file headings, a list's heading, a hunk, a file, a stash, a
+;; conflict — but each in its own order, and each order is a decision. They used to
+;; re-derive all of it in three conds that drifted apart; now one classifier walks a
+;; command's order (its `targets`, data) and the command only says what it does with what
+;; it found. A difference between them is a difference in the tables below, where it can
+;; be read side by side.
+
+(def- git-stage-targets
+  ;; `s`: anything not staged yet (nil is a diff of history in *git-diff*). A hunk is only
+  ;; staged from `Unstaged changes`; one in an untracked file's diff falls to `:file`,
+  ;; which adds the whole file.
+  {:lists #{nil :unmerged :untracked :unstaged}
+   :reverse? false
+   :hunk-from #{:unstaged}
+   :order [:elsewhere :region :files :list :hunk :file]})
+
+(def- git-unstage-targets
+  ;; `u`: only what is in `Staged changes`, and there everything `s` knows.
+  {:lists #{:staged}
+   :reverse? true
+   :hunk-from #{:staged}
+   :order [:elsewhere :region :files :list :hunk :file]})
+
+(def- git-discard-targets
+  ;; `k`: a stash is dropped from wherever it is listed; a list's heading is the whole
+  ;; list (the Unmerged one refuses: conflicts are resolved one file at a time); on a
+  ;; conflicted FILE the ours-or-theirs question comes before everything else. There is
+  ;; no `:files` — a region over several files discards the file at POINT, because `k`
+  ;; asks about one named thing at a time, never a silent run of discards. An untracked
+  ;; file's hunk falls to `:file`, which deletes the file.
+  {:lists git-list-sections
+   :reverse? true
+   :hunk-from #{:staged :unstaged}
+   :order [:stash :elsewhere :list :unmerged :region :hunk :file]})
+
+(defn- git-list-heading? (row)
+  "Whether `row` is the heading of a file list (`Unstaged changes`, …)."
+  (and (:heading? row) (contains? git-list-sections (:type row))))
+
+(defn- git-list-at (m row)
+  "The file list point is in: where the row sits in *git-status*, else the list the file
+at point was diffed FROM — a *git-diff* has no list sections, its rows sit under a
+`:diff` root, and only the file value knows it is a staged (or unstaged) diff."
+  (or (git-list-of row) (:section (git-file-at m))))
+
+(defn- git-target-of (m row targets kind)
+  "Target `kind` at point as `[kind value]`, or nil when point is not on one. Each kind
+is looked for only when a command's order reaches it — a region's patch is cut only when
+no earlier kind matched."
+  (let (found (fn (here? value) (if here? [kind value] nil))
+        lst (git-list-at m row))
+    (case kind
+      :elsewhere (found (not (contains? (:lists targets) lst)) lst)
+      :stash (found (= (:type row) :stash) (:ref (:value row)))
+      :unmerged (found (= lst :unmerged) (git-file-at m))
+      :region (let (region (git-region-hunk m (:reverse? targets))) (found region region))
+      :files (let (files (git-region-files m)) (found files files))
+      :list (found (git-list-heading? row) (:type row))
+      :hunk
+        (let (hunk (git-hunk-at m))
+          (found (and hunk (contains? (:hunk-from targets) (:section hunk))) hunk))
+      :file (let (file (git-file-at m)) (found file file))
+      (error "git-target-of: unknown target kind: " kind))))
+
+(defn- git-target-at (m targets)
+  "What a working-tree command acts on at point, as `[kind value]`: the first kind in
+`(:order targets)` that point is on — `[:none nil]` off every row, `[:nothing nil]` when
+point is on a row none of them describes."
+  (let (row (git-row-at m))
+    (if (nil? row)
+      [:none nil]
+      (letrec (walk (fn (kinds)
+                      (cond
+                        (empty? kinds) [:nothing nil]
+                        else (or (git-target-of m row targets (first kinds)) (walk (rest kinds))))))
+        (walk (:order targets))))))
+
+(defn- git-file-paths (f)
+  "The paths a file value stands for in the index — both halves of a rename."
+  (if (:orig-path f) [(:path f) (:orig-path f)] [(:path f)]))
+
+(defn- git-plural (n word)
+  "`n word` with an `s` unless there is exactly one."
+  (str n " " word (if (= n 1) "" "s")))
+
+(defn- git-stage-list (m lst)
+  "`s` on a list's heading: stage all of it."
+  (case lst
+    :unstaged (git-do m "stage all" ["add" "-u"])
+    :untracked
+      (git-do m "stage untracked" (into ["add" "--"] (map (git-list-files m :untracked) :path)))
+    :unmerged
+      (git-do m "mark resolved" (into ["add" "--"] (map (git-list-files m :unmerged) :path)))
+    (message m "already staged")))
+
+(defcommand cmd-git-stage
+  (m key)
+  "Stage what is at point (s): the region's lines, the hunk, the file, the files the region
+covers, or — on a list's heading — the whole list."
+  (let ([kind value] (git-target-at m git-stage-targets))
+    (case kind
+      :elsewhere (message m "already staged")
+      :region
+        (let ([file patch] value)
+          (if (= (:section file) :untracked)
+            (git-do m "stage" ["add" "--" (:path file)])
+            (git-do-hunk (git-unmark m) "stage lines" patch true false)))
+      :files (git-do (git-unmark m) "stage" (into ["add" "--"] (map value :path)))
+      :list (git-stage-list m value)
+      :hunk (git-do-hunk m "stage hunk" (git-hunk-patch value) true false)
+      :file (git-do m "stage" ["add" "--" (:path value)])
+      (message m "nothing to stage here"))))
+
+(defcommand cmd-git-stage-all
+  (m key)
+  "Stage all tracked modified files (S) — `git add -u`."
+  (git-do m "stage all" ["add" "-u"]))
+
+(defcommand cmd-git-unstage
+  (m key)
+  "Unstage what is at point (u): the region's lines, the hunk, the file, the files the
+region covers, or everything on the `Staged changes` heading."
+  (let ([kind value] (git-target-at m git-unstage-targets)
+        unstage (fn (mm verb paths) (git-unstage-paths mm verb paths)))
+    (case kind
+      :elsewhere (message m "not staged")
+      :region (git-do-hunk (git-unmark m) "unstage lines" (second value) true true)
+      :files (unstage (git-unmark m) "unstage" (mapcat value git-file-paths))
+      :list (unstage m "unstage all" ["."])
+      :hunk (git-do-hunk m "unstage hunk" (git-hunk-patch value) true true)
+      :file (unstage m "unstage" (git-file-paths value))
+      (message m "nothing to unstage here"))))
+
+(defcommand cmd-git-unstage-all
+  (m key)
+  "Unstage all staged changes (U)."
+  (git-unstage-paths m "unstage all" ["."]))
+
+(defn- git-discard-file-args (f)
+  "The argv that throws away file `f`'s change in its list. A staged NEW file has nothing
+in HEAD to go back to, so it is removed; any other staged change is checked out from HEAD
+(index and work tree together — from the index alone would keep it); an unstaged one from
+the index."
+  (case (:section f)
+    :staged (if (= (:x f) "A") ["rm" "-f" "--" (:path f)] ["checkout" "HEAD" "--" (:path f)])
+    :untracked ["clean" "-f" "--" (:path f)]
+    ["checkout" "--" (:path f)]))
+
+(defn- git-discard-list (m lst)
+  "`k` on a list's heading: throw the whole list away, after a question that says so."
+  (let (files (git-list-files m lst))
+    (case lst
+      :untracked
+        (vcsproc/vcs-confirm m
+          (str "Delete " (git-plural (count files) "untracked file") "? git has no copy of them.")
+          (fn (mm) (git-do mm "clean" (into ["clean" "-f" "--"] (map files :path)))))
+      :unstaged
+        (vcsproc/vcs-confirm m
+          (str "Discard the unstaged changes to " (git-plural (count files) "file") "?")
+          (fn (mm) (git-do mm "discard" (into ["checkout" "--"] (map files :path)))))
+      :staged
+        (vcsproc/vcs-confirm m
+          "Discard every staged change, from the index AND the work tree?"
+          (fn (mm)
+            (fold files mm (fn (a f) (git-do a "discard" (git-discard-file-args f))))))
+      (message m "resolve conflicts one file at a time: k on the file, or e to edit it"))))
+
+(defn- git-discard-patch (m verb section patch)
+  "Apply `patch` in reverse to throw it away. A staged change goes from the index and the
+work tree at once (`--index`): reversing it in the work tree alone left it staged."
+  (git-do-hunk m verb patch (if (= section :staged) :index false) true))
+
+(defn- git-discard-file (m f)
+  "`k` on file `f`: delete it when untracked (git has no copy), else discard its change —
+each after a question naming it."
+  (if (= (:section f) :untracked)
+    (git-remove-untracked m (:path f))
+    (vcsproc/vcs-confirm m
+      (str "Discard changes to " (:path f) "?")
+      (fn (mm) (git-do mm "discard" (git-discard-file-args f))))))
+
+(defn- git-ask-resolution (m f)
+  "`k` in a conflicted list: keep ours or theirs (`e` edits the file instead)."
+  (ed-read-char m
+    (str "Resolve " (:path f) " by keeping [o]urs or [t]heirs? (e edits it instead) ")
+    (fn (mm c)
+      (case c
+        "o" (git-resolve-with mm "ours")
+        "t" (git-resolve-with mm "theirs")
+        (message mm "cancelled")))))
+
+(defcommand cmd-git-discard
+  (m key)
+  "Throw away what is at point (k), after a question naming it: the region's lines, the
+hunk, the file (an untracked one is deleted — git has no copy), a list, or a stash."
+  (let ([kind value] (git-target-at m git-discard-targets))
+    (case kind
+      :stash (git-stash-drop-ref m value)
+      :unmerged (git-ask-resolution m value)
+      :region
+        (let ([file patch] value)
+          (vcsproc/vcs-confirm m
+            "Discard the selected lines?"
+            (fn (mm) (git-discard-patch (git-unmark mm) "discard lines" (:section file) patch))))
+      :list (git-discard-list m value)
+      :hunk
+        (vcsproc/vcs-confirm m
+          "Discard this hunk?"
+          (fn (mm) (git-discard-patch mm "discard hunk" (:section value) (git-hunk-patch value))))
+      :file (git-discard-file m value)
+      m)))
+
+(defn git-stash-drop-ref (m ref)
+  "Drop stash `ref` after a question — a dropped stash is only in the reflog's reach."
+  (vcsproc/vcs-confirm m
+    (str "Drop " ref "? It cannot be recovered from here.")
+    (fn (mm) (git-do mm "stash drop" ["stash" "drop" ref]))))
+
+;; ---- resolving a conflict (o / T on an unmerged file) ------------------------
+;; The two resolutions that cannot be typed into the file: "keep the version that was
+;; already here" and "keep the version that came in". Everything else is editing, which
+;; the editor already does — `e` opens the file at its first conflict, where `C-c ^` keeps
+;; one side of each hunk (`smerge`), and `s` here marks it resolved.
+;;
+;; `--ours` and `--theirs` are notoriously backwards during a REBASE: git replays your
+;; commits onto the other branch, so "ours" is the branch you are rebasing onto and
+;; "theirs" is your own work. The labels below say which is which by what it MEANS at the
+;; time, not by which flag it passes, because the flag is the part that misleads.
+
+(defn- git-resolve-with (m side)
+  "Resolve the unmerged file at point by taking one whole side, then stage it — `git
+checkout --ours|--theirs -- <path>` followed by `git add`, which is what marks it resolved.
+Without the add it would still be listed as unmerged and the rebase would not continue."
+  (let (f (git-file-at m))
+    (cond
+      (nil? f) (message m "not on a file")
+      (not (= (:section f) :unmerged)) (message m "this file is not conflicted")
+      else
+        (let (path (:path f))
+          (git-with-root m
+            (fn (m0 _root)
+              (git-run-then m0
+                ["checkout" (str "--" side) "--" path]
+                (fn (m1 r)
+                  (if (= (:exit r) 0)
+                    (git-do m1 "add" ["add" "--" path])
+                    (vcsproc/vcs-report-cmd m1 (str "checkout --" side) r))))))))))
+
+(defcommand cmd-git-take-ours
+  (m key)
+  "Resolve the conflict at point by keeping the side that was already here (o) — the
+branch you are merging INTO, or during a rebase the branch you are rebasing ONTO."
+  (git-resolve-with m "ours"))
+
+(defcommand cmd-git-take-theirs
+  (m key)
+  "Resolve the conflict at point by keeping the side that came in (T) — the branch being
+merged, or during a rebase your own commit being replayed."
+  (git-resolve-with m "theirs"))
+
+(defcommand cmd-git-resolve-in-file
+  (m key)
+  "Open the conflicted file at point at its first conflict (e) — Magit's ediff, done the
+smerge way: `C-c ^ u` / `C-c ^ l` / `C-c ^ a` keep the upper, the lower or both sides of
+the conflict at point, `C-c ^ n` / `C-c ^ p` move between them."
+  (let (f (git-file-at m)
+        root (git-resolve-root m))
+    (if (or (nil? f) (nil? root))
+      (message m "not on a file")
+      (let (m1 (pool/ed-pop-to-file m (path/join root (:path f)) 1))
+        (if (= (:section f) :unmerged) (cmd-smerge-next m1 nil) m1)))))
+
+;; ---- removing an untracked file ---------------------------------------------
+;; `k` on an untracked row used to answer "remove it from a shell, not here", which is a
+;; strange thing for an editor to say about a file it is showing you. The reason it said it
+;; is real — an untracked file has no copy in git, so deleting it is unrecoverable, unlike
+;; every other `k` in this buffer — but the answer to "this is irreversible" is to say so
+;; and ask, not to refuse and send you elsewhere.
+
+(defn- git-remove-untracked (m path)
+  "Delete an untracked file from the working tree, after confirmation that says so."
+  (vcsproc/vcs-confirm m
+    (str "Delete " path "? It is untracked, so git has no copy — this cannot be undone.")
+    (fn (mm) (git-do mm "clean" ["clean" "-f" "--" path]))))
