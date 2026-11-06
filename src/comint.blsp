@@ -1,0 +1,233 @@
+(defmodule comint
+  "The INPUT REGION of a line-oriented program's buffer (Emacs's comint): `the text after the
+prompt is yours`, one idea however many kinds of buffer have it. A shell (bshell) and a
+terminal in line mode (terminal) both carry `:input-start`; this module owns that field, the
+process mark, the boundary guard and commands that keep the prompt out of reach, the ↑/↓/C-r
+history over a buffer's own submitted lines, and M-x send-invisible, which asks the buffer's
+mode to read a line masked (the `:send-invisible` service)."
+  (:use model) ; ed-current-buf / ed-set-buf / message
+  (:use pool) ; ed-name-prompt
+  (:use commands) ; the editing commands the input region wraps (C-a, DEL, ↑/↓ …)
+  (:use interactive) ; defcommand
+  (:use editor/buffer)) ; goto-char / buffer-point / buffer-marker / replace-region
+;; formbuf (guard-clamp / tail-region) is referenced qualified below.
+
+;; ---- the process mark ---------------------------------------------------------
+;; While a command runs, its output lands at the PROCESS MARK (comint's `process-mark`), not
+;; at the end: anything typed ahead stays after it, below the output and, once the command
+;; ends, after the new prompt as input waiting to be sent. That is also what keeps the
+;; output's colour spans true — every edit the user makes is after them. The mark is a real
+;; buffer MARKER (`editor/buffer`'s, left gravity), so every edit carries it: text typed
+;; BEFORE it — C-a back onto the command line, a click up into the output — moves it
+;; along, and the next chunk still lands after the output, never mid-word. While the
+;; command runs, the input region starts there too (`input-region`).
+
+(def- process-mark :bshell-process-mark) ; the marker id
+
+(defn process-mark-at (b)
+  "Shell buffer `b`'s process mark — where a running command's output lands — or nil when
+none is set."
+  (buffer-marker b process-mark))
+
+(defn with-process-mark (b position)
+  "Shell buffer `b` with its process mark at `position`."
+  (buffer-marker-set b process-mark position))
+
+(defn without-process-mark (b)
+  "Shell buffer `b` with no process mark: its command is over."
+  (buffer-marker-delete b process-mark))
+
+;; ---- the input region ---------------------------------------------------------
+
+(defn input-region? (b)
+  "Whether buffer `b` has an input region — an `:input-start` past which typing goes: a
+shell, or a terminal in line mode. What the boundary and history commands serve."
+  (int? (:input-start b)))
+
+(defn input-region (b)
+  "`[start end]` of buffer `b`'s input region — CLAMPED into the buffer. A kill that
+reached above `:input-start` (click up into the scrollback, then C-k: the layers bind
+Backspace, not every kill) leaves the field past the end of the rope, and indexing off it
+would throw. With no `:input-start` the region is empty, at the end. While a shell's
+command runs the region starts at its PROCESS MARK instead (`process-mark-at`), as
+comint's does: the line it was started with is sent, and what is typed now is input for
+later. The one reader of the field, for the shell and a line-mode terminal alike."
+  (let (end (buffer-length b)
+        mark (process-mark-at b)
+        start (if (and (:bshell-running b) (int? mark)) mark (:input-start b)))
+    [(math/min (or start end) end) end]))
+(sig input-region (buffer -> (tuple int int)))
+
+(defn input-text (b)
+  "The text of buffer `b`'s input region (from the clamped input start to the end)."
+  (let ([start end] (input-region b)) (string/substring (buffer-text b) start end)))
+(sig input-text (buffer -> string))
+
+;; ---- input-region boundary (the prompt + output are not editable) -----------
+;; In a shell you can't backspace into the prompt or move left of it. These wrap the
+;; ordinary editing commands so motion/deletion stops at the buffer's `:input-start`;
+;; point in the output *above* the input line stays free (so you can read/select it).
+
+(defn- bshell-cur-istart (m)
+  "The current buffer's input start — `input-region`'s, clamped into the buffer."
+  (first (input-region (ed-current-buf m))))
+
+(defcommand cmd-bshell-beginning-of-input
+  (m key)
+  "C-a / Home: jump to the start of the input (just after the prompt) on the input line;
+elsewhere (point up in the output) a normal beginning-of-line."
+  (let (b (ed-current-buf m)
+        start (bshell-cur-istart m))
+    (if (>= (buffer-point b) start)
+      (ed-set-buf m (goto-char b start))
+      (cmd-beginning-of-line m key))))
+
+(defcommand cmd-bshell-backward-char
+  (m key)
+  "C-b / Left: never cross left into the prompt — a no-op exactly at the input start; a
+normal backward-char otherwise (within the input, or freely within the output above)."
+  (if (= (buffer-point (ed-current-buf m)) (bshell-cur-istart m))
+    m
+    (cmd-backward-char m key)))
+
+(defcommand cmd-bshell-delete-backward
+  (m key)
+  "Backspace: never delete into the prompt or the read-only output — a no-op at or before
+the input start; a normal backward delete within the input."
+  (if (<= (buffer-point (ed-current-buf m)) (bshell-cur-istart m))
+    m
+    (cmd-delete-backward m key)))
+
+(defn- bshell-input-line-start (text istart)
+  "The offset of the start of the line that holds the input region (the char after the
+last newline before `istart`)."
+  (let (nl (string/last-index-of (string/substring text 0 istart) "\n"))
+    (if (< nl 0) 0 (+ nl 1))))
+
+(defn bshell-enforce-boundary (m)
+  "Pull point out of the prompt if it landed there — `formbuf/guard-clamp` over the
+one editable region a shell buffer has (`formbuf/tail-region` from the input start:
+everything after the prompt is yours). The `:clamp` policy rather than `:veto`
+because a shell's generated part is legitimately navigable — you scroll and select
+output freely; only *typing* position is constrained. A no-op in any other buffer."
+  (let (b (ed-current-buf m))
+    (if (not (input-region? b))
+      m
+      (let (istart (first (input-region b))
+            line-start (bshell-input-line-start (buffer-text b) istart))
+        ;; Only the prompt PORTION of the input line is out of bounds: point in the
+        ;; output above it stays put, so the scrollback keeps its own cursor.
+        (if (and (< (buffer-point b) istart) (>= (buffer-point b) line-start))
+          (formbuf/guard-clamp m
+            (fn (mm) (buffer-text (ed-current-buf mm)))
+            (fn (mm) (buffer-point (ed-current-buf mm)))
+            (fn (mm p) (ed-set-buf mm (goto-char (ed-current-buf mm) p)))
+            (fn (text) (formbuf/tail-region text istart)))
+          m)))))
+
+(defn bshell-post-key (m-before m key)
+  "The bshell layer's `:post-key` guard (layers §7): repair, don't veto — point is
+clamped out of the prompt rather than the keystroke undone, so `m-before` is unused."
+  (bshell-enforce-boundary m))
+
+;; ---- command history (↑/↓ recall, like the Brood REPL; per buffer) ----------
+
+(defn bshell-history (m)
+  "The current bshell buffer's submitted-line history (oldest first)."
+  (or (:bshell-history (ed-current-buf m)) []))
+
+(defn- bshell-cur-set (m k v)
+  "The model with field `k`=`v` set on the *current* buffer."
+  (ed-set-buf m (assoc (ed-current-buf m) k v)))
+
+(defn remember-input (m line)
+  "Record submitted `line` in the current buffer's in-memory history (skipping an immediate
+duplicate) and reset that buffer's browse cursor — so the next ↑ starts from the newest.
+Nothing is persisted: a line-mode terminal (iex, nest repl) keeps its own history this
+way, out of the SHELL's history file."
+  (let (h (bshell-history m)
+        n (count h)
+        h2 (if (and (> n 0) (= (nth h (dec n)) line)) h (into h [line])))
+    (ed-set-buf m
+      (assoc (ed-current-buf m) :bshell-history h2 :bshell-hist-idx nil :bshell-draft nil))))
+
+(defn- bshell-set-input (m s)
+  "Replace the input region of the current buffer with `s`, point at the end."
+  (let (b (ed-current-buf m)
+        [start end] (input-region b))
+    (ed-set-buf m (end-of-buffer (replace-region b start end s)))))
+
+(defn- bshell-in-output? (m)
+  "Whether point is above the input line (in the read-only output) — where ↑/↓ should move
+by line to read output, not browse history."
+  (let (b (ed-current-buf m))
+    (< (buffer-point b) (bshell-input-line-start (buffer-text b) (bshell-cur-istart m)))))
+
+(defn- bshell-input-text (m)
+  "The current input region's text (from the input start to the buffer end)."
+  (input-text (ed-current-buf m)))
+
+(defn- bshell-line-nav? (m)
+  "Whether ↑/↓ should move by line instead of browsing history: point is in the output
+above, or the input is a multi-line form mid-edit (so the arrows navigate the form)."
+  (or (bshell-in-output? m) (includes? (bshell-input-text m) "\n")))
+
+(defcommand cmd-bshell-previous-history
+  (m key)
+  "↑ / C-p: recall the previous command from this buffer's history into the input (browsing
+the live input as the slot past the newest). Above the input line, an ordinary move-up."
+  (if (bshell-line-nav? m)
+    (cmd-previous-line m key)
+    (let (h (bshell-history m)
+          n (count h))
+      (if (= n 0)
+        m
+        (let (b (ed-current-buf m)
+              idx (:bshell-hist-idx b)
+              draft (if (nil? idx) (input-text b) (:bshell-draft b))
+              new-idx (if (nil? idx) (dec n) (math/max 0 (dec idx))))
+          (bshell-set-input (bshell-cur-set (bshell-cur-set m :bshell-hist-idx new-idx)
+                              :bshell-draft draft)
+            (nth h new-idx)))))))
+
+(defcommand cmd-bshell-next-history
+  (m key)
+  "↓ / C-n: recall the next command, or restore the live input once you step past the
+newest. Above the input line, an ordinary move-down."
+  (if (bshell-line-nav? m)
+    (cmd-next-line m key)
+    (let (b (ed-current-buf m)
+          h (bshell-history m)
+          n (count h)
+          idx (:bshell-hist-idx b))
+      (if (nil? idx)
+        m
+        (let (new-idx (+ idx 1))
+          (if (>= new-idx n)
+            (bshell-set-input (bshell-cur-set m :bshell-hist-idx nil) (or (:bshell-draft b) ""))
+            (bshell-set-input (bshell-cur-set m :bshell-hist-idx new-idx) (nth h new-idx))))))))
+
+(defcommand cmd-bshell-history-search
+  (m key)
+  "C-r: search this buffer's command history — a filterable minibuffer list (newest first);
+the chosen entry replaces the current input. Reverse-i-search, the editor-idiomatic way."
+  (let (h (reverse (bshell-history m)))
+    ; newest first
+    (if (empty? h)
+      (message m "bshell: no history yet")
+      (assoc m
+        :minibuffer (ed-name-prompt "History: " h (fn (mm t) (bshell-set-input mm t)) 15)))))
+
+;; ---- send-invisible -------------------------------------------------------------
+
+;; check-allow: the service is a command in all but name, resolved late
+(check-allow :trusted
+  (defcommand cmd-send-invisible
+    (m key)
+    "M-x send-invisible (Emacs's `comint-send-invisible`): read a line masked and send it to
+the program in this buffer — a line-mode terminal's, or the command a shell is running —
+without showing it or remembering it. For a password prompt bedit did not recognise; one
+it recognises opens this read by itself. The buffer's mode does the reading (its
+`:send-invisible` service), so this names no kind of buffer."
+    (let (service (editor/layers/layer-facet (ed-current-buf m) :send-invisible))
+      (if (nil? service) (message m "no program here to send to") (ed-call-deferred m service m)))))

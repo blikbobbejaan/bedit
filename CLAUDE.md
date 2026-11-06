@@ -918,14 +918,17 @@ src/projects.blsp           project root + file walk (find-file-in-project); a V
 src/formbuf.blsp            FORM BUFFERS: generated text with editable regions (a shell's
                             input, a tutorial's boxes) — the region algebra, `splice`, and the
                             `:veto` / `:clamp` guards. Pure; moved from brood's std by ADR-417
+src/comint.blsp             the INPUT REGION of a line-oriented program's buffer (Emacs's comint):
+                            `:input-start`, the process mark, the boundary guard, the ↑/↓/C-r
+                            history over a buffer's submitted lines, and M-x send-invisible, which
+                            asks the mode (`:send-invisible`). A shell and a line-mode terminal
+                            both stand on it, neither knowing the other
 src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a line
                             typed at bedit's own prompt runs as `sh -c` (pipes, its ANSI
                             colours as faces — ansicolor) or, starting with `(`, evaluates
                             as Brood in the worker; a running command's output lands at the
-                            PROCESS MARK (`:bshell-output-at`, comint's), before input typed
-                            ahead, which the next prompt then keeps; owns the input-region
-                            vocabulary (`:input-start`, the boundary guard, ↑/↓/C-r history)
-                            that a line-mode terminal reuses. A running command whose output
+                            PROCESS MARK (`comint`), before input typed ahead, which the next
+                            prompt then keeps. A running command whose output
                             ends at a password prompt (`passwd/password-prompt?`: `sudo -S`,
                             `Password:`) gets the answer read masked and written to its stdin,
                             never the buffer, the next command or the history file: one asked
@@ -942,7 +945,7 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             stays the editor's, C-y pastes, C-x c is the C-c map, C-x C-x /
                             C-x C-y send the literal. LINE mode (the project REPL: iex -S
                             mix, nest repl): the input after the program's prompt is
-                            bedit's, with bshell's history and boundary keys, RET sends
+                            bedit's, with comint's history and boundary keys, RET sends
                             it — C-c C-j / C-c C-k switch. A PASSWORD the program asks for
                             (the worker asks the pty on each render — echo off in line
                             mode, `os/pty-password?`, brood ADR-570 — else the prompt's
