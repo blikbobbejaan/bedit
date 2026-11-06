@@ -336,6 +336,8 @@ src/spancache.blsp          what a pane is coloured with, kept across frames: fo
                             time, a band from a held tree or a line cache, a long line clipped to
                             what is shown; the gutter's cells likewise; `ed-refresh-spans` once per
                             event. `ed-visible-windows`, the char ranges a per-window highlight reads
+src/scrollbar.blsp          the overlay scrollbar: the thumb as render ops, the pointer's grab and drag,
+                            its fade; `model/ed-scrollbar-wake` stays below it, as every scroll calls it
 src/mouse.blsp              `[:mouse …]` folded into the model: a click, a drag selection, the
                             scrollbar's thumb, a divider's resize, the wheel on the pane under the
                             pointer. A middle click places point (`ed-mouse-set-point`) and commands

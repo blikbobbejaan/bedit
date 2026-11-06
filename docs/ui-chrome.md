@@ -124,7 +124,7 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
 | segment hover  | `statusbar/sb--hover-block`       | bordered inset `frect` block (surface0 fill + surface1 rim, Emacs `mouse-face`) | solid highlight band |
 | completion card| `completion/completion-menu-ops` → `display/card-surface`+`card-pill` | rounded `frect` + pill | flat `rect` card |
 | tooltip        | `statusbar/statusbar-tooltip-ops` → `display/tooltip` | rounded bordered card | flat bordered card |
-| scrollbar      | `view/ed-scrollbar-ops`           | rounded `frect` pill         | (none)           |
+| scrollbar      | `scrollbar/ed-scrollbar-ops`           | rounded `frect` pill         | (none)           |
 
 ## The status bar is a segment model (extensible chrome)
 

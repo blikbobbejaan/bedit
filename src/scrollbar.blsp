@@ -1,0 +1,120 @@
+(defmodule scrollbar
+  "The overlay scrollbar: the thumb as render ops, where a pointer grabs it and what a drag
+scrolls to, and its fade once a scroll has gone quiet. `model/ed-scrollbar-wake` is the one
+piece below this module: every change of a pane's `:top` calls it."
+  (:use editor/buffer)
+  (:use model)
+  (:use panes) ; ed-pane-vrows — whether the buffer overflows the pane
+  (:use scroll) ; ed-max-top — the far end of the track
+  (:use editor/pane :only [pane-update-path]) ; a thumb drag scrolls its pane
+  (:use theme) ; face-scrollbar-thumb
+  (:use ui-kit :only [ui-space])
+  (:use editor/display)) ; frect — the thumb
+
+;; ---- per-pane scrollbar (rightmost column) ----------------------------------
+
+;; A smooth, native-style overlay scrollbar: a rounded `frect` *pill* drawn at sub-cell
+;; pixel precision (so its height/position track the scroll fraction continuously, not
+;; quantised to whole rows) and alpha-blended at the model's fade `opacity` — hidden at
+;; rest, fading in on scroll and out after (`model/ed-scrollbar-wake`). No track.
+(defdyn *scrollbar-width* 0.5) ; thumb width in cells (≈ half a cell, a slim modern bar)
+(def *scrollbar-pad* (ui-space :thumb-inset)) ; gap from the pane's right edge, in cells
+(def *scrollbar-min-thumb* 1.5) ; min thumb height in cells, so it stays grabbable
+(defn ed-scrollbar-ops (buf top vh sx sy opacity &optional (track nil))
+  "An overlay scrollbar thumb hugging the right edge of column `sx`, over the `track` rows
+(the pane's; `vh` when not given) from `sy`: a single rounded `frect` pill sized by the
+visible fraction (`vh` lines in view over `buffer-line-count`) and positioned by `top`,
+both in **fractional cells** so it moves smoothly. The two heights differ for a zoomed
+pane, whose page is fewer, bigger lines than it has window rows. Drawn alpha-blended at `opacity` (0..1) from the fade state
+(`ed-scrollbar-opacity`). Hidden (`()`) when the buffer fits — nothing to scroll —
+or when fully faded out. The reserved column stays regardless (text width already
+excludes it), so showing/hiding never reflows text. Hit-testing shares the column
+predicate (`scrollbar/ed-scrollbar-hit?`)."
+  (let (line-count (buffer-line-count buf))
+    (if (or (<= line-count vh) (<= opacity 0.0))
+      '()
+      (let (total (math/max 1 line-count)
+            track (or track vh)
+            thumb-h (math/max *scrollbar-min-thumb* (/ (* 1.0 track vh) total))
+            maxstart (math/max 0.0 (- track thumb-h))
+            denom (math/max 1 (- total vh))
+            thumb-y (math/min maxstart (* maxstart (/ (* 1.0 top) denom)))
+            ;; hug the right edge: the pill's right side sits `*scrollbar-pad*` cells
+            ;; inside the pane edge (sx+1), with the pill `*scrollbar-width*` cells wide.
+            x (- (+ sx 1) *scrollbar-width* *scrollbar-pad*))
+        [(frect x
+           (+ sy thumb-y)
+           *scrollbar-width*
+           thumb-h
+           face-scrollbar-thumb
+           opacity
+           (/ *scrollbar-width* 2))]))))
+
+(defn ed-scrollbar-drag (m row col)
+  "While dragging a scrollbar (`:sb-drag` set by `ed-mouse-press`), scroll its pane to
+follow the pointer (`ed-scrollbar-top-for`). A no-op if not dragging one."
+  (let (sb (:sb-drag m))
+    (if (nil? sb)
+      m
+      (assoc m
+        :layout
+          (pane-update-path (:layout m)
+            (:path sb)
+            (fn (w)
+              (assoc w
+                :top
+                  (ed-scrollbar-top-for (ed-buf-at m (:buf sb))
+                    (:vh sb)
+                    row
+                    (:sy sb)
+                    (:w sb)
+                    (:track sb)))))))))
+
+(sig ed-scrollbar-top-for (buffer int int int &optional (or nil int) (or nil int) -> int))
+(defn ed-scrollbar-top-for (buf vh row sy &optional (w nil) (track nil))
+  "The pane `:top` for a scrollbar click/drag at screen `row`, on a track of `track` rows
+(the pane's window rows; `vh` when not given) starting at `sy`, with `vh` buffer lines in
+view: a proportional map — the track top scrolls to 0, the bottom to `ed-max-top`
+(row-counted for a wrapped buffer given its text width `w`) — clamped into `[0, max-top]`.
+The two heights differ for a zoomed pane: its track is the window's rows, its page fewer,
+bigger lines."
+  (let (maxtop (ed-max-top buf (math/max 1 vh) w)
+        vh (or track vh)
+        rr (math/max 0 (math/min (dec vh) (- row sy))))
+    (if (<= maxtop 0)
+      0
+      (math/max 0 (math/min maxtop (math/quot (* maxtop rr) (math/max 1 (dec vh))))))))
+
+(defn ed-scrollbar-hit? (pane buf row col)
+  "True if `[row col]` lands on `pane`'s scrollbar: its rightmost column, on a text row
+(above the mode line), with the bar shown — `buf` doesn't fit the `vh` text rows (the
+same predicate `scrollbar/ed-scrollbar-ops` draws under)."
+  (let ([px py pw ph] (:rect pane)
+        vh (math/max 1 (dec ph)))
+    (and (= col (+ px (dec pw)))
+      (>= row py)
+      (< row (+ py vh))
+      (> (buffer-line-count buf) (math/max 1 (ed-pane-vrows pane buf))))))
+
+(defn ed-scrollbar-opacity (m)
+  "The overlay scrollbar's opacity this frame (0..1): pinned full while dragging it,
+else the fade ramp from the `:sb-fade` budget — held at 1.0, then linear to 0. 0 ⇒ the
+view omits the thumb entirely."
+  (if (:sb-drag m)
+    1.0
+    (let (budget (or (:sb-fade m) 0))
+      (if (<= budget 0)
+        0.0
+        (math/min 1.0 (/ (* 1.0 budget) *scrollbar-fade-ticks*))))))
+
+(sig ed-scrollbar-start-fade (model -> model))
+(defn ed-scrollbar-start-fade (m)
+  "The hold is over: drop it (a fired one-shot is dead until its entry is recreated, which
+is what lets the next scroll arm a fresh one) and start the fade ticker — or, under
+`:reduce-motion` ([[ed-reduce-motion?]]), hide the thumb at once, with no fade."
+  (let (held (ed-drop-timer m :scrollbar-hold))
+    (if (ed-reduce-motion? m)
+      (assoc held :sb-fade 0)
+      (ed-set-timer held :scrollbar-fade {:every *scrollbar-fade-ms*}))))
+
+(def *scrollbar-fade-ms* 16) ; the fade timer beat (~60fps while it ramps)
