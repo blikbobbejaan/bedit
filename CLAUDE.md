@@ -708,10 +708,14 @@ src/formatter.blsp          M-x format-buffer + format-on-save: the language's o
                             and run over the FILE, so a failing formatter costs nothing
                             (named to dodge std's `format`: a release resolves a std name
                             first, so a project module called `format` never ran)
+src/complete-words.blsp     what completion knows of a buffer's words: the word boundary, the rope
+                            scan, the `:word-index` built off the loop, the always-on source
+src/complete-card.blsp      the popup as drawn: the menu card, anchored where the completion STARTS
+                            (Corfu's), so it does not slide as letters are typed into it, and the
+                            info card beside it
 src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — multi-source merge
-                            (named to dodge std's `tool/complete`, which shadows a bare `complete`);
-                            the card is anchored where the completion STARTS (Corfu's), so it
-                            does not slide as letters are typed into it. The auto popup is per
+                            (named to dodge std's `tool/complete`, which shadows a bare `complete`).
+                            The auto popup is per
                             mode (`completion-auto-for?`): the user's `:completion-auto` entry
                             for the mode, else the mode's `:completion-auto` facet — off in
                             text-mode (prose completes on demand, C-M-i), on in prog-mode and the

@@ -1,0 +1,194 @@
+(defmodule complete-card
+  "The completion popup as it is drawn: the menu card, anchored where the completion started,
+and the info card beside it (Corfu's `corfu-popupinfo`) with the documentation it shows.
+`complete-at-point` holds the popup's state; the view splices these ops in."
+  (:use editor/buffer) ; buffer-current-line / buffer-column — where the card anchors
+  (:use model) ; ed-current-buf / ed-mode-service / register-timer-client
+  (:use completion) ; the shared window/width helpers (+ the look config)
+  (:use ui-kit) ; ui-panel / ui-list / ui-clip — the popup is one windowed list in a card
+  (:use theme) ; ui-ctx — the kit's semantic-role palette
+  (:use editor/display)) ; the `text` render op for the popup
+
+;; ---- the info panel (Corfu's `corfu-popupinfo-mode`) ----------------------------------
+;; The selected candidate's documentation in a card beside the popup, after a short quiet:
+;; the source's own (`:docs` in its answer — a language server's item documentation) or else
+;; the mode's `:doc-at` service asked about the candidate (brood-mode: arglist, signature,
+;; docstring from the live image). Delayed, as Corfu's is, so stepping through the list with
+;; C-n does not look up every row on the way; once a panel has shown, the next one follows
+;; sooner (Corfu's `corfu-popupinfo-delay` pair). A panel only paints while its candidate is
+;; the selected one, so it never documents the wrong row. `:completion-popupinfo false` on
+;; the model turns it off.
+
+(defdyn *completion-info-delay-ms* 500) ; the quiet before the first panel
+(defdyn *completion-info-again-ms* 150) ; …and before each one after it, while the popup is open
+(def *completion-info-max-lines* 14)
+(def *completion-info-max-width* 64)
+
+(defn completion-info? (m)
+  "Whether the info panel is on: unless the model's `:completion-popupinfo` is `false`."
+  (not (= false (:completion-popupinfo m))))
+
+(defn completion-selected (m)
+  "The popup's selected candidate, or nil (no popup, or nothing selected)."
+  (let (c (:completion m))
+    (when (and c (>= (:index c) 0)) (nth (:items c) (:index c) nil))))
+
+(defn- completion-info-due? (m)
+  ;; a candidate is selected and the panel is not (yet) about it
+  (let (selected (completion-selected m))
+    (and selected
+      (completion-info? m)
+      (not (= selected (map/get-in m [:completion :info :candidate]))))))
+
+(defn completion-info-timer (m)
+  "The info panel's timer, for `model/register-timer-client`: an idle one-shot while the
+selected candidate has no panel yet — [[*completion-info-delay-ms*]] for the first,
+[[*completion-info-again-ms*]] once one has shown in this popup."
+  (when (completion-info-due? m)
+    {:after (if (map/get-in m [:completion :info])
+              *completion-info-again-ms*
+              *completion-info-delay-ms*)
+     :idle? true}))
+
+(defn completion-doc-lines (m candidate)
+  "`candidate`'s documentation as lines: the popup's `:docs` entry for it (a string, or an LSP
+`MarkupContent` map), else the current buffer's `:doc-at` service asked about the candidate
+alone, else `()`. A service that raises costs the panel, never the frame."
+  (let (doc (get (map/get-in m [:completion :docs] {}) candidate))
+    (cond
+      (string? doc) (string/split (string/trim doc) "\n")
+      (and (map? doc) (string? (:value doc))) (string/split (string/trim (:value doc)) "\n")
+      else
+        (let (svc (ed-mode-service (ed-current-buf m) :doc-at))
+          (or (when svc
+                (check-allow :discarded-catch
+                  (try (svc candidate (string/length candidate)) (catch _ nil))))
+            '())))))
+
+(defn completion-info-load (m)
+  "The info timer fired: look up the selected candidate's documentation
+([[completion-doc-lines]]) and keep it on the popup as `:info {:candidate :lines}` — an
+empty `:lines` too, so a candidate with no docs is not asked again."
+  (if (not (completion-info-due? m))
+    m
+    (let (selected (completion-selected m))
+      (map/assoc-in m
+        [:completion :info]
+        {:candidate selected :lines (completion-doc-lines m selected)}))))
+
+(register-timer-client :completion-info
+  'complete-card/completion-info-timer 'complete-card/completion-info-load)
+
+;; ---- rendering (overlay the menu; view splices these ops in) ----------------
+
+(def ed-popup-style
+  ;; a frameless popup card (no :border): a raised surface with the `:popup` padding (no
+  ;; rows above or below, a cell at each side)
+  ;; and a rounded selection pill (GUI) / solid bar (terminal) — the SAME `ui-list`
+  ;; look as the right-click context menu, so the two read identically.
+  {:fg :on-surface :bg :surface :pad :popup :radius *completion-card-radius*})
+
+(def- ed-info-style
+  ;; the info card: the popup's surface, with a hairline so it reads as a separate card
+  {:fg :on-surface :bg :surface :pad :popup :radius *completion-card-radius* :border true})
+
+(defn- complete-info-ops (m c area stage cols rows ctx)
+  "The info panel's ops beside the popup card at `area`, kept off the chrome around `stage`
+as the card is (`ui-place`): right of it when it fits, else left,
+else none. Empty unless the panel is about the selected candidate and has lines."
+  (let (info (:info c))
+    (if (or (nil? info)
+          (not (completion-info? m))
+          (not (= (:candidate info) (completion-selected m)))
+          (empty? (:lines info)))
+      []
+      (let ([pcol prow pw _] area
+            [room-col _ room-w room-h] (ui-card-room stage)
+            lines (into []
+                    (take (:lines info)
+                      (math/min *completion-info-max-lines* (math/max 1 room-h))))
+            w (+ (first (ui-pad-size (:pad ed-info-style)))
+                (math/min *completion-info-max-width*
+                  (fold lines 1 (fn (widest line) (math/max widest (string/length line))))))
+            right (+ pcol pw 1)
+            left (- pcol w 1)
+            col (cond
+                  (<= (+ right w) (+ room-col room-w)) right
+                  (>= left room-col) left
+                  else nil))
+        (if (nil? col)
+          []
+          (let (face (ui-face (:theme ctx) {:fg :on-surface :bg :surface})
+                panel (ui-panel (ui-place [col prow w (count lines)] stage cols rows)
+                        ctx
+                        ed-info-style
+                        (fn (inner _ctx)
+                          (let ([icol irow iw _] inner)
+                            {:ops (map (seq/enumerate lines)
+                                    (fn ([i line]) (text (+ irow i) icol (ui-clip line iw) face)))
+                             :zones []}))))
+            (:ops panel)))))))
+
+(sig complete-popup-ops (model int int -> any))
+(defn complete-popup-ops (m cols rows)
+  "Render ops for the completion menu (empty when no popup is open): a windowed `ui-list`
+in a frameless `ui-panel` (src/ui-kit.blsp) anchored at point — `*completion-max*` items
+scrolled around the selection, flipped above point when there's no room below — and beside
+it the selected candidate's info panel when one has loaded. Both cards keep `:card-gap` off
+the pane's header line and mode line (`ui-kit/ui-place`). One widget paints AND hit-tests
+the card, the same one behind the context menu."
+  (let (c (:completion m))
+    (if (nil? c)
+      []
+      (let (buf (ed-current-buf m)
+            items (:items c)
+            idx (:index c)
+            total (count items)
+            ;; the window cell where the completion STARTS, on point's row: the pane's place,
+            ;; its header row and gutter, wrapping and sideways scroll — the buffer's line and
+            ;; column alone put the card on the cursor's own row under a header, and at the
+            ;; wrong column beside a gutter or in a split. Anchored at the prefix's start, not
+            ;; at point, as Corfu and company place theirs: a card that rode the cursor slid
+            ;; one column right with every letter typed into it — the jitter you saw typing a
+            ;; word in prose. Its labels line up under the word being completed (the card's
+            ;; pad and the pill's inset are the `lead` columns it starts left of it).
+            cell (panes/ed-point-screen-cell m cols rows (:start c))
+            crow (if cell (first cell) (- (buffer-current-line buf) (ed-current-top m)))
+            ;; the pane's text rows, less the gap the card keeps from its chrome
+            stage (panes/ed-card-stage m cols rows [crow (if cell (second cell) 0)])
+            [_ room-top _ room-h] (ui-card-room stage)
+            room-bottom (+ room-top room-h)
+            ;; cap to the room on the roomier side of point, so a short pane never paints
+            ;; the menu over its mode line / header line. The frameless card is exactly
+            ;; `vis` rows tall, so no frame rows to reserve.
+            vis (math/max 1
+                  (math/min *completion-max*
+                    total
+                    (math/max (- room-bottom crow 1) (- crow room-top))))
+            ;; nothing selected (an auto popup) scrolls as if the first were
+            wstart (completion-window-start total (math/max 0 idx) vis)
+            window (take (drop items wstart) vis)
+            ;; label field width; the card adds its `:popup` padding and the row inset on
+            ;; both sides of the pill (1 + 1 cells each side), so the widest label fits whole
+            textw (completion-menu-width window)
+            [pad-w _] (ui-pad-size (:pad ed-popup-style))
+            inset (ui-row-inset ed-popup-style)
+            ;; how far the labels sit right of the card's edge: its left pad + the row inset
+            lead (+ (ui-pad-amount (:pad ed-popup-style) 3) inset)
+            rowfn (fn (it i sel?) {:label (ui-clip it textw) :enabled true})
+            ccol (math/max 0 (- (if cell (second cell) (buffer-column buf)) lead))
+            ;; place the vis-tall card below the cursor line if it fits, else above
+            below? (<= (+ crow 1 vis) room-bottom)
+            row0 (if below? (+ crow 1) (- crow vis))
+            area (ui-place [ccol row0 (+ textw pad-w (* 2 inset)) vis] stage cols rows)
+            ctx (ui-ctx (:gui m))
+            res (ui-panel area
+                  ctx
+                  ed-popup-style
+                  (ui-list {:items window
+                            :selected (when (>= idx 0) idx)
+                            :base wstart
+                            :row rowfn
+                            :tag :complete-run
+                            :style ed-popup-style})))
+        (append (:ops res) (complete-info-ops m c area stage cols rows ctx))))))
