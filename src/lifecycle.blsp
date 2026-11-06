@@ -6,7 +6,7 @@ running (`model/register-exit-query`)."
   (:use interactive) ; defcommand
   (:use model)
   (:use minibuffer)
-  (:use sidecar :only [buffer-sudo-user ed-remove-auto-save])
+  (:use sidecar :only [ed-forget-auto-save])
   (:use autorevert :only [ed-revert-at])
   (:use projects :only [file-display-name recent-files])
   (:use pool)) ; find-file, saving, the path prompt
@@ -34,39 +34,18 @@ A buffer whose mode refuses writing (`ed-no-write-refusal` — a hex view) is re
           (or (buffer-file (ed-current-buf m)) (str (ed-default-dir m) "/"))
           (if (:recent-files m) (recent-files) [])
           (fn (mm path)
-            (if (string/starts-with? path "/sudo:")
-              (ed-write-file-as-root mm path)
-              (ed-write-file-to mm path)))))))
-
-(defn- ed-write-file-as-root (m spec)
-  "C-x C-w to a TRAMP sudo path (`/sudo::/etc/motd`): the buffer becomes a sudo buffer
-backed by that file (`sudoedit`) and is saved through sudo — the password asked for when
-sudo wants one."
-  (let (parts (sudoedit/parse-sudo-path spec))
-    (if (or (nil? parts) (not (sudoedit/local-host? (:host parts))) (string/blank? (:path parts)))
-      (message m (str "write failed: not a sudo path on this machine: " spec " (/sudo::PATH)"))
-      (let (path (path/normalize (path/absolute (:path parts)))
-            old (ed-current-buf m)
-            old-key (hosted/hosted-key old)
-            b (assoc old
-                :file path
-                :sudo true
-                :sudo-user (:user parts)
-                :name (file-display-name path (ed-project-root m)))
-            index (ed-current-index m)
-            m2 (hosted/hosted-rekey-slot (dissoc (ed-set-buf m b) :status) index old-key))
-        (do
-          (ed-remove-auto-save (buffer-file old) (buffer-sudo-user old))
-          (ed-save-buf-at m2 index))))))
+            (let (handler (ed-path-handler path))
+              (if (nil? handler)
+                (ed-write-file-to mm path)
+                (ed-handler-call handler :write-file mm mm path))))))))
 
 (defn- ed-write-file-to (mm path)
-  "C-x C-w to plain `path`: the buffer written there and backed by it — no longer edited as
-root, if it was."
-  (let (old-file (buffer-file (ed-current-buf mm))
-        old-sudo (buffer-sudo-user (ed-current-buf mm))
-        old-key (hosted/hosted-key (ed-current-buf mm)))
+  "C-x C-w to plain `path`: the buffer written there and backed by it — no longer its file
+handler's, if it was."
+  (let (old (ed-current-buf mm)
+        old-key (hosted/hosted-key old))
     (try
-      (let (b (assoc (dissoc (ed-current-buf mm) :sudo :sudo-user)
+      (let (b (assoc (ed-buffer-unhandled old)
                 :file path
                 :name (file-display-name path (ed-project-root mm))))
         ;; keep what save-buffer returns: it is unmodified AND stamped with the
@@ -78,7 +57,7 @@ root, if it was."
               m2 (hosted/hosted-rekey-slot (dissoc (ed-set-buf mm b2) :status)
                    (ed-current-index mm)
                    old-key))
-          (ed-remove-auto-save old-file old-sudo)
+          (ed-forget-auto-save old)
           (message m2 (str "wrote " path))))
       (catch e (message mm (str "write failed: " (error-message e)))))))
 
@@ -90,8 +69,8 @@ brings back what was discarded."
   (let (b (ed-current-buf m) f (buffer-file b))
     (if (nil? f)
       (message m "no file to revert")
-      (if (= true (:sudo b))
-        (ed-revert-as-root m (ed-current-index m) nil)
+      (if (ed-buffer-handler b)
+        (ed-revert-handled m (ed-current-index m) nil)
         (try
           (message (ed-revert-at m (ed-current-index m)) (str "reverted " f))
           (catch e (message m (str "revert failed: " (error-message e)))))))))
@@ -185,18 +164,18 @@ it means and why they are not listed as answers."
     (if (empty? pending)
       (message m "(no changes need saving)")
       ;; a run starts with an empty queue: one abandoned (C-g) must not be saved by this one
-      (ed-map-y-or-n (dissoc m :quit-sudo-saves)
+      (ed-map-y-or-n (dissoc m :deferred-saves)
         pending
         (fn (i) (str "Save file " (buffer-file (ed-buf-at m i)) "?"))
         (fn (mm i) (ed-save-or-queue mm i))
         (fn (mm n)
-          (let (said (message (dissoc mm :quit-sudo-saves)
-                       (if (= n 0)
-                         "(no buffers saved)"
-                         (str "saved " n " buffer" (if (= n 1) "" "s"))))
-                queued (or (:quit-sudo-saves mm) []))
-            ;; the ones edited as root go after, one sudo job at a time
-            (if (empty? queued) said (sudoedit/ed-sudo-save-all said queued identity))))))))
+          ;; the ones a file handler saves later go after the questions
+          (ed-run-deferred-saves (message (dissoc mm :deferred-saves)
+                                   (if (= n 0)
+                                     "(no buffers saved)"
+                                     (str "saved " n " buffer" (if (= n 1) "" "s"))))
+            (:deferred-saves mm)
+            identity))))))
 
 (defn ed-live-processes-prompt (live)
   "The question C-x C-c asks when `live` (lines from `model/ed-live-processes`) is not
@@ -237,15 +216,13 @@ knows); the running processes are still asked about."
                             (if (ed-yes-key? k)
                               (ed-quit-confirm-processes m2)
                               (message m2 "quit canceled"))))))
-        ;; a file edited AS ROOT is written off the loop, after its password when sudo wants
-        ;; one (sudoedit): its saves wait until every question is answered, and the quit goes
+        ;; a save that lands later waits until every question is answered, and the quit goes
         ;; on when the last has landed — or stops, saying why, when one fails or is cancelled
         finish (fn (mm _)
-                 (let (queued (or (:quit-sudo-saves mm) []))
-                   (if (empty? queued)
-                     (after-saves mm)
-                     (sudoedit/ed-sudo-save-all (dissoc mm :quit-sudo-saves)
-                       queued after-saves " — quit canceled"))))
+                 (ed-run-deferred-saves (dissoc mm :deferred-saves)
+                   (:deferred-saves mm)
+                   after-saves
+                   " — quit canceled"))
         save (fn (mm i) (ed-save-or-queue mm i)))
     (if save-all?
       (finish (fold pending m save) 0)
@@ -256,15 +233,32 @@ knows); the running processes are still asked about."
         finish))))
 
 (defn- ed-save-or-queue (m i)
-  "Save pool buffer `i` now — or, edited as root (sudoedit), queue it on `:quit-sudo-saves`
-for after the questions: its save asks for a password and lands later, and a masked prompt
-must not open between two y-or-n questions."
-  (let (b (ed-buf-at m i))
-    (if (= true (:sudo b))
-      (assoc m
-        :quit-sudo-saves
-          (conj (or (:quit-sudo-saves m) []) [(buffer-file b) (or (:sudo-user b) "root")]))
-      (ed-save-buf-at m i))))
+  "Save pool buffer `i` now — or, when its file handler's save lands later, queue it on
+`:deferred-saves` for after the questions: it may ask for a password, and a masked prompt must
+not open between two y-or-n questions."
+  (let (b (ed-buf-at m i)
+        handler (ed-buffer-handler b)
+        entry (when handler (ed-handler-call handler :later-entry nil b)))
+    (if (nil? entry)
+      (ed-save-buf-at m i)
+      (map/assoc-in m
+        [:deferred-saves (:name handler)]
+        (conj (or (map/get-in m [:deferred-saves (:name handler)]) []) entry)))))
+
+;; check-allow: `then` is a continuation and the handlers' saves are resolved late; each
+;; answers a model
+(check-allow :trusted
+  (defn- ed-run-deferred-saves (m queued then &optional (abandon-note nil))
+    ;; `queued`, `:deferred-saves`' `{handler-name entries}`, each handler's in turn, then
+    ;; `(then m)`. A handler taken away since the question is passed over.
+    (if (empty? queued)
+      (then m)
+      (let ([name entries] (first queued)
+            handler (registry/lookup :model/file-handlers name)
+            next (fn (mm) (ed-run-deferred-saves mm (rest queued) then abandon-note)))
+        (if (nil? handler)
+          (next m)
+          (ed-handler-call handler :save-all m m entries next abandon-note))))))
 
 (defcommand cmd-quit
   (m key)
@@ -284,7 +278,7 @@ way). ESC is *not* quit (it's `keyboard-escape-quit`; see `modes`)."
   (let (m (slowlog/flush-latency m 1))
     (if (:frame? m)
       (assoc m :done true)
-      (ed-quit-ask (dissoc m :quit-sudo-saves) (ed-modified-file-indices m) false))))
+      (ed-quit-ask (dissoc m :deferred-saves) (ed-modified-file-indices m) false))))
 
 (defcommand cmd-save
   (m key)

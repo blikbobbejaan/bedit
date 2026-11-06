@@ -51,17 +51,12 @@ before reading it — else nil: within it, missing, a directory, or `threshold` 
     (when (and (> threshold 0) (int? size) (> size threshold) (not (file/dir? path))) size)))
 
 (defn ed-file-of-spec (spec)
-  "The file a path the user typed names: `spec` itself, or for a TRAMP sudo path
-(`/sudo::/etc/hosts`, `/sudo:www@:/x` — sudoedit) the file after the method's second colon,
-so a file opened as root is asked about by its size as a plain one is.
+  "The file a path the user typed names: `spec` itself, or what its file handler says it names,
+so a file reached through a handler is asked about by its size as a plain one is.
 
-    (pool/ed-file-of-spec \"/sudo::/etc/hosts\")   ;=> \"/etc/hosts\"
     (pool/ed-file-of-spec \"/home/me/a.txt\")   ;=> \"/home/me/a.txt\""
-  (if (string/starts-with? spec "/sudo:")
-    (let (rest (string/substring spec 6 (string/length spec))
-          colon (index-of rest ":"))
-      (if (< colon 0) spec (string/substring rest (inc colon) (string/length rest))))
-    spec))
+  (let (handler (ed-path-handler spec))
+    (if (nil? handler) spec (ed-handler-call handler :file-of spec spec))))
 
 (defn ed-large-file-question (m path)
   "The question to ask before opening `path`, or nil to open it at once: nil when it is
@@ -105,14 +100,14 @@ Emacs's `file-truename`."
 (defn- ed-buffer-index-by-truename (m path)
   "The pool index of a buffer visiting the file `path` is really (Emacs's
 `find-file-existing-other-name`): the two names of a symlink are one file, and two buffers
-on it would each save over the other. nil when none is. A buffer edited as root is another
-buffer on purpose (`sudoedit`, one per file and user)."
+on it would each save over the other. nil when none is. A buffer a file handler owns is
+another buffer on purpose: the same file reached another way."
   (let (truename (file-truename path))
     (when truename
       (let (i (seq/index-where (:buffers m)
                 (fn (b)
                   (let (file (buffer-file b))
-                    (and file (not (:sudo b)) (= (file-truename file) truename))))))
+                    (and file (nil? (ed-buffer-handler b)) (= (file-truename file) truename))))))
         (if (< i 0) nil i)))))
 
 (defn ed-read-file (path)
@@ -155,23 +150,6 @@ anywhere does. Loads `dired` on first use; by then this module has finished load
 has finished loading."
     (do (require-one 'hexl) ((reflect/eval 'hexl/ed-open-binary) m path root bytes))))
 (sig ed-open-binary (model string any any -> model))
-
-;; check-allow: as above — `sudoedit` stands on this module, so it is reached late, and its
-;; entry points answer a model.
-(check-allow :trusted
-  (defn ed-open-as-root (m spec)
-    "Open the TRAMP sudo path `spec` (`/sudo::/etc/hosts`) as root
-(`sudoedit/ed-sudo-find-file`, which may ask for the password first). Loads `sudoedit` on
-first use."
-    (do (require-one 'sudoedit) ((reflect/eval 'sudoedit/ed-sudo-find-file) m spec))))
-(sig ed-open-as-root (model string -> model))
-
-(check-allow :trusted
-  (defn ed-save-as-root (m i)
-    "Save pool buffer `i`, edited as root, through sudo (`sudoedit/ed-sudo-save`, which may
-ask for the password first). Loads `sudoedit` on first use."
-    (do (require-one 'sudoedit) ((reflect/eval 'sudoedit/ed-sudo-save) m i))))
-(sig ed-save-as-root (model int -> model))
 
 (sig ed-goto-line (buffer int -> buffer))
 (defn ed-goto-line (b n)
@@ -642,11 +620,11 @@ fresh buffer backed by it (so Ctrl-S creates it). A relative or `~` path is reso
 to absolute (`path-absolute`) first, so the prompt can stay short/relative while the
 buffer's `:file`, dedup, and project-relative name all key off a canonical path. A
 directory opens in dired (Emacs `find-file` on a directory), a binary as
-a hex view (`ed-open-binary`). A TRAMP sudo path — `/sudo::/etc/hosts` — opens the file
-as root (`sudoedit/ed-sudo-find-file`, which may ask for the password first)."
+a hex view (`ed-open-binary`). A path a file handler claims goes to that handler
+(`model/register-file-handler`)."
   (cond
     (string/blank? path) (message m "(no file)")
-    (string/starts-with? path "/sudo:") (ed-open-as-root m path)
+    (ed-path-handler path) (ed-open-handled m path)
     (file/dir? (path/absolute path)) (ed-open-dired m (path/absolute path))
     else
       (let (path (path/normalize (path/absolute path)) ; `./` and `..` collapsed: one spelling per file
@@ -869,21 +847,28 @@ The buffer is first made what its `.editorconfig` asks (`conventions/prepare-for
 trailing whitespace trimmed, a final newline added) — edits on the buffer, so what is
 written is what is shown.
 
-A buffer edited AS ROOT (`:sudo`, sudoedit.blsp) is written through sudo instead
-(`sudoedit/ed-sudo-save`, which may ask for the password first)."
-  (if (= true (:sudo (ed-buf-at m i)))
-    (ed-save-as-root m i)
-    (ed-save-buf-with m i charset/save "")))
+A buffer a file handler owns is that handler's to save (`model/register-file-handler`)."
+  (let (handler (ed-buffer-handler (ed-buf-at m i)))
+    (if (nil? handler)
+      (ed-save-buf-with m i charset/save "")
+      (ed-save-handled m i handler))))
+
+(defn- ed-denied-hint (buf reason)
+  ;; a file the user may not write: what a handler offers instead, Emacs's TRAMP. Not to a
+  ;; buffer a handler already writes, nor for any other failure.
+  (if (and (nil? (ed-buffer-handler buf)) (includes? (string/lower reason) "permission denied"))
+    (or (seq/find (seq/keep (ed-file-handlers) :denied-hint) string?) "")
+    ""))
+
 (sig ed-save-buf-with (model int any string -> model))
 (defn ed-save-buf-with (m i write note)
   "[[ed-save-buf-at]]'s save of pool buffer `i` with the file written by `write` — `(write
 buffer)`, answering the buffer stamped and unmodified, or raising (`editor/buffer/save-buffer`
-for a plain file; sudoedit's writer for a file edited as root) — and `note` appended to the
+for a plain file, a file handler's writer for one of its own) — and `note` appended to the
 `saved …` the echo area says. Everything else is the plain save's: the `.editorconfig`
 fix-ups first, the sidecar removed, a hosted slot's process told."
   (let (original (ed-buf-at m i)
-        buf (prepare-for-save original)
-        sudo? (= true (:sudo original)))
+        buf (prepare-for-save original))
     (try
       ;; `save-buffer` answers the buffer stamped with the file's new mtime, so the idle
       ;; beat's change check (`ed-revert-changed-files`) knows text and file agree again
@@ -897,7 +882,7 @@ fix-ups first, the sidecar removed, a hosted slot's process told."
             m2 (ed-ship-save-edits (if created? (ed-project-files-forget m1 f) m1)
                  i original buf))
         (do
-          (ed-remove-auto-save f (buffer-sudo-user original))
+          (ed-forget-auto-save original)
           ;; A HOSTED slot's buffer process owns the buffer's state, and it has to hear about
           ;; the save too. Only the pool copy used to be marked saved: the process went on
           ;; answering "modified", so another frame showed the buffer unsaved and the next
@@ -910,15 +895,10 @@ fix-ups first, the sidecar removed, a hosted slot's process told."
           (message m2 (str "saved " f note))))
       (catch e
         (message m
-          (str "save failed: "
-            (error-message e)
-            ;; a file the user may not write: Emacs's answer is TRAMP's sudo
-            (if (and (not sudo?) (includes? (string/lower (error-message e)) "permission denied"))
-              " — M-x sudo-edit to save it as root"
-              "")))))))
+          (str "save failed: " (error-message e) (ed-denied-hint original (error-message e))))))))
 
 ;; ---- a save that lands later ----------------------------------------------------
-;; A file written OFF the loop (as root, through sudo — sudoedit.blsp) is saved in two
+;; A file a handler writes OFF the loop (`model/register-file-handler`) is saved in two
 ;; halves: the buffer made what its `.editorconfig` asks and its text taken now
 ;; ([[ed-save-prepare]]), the buffer marked saved when the write has landed
 ;; ([[ed-save-landed]]). Until then it stays modified; a write that fails leaves it so.
@@ -945,7 +925,7 @@ stays modified, its newer text unwritten. `note` follows the `saved …` the ech
         saved (if current? (mark-buffer-saved stamped) (assoc stamped :saved-rope rope)))
     (do
       (when current?
-        (ed-remove-auto-save f (buffer-sudo-user b))
+        (ed-forget-auto-save b)
         ;; the process marks the text it holds — the same text, the write's edits having
         ;; reached it first (a mailbox is FIFO)
         (let (proc (map/get-in m [:hosted i :proc]))
@@ -974,12 +954,25 @@ that was not one (`filecoding`). A buffer with unsaved text is the caller's to r
       (message m "this buffer visits no file")
       (ed-open-binary (ed-kill-buffer-at m i) path (:project-root m) bytes))))
 
+;; check-allow: a handler's operation is resolved late; every one answers a model
+(sig ed-open-handled (model string -> model))
 (check-allow :trusted
-  (defn ed-revert-as-root (m i coding)
-    "Read pool buffer `i`, edited as root, again through sudo (`sudoedit/ed-sudo-revert`, which
-may ask for the password first). Loads `sudoedit` on first use."
-    (do (require-one 'sudoedit) ((reflect/eval 'sudoedit/ed-sudo-revert) m i coding))))
-(sig ed-revert-as-root (model int any -> model))
+  (defn- ed-open-handled (m spec)
+    ;; the typed path `spec` opened by the file handler claiming it
+    (ed-handler-call (ed-path-handler spec) :find-file m m spec)))
+
+(sig ed-save-handled (model int any -> model))
+(check-allow :trusted
+  (defn- ed-save-handled (m i handler)
+    ;; pool buffer `i` saved by `handler`, which owns it
+    (ed-handler-call handler :save m m i)))
+
+(sig ed-revert-handled (model int any -> model))
+(check-allow :trusted
+  (defn ed-revert-handled (m i coding)
+    "Read pool buffer `i` again through the file handler that owns it, in `coding` (nil for the
+one it has)."
+    (ed-handler-call (ed-buffer-handler (ed-buf-at m i)) :revert m m i coding)))
 
 (defcommand cmd-kill-buffer
   (m key)
@@ -1004,7 +997,7 @@ that mode asked to take with it (`layers/request-close`) are killed as well."
             (if (ed-yes-key? k)
               (do
                 ;; the text was given up: a sidecar left now would offer it back on every visit
-                (ed-remove-auto-save (buffer-file buf) (buffer-sudo-user buf))
+                (ed-forget-auto-save buf)
                 (ed-kill-at mm (ed-current-index mm) true))
               (message mm "kill canceled"))))
       else (ed-kill-at m (ed-current-index m) true))))

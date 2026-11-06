@@ -118,7 +118,12 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             what a VISIT passes through (`register-visit-step`, Emacs's
                             find-file-hook, `{:order :run :instead :passing}`: save-place,
                             so-long, the recovery note, which is said `:instead` of the open
-                            notice). The core names no feature: a
+                            notice) and the files reached ANOTHER WAY (`register-file-handler`,
+                            Emacs's file-name-handler-alist: a row claims a typed path by
+                            `:prefix` and a buffer by `:mark`, and answers `:find-file`,
+                            `:write-file`, `:save`, `:revert`, `:file-of`; a `:later-entry` +
+                            `:save-all` for a save that lands after the questions). The core
+                            names no feature: a
                             module registers its rows when it loads, each row CLAIMED for the
                             file that registered it (`ownership/claim!`), so a package's rows
                             go back with the package. Also the OUTPUT CAP
@@ -170,7 +175,8 @@ src/sidecar.blsp            where a sidecar lives and the note a visit shows whe
 src/autorevert.blsp         auto-revert of files changed on disk (one undoable edit, std's
                             `revert-buffer`; idle beat, order 120, after the sidecars). A file
                             edited as root is left alone
-src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and `sudo-edit`) over brood's
+src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and `sudo-edit`), the first
+                            file handler (`model/register-file-handler`), over brood's
                             `sudo` (ADR-588): `C-x C-f /sudo::/etc/hosts` (or `/sudo:USER@:PATH`, this
                             machine only), `M-x sudo-edit` (the current file, its unsaved text kept),
                             `C-x C-w /sudo::PATH`. The buffer remembers (`:sudo`, `:sudo-user`, carried
