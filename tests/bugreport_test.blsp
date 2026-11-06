@@ -1,0 +1,105 @@
+;; M-x report-bug (src/bugreport.blsp): what the editor catches is kept once per kind of
+;; error, shown before it is sent, and sent only when the reader says so.
+(defmodule bugreport-test
+  (:use test)
+  (:use model)
+  (:use bugreport)
+  (:use editor/buffer)
+  (:use-internals bedit/input) ; ed-recover — a command error goes through the real recovery
+  (:use main :only [])) ; the released image: the error sink registered
+
+(purge-stale-temp "bedit-bugreport-")
+
+(defn- scratch-errors-file ()
+  (let (dir (temp-dir "bedit-bugreport-"))
+    (do (file/mkdir dir) (path/join dir "errors.blsp"))))
+
+(defn- caught (kind message) {:kind kind :message message :file "src/probe.blsp" :line 7})
+
+(describe "what bedit keeps of an error it caught"
+  (test "a kind of error is kept once a session, under its signature"
+    (binding (*errors-file* (scratch-errors-file))
+      (assert= (record! (caught :probe-once "boom: 1") :command) :new)
+      ;; the same bug again — another message, same kind and site — is not new
+      (assert= (record! (caught :probe-once "boom: 2") :command) nil)
+      (let (kept-now (kept))
+        (assert= (count kept-now) 1)
+        (let (entry (second (first kept-now)))
+          (assert= (:times entry) 1)
+          (assert= (map/get-in entry [:report :context :program]) "bedit")
+          (assert= (map/get-in entry [:report :context :where]) :command)
+          (assert= (map/get-in entry [:report :site :file]) "src/probe.blsp")))))
+
+  (test "what was sent is not offered again"
+    (binding (*errors-file* (scratch-errors-file))
+      (record! (caught :probe-sent "x") :render)
+      (let ([signature _] (first (pending)))
+        (mark-sent! signature)
+        (assert= (pending) []))))
+
+  (test "a command that raises says so once, pointing at M-x report-bug"
+    (binding (*errors-file* (scratch-errors-file))
+      ;; `ed-error-text` is what input's recovery says of a command that raised
+      (let (once (ed-error-text (caught :probe-command "the probe failed") :command)
+            twice (ed-error-text (caught :probe-command "second") :command))
+        (is (includes? once "the probe"))
+        (is (includes? once "M-x report-bug"))
+        (is (not (includes? twice "M-x report-bug")))))))
+
+(describe "the report as it will be sent"
+  (test "the buffer's text reads back as the note and the report"
+    (let (report (crash-report/describe-error (caught :probe-text "boom") {:program "bedit"})
+          text (report-text report {:times 2} 0 "https://example.invalid/reports")
+          written (string/replace text "\n\n\n" "\nI was saving a file\nwhen it raised\n\n")
+          [note read-back] (parse written))
+      (assert= note "I was saving a file\nwhen it raised")
+      (assert= read-back report)
+      (is (includes? text "2 session(s)"))
+      (is (includes? text "https://example.invalid/reports"))))
+
+  (test "a report edited past reading says so instead of sending"
+    (let (report (crash-report/describe-error (caught :probe-broken "boom")))
+      (is (failure? (parse (string/replace (report-text report nil 0 "u") "{" "("))))
+      (is (failure? (parse "no marker here"))))))
+
+(defn- report-model ()
+  (cmd-report-bug (ed-init (make-buffer "" "*scratch*")) nil))
+
+(describe "sending a report"
+  (test "C-c C-c sends what the buffer says, with the note, and marks the error sent"
+    (binding (*errors-file* (scratch-errors-file))
+      (record! (caught :probe-send "boom") :command)
+      (let (m (report-model)
+            noted (ed-set-buf m (insert (ed-current-buf m) "it broke on save"))
+            after (binding (*post* (fn (url body) (do (send (self) [:posted body]) {:status 201})))
+                    (cmd-report-bug-send noted nil))
+            probe-sent-body (receive ([:posted body] body) (after 1000 {})))
+        (assert= (:note probe-sent-body) "it broke on save")
+        (assert= (:kind probe-sent-body) :probe-send)
+        (is (string? (:signature probe-sent-body)))
+        (is (includes? (:echo after) "report sent"))
+        (assert= (ed-buffer-index-by-name after "*Bug Report*") nil)
+        (assert= (pending) []))))
+
+  (test "a refused report stays, to send again"
+    (binding (*errors-file* (scratch-errors-file))
+      (record! (caught :probe-refused "boom") :command)
+      (let (after (binding (*post* (fn (url body) {:status 429}))
+                    (cmd-report-bug-send (report-model) nil)))
+        (is (includes? (:echo after) "refused"))
+        (is (not (nil? (ed-buffer-index-by-name after "*Bug Report*"))))
+        (assert= (count (pending)) 1))))
+
+  (test "a report not reached keeps the buffer and says why"
+    (binding (*errors-file* (scratch-errors-file))
+      (record! (caught :probe-unreached "boom") :command)
+      (let (after (binding (*post* (fn (url body) (failure/with {} "connection refused")))
+                    (cmd-report-bug-send (report-model) nil)))
+        (is (includes? (:echo after) "connection refused"))
+        (assert= (count (pending)) 1))))
+
+  (test "with nothing caught, a report is the note alone"
+    (binding (*errors-file* (scratch-errors-file))
+      (let (m (report-model))
+        (is (includes? (buffer-text (ed-current-buf m)) "No error is waiting"))
+        (is (includes? (buffer-text (ed-current-buf m)) ":user-report"))))))

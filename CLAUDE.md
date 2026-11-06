@@ -201,6 +201,15 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
                             and SIGHUP / SIGTERM auto-save every unsaved buffer before the
                             terminal is restored (`main/terminal-hangup`). Named to dodge std's `sudo`
+src/bugreport.blsp          M-x report-bug (Emacs's report-emacs-bug): every error the editor CATCHES
+                            (a command, a render error frame, a fontify, a loop the supervisor
+                            restarted) reaches its error sink (`model/register-error-sink`),
+                            described as data by brood's `crash-report/describe-error` (redacted,
+                            no buffer text) and kept in state/errors.blsp once per kind a session;
+                            the first time, the echo area points at M-x report-bug. *Bug Report*
+                            shows exactly what would be sent, editable, under your note; C-c C-c
+                            sends it off the loop to `:bug-report-url` (the hive), C-c C-k drops
+                            it. Nothing is sent otherwise; `*post*` is bound in tests
 src/recover.blsp            M-x recover-this-file / recover-session: a sidecar's text put back as one
                             undoable edit (Emacs's), from the open and recent files
 src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `supervise`): a loop that

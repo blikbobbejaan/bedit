@@ -1,0 +1,245 @@
+(defmodule bugreport
+  "M-x report-bug (Emacs's report-emacs-bug): the errors bedit caught, kept and sent to the
+hive when you say so.
+
+Every error the editor catches — a command that raised, a frame that failed to paint, a loop
+the supervisor restarted — reaches this module's error sink (`model/register-error-sink`). It
+is described as data (brood's `crash-report/describe-error`: its kind, where it was raised,
+the functions above, the versions — redacted, no buffer text) and kept in
+state/errors.blsp, once per kind of error per session, by its signature. The first time a
+kind shows in a session the echo area says M-x report-bug sends it; nothing is sent until you
+do.
+
+M-x report-bug opens *Bug Report*: the newest unsent error as the literal that will be sent,
+editable, under room for a note. C-c C-c sends exactly that text (a task, off the loop) to
+init.blsp's `:bug-report-url`, the hive by default; C-c C-k drops it. With nothing waiting it
+opens a report with no error in it, for a bug that raised nothing."
+  (:use modes :only []) ; register-type runs at load, after modes declares its kinds
+  (:use editor/buffer) ; the report's text, point on the note
+  (:use editor/keymap :only [keymap-bind]) ; C-c C-c / C-c C-k
+  (:use interactive) ; defcommand
+  (:use model) ; message / register-error-sink / register-task-reply / ed-headless?
+  (:use pool :only [ed-show-named ed-kill-buffer-named]) ; the *Bug Report* buffer
+  (:use projects :only [editor-state-dir persist-read-value persist-write!]) ; state/errors.blsp
+  (:use about :only [bedit-version]) ; the version a report carries
+  (:use task :only [task])) ; the send runs off the loop
+
+(def *buffer-name* "*Bug Report*")
+
+(def *max-kept* 50)
+;; How many kinds of error state/errors.blsp keeps: past that the least recently seen go.
+
+(defdyn *errors-file* nil)
+;; The file the errors are kept in, nil for state/errors.blsp; a test binds its own.
+
+(defdyn *post* (fn (url report) (crash-report/post url report)))
+;; How a report is sent, as data: a test binds its own (no network in a test), and a send
+;; reads it ON the loop and hands it to the task, because a binding does not cross into the
+;; task's process.
+
+(def- send-timeout-ms 20000)
+
+(def- marker ";; ---- the report: sent as written — edit or delete anything in it ----")
+
+;; ---- keeping what was caught ---------------------------------------------------------
+
+(defn errors-file ()
+  "Where the caught errors are kept: state/errors.blsp, or what a test bound."
+  (or *errors-file* (path/join (editor-state-dir) "errors.blsp")))
+
+(defn kept ()
+  "The kept errors, `{signature {:report :times :first :last :sent}}` — `{}` when none."
+  (let (stored (persist-read-value (errors-file) {})) (if (map? stored) stored {})))
+
+(defn- context (where)
+  "What a report says of the editor: which program, its version, where the error was caught."
+  {:program "bedit" :version (bedit-version) :where where})
+
+(defn- newest-first (entries) (seq/sort-by entries (fn ([_ entry]) (- 0 (:last entry 0)))))
+
+(defn keep! (report now)
+  "Keep `report` under its signature, counting the sessions it happened in, at time `now`;
+the least recently seen go past [[*max-kept*]]. Returns the entry."
+  (let (all (kept)
+        signature (:signature report)
+        before (get all signature {})
+        entry {:report report
+               :times (inc (:times before 0))
+               :first (or (:first before) now)
+               :last now
+               :sent (:sent before)}
+        updated (into {} (take (newest-first (assoc all signature entry)) *max-kept*)))
+    (do
+      (persist-write! (errors-file)
+        updated
+        "errors bedit caught, for M-x report-bug; nothing here is sent unless you send it; safe to delete")
+      entry)))
+
+(defn record! (error where)
+  "The error sink: describe `error`, caught at `where`, and keep it — once per kind of error
+in a session. `:new` the first time, so the echo area points at M-x report-bug once."
+  (let (report (crash-report/describe-error error (context where))
+        signature (:signature report))
+    (if (registry/lookup :bugreport/seen signature)
+      nil
+      (do
+        (registry/put! :bugreport/seen signature true)
+        (keep! report (os/now))
+        :new))))
+
+(defn pending ()
+  "The kept errors not yet sent, the most recently seen first, as `[signature entry]` pairs."
+  (into [] (seq/reject (newest-first (kept)) (fn ([_ entry]) (:sent entry)))))
+
+(defn mark-sent! (signature)
+  "Mark the kept error `signature` sent, so M-x report-bug offers the next one."
+  (let (all (kept))
+    (when (contains? all signature)
+      (persist-write! (errors-file) (map/assoc-in all [signature :sent] (os/now))))
+    nil))
+
+;; ---- the report as text ---------------------------------------------------------------
+
+(defn report-literal (report)
+  "`report` as a Brood map literal with one key to a line, which reads back as it was."
+  (str "{"
+    (string/join (map (seq/sort-by (keys report) ->string)
+                   (fn (key) (str (pr-str key) " " (pr-str (get report key)))))
+      "\n ")
+    "}"))
+
+(defn report-text (report entry waiting url)
+  "The *Bug Report* buffer: what it is and how to send it, room for a note, then `report`.
+`entry` is the kept error it came from (nil for a report with no error), `waiting` how many
+more are kept unsent."
+  (string/join (seq/reject [";; A bug report for bedit. Say above the report what you were doing; it helps more"
+                             (str ";; than anything else in it. C-c C-c sends this buffer's text to "
+                               url ",")
+                             ";; C-c C-k drops it. Nothing else is sent, and nothing is sent until you say so."
+                             (if entry
+                               (str ";; This error happened in " (:times entry) " session(s).")
+                               ";; No error is waiting: this report is your note alone, with the versions.")
+                             (if (> waiting 0)
+                               (str ";; "
+                                 waiting
+                                 " more error(s) are waiting: M-x report-bug again after this one.")
+                               nil)
+                             ""
+                             ""
+                             ""
+                             marker
+                             (report-literal report)
+                             ""]
+                 nil?)
+    "\n"))
+
+(defn parse (text)
+  "`[note report]` read back from the *Bug Report* buffer's `text`: the note is what was
+written above the report (its `;;` lines left out), the report the map below it. A failure
+saying what is wrong when the report no longer reads as a map."
+  (let (at (index-of text marker))
+    (if (< at 0)
+      (failure/with {} "the report's marker line is gone; M-x report-bug starts again")
+      (let (above (string/substring text 0 at)
+            below (string/substring text (+ at (string/length marker)))
+            note (string/trim (string/join (seq/reject (string/split above "\n")
+                                             (fn (line)
+                                               (string/starts-with? (string/triml line) ";;")))
+                                "\n"))
+            attempt (try [(reflect/read-string below) nil] (catch e [nil (error-message e)])))
+        (cond
+          (second attempt) (failure/with {} "the report does not read: " (second attempt))
+          (map? (first attempt)) [note (first attempt)]
+          else (failure/with {} "the report is not a map any more; M-x report-bug starts again"))))))
+
+;; ---- the commands -----------------------------------------------------------------------
+
+(defn- the-url (m)
+  (or (:bug-report-url m) (config/setting {} :bug-report-url)))
+
+(defcommand cmd-report-bug
+  (m key)
+  "Report a bug in bedit (Emacs's report-emacs-bug): *Bug Report* shows the newest error bedit
+caught and has not sent, exactly as it would be sent, under room for your note. C-c C-c sends
+it to the hive, C-c C-k drops it. With no error waiting it is a report of your note alone."
+  (let (waiting (pending)
+        [signature entry] (or (first waiting) [nil nil])
+        report (if entry
+                 (:report entry)
+                 (crash-report/describe-error {:kind :user-report :message ""} (context :by-hand)))
+        text (report-text report entry (math/max 0 (dec (count waiting))) (the-url m))
+        shown (ed-show-named m *buffer-name* text :bug-report)
+        ;; point on the note's first line, under the header
+        note-at (index-of text "\n\n\n"))
+    (assoc (ed-set-buf shown (goto-char (ed-current-buf shown) (+ note-at 2)))
+      :bug-report-signature signature)))
+
+(defcommand cmd-report-bug-drop
+  (m key)
+  "Drop this bug report (C-c C-k): nothing is sent, and the error stays kept for later."
+  (message (dissoc (ed-kill-buffer-named m *buffer-name*) :bug-report-signature)
+    "report dropped — nothing was sent"))
+
+(defn- send-body (note report)
+  "What goes to the hive: the report as written, the note, and its signature (recomputed when
+the reader deleted it)."
+  (assoc report
+    :note note
+    :signature (or (:signature report) (crash-report/signature report))))
+
+(defcommand cmd-report-bug-send
+  (m key)
+  "Send this bug report to the hive (C-c C-c): the buffer's text as it stands, off the loop. One
+at a time."
+  (cond
+    (:bug-report-job m) (message m "a report is already being sent")
+    else
+      (let (parsed (parse (buffer-text (ed-current-buf m))))
+        (if (failure? parsed)
+          (message m (error-message parsed))
+          (let ([note report] parsed
+                body (send-body note report)
+                url (the-url m)
+                post *post*)
+            (if (ed-headless?)
+              (ed-report-sent m (post url body))
+              (assoc (message m (str "sending the report to " url "…"))
+                :bug-report-job (task (fn () (post url body)) {:timeout send-timeout-ms}))))))))
+
+(defn ed-report-sent (m response)
+  "Fold a send's `response`: sent, the error is marked so and the buffer goes; refused or not
+reached, the buffer stays with the reason, to send again."
+  (let (m1 (dissoc m :bug-report-job)
+        status (when (map? response) (:status response)))
+    (cond
+      (and (int? status) (>= status 200) (< status 300))
+        (let (signature (:bug-report-signature m1))
+          (do
+            (when signature (mark-sent! signature))
+            (message (dissoc (ed-kill-buffer-named m1 *buffer-name*) :bug-report-signature)
+              (str "report sent — thank you"
+                (let (more (count (pending))) (if (> more 0) (str "; " more " more waiting") ""))))))
+      (int? status)
+        (message m1
+          (str "the hive refused the report (" status "); it is still here to send again"))
+      (failure? response)
+        (message m1
+          (str "the report was not sent: " (error-message response) "; C-c C-c tries again"))
+      else (message m1 "the report was not sent: no answer in time; C-c C-c tries again"))))
+
+;; ---- the mode and the rows ----------------------------------------------------------------
+
+(def bug-report-keymap
+  (-> {}
+    (keymap-bind [:ctrl-c :ctrl-c] 'bugreport/cmd-report-bug-send)
+    (keymap-bind [:ctrl-c :ctrl-k] 'bugreport/cmd-report-bug-drop)))
+
+(def bug-report-mode-layer
+  {:name 'bug-report
+   :doc "A bug report for bedit: write what you were doing; C-c C-c sends, C-c C-k drops."
+   :keymap bugreport/bug-report-keymap
+   :commands (modes/layer-commands bugreport/bug-report-keymap)})
+
+(modes/register-type :bug-report '(bugreport/bug-report-mode-layer modes/text-mode-layer))
+(register-error-sink :bugreport 'bugreport/record!)
+(register-task-reply :bug-report-job 'bugreport/ed-report-sent nil "report")
