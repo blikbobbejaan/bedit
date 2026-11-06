@@ -65,7 +65,7 @@ stay untouched.
    (`registry-share` with the slot's text + `{:file :type :dir}`), so every live buffer
    is registered the moment it exists, in the single-frame case too. `hosted-drop-slot`
    (kill-buffer) removes it from the registry. `hosted-rehost` re-shares after a crash.
-2. **Two registry events** in `input/ed-event-handlers`: `:registry-added` → a frame
+2. **Two registry events** in `events/ed-event-handlers`: `:registry-added` → a frame
    without that buffer adds a pool slot (`make-buffer "" name file`, typed from `meta`,
    dir set) and links it to the process — the seed push fills the text; a frame that has
    it but whose link is dead (the crash case) relinks. `:registry-removed` → the slot is

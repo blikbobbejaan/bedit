@@ -434,7 +434,11 @@ src/ui-kit.blsp             the widget kit over editor/display: a widget is `(ar
                             transient, context menu, completion + info card and tooltips keep
                             `:card-gap` off the mode line / echo area / header line and the
                             window's edges, over the stage `panes/ed-card-stage` names
-src/input.blsp              dispatch: fold a key/mouse/tick event into the next model; and the
+src/events.blsp             what reaches the loop besides keys, one `[:tag …]` handler each by symbol:
+                            resize, mouse, a task's reply, a process down, redirected output, a
+                            client's identity. A feature's own tags register in `model`
+src/input.blsp              dispatch: fold a key or tick into the next model, the post-event step
+                            (`ed-post-step`); and the
                             keyboard-macro REPLAY (`ed-run-macro`): N passes (C-u N C-x e), or
                             until one fails (C-u 0), each stopping at the first key whose
                             command fails (`model/ed-ding` or a throw), as Emacs's does — in
