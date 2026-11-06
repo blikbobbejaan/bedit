@@ -523,7 +523,7 @@ src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (re
 src/hexl.blsp               hexl-mode: a binary file opened as a read-only hex view (pool's
                             find-file reaches it late-bound); the mode's `:no-write` facet is
                             what makes C-x C-s / C-x C-w refuse it
-src/pool.blsp               the buffer pool and where its buffers are shown — open / select /
+src/pool.blsp               the buffer pool and where its buffers are shown — open / select / C-x k /
                             kill, `ed-display-buffer` (Emacs display-buffer: init.blsp's
                             `:display-buffer` RULES first — `{:match name-regex | type-or-mode
                             :request :action :same-window | :other-window | :reuse | {:side
