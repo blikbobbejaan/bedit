@@ -1,0 +1,168 @@
+(defmodule org-mode
+  "org-mode: outlines, TODOs and folding. The text is `org`'s (src/org.blsp): the colouring
+and the outline facts (a heading's level, where its subtree ends, the TODO cycle). Folding
+is the editor's (src/folds.blsp); this mode supplies what a fold covers (`:fold-extent`)
+and the keys. Prose wraps, as in markdown: an Org paragraph is one long line."
+  (:use modes :only [register-language-mode layer-commands])
+  (:use interactive :only [defcommand]))
+
+(defn org-fold-extent (rope line)
+  "Org's `:fold-extent`: the last line of the subtree under the heading at `line` of
+`rope`, or nil when `line` is not a heading. Reads only the subtree's lines."
+  (let (line-count (text/line-count rope)
+        line-at (fn (index) (wrap/rope-line-text rope index)))
+    (when (and (< line line-count) (org/heading-level (line-at line)))
+      (org/subtree-end-by line-at line-count line))))
+
+(defn- org-current-line (buf) (wrap/line-text buf (editor/buffer/buffer-current-line buf)))
+
+(defn- org-replace-line (m f)
+  ;; the current line replaced by `(f text)`, point keeping its distance from the line's end
+  (let (buf (model/ed-current-buf m)
+        line (editor/buffer/buffer-current-line buf)
+        text (wrap/line-text buf line)
+        start (text/line->char (editor/buffer/buffer-rope buf) line)
+        from-end (- (string/length text) (editor/buffer/buffer-column buf))
+        replaced (f text))
+    (first (model/ed-try-edit m
+             (fn (b)
+               (editor/buffer/goto-char (editor/buffer/replace-region b
+                                          start
+                                          (+ start (string/length text))
+                                          replaced)
+                 (+ start (math/max 0 (- (string/length replaced) from-end)))))))))
+
+(defcommand cmd-org-cycle
+  (m key)
+  "TAB in Org: on a heading, cycle its subtree FOLDED → CHILDREN → SUBTREE (Org's
+`org-cycle`); anywhere else, indent or complete as TAB always does."
+  (let (buf (model/ed-current-buf m)
+        [cycled state] (folds/cycle-heading buf (editor/buffer/buffer-current-line buf)))
+    (if (nil? state)
+      (commands/cmd-indent-or-complete m key)
+      (model/message (model/ed-set-buf m cycled)
+        (case state :folded "FOLDED" :children "CHILDREN" "SUBTREE")))))
+
+(defcommand cmd-org-cycle-buffer
+  (m key)
+  "S-TAB in Org: every heading folded (the overview), or everything shown."
+  (let ([cycled state] (folds/cycle-buffer (model/ed-current-buf m)))
+    (model/message (model/ed-set-buf m cycled) (if (= state :overview) "OVERVIEW" "SHOW ALL"))))
+
+(defcommand cmd-org-todo
+  (m key)
+  "Step the heading's TODO keyword: none → TODO → DONE → none (C-c C-t, Org's `org-todo`)."
+  (if (nil? (org/heading-level (org-current-line (model/ed-current-buf m))))
+    (model/message m "not on a heading")
+    (org-replace-line m org/cycle-todo)))
+
+(defn- org-heading-from (rope line-count line step)
+  ;; the nearest heading line from `line` in direction `step`, or nil — reading the lines it
+  ;; passes, not the document
+  (let (next (+ line step))
+    (cond
+      (or (< next 0) (>= next line-count)) nil
+      (org/heading-level (wrap/rope-line-text rope next)) next
+      else (org-heading-from rope line-count next step))))
+
+(defn- org-heading-move (m step none)
+  (let (buf (model/ed-current-buf m)
+        rope (editor/buffer/buffer-rope buf)
+        target (org-heading-from rope
+                 (text/line-count rope)
+                 (editor/buffer/buffer-current-line buf)
+                 step))
+    (if (nil? target)
+      (model/message m none)
+      (model/ed-set-buf m
+        (editor/buffer/goto-char buf (text/line->char (editor/buffer/buffer-rope buf) target))))))
+
+(defcommand cmd-org-next-heading
+  (m key)
+  "Move to the next heading, at any level (C-c C-n)."
+  (org-heading-move m 1 "No next heading"))
+
+(defcommand cmd-org-previous-heading
+  (m key)
+  "Move to the previous heading, at any level (C-c C-p)."
+  (org-heading-move m -1 "No previous heading"))
+
+(defn- org-change-level (m delta)
+  (let (text (org-current-line (model/ed-current-buf m))
+        level (org/heading-level text))
+    (cond
+      (nil? level) (model/message m "not on a heading")
+      (and (< delta 0) (= level 1)) (model/message m "cannot promote a top-level heading")
+      else
+        (org-replace-line m
+          (fn (line) (if (< delta 0) (string/substring line 1 (string/length line)) (str "*" line)))))))
+
+(defcommand cmd-org-promote
+  (m key)
+  "One star fewer on this heading (M-<left>, Org's `org-do-promote`)."
+  (org-change-level m -1))
+
+(defcommand cmd-org-demote
+  (m key)
+  "One star more on this heading (M-<right>, Org's `org-do-demote`)."
+  (org-change-level m 1))
+
+(defcommand cmd-org-meta-return
+  (m key)
+  "A new heading at this one's level on the line below (M-RET); off a heading, a newline."
+  (let (level (org/heading-level (org-current-line (model/ed-current-buf m))))
+    (if (nil? level)
+      (commands/cmd-newline m key)
+      (let (at-end (model/ed-set-buf m (editor/buffer/end-of-line (model/ed-current-buf m))))
+        (first (model/ed-try-edit at-end
+                 (fn (b) (editor/buffer/insert b (str "\n" (string/repeat "*" level) " ")))))))))
+
+(defn org-on-move (m)
+  "org-mode's `:on-move`: point that lands inside a fold some way other than C-n / C-p
+— a search, a jump — opens it, so the cursor is never in hidden text."
+  (let (buf (model/ed-current-buf m)
+        revealed (folds/reveal buf))
+    (if (= revealed buf) m (model/ed-set-buf m revealed))))
+
+(def org-keymap
+  (-> {}
+    (editor/keymap/keymap-bind [:tab] 'org-mode/cmd-org-cycle)
+    (editor/keymap/keymap-bind [:back-tab] 'org-mode/cmd-org-cycle-buffer)
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-t] 'org-mode/cmd-org-todo)
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-n] 'org-mode/cmd-org-next-heading)
+    (editor/keymap/keymap-bind [:ctrl-c :ctrl-p] 'org-mode/cmd-org-previous-heading)
+    (editor/keymap/keymap-bind [:alt-left] 'org-mode/cmd-org-promote)
+    (editor/keymap/keymap-bind [:alt-right] 'org-mode/cmd-org-demote)
+    (editor/keymap/keymap-bind [:alt-enter] 'org-mode/cmd-org-meta-return)))
+
+;; the header line's crumbs for an Org buffer (`headerline/crumbs`): the headings point is
+;; under. Memoised on the rope and the line, because the header asks every frame and the walk
+;; up to a top-level heading is as long as the subtree.
+(memo/defmemo org-crumbs-at
+  4
+  (rope line)
+  (org/heading-path (fn (i) (wrap/rope-line-text rope i)) line))
+
+(defn org-breadcrumbs (buf)
+  "org-mode's `:breadcrumbs`: the titles of the headings point is under, outermost first."
+  (org-crumbs-at (editor/buffer/buffer-rope buf) (editor/buffer/buffer-current-line buf)))
+
+(def org-mode-layer
+  {:name 'org
+   :file-pattern "\\.org$"
+   :fontify 'org/org-spans
+   :line-lexer 'org/org-line-lexer
+   ;; the band's first line, or the `#+BEGIN_` above it still open — not 200 lines of lead-in
+   :fontify-restart 'org/org-fontify-restart
+   :long-lines :wrap
+   ;; a heading, a `#+KEYWORD` line and a drawer line are never filled into the text below
+   ;; them (`fill`) — `* Heading` would otherwise read as a list item
+   :fill-separate "^(\\*+ |[ \t]*#\\+|[ \t]*:[A-Za-z_-]+:)"
+   :fold-extent 'org-mode/org-fold-extent
+   :breadcrumbs 'org-mode/org-breadcrumbs
+   :on-move 'org-mode/org-on-move
+   :keymap org-mode/org-keymap
+   :commands (layer-commands org-mode/org-keymap)
+   :comment-syntax "# "})
+
+(register-language-mode 'org-mode/org-mode-layer :org)

@@ -604,8 +604,7 @@ src/languages.blsp          `deflanguage` declares a tree-sitter language from O
                             language's OWN spec's faces, found per frame (`language-faces`), so
                             a missing language or grammar keeps the host's colours. `deflexer`
                             is its sibling for the line-lexer languages (a pattern + a `lex-*`
-                            stem): env, JSON5, Makefile / INI / commit. And org-mode (`org`'s
-                            spans and outline, folding, TODO cycling, heading motion)
+                            stem): env, JSON5, Makefile / INI / commit
 src/tsbrackets.blsp         show-paren over a tree-sitter parse: a bracket is a delimiter
                             TOKEN, its partner the matching token under the same parent (so a
                             `(` in a string matches nothing), read off the held tree when the
@@ -614,8 +613,10 @@ src/tsbrackets.blsp         show-paren over a tree-sitter parse: a bracket is a 
                             block's braces) is found among the parent's children, anonymous
                             tokens included (`node-children` all?), with no length cap
 src/org.blsp                Org text: `org-spans` (the colouring), heading levels, where a
-                            subtree ends, the TODO cycle. Pure; languages.blsp's org-mode
-                            is the mode over it (moved from brood's std by ADR-417)
+                            subtree ends, the TODO cycle. Pure; org-mode is the mode over it
+                            (moved from brood's std by ADR-417)
+src/org-mode.blsp           org-mode: the mode over `org` — folding (TAB, S-TAB), TODO cycling,
+                            heading motion, promote / demote, breadcrumbs
 src/mail.blsp               mail: mbox-mode (C-c C-n / C-c C-p between messages, on rope
                             searches that cost the distance, not the offset), eml-mode, and
                             C-c C-v — the message at point DECODED in *Message* (Gnus's
