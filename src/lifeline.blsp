@@ -7,7 +7,9 @@ writes an auto-save sidecar for every file buffer whose text the file does not h
 (`emergency-save!`, from the buffer processes), closes the dead loop's window and starts a
 fresh loop that adopts every buffer from the registry. A loop that keeps dying is let go
 once it has been restarted `*restart-max*` times inside `*restart-window-ms*`, its sidecars
-written, so a fault that recurs on every start cannot spin. A clean quit ends the loop normally, and `main`
+written, so a fault that recurs on every start cannot spin. Told to end (SIGTERM, SIGHUP,
+SIGINT) it writes the same sidecars and ends the loop, stuck or not; a daemon does the same
+across its sessions (`start-keeper`). A clean quit ends the loop normally, and `main`
 with it, as before.
 
 Mechanism only: what a loop IS — how it opens its window, how a restarted one is seeded —
@@ -18,6 +20,27 @@ is `main`'s, handed in as functions."
 
 (def *restart-max* 3)
 (def *restart-window-ms* 60000)
+
+(def- fatal-signals [:term :hup :int])
+
+(defn- trap-fatal (pid)
+  "Route the signals that end the runtime to `pid`. Who had each before, a map. A platform
+without Unix signals has nothing to route, and answers an empty map."
+  (check-allow :discarded-catch
+    (try
+      (into {} (map fatal-signals (fn (sig) [sig (os/trap sig pid)])))
+      (catch _ {}))))
+
+(defn- restore-traps (previous)
+  "Give each signal in `previous` ([[trap-fatal]]) back to whoever held it."
+  (doseq (entry previous) (os/trap (first entry) (second entry))))
+
+(defn signal-exit-code (sig)
+  "The exit status of a program ended by `sig`, as the shell reports a signal death.
+
+    (lifeline/signal-exit-code :term)   ;=> 143
+    (lifeline/signal-exit-code :hup)   ;=> 129"
+  (case sig :hup 129 :int 130 143))
 
 (defn- unsaved-text (entry)
   "`[path text user]` (`user` nil unless it is edited through sudo) for registry `entry` when it is a file buffer MODIFIED since it was read
@@ -103,6 +126,16 @@ its last frame, and its input would go to a mailbox nobody reads."
 close, and restart it or stop (see [[supervise]])."
   (receive
     ([:lifeline/loop ^child announced] (watch supervisor restart on-death child announced deaths))
+    ;; the runtime was told to end (a logout, a `kill`): this process holds the signal so a
+    ;; loop stuck in a turn cannot lose the text; the loop is ended, not waited for
+    ([:signal sig] (let (registry (:registry state)
+                         saved (if (nil? registry) [] (emergency-save! registry)))
+                     (do
+                       (exit child :kill)
+                       (close-window! (:window state))
+                       (when on-death
+                         (on-death {:signal sig :saved saved :restarting? false}))
+                       [:signal sig])))
     ;; the loop is ending for good (its terminal hung up): whatever ends it, no restart
     ([:lifeline/no-restart ^child] (watch supervisor
                                      restart
@@ -140,9 +173,49 @@ close, and restart it or stop (see [[supervise]])."
 loop ends abnormally, write the unsaved buffers' sidecars ([[emergency-save!]]), close its
 window, and run `(restart supervisor state)` in a fresh child, where `state` is what the dead
 loop announced ([[announce!]]) — `{:window :registry :live}`. `on-death`, when given, is
-called with `{:reason :saved :restarting?}`, for the log. Returns `:quit` when a loop ends
+called with `{:reason :saved :restarting?}` (`:signal` for `:reason` below), for the log. Returns `:quit` when a loop ends
 normally (the editor quit), `:died` after a loop died with no restart allowed
-([[restart-allowed?]]) or without having announced a registry to restart from."
+([[restart-allowed?]]) or without having announced a registry to restart from.
+
+The supervisor also holds SIGTERM, SIGHUP and SIGINT ([[trap-fatal]]), taken before the first
+loop starts: on one the sidecars are written from the buffer processes, the loop is ended
+whatever it is doing, its window closed, and `[:signal sig]` returned ([[signal-exit-code]]
+is the status). A terminal display takes `:term` and `:hup` while it is entered, for its own
+hang-up (brood ADR-586), and gives them back here when it leaves."
   (let (supervisor (self)
+        previous (trap-fatal supervisor)
         first-child (spawn (fn () (start supervisor))))
-    (do (monitor first-child) (watch supervisor restart on-death first-child {} []))))
+    (do
+      (monitor first-child)
+      (let (outcome (watch supervisor restart on-death first-child {} []))
+        (do (restore-traps previous) outcome)))))
+
+;; ---- the daemon: no loop of its own to supervise ---------------------------------
+;; A served session's loop is supervised by `serve`, one per session, and a runtime told to
+;; end takes them all at once. So a daemon has one KEEPER: it holds the signals and the
+;; registry of every live session, and saves them all before the runtime goes.
+
+(defn- keeper (on-signal registries)
+  "The keeper's loop over the set `registries` (see [[start-keeper]]). A registry that dies
+leaves the set, so a session that ended costs the save no timeout."
+  (receive
+    ([:lifeline/keep registry] (if (contains? registries registry)
+                                 (keeper on-signal registries)
+                                 (do
+                                   (monitor registry)
+                                   (keeper on-signal (conj registries registry)))))
+    ([:down _ registry _] (keeper on-signal (set/disj registries registry)))
+    ([:signal sig] (on-signal sig (into [] (mapcat registries emergency-save!))))))
+
+(defn start-keeper (on-signal)
+  "Start the daemon's keeper, named `:lifeline-keeper`: it takes the fatal signals and, on
+one, writes the sidecars of every registry handed to it ([[keep-registry]]) and calls
+`(on-signal sig saved)`, which ends the runtime. Its pid."
+  (let (pid (spawn (fn () (keeper on-signal #{}))))
+    (do (proc/register :lifeline-keeper pid) (trap-fatal pid) pid)))
+
+(defn keep-registry (registry)
+  "Have the daemon's keeper ([[start-keeper]]) save `registry` when the runtime is told to
+end. Nothing outside a daemon, where there is no keeper."
+  (when (not (nil? (proc/whereis :lifeline-keeper)))
+    (send :lifeline-keeper [:lifeline/keep registry])))

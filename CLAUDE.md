@@ -182,6 +182,10 @@ src/lifeline.blsp           the editor loop under a SUPERVISOR (`main` runs `sup
                             after `*restart-max*` restarts a minute, so a fault on every start
                             cannot spin — and never once a -nw loop's terminal hung up
                             (`no-restart!`): a loop restarted on a dead terminal only dies again.
+                            The supervisor also holds SIGTERM, SIGHUP and SIGINT: told to end, it writes
+                            those sidecars, ends the loop whatever it is doing and exits 128+n. A daemon
+                            has one KEEPER doing that across every session (`start-keeper`), a terminal
+                            display taking `:term` and `:hup` while entered (ADR-586).
                             Its `emergency-save!` is a served session's crash hook too (remote)
 src/diagcheck.blsp          the advisory diagnostics CHECK, off the loop on the idle beat — in
                             the sandbox child for a brood buffer (its own session client), an

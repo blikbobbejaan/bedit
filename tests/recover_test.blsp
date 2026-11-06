@@ -163,6 +163,65 @@ the edit has landed (`buffer-sync` is the barrier)."
       (is (:restarting? death))
       (assert= (file/slurp (ed-auto-save-path path)) "unsaved\n")
       (registry-stop registry)))
+  (test "told to end, supervise saves, ends a stuck loop and gives the signal back"
+    (let (path (fixture-file "old\n")
+          registry (registry-start)
+          _ (share-edited registry "notes.txt" "unsaved\n" {:file path})
+          test-process (self)
+          worker (spawn
+                   (fn ()
+                     (send test-process
+                       [:outcome
+                         (supervise
+                           (fn (supervisor)
+                             (do
+                               (announce! supervisor nil registry {})
+                               (send test-process [:loop (self) supervisor])
+                               ;; a loop stuck in a turn never reads its mail
+                               (receive (:never-sent nil))))
+                           (fn (supervisor state) (error "a signal must not restart"))
+                           (fn (death) (send test-process [:death death])))])))
+          [loop-process supervisor] (receive ([:loop pid owner] [pid owner]) (after 2000 [nil nil]))
+          probe (monitor loop-process))
+      (do
+        (send supervisor [:signal :term])
+        (assert= (receive ([:outcome outcome] outcome) (after 4000 :never)) [:signal :term])
+        (assert= (receive ([:down ^probe _ _] :ended) (after 2000 :alive)) :ended)
+        (let (death (receive ([:death d] d) (after 2000 {})))
+          (assert= (:signal death) :term)
+          (assert= (:saved death) [path])
+          (refute (:restarting? death)))
+        (assert= (file/slurp (ed-auto-save-path path)) "unsaved\n")
+        (registry-stop registry))))
+  (test "a signal's exit status is the one a shell reports"
+    (assert= (signal-exit-code :term) 143)
+    (assert= (signal-exit-code :hup) 129)
+    (assert= (signal-exit-code :int) 130))
+  (test "a daemon's keeper saves every live session and forgets a finished one"
+    (let (first-path (fixture-file "old\n")
+          second-path (fixture-file "old\n")
+          first-registry (registry-start)
+          second-registry (registry-start)
+          finished (registry-start)
+          _ (share-edited first-registry "a.txt" "one\n" {:file first-path})
+          _ (share-edited second-registry "b.txt" "two\n" {:file second-path})
+          test-process (self)
+          keeper (start-keeper (fn (sig saved) (send test-process [:kept sig saved]))))
+      (do
+        (keep-registry first-registry)
+        (keep-registry second-registry)
+        (keep-registry second-registry)
+        (keep-registry finished)
+        (registry-stop finished)
+        (send keeper [:signal :hup])
+        (let ([sig saved] (receive ([:kept s paths] [s paths]) (after 6000 [nil nil])))
+          (assert= sig :hup)
+          (assert= (sort saved) (sort [first-path second-path])))
+        (assert= (file/slurp (ed-auto-save-path second-path)) "two\n")
+        (registry-stop first-registry)
+        (registry-stop second-registry))))
+  (test "outside a daemon a registry has no keeper to go to"
+    (assert= (keep-registry (self)) nil))
   (test "a loop that keeps dying is let go"
     (let (registry (registry-start)
           outcome (supervise (fn (supervisor)
@@ -174,6 +233,19 @@ the edit has landed (`buffer-sync` is the barrier)."
     (is (restart-allowed? [] 0))
     (refute (restart-allowed? [1 2 3] 10))
     (is (restart-allowed? [1 2] 10))))
+
+(describe "a save keeps the file it wrote"
+  (test "its mode, and a symlink as a symlink"
+    (let (path (fixture-file "old\n")
+          link (str path ".link"))
+      (os/cmd "chmod" ["751" path])
+      (os/cmd "ln" ["-s" path link])
+      (let (m (ed-find-file (ed-init (make-buffer "")) link))
+        (ed-save-buf-at (ed-update m "x" 80 24)
+          (or (ed-buffer-index-by-file m link) (error "the visited link is not in the pool"))))
+      (is (:symlink? (file/stat link)))
+      (assert= (file/slurp path) "xold\n")
+      (assert= (mode-bits path) 489))))
 
 (describe "a CRLF file keeps its line endings"
   (test "visited, edited and saved, it is written with CRLF again"
