@@ -1,0 +1,163 @@
+(defmodule autorevert
+  "Files that change under the editor (Emacs's auto-revert): a buffer whose file another writer
+changed is reloaded when it has no unsaved changes, and warned about once when it does
+(`cmd-save` then asks before overwriting). The re-read keeps every window's point on its
+logical line. Policy over the pool on the idle beat, so it costs a keystroke nothing; the
+knowledge of \"changed since we last agreed\" lives in `std/editor/buffer`."
+  (:use editor/buffer) ; buffer-file / buffer-modified? / revert-buffer / buffer-file-changed?
+  (:use editor/pane) ; pane-leaf-paths / pane-payload-at — which buffers are on screen
+  (:use model)) ; ed-buf-at / ed-set-buf-at / ed-map-panes / message — the pool it walks
+
+(def *follow-points-max-chars* 400000) ; past this, a re-read keeps the character offset
+
+(defn- ed-follow-points (old new points)
+  "The character offsets `points` of rope `old` moved to the same logical line and column
+of rope `new`: one line diff for all of them (`diff/map-lines`), so a point whose line was
+pushed down by lines added above it stays on it, and the column is clamped to its line.
+Past `*follow-points-max-chars*` the diff is skipped and each offset is only clamped to
+the new length."
+  (let (old-length (text/length old)
+        new-length (text/length new)
+        points (map points (fn (point) (math/min point old-length))))
+    (if (or (>= old-length *follow-points-max-chars*) (>= new-length *follow-points-max-chars*))
+      (map points (fn (point) (math/min point new-length)))
+      (map (seq/zip points
+             (diff/map-lines old new (map points (fn (point) (text/char->line old point)))))
+        (fn ([point line])
+          (let (column (- point (text/line->char old (text/char->line old point)))
+                text (text/line new line)
+                ;; the line's own characters: `text/line` keeps its newline
+                width (if (string/ends-with? text "\n")
+                        (dec (string/length text))
+                        (string/length text)))
+            (+ (text/line->char new line) (math/min column width))))))))
+
+(defn ed-follow-reread (m i old)
+  "The model with pool buffer `i`, which now holds a text re-read from its file, given
+back its point and every pane's on it: each moved from where it was in buffer `old` (the
+buffer before the re-read) to the same logical line and column of the new text, through
+one line diff. A pane's mark is dropped — it named an offset of the old text. What a
+revert and a formatter landing share: someone else rewrote the file, and the reader
+should still be looking at the line they were on."
+  (let (new (ed-buf-at m i)
+        points (into [(buffer-point old)]
+                 (seq/keep (pane-leaf-paths (:layout m))
+                   (fn (path)
+                     (let (w (pane-payload-at (:layout m) path))
+                       (when (= (:buffer w) i) (:point w))))))
+        moved (map/zipmap points (ed-follow-points (buffer-rope old) (buffer-rope new) points)))
+    (ed-map-panes (ed-set-buf-at m i (goto-char new (get moved (buffer-point old))))
+      (fn (w)
+        (if (and (= (:buffer w) i) (not (nil? (:point w))))
+          (assoc w :point (get moved (:point w)) :mark nil)
+          w)))))
+
+(defn ed-revert-at (m i &optional contents)
+  "Re-read pool buffer `i` from its file, discarding its unsaved changes as ONE undoable
+edit (std's `revert-buffer`, keeping the undo list as Emacs's does): C-/ brings back what it
+held, unsaved edits and all, and the history before that is still there. It is the same
+buffer, so it keeps its name, mode (`:layers`), dir and everything else on it; every pane
+on it keeps its point on the same logical line and column (`ed-follow-reread`). The
+shared core of `M-x revert-buffer` (the current buffer) and the idle beat's auto-revert
+(any buffer another writer changed). `contents` is the file's text when the caller read it, as
+a root file's is through sudo. Raises if the file cannot be read — the callers
+report."
+  (let (b (ed-buf-at m i)
+        file (or (buffer-file b) (error "revert: buffer " (buffer-name b) " has no file")))
+    (ed-follow-reread (ed-set-buf-at m
+                        i
+                        (let (coding (:coding b))
+                          (revert-buffer b
+                            (or contents (when coding (charset/read-text file coding))))))
+      i b)))
+
+;; ---- files that change under the editor ------------------------------------
+;; Another writer — a formatter, `git checkout`, a build step, a colleague's editor —
+;; rewrites a file this editor has open. Emacs's answer is two-fold: `auto-revert` reloads
+;; a buffer with no unsaved changes, and a buffer WITH changes is protected: the save
+;; asks before overwriting the other writer's work. The knowledge of "changed since we
+;; last agreed" lives in `std/editor/buffer` (`:file-mtime`, `buffer-file-changed?`);
+;; this is the policy over it, run on the idle beat so it costs a keystroke nothing.
+
+;; Asking the disk is a stat per buffer, and the idle beat follows every pause in typing: a
+;; session with a hundred files open paid a hundred stats each time. So a beat asks about the
+;; buffers on SCREEN — the ones a stale text would mislead you in right now — and the rest take
+;; turns, a few every `*auto-revert-interval-ms*` (Emacs's `auto-revert-interval`), never more
+;; than `*auto-revert-max-per-beat*` stats in all. A buried buffer is still reverted; within a
+;; few rounds rather than on the next beat, and certainly before it is shown again.
+
+(def *auto-revert-interval-ms* 5000)
+(def *auto-revert-max-per-beat* 8)
+
+(defn- ed-file-buffer? (m i)
+  ;; a file edited as root (sudoedit) is left alone, as Emacs's auto-revert leaves a remote
+  ;; file: re-reading it needs sudo, and a password nobody asked for
+  (let (b (ed-buf-at m i)) (and (not (nil? (buffer-file b))) (not (= true (:sudo b))))))
+
+(defn ed-auto-revert-candidates (m now-ms)
+  "`[indices model']`: the pool indices of the file buffers this beat asks the disk about, at
+most `*auto-revert-max-per-beat*` — every one shown in a pane, then, once per
+`*auto-revert-interval-ms*`, the next of the rest in turn from `:auto-revert-cursor` (wrapping
+round the pool). `model'` carries the cursor moved past the ones taken and the round's time
+(`:auto-revert-at`)."
+  (let (layout (:layout m)
+        size (count (:buffers m))
+        shown (seq/distinct (seq/filter (map (pane-leaf-paths layout)
+                                          (fn (path) (:buffer (pane-payload-at layout path))))
+                              (fn (i) (and (int? i) (< i size) (ed-file-buffer? m i)))))
+        visible (take shown *auto-revert-max-per-beat*)
+        room (- *auto-revert-max-per-beat* (count visible))
+        due? (>= (- now-ms (or (:auto-revert-at m) 0)) *auto-revert-interval-ms*))
+    (if (or (not due?) (<= room 0) (= size 0))
+      [visible m]
+      (let (start (math/mod (or (:auto-revert-cursor m) 0) size)
+            ;; one lap of the pool at most, from the cursor
+            [hidden next] (fold (range size)
+                            [[] start]
+                            (fn (acc step)
+                              (let ([taken cursor] acc
+                                    i (math/mod (+ start step) size))
+                                (if (or (>= (count taken) room)
+                                      (includes? visible i)
+                                      (not (ed-file-buffer? m i)))
+                                  (if (>= (count taken) room) acc [taken (inc i)])
+                                  [(conj taken i) (inc i)])))))
+        [(append visible hidden) (assoc m :auto-revert-cursor next :auto-revert-at now-ms)]))))
+
+(defn- ed-revert-if-changed (m i)
+  "Pool buffer `i` checked against its file: reverted when it is clean, warned about when it
+is not (see [[ed-revert-changed-files]]), unchanged when the disk agrees."
+  (let (b (ed-buf-at m i)
+        f (buffer-file b))
+    (if (or (nil? f) (not (buffer-file-changed? b)))
+      m
+      (let (now (file/mtime f))
+        (cond
+          (not (buffer-modified? b))
+            (try
+              (message (ed-revert-at m i) (str "reverted " f " (changed on disk)"))
+              (catch e
+                (do
+                  (log/warn (str "auto-revert of " f " failed: " (error-message e)))
+                  m)))
+          (= (:disk-warned b) now) m
+          else
+            (message (assoc m :buffers (assoc (:buffers m) i (assoc b :disk-warned now)))
+              (str f " changed on disk — save will ask; M-x revert-buffer to reload")))))))
+
+(sig ed-revert-changed-files (model -> model))
+(defn ed-revert-changed-files (m)
+  "For the file buffers this beat asks about ([[ed-auto-revert-candidates]]: the ones on
+screen, and the rest in turn) whose file was written since it last agreed with the buffer
+(`buffer-file-changed?`): a buffer with NO unsaved changes is reverted in place (Emacs
+`global-auto-revert-mode`) with a note in the echo area; one WITH unsaved changes is left
+alone and warned about once per on-disk version (`:disk-warned` remembers the mtime told
+about), since `cmd-save` will ask before overwriting. A revert that fails (the file
+unreadable now) is logged and skipped. Runs on the idle beat."
+  (let ([indices stepped] (ed-auto-revert-candidates m (os/now)))
+    (fold indices stepped ed-revert-if-changed)))
+
+;; ---- registration: on the idle beat, after the sidecars -----------------------------
+;; It does not arm the beat (no `:stale?`) — an edit does, and the disk check follows it once
+;; typing settles: order 120, after autosave's sidecar round at 110.
+(register-idle-job :auto-revert {:order 120 :run 'autorevert/ed-revert-changed-files})

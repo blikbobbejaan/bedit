@@ -153,14 +153,16 @@ src/scroll.blsp             keeping point on screen: the scroll-margin clamp, ho
                             visual-line-mode), the `:long-lines` setting for its mode, the line's
                             KIND (`:line-kinds`: a section heading truncates, its body wraps),
                             the mode's `:long-lines` facet, the setting's `:default`
-src/autosave.blsp           `#file#` auto-save sidecars (owner-only, on the idle beat and a timer of
-                            their own) + auto-revert of files changed on disk (one undoable edit, std's
-                            `revert-buffer`); the note a visit
-                            shows when a sidecar is newer than its file. A file edited as root
-                            (sudoedit) keeps its sidecar PRIVATE — `state/auto-save/#%2Fsudo::%2Fetc%2Fhosts#`,
+src/autosave.blsp           `#file#` auto-save sidecars written (owner-only, on the idle beat, order
+                            110, and a timer of their own). Only a MODIFIED buffer is ever written
+src/sidecar.blsp            where a sidecar lives and the note a visit shows when one is newer than
+                            its file. A file edited as root (sudoedit) keeps its sidecar PRIVATE —
+                            `state/auto-save/#%2Fsudo::%2Fetc%2Fhosts#`,
                             its TRAMP path (the user in it) percent-encoded, a long one hashed with
-                            the path in `NAME.spec` beside it; never beside the file — and
-                            auto-revert leaves it alone. Only a MODIFIED buffer is ever written
+                            the path in `NAME.spec` beside it; never beside the file
+src/autorevert.blsp         auto-revert of files changed on disk (one undoable edit, std's
+                            `revert-buffer`; idle beat, order 120, after the sidecars). A file
+                            edited as root is left alone
 src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and `sudo-edit`) over brood's
                             `sudo` (ADR-588): `C-x C-f /sudo::/etc/hosts` (or `/sudo:USER@:PATH`, this
                             machine only), `M-x sudo-edit` (the current file, its unsaved text kept),
