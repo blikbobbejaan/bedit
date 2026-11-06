@@ -230,7 +230,7 @@ src/userkeys.blsp           init.blsp's `:keys` (global-set-key) and `:mode-keys
                             command by its M-x name, compiled onto the model as `:user-keys` by
                             `config/apply-to-model` (startup, frames, M-x reload-config) and bound
                             INTO the layers dispatch resolves (`ed-user-scope`, which
-                            `input/ed-scope` returns) — so C-h k / where-is report them too. A
+                            `userkeys/ed-scope` returns) — so C-h k / where-is report them too. A
                             mode's bindings go into the layer of that name, even one whose module
                             loads later; the global ones into the profile's base layer
 src/about.blsp              M-x version · --version · C-h C-a *About bedit* — bedit's version,
