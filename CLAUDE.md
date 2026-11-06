@@ -448,12 +448,13 @@ src/input.blsp              dispatch: fold a key or tick into the next model, th
                             ticker, so C-g between them quits the run (its work kept) and other
                             input waits for it (`:macro-typeahead`)
 src/commands.blsp           the GENERAL editing commands, each a (model key) -> model — motion,
-                            editing, kill ring, panes, buffers, prompts. A feature's commands
+                            editing, kill ring, buffers, prompts. A feature's commands
                             live in its own module (dired, help, vim, registers, hexl,
-                            eval-commands, shell-command), bound by qualified symbol. The
-                            window movers are Emacs's windmove-swap-states-* (C-S-arrows and
-                            Emacs's s-S-arrows) and window-swap-states; a side window's `:side`
-                            mark stays with its PLACE (`ed-keep-sides`)
+                            eval-commands, shell-command), bound by qualified symbol
+src/window-commands.blsp    the window commands: tiled splits, windmove and Emacs's
+                            windmove-swap-states-* (C-S-arrows and s-S-arrows), window-swap-states,
+                            the C-x 4 prefix; a side window's `:side` mark stays with its PLACE
+                            (`ed-keep-sides`)
 src/lifecycle.blsp          the file and session commands: write and revert a file, reload the config,
                             quit with its questions (`ed-map-y-or-n`, what is still running)
 src/project-commands.blsp   C-x p f over a file list cached per root, refreshed off the loop; C-x p p

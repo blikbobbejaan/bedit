@@ -1,0 +1,329 @@
+(defmodule window-commands
+  "The window commands: tiled splits (C-x 2 / 3 / 0 / 1 / o), moving between and swapping panes
+(windmove, Emacs's windmove-swap-states), and the C-x 4 other-window prefix. A side window's
+`:side` mark stays with its PLACE (`ed-keep-sides`)."
+  (:use editor/buffer)
+  (:use editor/pane) ; the pane-tree ops behind the split / other / delete commands
+  (:use interactive) ; defcommand
+  (:use model)
+  (:use panes)
+  (:use projects :only [recent-files])
+  (:use scroll) ; a split reads a buffer's long-lines policy
+  (:use pool))
+
+;; ---- panes (tiled splits, Emacs C-x 2/3/0/1/o) ----------------------------
+;; Operate on the model's `:layout` pane tree (std/pane). A split shows the
+;; same buffer in the new pane (point/scroll independent); selection/edits follow
+;; the selected pane.
+
+(defn- ed-split (m dir)
+  "Split the selected pane in `dir` (`:row` = top/bottom, `:col` = left/right); both panes show
+the current buffer at the current point/mark AND the same scroll position, each then tracking
+**independently** (window-point — `model/ed-with-window-point`). Snapshotting the point onto
+BOTH panes is what stops a later move in one from dragging the other: a pane with no
+window-point falls back to the shared buffer point, so the original pane needs its own
+snapshot too, not just the new one.
+
+The SCROLL is carried for the same reason Emacs's `C-x 2` shows you the same text twice. The
+new pane used to start at `:top 0` while its point was wherever yours was — so it opened on
+the top of the file with the cursor off screen, and the first key you pressed in it made the
+viewport snap down to point. That reads as the pane jumping when you navigate to it; it is
+really the pane having been wrong since it opened."
+  (let (b (ed-current-buf m)
+        pt (buffer-point b)
+        mk (buffer-mark b)
+        here (ed-current-pane m)
+        anchored (pane-update-selected (:layout m) (fn (w) (assoc w :point pt :mark mk))))
+    (assoc m
+      :layout
+        (pane-split anchored
+          dir
+          (assoc (ed-pane (ed-current-index m))
+            :point pt
+            :mark mk
+            :top (get here :top 0)
+            :hscroll (get here :hscroll 0)
+            :scroll-frac (get here :scroll-frac 0.0))))))
+
+(defcommand cmd-split-pane-below
+  (m key)
+  "Split the selected pane top/bottom; the new pane shows the same buffer, cursor independent (C-x 2)."
+  (ed-split m :row))
+
+(defcommand cmd-split-pane-right
+  (m key)
+  "Split the selected pane left/right; the new pane shows the same buffer, cursor independent (C-x 3)."
+  (ed-split m :col))
+
+(defcommand cmd-other-pane
+  (m key)
+  "Move selection to the next pane, wrapping (C-x o)."
+  (assoc m :layout (pane-other (:layout m))))
+
+(defn ed-unside-lone-pane (layout)
+  "`layout`, its pane no longer marked a side window (`pool/ed-display-buffer`'s `:side`) when it
+is the only one left — a lone pane is the frame, not a strip along it, and the next other-window
+display must be free to use it."
+  (if (= (pane-count layout) 1) (pane-update-selected layout (fn (w) (dissoc w :side))) layout))
+
+(defcommand cmd-delete-pane
+  (m key)
+  "Delete the selected pane; its sibling fills the space (C-x 0)."
+  (assoc m :layout (ed-unside-lone-pane (pane-delete (:layout m)))))
+
+(defcommand cmd-delete-other-panes
+  (m key)
+  "Collapse the layout to just the selected pane (C-x 1)."
+  (assoc m :layout (ed-unside-lone-pane (pane-delete-others (:layout m)))))
+
+;; ---- moving panes around: windmove / buffer-move / transpose-frame ------------
+;; The mechanism is `editor/pane` (`pane-neighbor`, `pane-swap`, `pane-rotate`,
+;; `pane-transpose`, `pane-flip`); this is the policy — which key, what the echo says, and
+;; that a swap FOLLOWS the buffer (you keep looking at what you were looking at, one pane
+;; over), which is what makes `C-S-<arrow>` read as "move this window".
+
+(def- ed-dir-name {:left "left" :right "right" :up "up" :down "down"})
+
+(sig ed-neighbor-path (model keyword -> any))
+(defn- ed-neighbor-path (m dir)
+  "The path of the pane beside the selected one in `dir`, or nil at the edge (or before
+any frame has laid the panes out — `ed-layout-now`)."
+  (let (layout (ed-layout-now m))
+    (if (nil? layout)
+      nil
+      (let (p (pane-neighbor layout (pane-selected-path (:layout m)) dir))
+        (if (nil? p) nil (:path p))))))
+
+(sig ed-windmove (model keyword -> model))
+(defn ed-windmove (m dir)
+  "Select the pane in direction `dir` (windmove), or say there is none."
+  (let (to (ed-neighbor-path m dir))
+    (if (nil? to)
+      (message m (str "no window " (get ed-dir-name dir)))
+      (assoc m :layout (pane-select-path (:layout m) to)))))
+
+(defn ed-keep-sides (before after)
+  "`after` — `before` with its payloads moved between the same leaves (a swap, a rotation) —
+with each leaf's `:side` mark as it was in `before`: a side window (`pool/ed-display-buffer`'s
+`:side` rule) is a PLACE, so the buffer moved into it is shown there and the mark stays."
+  (fold (pane-leaf-paths after)
+    after
+    (fn (tree path)
+      (let (side (:side (pane-payload-at before path)))
+        (pane-update-path tree
+          path
+          (fn (payload) (if (nil? side) (dissoc payload :side) (assoc payload :side side))))))))
+
+(sig ed-swap-pane (model keyword -> model))
+(defn ed-swap-pane (m dir)
+  "Move the selected pane's buffer into the pane in direction `dir`, taking that pane's
+buffer in exchange, and follow it — selection ends up on the neighbour, still on your
+buffer (`buffer-move`'s `buf-move-<dir>`). At the edge, says so."
+  (let (to (ed-neighbor-path m dir))
+    (if (nil? to)
+      (message m (str "no window " (get ed-dir-name dir) " to swap with"))
+      (let (here (pane-selected-path (:layout m)))
+        (assoc m
+          :layout (pane-select-path (ed-keep-sides (:layout m) (pane-swap (:layout m) here to)) to))))))
+
+(defcommand cmd-windmove-left
+  (m key)
+  "Select the pane to the left (M-<left>)."
+  (ed-windmove m :left))
+(defcommand cmd-windmove-right
+  (m key)
+  "Select the pane to the right (M-<right>)."
+  (ed-windmove m :right))
+(defcommand cmd-windmove-up (m key) "Select the pane above (M-<up>)." (ed-windmove m :up))
+(defcommand cmd-windmove-down (m key) "Select the pane below (M-<down>)." (ed-windmove m :down))
+
+(defcommand cmd-windmove-swap-states-left
+  (m key)
+  "Move this window left: swap its buffer with the pane to the left and follow it (Emacs
+`windmove-swap-states-left`). Bound to C-S-<left>, and to Emacs's own s-S-<left>
+(`windmove-swap-states-default-keybindings` binds Shift+Super + arrows unless given other
+modifiers) — which a desktop may keep for itself (GNOME moves a window between monitors with
+it), so C-S-<left> is the key that always arrives."
+  (ed-swap-pane m :left))
+(defcommand cmd-windmove-swap-states-right
+  (m key)
+  "Move this window right: swap its buffer with the pane to the right and follow it (Emacs
+`windmove-swap-states-right`). Bound to C-S-<right>, and to Emacs's own s-S-<right>, which a
+desktop may keep for itself — see [[cmd-windmove-swap-states-left]]."
+  (ed-swap-pane m :right))
+(defcommand cmd-windmove-swap-states-up
+  (m key)
+  "Move this window up: swap its buffer with the pane above and follow it (Emacs
+`windmove-swap-states-up`). Bound to C-S-<up>, and to Emacs's own s-S-<up>, which a desktop
+may keep for itself — see [[cmd-windmove-swap-states-left]]."
+  (ed-swap-pane m :up))
+(defcommand cmd-windmove-swap-states-down
+  (m key)
+  "Move this window down: swap its buffer with the pane below and follow it (Emacs
+`windmove-swap-states-down`). Bound to C-S-<down>, and to Emacs's own s-S-<down>, which a
+desktop may keep for itself — see [[cmd-windmove-swap-states-left]]."
+  (ed-swap-pane m :down))
+
+(defcommand cmd-window-swap-states
+  (m key)
+  "Swap this window's buffer with the next window's (Emacs `window-swap-states`, M-x
+window-swap-states): each pane shows what the other did, scroll and point with it, and
+selection stays in this pane — now on the other buffer. With one window, says so."
+  (let (layout (:layout m)
+        here (pane-selected-path layout)
+        paths (pane-leaf-paths layout))
+    (if (< (count paths) 2)
+      (message m "no other window to swap with")
+      (let (next (nth paths (math/mod (inc (index-of paths here)) (count paths))))
+        (assoc m :layout (ed-keep-sides layout (pane-swap layout here next)))))))
+
+(defcommand cmd-rotate-panes
+  (m key)
+  "Rotate every pane's buffer one step forward through the layout (M-x rotate-windows;
+`C-u N` for N steps, a negative argument turns the other way). Selection stays in
+place, so the pane you are in shows the next buffer along."
+  (message (assoc m :layout (ed-keep-sides (:layout m) (pane-rotate (:layout m) 1)))
+    "windows rotated"))
+
+(defcommand cmd-rotate-panes-backward
+  (m key)
+  "Rotate every pane's buffer one step backward through the layout (M-x
+rotate-windows-backward) — `rotate-windows` under a negative argument."
+  (message (assoc m :layout (ed-keep-sides (:layout m) (pane-rotate (:layout m) -1)))
+    "windows rotated back"))
+(register-inverse 'window-commands/cmd-rotate-panes 'window-commands/cmd-rotate-panes-backward)
+
+(defcommand cmd-transpose-panes
+  (m key)
+  "Turn every split the other way — stacked panes become side by side and back
+(M-x transpose-windows; `transpose-frame`)."
+  (message (assoc m :layout (pane-transpose (:layout m))) "windows transposed"))
+
+(defcommand cmd-flip-panes
+  (m key)
+  "Mirror the layout top-to-bottom (M-x flip-windows; `flip-frame`) — every stacked split's
+panes exchange places, sizes kept."
+  (message (assoc m :layout (pane-flip (:layout m) :row)) "windows flipped"))
+
+(defcommand cmd-flop-panes
+  (m key)
+  "Mirror the layout left-to-right (M-x flop-windows; `flop-frame`) — every side-by-side
+split's panes exchange places, sizes kept."
+  (message (assoc m :layout (pane-flip (:layout m) :col)) "windows flopped"))
+
+(defcommand cmd-toggle-line-numbers
+  (m key)
+  "Toggle the left line-number gutter on the selected pane (C-x l). Pane-local, so
+one pane can show numbers while another doesn't."
+  (ed-toggle-line-numbers m))
+
+(defn- ed-long-lines-command (m policy)
+  "Toggle `policy` as the current buffer's own long-lines policy (`ed-toggle-long-lines`)
+and say what its long lines do now, under the policy's name (`scroll/*long-lines-policies*`).
+The horizontal scroll is reset when the buffer is laid out row-wise: its rows say where
+each starts."
+  (let (buf (ed-toggle-long-lines (ed-current-buf m) policy)
+        name (:name (get *long-lines-policies* policy))
+        now (ed-long-lines buf)
+        m2 (ed-set-buf m buf))
+    (message (if (= now :scroll) m2 (ed-set-hscroll m2 0))
+      (str name (if (= now policy) " on: " " off: ") (ed-long-lines-says now)))))
+
+(defcommand cmd-visual-line-mode
+  (m key)
+  "Toggle visual-line-mode on the current buffer (M-x visual-line-mode): a long line
+shows on as many rows as it needs, broken after words (`wrap/segments`), instead of
+scrolling sideways — Emacs's `visual-line-mode`, per buffer, over whatever its mode or the
+`:long-lines` setting said. `C-n`/`C-p` move by screen row."
+  (ed-long-lines-command m :wrap))
+
+(defcommand cmd-toggle-truncate-lines
+  (m key)
+  "Toggle truncate-lines on the current buffer (M-x toggle-truncate-lines, Emacs's name): a
+long line keeps to ONE row, cut at the pane's edge with an ellipsis (`:truncation-ellipsis`,
+`…`) in its last cell; point past the cut scrolls that one line sideways to show it, and a
+click on the ellipsis goes to the line's end. Toggled off, the buffer goes back to what its
+mode or the `:long-lines` setting says (in a section buffer, headings truncated and a hunk's
+code wrapped), or to scrolling when that was truncation too."
+  (ed-long-lines-command m :truncate))
+
+;; ---- C-x 4: the other-window prefix -----------------------------------------
+;; Emacs's second-most-used prefix after C-x itself, and it was entirely absent. Every
+;; piece it needs already existed: `ed-pop-to-file` / `ed-pop-to-index` are the
+;; "other pane, select it, point on the line" placement that `next-error` and
+;; goto-definition have used all along, and the prompts are the same ones `C-x C-f` and
+;; `C-x b` open. This is the prefix wired onto them, not new machinery.
+
+(defn ed-find-file-other-window (m path)
+  "Open `path` in a pane OTHER than the current one and select it (`C-x 4 f`).
+
+Goes through `ed-pop-to-file`, so it inherits the placement rule the results buffers
+already follow: reuse a pane already showing the file, split a lone pane, otherwise take
+the next one — Emacs `display-buffer`'s reuse-first order. A directory opens in dired there,
+as `find-file-other-window` does."
+  (if (file/dir? path) (ed-open-dired-other-window m path) (ed-pop-to-file m path 1)))
+
+(defcommand cmd-find-file-other-window
+  (m key)
+  "Find a file in the other window (C-x 4 f) — the `C-x C-f` prompt, opening into another
+pane instead of replacing this one."
+  (assoc m
+    :minibuffer
+      (ed-find-file-other-window-prompt (str (ed-default-dir m) "/")
+        (if (:recent-files m) (recent-files) []))))
+
+(defn- ed-find-file-other-window-prompt (initial recent)
+  "`ed-find-file-prompt` pointed at the other window, with a prompt that says so."
+  (ed-find-file-prompt initial
+    recent
+    (fn (m path) (ed-visit-file m path ed-find-file-other-window))
+    "Find file other window: "))
+
+(defcommand cmd-switch-buffer-other-window
+  (m key)
+  "Switch to a buffer in the other window (C-x 4 b) — the `C-x b` prompt, displaying into
+another pane and selecting it."
+  (let (cur (buffer-name (ed-current-buf m))
+        names (seq/reject (ed-recent-buffers m) (fn (n) (= n cur))))
+    (assoc m
+      :minibuffer
+        (ed-name-prompt "Switch to buffer other window: "
+          names
+          (fn (mm t)
+            (if (string/blank? t)
+              (message mm "no buffer")
+              (ed-pop-to-buffer-named mm t 1)))))))
+
+(defcommand cmd-kill-buffer-and-window
+  (m key)
+  "Kill this buffer and delete its pane (C-x 4 0) — the pair you almost always want after
+reading something in a `C-x 4` pane, and two keystrokes with a buffer switch between them
+when done as `C-x k` `C-x 0`."
+  (let (doomed (buffer-name (ed-current-buf m))
+        killed (cmd-kill-buffer m key)
+        ;; Did the kill actually happen? Ask whether the buffer is GONE — not whether we
+        ;; landed somewhere that looks like a refusal. `cmd-kill-buffer` can decline
+        ;; (*Messages*) or ask first (unsaved changes, leaving a `:read-char` prompt), and
+        ;; deleting the pane under either would answer a question not yet put to the
+        ;; reader. Proxies for this are wrong in the obvious case: *Messages* is also
+        ;; exactly where a SUCCESSFUL kill often leaves you, so "are we in *Messages*"
+        ;; refused every ordinary kill.
+        gone? (nil? (ed-buffer-index-by-name killed doomed)))
+    (if (and gone? (nil? (:read-char killed)))
+      (assoc killed :layout (pane-delete (:layout killed)))
+      killed)))
+
+;; a guest may run these (src/guest.blsp)
+(interactive/declare-trait :guest
+  '(window-commands/cmd-delete-other-panes window-commands/cmd-delete-pane
+     window-commands/cmd-flip-panes window-commands/cmd-flop-panes
+     window-commands/cmd-kill-buffer-and-window window-commands/cmd-other-pane
+     window-commands/cmd-rotate-panes window-commands/cmd-rotate-panes-backward
+     window-commands/cmd-split-pane-below window-commands/cmd-split-pane-right
+     window-commands/cmd-switch-buffer-other-window window-commands/cmd-toggle-line-numbers
+     window-commands/cmd-toggle-truncate-lines window-commands/cmd-transpose-panes
+     window-commands/cmd-visual-line-mode window-commands/cmd-windmove-down
+     window-commands/cmd-windmove-left window-commands/cmd-windmove-right
+     window-commands/cmd-windmove-swap-states-down window-commands/cmd-windmove-swap-states-left
+     window-commands/cmd-windmove-swap-states-right window-commands/cmd-windmove-swap-states-up
+     window-commands/cmd-windmove-up window-commands/cmd-window-swap-states))
