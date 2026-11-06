@@ -18,14 +18,14 @@ the reverse: the two things find-file needs from above it — the hex view of a 
   (:use filename) ; expand / as-input / shadow-end — a typed path read the Emacs way
   (:use mincomplete) ; ed-complete-name / ed-complete-path / path candidates — the prompts
   (:use projects) ; project-root / file-display-name / remember-* — the project a file is in
-  (:use sidecar) ; a saved file's sidecar removed, the recovery note on a visit
+  (:use sidecar) ; a saved file's sidecar removed
   (:use display-rules) ; the rules, their defaults, an action read
   (:use conventions :only [prepare-for-save]) ; .editorconfig's trailing whitespace / final newline
   (:use charset :only [label]) ; a file's coding: loaded with the pool, as a release needs
   (:use minibuffer)
   (:use model)) ; the pool + layout accessors, ed-stamp, message, ed-mb-edit
-;; collab (unshare a killed slot), hosted (drop / rekey a slot), editor/layers (close hooks,
-;; buffer types) and text (line->char) are referenced qualified below and auto-load.
+;; editor/layers (close hooks, buffer types) and text (line->char) are referenced qualified
+;; below and auto-load.
 
 (defn ed-name-prompt (prompt names on-complete &optional (limit 20) (recent []))
   "A Vertico minibuffer spec that completes input against a fixed `names` list — Tab to
@@ -232,8 +232,8 @@ name when it shows the pane again."
   (assoc m :closed-with-source (conj (or (:closed-with-source m) #{}) name)))
 
 (defn ed-kill-at (m killed-idx follow-companions?)
-  "Kill pool buffer `killed-idx`: fire its mode layers' `:on-close`, unhost/unshare it,
-remove it, and re-point the panes that showed it (appending a fresh `*scratch*` if the pool
+  "Kill pool buffer `killed-idx`: fire its mode layers' `:on-close`, let everything kept by
+pool index let go of it (`model/ed-drop-slot`), remove it, and re-point the panes that showed it (appending a fresh `*scratch*` if the pool
 would be left with nothing editable). The body of `cmd-kill-buffer`, factored out so the
 companion sweep below can reuse the whole path rather than half of it.
 
@@ -253,28 +253,8 @@ loop."
         companions (if follow-companions?
                      (try (editor/layers/close-requests closed) (catch _ (list)))
                      (list))
-        ;; save-place: where you were in the file, for the next time it is opened (live
-        ;; editor only, like recentf)
-        _ (when (:save-place m) (saveplace/remember-place! buf))
-        ;; a collab-shared slot withdraws its presence first; a registry-hosted one (frames)
-        ;; is dropped by `hosted-drop-slot` itself, which also removes it from the registry
-        m0 (if (map/get-in m [:hosted killed-idx :collab?])
-             (collab/collab-unshare m killed-idx) ; presence withdraw + unsubscribe
-             m)
-        ;; the `Loading…` buffer of a file being opened as root (sudoedit): killing it
-        ;; cancels the open — its task stopped, so no buffer appears after all
-        m0 (if (and (:sudo-loading buf)
-                 (:sudo-proc m0)
-                 (= (:sudo-loading buf) (:path (:sudo-job m0))))
-             (do (task/cancel (:sudo-proc m0)) (dissoc m0 :sudo-proc :sudo-job))
-             m0)
-        m0 (hosted/hosted-drop-slot m0 killed-idx) ; stop-if-local + index remap
-        ;; its parse tree freed, the trees above it shifted down with the pool
-        m0 (syntaxtree/ed-drop-syntax-tree-slot m0 killed-idx)
-        ;; and its line cache, the caches above it shifted the same way
-        m0 (linecache/ed-drop-line-cache-slot m0 killed-idx)
-        ;; and its string-state cache (electric pairs, M-q), likewise
-        m0 (stringstate/ed-drop-string-cache-slot m0 killed-idx)
+        ;; everything kept by pool index follows the pool (`model/register-slot-keeper`)
+        m0 (ed-drop-slot m killed-idx)
         removed (seq/remove-nth (:buffers m0) killed-idx)
         label (str "killed " (buffer-name buf))
         m1 (if (ed-has-editable? removed)
@@ -578,17 +558,20 @@ pane; if the buffer is already visible, that pane is refreshed in place (press-t
 (defn- ed-ensure-file-buffer (m path)
   "Ensure the (absolute) `path` is in the pool WITHOUT changing selection — returns
 `[m idx]`. Reuses an open buffer for the file, else reads-or-news it (find-file
-semantics: an existing file is read, a missing one starts a fresh backed buffer). A file
-with a line over `:so-long-threshold` comes in in so-long's cheap state, and says so."
+semantics: an existing file is read, a missing one starts a fresh backed buffer). The visit
+steps marked `:passing` run over it, and what they note is said."
   (let (idx (ed-buffer-index-by-file m path))
     (if idx
       [m idx]
       (let (root (or (project-root (path/dirname path)) (:project-root m))
             read (ed-stamp (assoc (find-file-buffer path) :name (file-display-name path root)))
-            [buf so-long-note] (solong/so-long-visit read (solong/model-threshold m))
-            bufs (into (:buffers m) [(ed-inherit-dir m buf)])
+            visit (ed-visit-steps m read true)
+            bufs (into (:buffers m) [(ed-inherit-dir m (:buffer visit))])
             added (assoc m :buffers bufs))
-        [(if so-long-note (message added so-long-note) added) (dec (count bufs))]))))
+        [(if (empty? (:notes visit))
+           added
+           (message added (string/join (:notes visit) " — ")))
+          (dec (count bufs))]))))
 
 (defn ed-pop-to-index (m idx &optional (line nil))
   "Show pool buffer `idx` at (1-based) `line` in a pane OTHER than the current one, select
@@ -712,29 +695,24 @@ as root (`sudoedit/ed-sudo-find-file`, which may ask for the password first)."
 (defn- ed-open-text (m path root text coding)
   "The pool with `path` open in a new buffer holding `text` (its contents, already read —
 nil for a file that does not exist yet) in `coding` (nil for UTF-8), selected, and the open
-said in the echo area."
+said in the echo area. The buffer passes through the visit steps first
+(`model/register-visit-step`): a note of theirs marked `:instead` is said in place of the open
+notice, and the rest follow it."
   (try
     (let (opened-buf (assoc (charset/with-coding (if (nil? text)
                                                    (find-file-buffer path)
                                                    (buffer-from-file path text))
                               coding)
                        :name (file-display-name path root))
-          ;; save-place: back where you left it (live editor only, like recentf)
-          placed (if (:save-place m) (saveplace/restore-place opened-buf) opened-buf)
-          ;; so-long: a line over `:so-long-threshold` puts the buffer in its cheap state at
-          ;; once, before the first frame lays that line out
-          [buf so-long-note] (solong/so-long-visit placed (solong/model-threshold m))
-          opened (ed-open-buffer m buf)
-          ;; a sidecar newer than the file: unsaved text from a session that ended
-          ;; without saving — said INSTEAD of the open notice, so it is what you read
-          recovery (ed-recovery-note path))
+          visit (ed-visit-steps m opened-buf)
+          opened (ed-open-buffer m (:buffer visit)))
       (message opened
-        (or recovery
+        (or (:instead visit)
           (str (if (nil? text) (str "new file " path) (str "opened " path))
             (if coding (str " as " (charset/label coding)) "")
             ;; a tree-sitter language with no grammar loaded says how to get one
             (missing-note (ed-current-buf opened))
-            (if so-long-note (str " — " so-long-note) "")))))
+            (string/join (map (:notes visit) (fn (note) (str " — " note))) "")))))
     (catch e (message m (str "open failed: " (error-message e))))))
 
 (defn ed-default-dir (m)

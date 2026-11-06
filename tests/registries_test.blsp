@@ -1,0 +1,122 @@
+;; The registries the core folds instead of naming features. Each row is written by a module
+;; when it loads, so what can go wrong is not the code in a row but the shape of the whole:
+;; the order, a row the fold never reaches, a package's row left behind.
+(defmodule registries-test
+  (:use test)
+  (:use model)
+  (:use pool)
+  (:use editor/buffer)
+  ;; every module with a row: an unloaded row is a row that does not run
+  (:use collab)
+  (:use hosted)
+  (:use syntaxtree)
+  (:use linecache)
+  (:use stringstate)
+  (:use sudoedit)
+  (:use saveplace)
+  (:use solong)
+  (:use recover)
+  (:use sidecar))
+
+(purge-stale-temp "bedit-registries-")
+
+(defn- keeper-names () (map (ed-slot-keepers) :name))
+
+(defn- fixture-file (name text)
+  "A fresh file `name` holding `text` in its own temp directory; its path."
+  (let (dir (temp-dir "bedit-registries-")
+        _ (file/mkdir dir)
+        path (path/join dir name))
+    (do (file/spit path text) path)))
+
+(defn- long-text () (str (string/join (map (range 3000) (fn (_) "x")) "") "\n"))
+
+(describe "a kill's slot keepers"
+  (test "run in the load-bearing order: a link is used before it goes, the caches last"
+    (assert= (vec (keeper-names))
+      [:save-place :collab :sudo-open :hosted :syntax-trees :line-caches :string-caches]))
+
+  (test "a table beside the pool shifts by the one rule, its indexes with it"
+    (assert= (shift-slots {0 :a 1 :b 2 :c} 1) {0 :a 1 :c})
+    (assert= (shift-slots nil 1) nil)
+    (assert= (shift-slot-index 2 1) 1)
+    (assert= (shift-slot-index 1 1) nil)
+    (assert= (shift-slot-index 0 1) 0)
+    (assert= (shift-slot-index nil 1) nil))
+
+  (test "every table keyed by pool index follows one kill"
+    (let (m (assoc (ed-init (make-buffer "one" "a"))
+              :line-caches {0 :a 1 :b}
+              :string-caches {0 :c 1 :d}
+              :syntax-trees {1 :e}
+              :string-warm-index 1
+              :tree-warm-index 1)
+          dropped (ed-drop-slot m 0))
+      (assert= (:line-caches dropped) {0 :b})
+      (assert= (:string-caches dropped) {0 :d})
+      (assert= (:syntax-trees dropped) {0 :e})
+      (assert= (:string-warm-index dropped) 0)
+      (assert= (:tree-warm-index dropped) 0)
+      (is (:pool-shifted dropped))))
+
+  (test "a shared slot withdraws through its link before the hosted row unhosts it"
+    (let (shared (ed-open-buffer (ed-init (make-buffer "one" "a")) (make-buffer "two" "b"))
+          proc (spawn-buffer (make-buffer "two" "b"))
+          slot (map/assoc-in (hosted/ed-host-slot shared 1 proc) [:hosted 1 :collab?] true)
+          dropped (ed-drop-slot slot 1))
+      (is (nil? (map/get-in dropped [:hosted 1])))
+      ;; a shared host outlives its subscribers: the hosted row must not have stopped it
+      (is (proc/alive? proc))
+      (stop-buffer proc)))
+
+  (test "a row without its module does nothing rather than failing the kill"
+    (ownership/with-claimant "/nowhere/gone/x.blsp"
+      (fn () (register-slot-keeper :gone {:order 1 :drop 'nowhere-module/hook})))
+    (let (m (ed-init (make-buffer "one" "a")))
+      (is (map? (ed-drop-slot m 0))))
+    (ownership/release-under! "/nowhere/gone"))
+
+  (test "a package's row goes back with the package"
+    (ownership/with-claimant "/nowhere/pkg/x.blsp"
+      (fn () (register-slot-keeper :pkg {:order 1 :slots [:pkg-table]})))
+    (is (includes? (keeper-names) :pkg))
+    (ownership/release-under! "/nowhere/pkg")
+    (is (not (includes? (keeper-names) :pkg)))))
+
+(describe "a visit's steps"
+  (test "run in order, the place restored before a long line is looked for"
+    (assert= (vec (map (map (registry/ranked :model/visit-steps) second) :name))
+      [:save-place :so-long :recovery]))
+
+  (test "a long line is noted after the open notice"
+    (let (path (fixture-file "long.txt" (long-text))
+          opened (ed-find-file (assoc (ed-init (make-buffer "")) :so-long-threshold 100) path))
+      (is (so-long? (ed-current-buf opened)))
+      (is (includes? (:echo opened) (str "opened " path " — so-long: line 1")))))
+
+  (test "a newer sidecar is said instead of every other note"
+    (let (path (fixture-file "long.txt" (long-text))
+          sidecar (ed-auto-save-path path)
+          _ (file/spit sidecar "unsaved")
+          _ (file/set-mtime path 1577836800000)
+          opened (ed-find-file (assoc (ed-init (make-buffer "")) :so-long-threshold 100) path))
+      ;; the steps still ran: only the note gave way
+      (is (so-long? (ed-current-buf opened)))
+      (is (includes? (:echo opened) "M-x recover-this-file"))
+      (is (not (includes? (:echo opened) "opened")))
+      (is (not (includes? (:echo opened) "so-long")))))
+
+  (test "a jump runs only the steps marked for it, and says what they note"
+    (let (path (fixture-file "long.txt" (long-text))
+          base (assoc (ed-init (make-buffer "")) :so-long-threshold 100)
+          jumped (ed-pop-to-file base path 1))
+      (is (so-long? (ed-current-buf jumped)))
+      (is (string/starts-with? (:echo jumped) "so-long: line 1"))))
+
+  (test "a jump has no open notice to replace: a newer sidecar waits for a real visit"
+    (let (path (fixture-file "notes.txt" "text\n")
+          sidecar (ed-auto-save-path path)
+          _ (file/spit sidecar "unsaved")
+          _ (file/set-mtime path 1577836800000)
+          jumped (ed-pop-to-file (ed-init (make-buffer "")) path 1))
+      (is (not (includes? (str (:echo jumped)) "recover-this-file"))))))

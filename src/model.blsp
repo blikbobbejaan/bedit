@@ -691,6 +691,12 @@ runs under its package's claimant (`ownership/with-symbol-claimant`), so a row i
 as it runs goes back with the package."
   (ownership/with-symbol-claimant sym (fn () (reflect/call-if-bound sym fallback m))))
 
+(defn ed-call-hook (sym fallback & arguments)
+  "[[ed-call-deferred]] for a hook that takes `arguments` rather than a model alone: a registry
+row's symbol, called under its package's claimant if its module has loaded, else `fallback`."
+  (ownership/with-symbol-claimant sym
+    (fn () (apply reflect/call-if-bound sym fallback arguments))))
+
 ;; `(seqable diagnostic)`, not `(list …)`: the LSP path hands over a VECTOR, which the
 ;; runtime contract (ADR-380) refused.
 (sig ed-set-diagnostics (model (seqable diagnostic) any &optional (or nil string) -> model))
@@ -1332,6 +1338,115 @@ the pool, then any pool buffer never selected in this session (in pool order)."
 (Emacs `other-buffer`): `switch-to-buffer`'s default. Nil when there is no other."
   (let (cur (buffer-name (ed-current-buf m)))
     (seq/find (ed-recent-buffers m) (fn (n) (not (= n cur))))))
+
+;; ---- pool slots: what is kept by pool index -------------------------------------
+;; A kill removes a slot from `:buffers`, and everything else keyed by pool index has to follow
+;; or it describes the document that shifted into the index. Each module that keeps such a
+;; table says so with a ROW ([[register-slot-keeper]]), so `pool/ed-kill-at` folds the rows
+;; and names none of the features. A module's row exists from the moment it loads, and a
+;; module that has not loaded has nothing to shift.
+;;
+;; A row is `{:order :slots :drop}`:
+;;   :order  the position in the chain. ORDER MATTERS: `:drop` runs while the buffer is still in
+;;           the pool. A hook that needs a slot's link (collab withdrawing its presence) runs
+;;           before the row that unhosts it, and hosted runs before the caches, which only
+;;           follow the pool.
+;;   :slots  the model keys holding `{pool-index entry}` tables, shifted by [[shift-slots]],
+;;           one rule for all of them.
+;;   :drop   optional `(model killed) -> model` symbol, run before `:slots` are shifted: what a
+;;           table cannot say, such as an in-flight job's index ([[shift-slot-index]]).
+
+(defn register-slot-keeper (name keeper)
+  "Add the row `name`, `{:order :slots :drop}` (see the comment above), replacing any row
+registered under `name`. Called when the keeper's module loads."
+  (ownership/claim! :model/slot-keepers name (assoc keeper :name name :rank (:order keeper))))
+
+(defn ed-slot-keepers ()
+  "The registered slot keepers, in `:order`: the order a kill runs them in."
+  (map (registry/ranked :model/slot-keepers) second))
+
+(defn shift-slot-index (index killed)
+  "Where something aimed at pool slot `index` aims once slot `killed` is removed: nil when it
+is the one killed, and a value that is not an index stays as it is.
+
+    (model/shift-slot-index 3 1)   ;=> 2
+    (model/shift-slot-index 1 1)   ;=> nil
+    (model/shift-slot-index 0 1)   ;=> 0"
+  (cond
+    (not (int? index)) index
+    (= index killed) nil
+    (> index killed) (dec index)
+    else index))
+
+(defn shift-slots (table killed)
+  "`table`, a map keyed by pool index, without slot `killed` and with the entries above it
+moved down one: the pool's own shift, for everything kept beside the pool. nil stays nil.
+
+    (model/shift-slots {0 :a 1 :b 2 :c} 1)   ;=> {0 :a 1 :c}"
+  (when (not (nil? table))
+    (fold (%map-pairs (dissoc table killed))
+      {}
+      (fn (acc [index entry]) (assoc acc (if (> index killed) (dec index) index) entry)))))
+
+(defn- shift-tables (m keys killed)
+  ;; each of the model's `keys` that holds a table, shifted; one that holds none stays absent
+  (fold keys
+    m
+    (fn (acc key)
+      (let (table (get acc key)) (if (nil? table) acc (assoc acc key (shift-slots table killed)))))))
+
+;; check-allow: a hook is resolved late, so its result is unknown to the checker; every hook
+;; answers a model
+(sig ed-drop-slot (model int -> model))
+(check-allow :trusted
+  (defn ed-drop-slot (m killed)
+    "`m` with everything kept by pool index ready for slot `killed` to leave the pool: every
+registered keeper's `:drop`, then its `:slots`, in `:order`, each seeing the model the
+previous one left. The buffer itself is still in `:buffers`; removing it is the caller's."
+    (fold (ed-slot-keepers)
+      m
+      (fn (acc keeper)
+        (let (hook (:drop keeper)
+              dropped (if (nil? hook) acc (ed-call-hook hook acc acc killed)))
+          (shift-tables dropped (:slots keeper []) killed))))))
+
+;; ---- a file comes into the pool (Emacs's `find-file-hook`) ----------------------
+;; A buffer just made from a file passes through a chain of steps before it is shown: the
+;; place it was left at, the state a very long line puts it in, the note that a sidecar is
+;; newer. Each is a ROW its module registers at load ([[register-visit-step]]), so
+;; `pool/ed-open-text` folds the table and names none of them.
+;;
+;; A row is `{:order :run :instead :passing}`:
+;;   :order    the position in the chain, each step seeing the buffer the previous one left.
+;;   :run      `(model buffer) -> [buffer note]` symbol. `note` is nil, or what the echo area
+;;             should say about the visit.
+;;   :instead  true when the note is said INSTEAD of the open notice: what you must read, a
+;;             recovery. The first such note in `:order` wins. Any other note follows the
+;;             open notice.
+;;   :passing  true when the step also runs for a file brought in by a jump
+;;             (`pool/ed-ensure-file-buffer`), which goes straight to a line and says nothing
+;;             of an open. Without it the step belongs to a visit a person asked for.
+
+(defn register-visit-step (name step)
+  "Add the visit step `name`, `{:order :run :instead :passing}` (see the comment above),
+replacing any step registered under `name`. Called when the step's module loads."
+  (ownership/claim! :model/visit-steps name (assoc step :name name :rank (:order step))))
+
+(defn ed-visit-steps (m buf &optional (passing? false))
+  "Run the visit steps over `buf`, a buffer just made from a file, in `:order`, and answer
+`{:buffer :instead :notes}`: the buffer they left, the first note that replaces the open
+notice, and the notes that follow it. With `passing?`, only the steps marked `:passing`."
+  (fold (map (registry/ranked :model/visit-steps) second)
+    {:buffer buf :instead nil :notes []}
+    (fn (acc step)
+      (if (and passing? (not (:passing step)))
+        acc
+        (let ([stepped note] (ed-call-hook (:run step) [(:buffer acc) nil] m (:buffer acc))
+              moved (assoc acc :buffer stepped))
+          (cond
+            (nil? note) moved
+            (:instead step) (assoc moved :instead (or (:instead acc) note))
+            else (assoc moved :notes (conj (:notes acc) note))))))))
 
 ;; ---- post-step hooks ------------------------------------------------------------
 ;; The per-event follow-ups that keep a derived view in step with the model the event left:

@@ -109,9 +109,16 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             the timers — and the REGISTRIES the rest plugs into: idle-beat jobs
                             (`register-idle-job`), off-loop task replies, inbound `[:tag …]`
                             event handlers, feature timers, process deaths
-                            (`register-down-handler`), and what is still running when
+                            (`register-down-handler`), what is still running when
                             C-x C-c asks (`register-exit-query`: a compile, a test run,
-                            the app, a terminal, a push). The core names no feature: a
+                            the app, a terminal, a push), what follows a KILL
+                            (`register-slot-keeper`, `{:order :slots :drop}`, run in order
+                            by `ed-drop-slot`: everything kept by pool index goes through
+                            one `shift-slots` — collab before hosted before the caches) and
+                            what a VISIT passes through (`register-visit-step`, Emacs's
+                            find-file-hook, `{:order :run :instead :passing}`: save-place,
+                            so-long, the recovery note, which is said `:instead` of the open
+                            notice). The core names no feature: a
                             module registers its rows when it loads, each row CLAIMED for the
                             file that registered it (`ownership/claim!`), so a package's rows
                             go back with the package. Also the OUTPUT CAP
@@ -272,7 +279,7 @@ src/themes.blsp             the theme registry (M-x theme-select): a live picker
                             `:syntax/definition` and `:syntax/punctuation` faces, brood ADR-614)
 src/ownership.blsp          WHO registered each registry row: every `register-*` (model's idle jobs,
                             task replies, event / down / timer handlers, exit queries, post-steps,
-                            layout keepers; statusbar chips; M-x commands; keymap profiles;
+                            layout keepers, slot keepers, visit steps; statusbar chips; M-x commands; keymap profiles;
                             modes, file patterns and interpreters; themes; chrome faces; vcs
                             backends; grammars; language specs) writes through `claim!`, which
                             records the file being loaded (`reflect/current-file`, or the bound
