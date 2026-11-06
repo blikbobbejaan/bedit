@@ -450,7 +450,7 @@ src/passwd.blsp             a password a program asks for (Emacs read-passwd + c
                             history and every hosted copy; type-ahead from before the prompt
                             stays as the next input, as comint leaves it) and
                             `secret-key?`, the typing key that opens a read asked for while
-                            you were elsewhere (input's `secret-overlay`)
+                            you were elsewhere (`secret-overlay`, here, over each mode's `:secret-pending?` / `:secret-key` facets)
 src/saveplace.blsp          a file reopens where it was left (Emacs save-place, `:save-place`): its
                             point kept when its buffer is killed or the editor quits
 src/solong.blsp             so-long (Emacs so-long-mode, `:so-long-threshold`): a file opened with a line
@@ -477,7 +477,10 @@ src/ui-kit.blsp             the widget kit over editor/display: a widget is `(ar
 src/events.blsp             what reaches the loop besides keys, one `[:tag …]` handler each by symbol:
                             resize, mouse, a task's reply, a process down, redirected output, a
                             client's identity. A feature's own tags register in `model`
-src/input.blsp              dispatch: fold a key or tick into the next model, the post-event step
+src/input.blsp              dispatch: fold a key or tick into the next model, first through the
+                            key overlays (`model/register-overlay`, `rank` order, listed here
+                            with why, pinned by tests/registries_test; each feature's in its
+                            own module), the post-event step
                             (`ed-post-step`); and the
                             keyboard-macro REPLAY (`ed-run-macro`): N passes (C-u N C-x e), or
                             until one fails (C-u 0), each stopping at the first key whose
@@ -995,7 +998,7 @@ src/bshell.blsp             per-project shell + Brood REPL buffer (C-x p e): a l
                             `Password:`) gets the answer read masked and written to its stdin,
                             never the buffer, the next command or the history file: one asked
                             while the shell was not shown waits for the first TYPED key there
-                            (input's `secret-overlay`), and input typed after the prompt
+                            (`passwd/secret-overlay`), and input typed after the prompt
                             appeared moves into the read without a trace
                             (`passwd/take-since-prompt`); type-ahead from before it stays
                             as the next input
@@ -1003,7 +1006,7 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             a program under a pty, its screen emulated by std/vt
                             (brood ADR-384) in the buffer's worker and painted into the
                             buffer's tail. CHAR mode (a full-screen program: claude,
-                            htop, vim): every key goes to it (input/term-overlay); C-x
+                            htop, vim): every key goes to it (`term-overlay`); C-x
                             stays the editor's, C-y pastes, C-x c is the C-c map, C-x C-x /
                             C-x C-y send the literal. LINE mode (the project REPL: iex -S
                             mix, nest repl): the input after the program's prompt is
@@ -1015,7 +1018,7 @@ src/terminal.blsp           a TERMINAL buffer (C-x p t, C-x p r, M-x claude, C-u
                             M-x send-invisible reads one by hand. A prompt that arrived while
                             the terminal was not shown waits for the first TYPED key there,
                             which opens the read as its first character (input's
-                            `secret-overlay`), never reaching the buffer or a macro; text
+                            `passwd/secret-overlay`), never reaching the buffer or a macro; text
                             typed after the prompt appeared moves into the read, leaving no
                             undo step (`passwd/take-since-prompt`; a redraw puts the marker
                             back), while type-ahead from before it stays. An answered prompt redrawn is not

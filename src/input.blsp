@@ -31,10 +31,7 @@ self-editing editor)."
   (:use window-commands) ; C-x 2 3 0 1 o, windmove, C-x 4: their keys reach them by symbol
   (:use lifecycle) ; the file and quit commands: their keys reach them by symbol
   (:use project-commands) ; likewise C-x p
-  (:use menu) ; the right-click context menu: open / move / run / close (the `:menu` overlay)
   (:use complete-at-point) ; the completion popup (Tab) + its modal key handling
-  (:use isearch) ; the modal incremental-search mini-loop
-  (:use query-replace) ; the modal query-replace mini-loop
   (:use interactive) ; current-prefix-arg / prefix-consuming? — the prefix-arg seam
   (:use editor/keymap) ; keymap-run — the std chord dispatcher's running half
   (:use editor/ui) ; overlay-route — the shared modal-overlay dispatch fallthrough
@@ -340,7 +337,7 @@ chord completes); a prefix-consuming command (set-mark) runs once and reads the 
 ;; `:repeat` transient: pressing the same key again re-invokes the command, and again, …
 ;; until any other key (which exits and dispatches normally). This is how a chord command
 ;; repeats — Emacs never hold-repeats chords; it taps. The `:repeat` overlay lives in
-;; `ed-transient-handlers`; arming happens here, post-dispatch.
+;; the overlay table; arming happens here, post-dispatch.
 
 (defn- ed-arm-repeat-mode (m input)
   "After `ed-dispatch-key`, arm `:repeat` (repeat-mode) when this step actually ran a
@@ -381,7 +378,7 @@ otherwise resolve and run the key through the active keymap (`ed-dispatch-key`).
 ;; owned key into the model, and `overlay-exit` dismisses before a non-owned key
 ;; falls through (skipped = no dismiss step). The shared `editor/ui/overlay-route`
 ;; routes one key to whichever is open. A new modal feature defines a record + impl
-;; and joins `ed-transient-handlers` instead of growing `ed-update`. The dispatch
+;; and registers a row (`model/register-overlay`) instead of growing `ed-update`. The dispatch
 ;; rule itself lives in std (ADR-094) — the observer's minibuffer rides the same
 ;; `overlay-route` — and re-registering an impl hot-swaps a live overlay (late
 ;; binding, same as commands).
@@ -431,45 +428,6 @@ keep reading; on an unbound key, say so. Esc/C-g aborts."
         (ed-cancel-key? input) (message (dissoc m :read-char) "quit")
         else ((map/get-in m [:read-char :then]) (dissoc m :read-char) input)))))
 
-(defrecord transient-overlay ()) ; a transient menu (Magit's `P`): every key is the menu's until it closes
-(impl Overlay
-  transient-overlay
-  ;; the flag is checked INLINE so a key in an editor that has never opened a menu never
-  ;; loads transient.blsp — the deferred-module rule `ed-terminals?` states for terminals
-  (overlay-active? (_ m) (:transient m))
-  ;; no overlay-owns? — modal: a menu binds its own keys and answers `:unbound` for the
-  ;; rest, which is how it decides for itself what an unknown key means
-  (overlay-handle (_ m input) (transient/ed-transient-key m input)))
-
-(defrecord menu-overlay ()) ; the right-click context menu: arrows move, M-<|M-> jump, Enter runs, Esc closes
-(impl Overlay
-  menu-overlay
-  (overlay-active? (_ m) (:menu m))
-  ;; no overlay-owns? — modal: every key is the menu's while it's open
-  (overlay-handle (_ m input)
-    (let (motion (editor/list-motion/motion-of input))
-      (cond
-        motion (ed-menu-motion m motion)
-        (= input :enter) (ed-menu-run m)
-        (ed-cancel-key? input) (ed-close-menu m)
-        ;; any other key is swallowed (the menu stays open)
-        else m))))
-(defrecord query-replace-overlay ())
-(impl Overlay
-  query-replace-overlay
-  (overlay-active? (_ m) (:query-replace m))
-  (overlay-owns? (_ m input) (qr-control-key? input))
-  (overlay-handle (_ m input) (qr-handle m input))
-  (overlay-exit (_ m) (qr-finish m)))
-
-(defrecord isearch-overlay ())
-(impl Overlay
-  isearch-overlay
-  (overlay-active? (_ m) (:isearch m))
-  (overlay-owns? (_ m input) (isearch-control-key? input))
-  (overlay-handle (_ m input) (isearch-handle m input))
-  (overlay-exit (_ m) (isearch-exit m)))
-
 (defrecord minibuffer-overlay ())
 (impl Overlay
   minibuffer-overlay
@@ -504,62 +462,6 @@ keep reading; on an unbound key, say so. Esc/C-g aborts."
 ;; preview is not a mode: it is a suggestion sitting beside what you are typing, and the
 ;; next keystroke should keep typing and let the idle beat recompute it, not dismiss it.
 
-(defn- ed-term-buffer? (m)
-  "Whether the selected pane shows a terminal buffer in CHAR mode (`terminal.blsp`): the
-program's keys. A term in line mode is edited like a shell, through the keymaps."
-  (let (b (ed-current-buf m)) (and (ed-terminal-buffer? b) (not (:term-line-mode b)))))
-
-(defrecord term-overlay ()) ; a terminal buffer: every key is the program's but C-x (the editor's prefix) and C-y (paste into it)
-(impl Overlay
-  term-overlay
-  (overlay-active? (_ m) (and (nil? (:pending m)) (ed-term-buffer? m)))
-  (overlay-owns? (_ m input) (not (includes? [:ctrl-x :ctrl-y] input)))
-  (overlay-handle (_ m input) (terminal/term-send-key m input)))
-;; No `overlay-exit`: C-x falling through starts a chord, and the buffer is still a terminal.
-
-(defn- ed-secret-pending? (m)
-  "Whether the selected buffer is a line-mode terminal or a shell whose program waits for a
-password no read is open for (`terminal/term-secret-pending?`,
-`bshell/bshell-secret-pending?`) — where a typed key belongs to a masked read. Asked on every
-key, so the buffer's own fields are read first: terminal.blsp is deferred, and a key in any
-other buffer must not load it."
-  (let (b (ed-current-buf m))
-    (cond
-      (and (ed-terminal-buffer? b) (= true (:term-secret b))) (terminal/term-secret-pending? m)
-      (and (= (:type b) :bshell) (= true (:bshell-secret b))) (bshell/bshell-secret-pending? m)
-      else false)))
-
-(defn- ed-secret-type (m input)
-  "Open the masked read of the selected terminal or shell waiting for a password with typing
-key `input` (`passwd/secret-key?`) — the read takes it, never the input region in clear."
-  (if (ed-terminal-buffer? (ed-current-buf m))
-    (terminal/term-secret-key m input)
-    (bshell/bshell-secret-key m input)))
-
-(defn- ed-secret-yank-text (m input)
-  "The text C-y would put in, when `input` is C-y and the kill ring has something — what a
-password prompt takes masked, as typed text; else nil."
-  (when (= input :ctrl-y)
-    (let (head (first (or (:kill-ring m) [])))
-      (when (and (string? head) (not (= head ""))) head))))
-
-(defn- ed-secret-text (text)
-  "Pasted or yanked `text` as typing into a password read: its line breaks dropped, so a
-paste never submits the password by itself."
-  [:text (string/replace (string/replace text "\r" "") "\n" "")])
-
-(defrecord secret-overlay ()) ; a terminal or shell waiting for a password: the first typed key opens the masked read
-(impl Overlay
-  secret-overlay
-  (overlay-active? (_ m) (and (nil? (:pending m)) (ed-secret-pending? m)))
-  ;; a C-y too: yanked text is typed into the masked read, never into the input region
-  (overlay-owns? (_ m input)
-    (or (passwd/secret-key? input) (string? (ed-secret-yank-text m input))))
-  (overlay-handle (_ m input)
-    (let (yanked (ed-secret-yank-text m input))
-      (ed-secret-type m (if (nil? yanked) input (ed-secret-text yanked))))))
-;; No `overlay-exit`: a key that does not type (RET, C-a, C-x …) is the buffer's as ever.
-
 (defrecord repeat-overlay ()) ; Emacs repeat-mode: tap the last key again to repeat the command
 (impl Overlay
   repeat-overlay
@@ -568,38 +470,30 @@ paste never submits the password by itself."
   (overlay-handle (_ m input) (ed-repeat-run m))
   (overlay-exit (_ m) (dissoc m :repeat)))
 
-(def- ed-transient-handlers
-  (list (describe-key-overlay)
-    (read-char-overlay)
-    (menu-overlay)
-    (query-replace-overlay)
-    (isearch-overlay)
-    (minibuffer-overlay)
-    (completion-overlay)
-    ;; BELOW the minibuffer, and that placement is load-bearing: reading an option's value
-    ;; (`:read`) leaves the menu on the model *and* opens a minibuffer, so if a transient
-    ;; outranked it the menu would eat the keys meant for the prompt. Under it, the prompt
-    ;; takes them and the menu resumes when it closes — with the value set.
-    (transient-overlay)
-    ;; a terminal owns its keys, but the minibuffer and the popups above it win when open
-    (term-overlay)
-    ;; a terminal or shell at a password prompt: below the minibuffer (the read it opens
-    ;; takes the next keys) and above the preview, whose dispatch would type the key
-    (secret-overlay)
-    ;; below everything you deliberately opened (the popup, a menu), and below a terminal:
-    ;; the preview has no exit, so a key it does not own skips every overlay under it
-    ;; straight to dispatch. Above the terminal, it sent a char-mode program's keys to
-    ;; self-insert in its read-only buffer for as long as a suggestion stood — and none
-    ;; reached the program to change the screen and clear it
-    (preview-overlay)
-    (repeat-overlay)))
+;; The input layer's own rows. The ranks between them are held for the features' rows, and the
+;; order is load-bearing (tests/registries_test pins it):
+;;   10 describe-key  20 read-char  30 menu  40 query-replace  50 isearch  60 minibuffer
+;;   70 completion  80 transient  90 term  100 secret  110 preview  120 repeat
+;; A transient menu is BELOW the minibuffer: reading an option's value leaves the menu on the
+;; model and opens a minibuffer, so a menu above it would eat the keys meant for the prompt.
+;; A terminal owns its keys, but the minibuffer and the popups above it win when open. The
+;; preview is below everything you deliberately opened and below a terminal: it has no exit,
+;; so a key it does not own skips every overlay under it straight to dispatch. Above the
+;; terminal, it sent a char-mode program's keys to self-insert in its read-only buffer for as
+;; long as a suggestion stood, and none reached the program to change the screen and clear it.
+(register-overlay :describe-key 10 (describe-key-overlay))
+(register-overlay :read-char 20 (read-char-overlay))
+(register-overlay :minibuffer 60 (minibuffer-overlay))
+(register-overlay :completion 70 (completion-overlay))
+(register-overlay :preview 110 (preview-overlay))
+(register-overlay :repeat 120 (repeat-overlay))
 
 (defn ed-route-transient (m input)
   "Fold `input` into the active transient overlay, or through normal dispatch
 (`ed-dispatch`) when none is open — via the shared `editor/ui/overlay-route`. The
 owning handler consumes the key; otherwise the overlay exits (`:exit`) and the key is
 dispatched normally (Emacs' dismiss-and-process)."
-  (overlay-route ed-transient-handlers m input ed-dispatch))
+  (overlay-route (ed-overlays) m input ed-dispatch))
 
 ;; ---- key repeat: the desktop's, not ours (brood ADR-441) ---------------------
 ;; The window is opened with `{:key-repeat :os}`: a held key's auto-repeats arrive as
@@ -748,11 +642,11 @@ every replay, and shown by anything that lists the macro."
   (if (and (vector? (:macro-recording m))
         (not (map/get-in m [:minibuffer :masked]))
         ;; nor the key that OPENS one: the first character of the password
-        (not (and (ed-secret-pending? m) (passwd/secret-key? input)))
+        (not (and (passwd/ed-secret-pending? m) (passwd/secret-key? input)))
         ;; nor a paste or a yank that opens one: the password itself
-        (not (and (ed-secret-pending? m)
+        (not (and (passwd/ed-secret-pending? m)
                (or (and (vector? input) (= (first input) :paste))
-                 (string? (ed-secret-yank-text m input)))))
+                 (string? (passwd/ed-secret-yank-text m input)))))
         (not (= input :blur))
         (not (= input :focus-in))
         (not (= input :close))
@@ -810,22 +704,23 @@ failure on the paint side (the `render error` frame)."
     (catch e (message m (str "fontify error: " (error-message e))))))
 
 (defn- ed-paste (m text textrows textcols)
-  "A bracketed paste from the terminal bedit runs in (`[:paste text]`, brood ADR-586): into a
-char-mode terminal buffer's program, bracketed as C-y pastes there; into the buffer as one
-yank when nothing modal holds the keys (`commands/ed-paste-text`, Emacs's `xterm-paste`);
+  "A bracketed paste from the terminal bedit runs in (`[:paste text]`, brood ADR-586): to the
+mode's `:paste` facet when it takes it; into the buffer as one yank when nothing modal holds the keys (`commands/ed-paste-text`, Emacs's `xterm-paste`);
 otherwise — a prompt, a search — each character the way typing gets there, as committed
 text does."
   (cond
     ;; a terminal or shell waiting for a password: the paste opens the masked read, as
     ;; typing does — never the input region, in clear
-    (and (passwd/ed-prompt-free? m) (nil? (:pending m)) (ed-secret-pending? m))
-      (ed-secret-type m (ed-secret-text text))
+    (and (passwd/ed-prompt-free? m) (nil? (:pending m)) (passwd/ed-secret-pending? m))
+      (passwd/ed-secret-type m (passwd/ed-secret-text text))
     (not (passwd/ed-prompt-free? m))
       (fold (string/->graphemes text)
         (dissoc m :preedit)
         (fn (acc character) (ed-key-step acc character textrows textcols)))
-    (ed-term-buffer? m) (terminal/term-paste-text m text)
-    else (ed-paste-text m text)))
+    ;; a mode may take it (a char-mode terminal's program); else one yank
+    else
+      (let (paste (ed-mode-service (ed-current-buf m) :paste))
+        (or (when paste (paste m text)) (ed-paste-text m text)))))
 
 (defn- ed-fold-input (m0 input textrows textcols cols rows)
   "Fold one input into the model, by what kind of input it is: a named timer, a bare tick, the
@@ -885,7 +780,7 @@ else — a key."
     else
       (ed-key-step (let (typed (ed-note-key (if (:preedit m0) (dissoc m0 :preedit) m0)))
                      (if (and (includes? *view-resume-keys* input)
-                           (nil? (overlay-active ed-transient-handlers typed)))
+                           (nil? (overlay-active (ed-overlays) typed)))
                        (ed-point-into-view typed textrows)
                        typed))
         input textrows textcols)))

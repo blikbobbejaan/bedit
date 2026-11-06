@@ -27,7 +27,7 @@
 ;;     with comint's history and boundary commands, and RET sends the line) — Emacs
 ;;     `term-char-mode` / `term-line-mode`, `C-c C-k` / `C-c C-j`. The project REPL
 ;;     (`C-x p r`) opens in line mode; a full-screen program in char mode;
-;;   - the OVERLAY (`input/term-overlay`) routes every key of a char-mode term buffer to the
+;;   - the OVERLAY (`term-overlay`, below) routes every key of a char-mode term buffer to the
 ;;     worker, except `C-x` — the editor's own prefix stays, so you can switch
 ;;     buffers and panes out of a running program — and `C-y`, which pastes into it;
 ;;     the mode layer adds `C-x c` (the editor's C-c map) and `C-x C-x` / `C-x C-y`
@@ -40,6 +40,7 @@ its screen emulated by `std/vt` and painted into a buffer — every key goes to 
 program, the buffer's tail is its screen, everything above it is scrollback."
   (:use editor/keymap :only [keymap-bind]) ; the mode keymap below
   (:use editor/layers :only [register-type-layers]) ; the buffer type below
+  (:use editor/ui :only [Overlay overlay-active? overlay-owns? overlay-handle overlay-exit]) ; its key overlay
   (:use clipboard)
   (:use minibuffer)
   (:use model)
@@ -458,7 +459,7 @@ the buffer, not into its history — and mark the request answered."
   "After screen `screen` folded into terminal `idx`: in line mode, note whether its program
 is waiting for a password, and when it has just started to — and you are looking at it,
 with no other prompt open — read it (`term-open-password`). Elsewhere the first key typed
-there, or RET, asks (`input/secret-overlay`)."
+there, or RET, asks (`passwd/secret-overlay`)."
   (let (b (ed-buf-at m idx))
     (if (not (:term-line-mode b))
       m
@@ -487,7 +488,7 @@ there, or RET, asks (`input/secret-overlay`)."
 
 ;; A prompt that arrives while you are looking at something else only marks the buffer
 ;; (`:term-secret`); the first key typed when you come back opens the read
-;; (`input/secret-overlay`, the shell's too — see passwd.blsp).
+;; (`passwd/secret-overlay`, the shell's too).
 
 (defn term-secret-pending? (m)
   "Whether the selected buffer is a line-mode terminal whose live program waits for a
@@ -836,11 +837,13 @@ nil, and the editor handles it as it would in any buffer."
       else nil)))
 
 (defn term-paste-text (m text)
-  "A paste the editor's own terminal delivered whole (`[:paste text]`, brood ADR-586) into
-the program of the selected terminal buffer — bracketed when the program asked for pastes
-to be marked, as C-y pastes the kill ring."
-  (let (pid (live-program (ed-current-buf m)))
-    (do (when pid (send pid [:term-paste text])) m)))
+  "The `:paste` facet: a paste the editor's own terminal delivered whole (`[:paste text]`, brood
+ADR-586) into the program of a char-mode terminal buffer — bracketed when the program asked
+for pastes to be marked, as C-y pastes the kill ring. nil in line mode, whose input is bedit's:
+the paste is an ordinary yank there."
+  (when (term-char-mode? m)
+    (let (pid (live-program (ed-current-buf m)))
+      (do (when pid (send pid [:term-paste text])) m))))
 
 (defn term-primary-answered (m text pid)
   "The rest of a middle click in a terminal pane once the PRIMARY selection's `text` is known:
@@ -887,7 +890,7 @@ palette. History keeps the colours it was written in — its cells are gone."
     m))
 
 ;; term-mode: a full-screen program under a real terminal emulator (M-x term, M-x claude —
-;; src/terminal.blsp). Its keys never reach a keymap: `input/term-overlay` hands every key but
+;; src/terminal.blsp). Its keys never reach a keymap: `term-overlay` hands every key but
 ;; C-x to the program, so the layer is the buffer's IDENTITY — no gutter (a terminal has
 ;; none, and the vt is sized to the pane's full width), the one editor binding a terminal
 ;; needs (C-y pastes, as in vterm — the program never wanted a ^Y), and the hook that stops the program with the buffer. Not stacked on text-mode.
@@ -920,8 +923,49 @@ palette. History keeps the colours it was written in — its cells are gone."
              ;; the editor's C-c map, under a key the program does not own
              (keymap-bind [:ctrl-x "c"] 'terminal/cmd-term-editor-c-c))
    :send-invisible 'terminal/term-send-invisible
+   ;; what the input layer and the mouse ask of a mode
+   :secret-pending? 'terminal/term-secret-pending?
+   :secret-key 'terminal/term-secret-key
+   :paste 'terminal/term-paste-text
+   :mouse 'terminal/term-mouse
    ;; line mode: point never enters the program's prompt (the shell's guard, same field)
    :post-key 'comint/input-post-key
    :modeline 'terminal/term-modeline
    :hooks {:on-close '(terminal/term-on-close)}})
 (register-type-layers :term (list 'terminal/term-mode-layer))
+
+(defn ed-terminal-buffer? (buf)
+  "Whether `buf` is a terminal buffer, of either mode."
+  (= (:type buf) :term))
+
+(defn- ed-terminals? (m)
+  ;; whether any pooled buffer is a terminal: a resize and a theme switch ask first
+  (any? (:buffers m) ed-terminal-buffer?))
+
+(defn term-char-mode? (m)
+  "Whether the selected pane shows a terminal buffer in CHAR mode: the program's keys. A term in
+line mode is edited like a shell, through the keymaps."
+  (let (b (ed-current-buf m)) (and (ed-terminal-buffer? b) (not (:term-line-mode b)))))
+
+(defrecord term-overlay ()) ; a terminal buffer: every key is the program's but C-x (the editor's prefix) and C-y (paste into it)
+(impl Overlay
+  term-overlay
+  (overlay-active? (_ m) (and (nil? (:pending m)) (term-char-mode? m)))
+  (overlay-owns? (_ m input) (not (includes? [:ctrl-x :ctrl-y] input)))
+  (overlay-handle (_ m input) (term-send-key m input)))
+;; No `overlay-exit`: C-x falling through starts a chord, and the buffer is still a terminal.
+
+(register-overlay :term 90 (term-overlay))
+
+(defn term-resized (m)
+  "A resize step: a pty child lays out against a size it is TOLD. It has no other way to learn
+one — `iex` wraps its own input at the width it believes it has — so a REPL opened in an
+80-column window and then widened kept wrapping at 80 until it was restarted."
+  (if (ed-terminals? m) (term-sync-sizes m) m))
+
+(defn term-recoloured (m)
+  "A palette step: a running program's SCREEN is read again through the new colours."
+  (if (ed-terminals? m) (term-repalette m) m))
+
+(register-resize-step :terminals 'terminal/term-resized)
+(register-palette-step :terminals 'terminal/term-recoloured)
