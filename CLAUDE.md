@@ -653,7 +653,7 @@ src/language-core.blsp      `deflanguage` declares a tree-sitter language from O
                             (brood ADR-489) is the code embedded in a language — a Terraform
                             heredoc named BASH / JSON / PY, a Dockerfile `RUN` line as shell,
                             Elixir's `~H` as HEEx (heex-mode) — coloured with the embedded
-                            language's OWN spec's faces, found per frame (`language-faces`), so
+                            language's OWN spec's faces, found per frame (`modes/language-faces`), so
                             a missing language or grammar keeps the host's colours. `deflexer`
                             is its sibling for the line-lexer languages (a pattern + a `lex-*`
                             stem): env, JSON5, Makefile / INI / commit
