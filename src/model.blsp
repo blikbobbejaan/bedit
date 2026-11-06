@@ -1496,6 +1496,62 @@ notice, and the notes that follow it. With `passing?`, only the steps marked `:p
   "The registered key overlays, in the order they are offered a key."
   (map (registry/ranked :model/overlays) (fn ([_ row]) (:overlay row))))
 
+;; [[register-presenter]]: who shows what the pool cannot show as text, by ROLE, so `pool`
+;; names no feature: `:directory` `(m path)` (dired — Emacs's `find-file-run-dired`),
+;; `:binary` `(m path root bytes)` (hexl's view of a file that is not text), `:new-frame`
+;; `(m name) -> model | nil` (a second window showing a buffer).
+(defn register-presenter (role presenter)
+  "Make the symbol `presenter` what shows `role` (see the comment above), replacing any
+registered for it. Called when its module loads."
+  (ownership/claim! :model/presenters role presenter))
+
+(defn ed-presenter (role)
+  "The symbol registered to show `role`, or nil when none is (its module not loaded)."
+  (registry/lookup :model/presenters role))
+
+;; check-allow: the presenter is resolved late, so its result is unknown to the checker; every
+;; presenter of these roles answers a model, as `fallback` is one
+(check-allow :trusted
+  (defn ed-present (m role fallback & arguments)
+    "`m` after the presenter registered for `role` shows `arguments`, or the model `fallback`
+when none is registered."
+    (let (presenter (ed-presenter role))
+      (if (nil? presenter) fallback (apply ed-call-hook presenter fallback m arguments)))))
+(sig ed-present (model keyword model & any -> model))
+
+(defn ed-prompt-free? (m)
+  "Whether nothing modal holds the keys — no prompt, search, menu or one-key read — so a
+password prompt may open without taking keys meant for something else, and a paste is one
+yank rather than typing into whatever is open."
+  (not (or (:minibuffer m) (:isearch m) (:query-replace m) (:read-char m) (:transient m) (:menu m))))
+
+;; [[register-paste-taker]]: a bracketed paste (`[:paste text]`) offered, while nothing modal
+;; holds the keys, to each row before the mode's `:paste` facet and the plain yank — a
+;; `(m text) -> model | nil` symbol, nil passing it on. A program waiting for a password
+;; (passwd) takes it into the masked read, never the input region in clear.
+(defn register-paste-taker (name taker)
+  "Add the paste taker `name`, replacing any registered under `name`. Called when its module
+loads."
+  (ownership/claim! :model/paste-takers name taker))
+
+(defn ed-take-paste (m text)
+  "The model after the first paste taker that takes `text`, or nil when none does."
+  (first (seq/keep (vals (registry/entries :model/paste-takers))
+           (fn (taker) (ed-call-hook taker nil m text)))))
+
+;; [[register-macro-guard]]: a key kept out of a keyboard macro being recorded — a
+;; `(m input) -> bool` symbol, true to keep it out. A password typed into a masked read
+;; (passwd) would be typed again on every replay, and shown by anything that lists the macro.
+(defn register-macro-guard (name guard)
+  "Add the macro guard `name`, replacing any registered under `name`. Called when its module
+loads."
+  (ownership/claim! :model/macro-guards name guard))
+
+(defn ed-macro-private? (m input)
+  "Whether a registered macro guard keeps `input` out of the macro being recorded."
+  (any? (vals (registry/entries :model/macro-guards))
+    (fn (guard) (= true (ed-call-hook guard false m input)))))
+
 (defn register-resize-step (name step)
   "Add `step`, a `(model) -> model` symbol the window's resize runs through, replacing any
 registered under `name`. Called when its module loads."
@@ -1601,6 +1657,33 @@ one left."
   (fold (registry/ranked :model/post-steps)
     m
     (fn (acc [_ step]) (ed-call-deferred acc (:run step) acc))))
+
+(defn register-input-step (name step)
+  "Add `step`, a `(model input) -> model` symbol run on every event BEFORE the timers are
+reconciled and the post-steps run — what an input marks for the idle beat to act on (a web
+mirror's snapshot gone stale) — replacing any registered under `name`. Called when its module
+loads."
+  (ownership/claim! :model/input-steps name step))
+
+(defn ed-run-input-steps (m input)
+  "Every registered input step over `m`, each seeing the model the previous one left."
+  (fold (vals (registry/entries :model/input-steps))
+    m
+    (fn (acc step) (ed-call-hook step acc acc input))))
+
+(defn register-tail-step (name step)
+  "Add `step`, `{:order :run}` with `:run` a `(before after input) -> model` symbol, run at the
+very end of an event once the buffers' processes have its edits (`hosted`) — what compares the
+model before the event with the one after (collab's presence and follow) — replacing any
+registered under `name`. Not run for a keyboard macro's replay, whose events each run their own.
+Called when its module loads."
+  (ownership/claim! :model/tail-steps name (assoc step :name name :rank (:order step))))
+
+(defn ed-run-tail-steps (before after input)
+  "Every registered tail step, in `:order`, over `after`."
+  (fold (registry/ranked :model/tail-steps)
+    after
+    (fn (acc [_ step]) (ed-call-hook (:run step) acc before acc input))))
 
 (defn ed-sync-window-point (m)
   "The model with the selected pane's window-local cursor also written to its pool buffer,
@@ -2424,3 +2507,49 @@ metric."
 
 (def *no-region-message* "no region (set the mark with C-SPC first)")
 ;; What a command that needs the region says without one.
+
+;; ---- lossage: the keys that reached the dispatcher (Emacs recent-keys) ------
+;; The command loop keeps it, as Emacs keeps recent-keys in its C core: every key the
+;; dispatcher sees goes in, and C-h l (`help`) reads it.
+
+(def *lossage-max* 100)
+;; How many recent keys `C-h l` remembers (Emacs keeps 300 in a C ring). The model carries
+;; them as a plain vector, so the cap is what stops a long session growing a field without
+;; bound — and it is read at trim time, not baked in, so raising it takes effect live.
+
+(def *lossage-slack* 32)
+;; How far the ring is allowed to run past `*lossage-max*` before it is cut back. The trim
+;; is the expensive half (a `take-last` plus a rebuild), and trimming on every keystroke
+;; past the cap paid it on every keystroke FOREVER. Cutting back in blocks amortises it
+;; over `*lossage-slack*` keys — this is the dispatcher's path, and it is the one place in
+;; the editor where a tenth of a millisecond is worth an integer of slack.
+;;
+;; `C-h l` reads the last `*lossage-max*` of whatever is here, so the overshoot never
+;; shows: the ring holds between max and max+slack, and the report takes the tail.
+
+(sig lossage-record (model any -> model))
+(defn lossage-record (m key)
+  "`m` with `key` appended to the lossage ring. Called by the dispatcher for every key that
+reaches it — including the ones no keymap binds, because \"nothing happened\" is exactly
+what you press C-h l to explain.
+
+On the hot path, so it does the least it can: `conj` onto a vector, and a trim only when
+the ring has run `*lossage-slack*` past the cap. Measured at 0.013 ms a keystroke against
+a 0.231 ms dispatch."
+  (let (ring (or (:lossage m) [])
+        grown (conj ring key))
+    (assoc m
+      :lossage
+      ;; `into []` is load-bearing: `seq/take-last` answers a LIST, and `conj` inserts at
+      ;; each kind's natural point — the head of a list. Left as one, the ring silently
+      ;; reversed itself the moment it first overflowed, and `C-h l` showed the hundred
+      ;; keys before the last hundred, newest last. It stays a vector so `conj` appends.
+        (if (> (count grown) (+ *lossage-max* *lossage-slack*))
+          (into [] (seq/take-last grown *lossage-max*))
+          grown))))
+
+(defn lossage-keys (m)
+  "The last `*lossage-max*` keys, oldest first — the ring as `C-h l` shows it, with the
+slack `lossage-record` leaves for amortisation trimmed off here instead."
+  (let (ring (or (:lossage m) []))
+    (if (> (count ring) *lossage-max*) (into [] (seq/take-last ring *lossage-max*)) ring)))

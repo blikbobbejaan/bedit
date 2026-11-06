@@ -1,0 +1,350 @@
+(defmodule eolnotes
+  "**End-of-line notes**: derived text shown AT a line and never inserted into it — a
+playground's results, a test's verdict, a type hint. One buffer annotation (`:eol-notes`),
+owner-keyed, that the margin glyph (`gutter`), the ghost text past the line's end (`view`) and
+the echo row (`echoarea`) all read. Producers: liveeval, the playgrounds and the tutorial,
+diagnostics. Split out of `results`, whose report buffers have nothing to do with it."
+  (:use editor/buffer) ; annotate / annotation — the notes are one buffer annotation
+  (:use wrap :only [raw-inlays]) ; a buffer's inlay rows, as stored
+  (:use memo)) ; defmemo — the per-line index, read every frame
+
+;; ---- end-of-line notes: derived text shown AT a line -------------------------
+;; A note is `{owner-key -> {:line n :kind :info|:pass|:fail|:running|:hint :text str}}`
+;; stored as ONE buffer annotation (`std/editor/buffer`'s `annotate`, so currency and
+;; staleness come for free) under `:eol-notes`. Three renderers share it: the margin
+;; glyph (`gutter/gutter-mark-for`), the ghost text past the line's end
+;; (`view/ed-eol-note-ops`), and the echo row when point is on the line
+;; (`echoarea/ed-eol-note-on-line`).
+;;
+;; Owner-keyed rather than line-keyed on purpose: the producer knows what a note is
+;; ABOUT (a playground box, a form, a test) and rebuilds its own entries, so a note
+;; can never be stranded at a line the text moved out from under. The tutorial's
+;; per-box verdicts are the first consumer; inline `C-x C-e` results, LSP inlay hints,
+;; git blame and test failure text are the same shape.
+;;
+;; TWO kinds of derived text, and the distinction is what [[set-note]] is for. A RESULT
+;; is what the code did and belongs under it; a HINT is what the language makes of the
+;; code — a type, a signature, a blame line — and belongs AT it. So one call places both,
+;; on two lines, from one note: `{… :text "=> 3" :hint ": int"}`. Neither is ever inserted
+;; into the buffer, which is the constraint the whole shape exists to honour — real lines
+;; would push everything below them down each time an answer arrived or a type changed,
+;; and text must not jump under the cursor.
+
+;; ---- anchoring: which line a note goes on ------------------------------------
+;; Line arithmetic over a buffer's TEXT rather than its rope: a producer deriving notes
+;; has the text already (it just parsed it into forms or regions), so asking the rope
+;; per note would traverse twice for one answer.
+
+;; Line arithmetic goes to the ROPE, never to the text. A producer deriving notes has the
+;; text already (it just parsed it into forms or regions), so asking the string "which line
+;; is offset N on?" looks free — but each such question is a `string/split` of the whole
+;; buffer, and a producer asks one per note. That is O(notes × buffer): 114ms to place the
+;; notes of a 500-form playground, on the keystroke path. The rope indexes lines already
+;; (`text/char->line`, O(log n)); asking it is both faster than a table built here and less
+;; code than one, which is the usual shape of a toolkit question answered by hand.
+
+(defn line-count (rope)
+  "How many lines `rope` has — a trailing newline ends a line, `\"\"` is one line."
+  (text/line-count rope))
+
+(defn line-of (rope pos)
+  "The 0-based line the character offset `pos` falls on, clamped into `rope`."
+  (text/char->line rope (math/min (math/max 0 pos) (text/length rope))))
+
+(defn line-text (rope line)
+  "The text of 0-based `line`, its trailing newline included; `\"\"` for a line that isn't
+there."
+  (if (or (< line 0) (>= line (line-count rope))) "" (text/line rope line)))
+
+(defn answer-line (rope pos)
+  "Where a RESULT for code ending at offset `pos` goes: **the line below when that line is
+blank**, else the code's own line.
+
+Not simply \"the line below\", which is what it reads best as — `=> 6` under the form rather
+than trailing it — because that only holds when the line below is empty. Two other cases
+share one answer:
+
+  - **The next form starts immediately below.** An answer placed there lands where that
+    form's own derived text already sits, and two ghost texts at one line's end paint over
+    each other — `=> bar` and `=> 42` come out as illegible mush. (What made this a bug and
+    not a curiosity: a buffer with no blank lines between forms is the normal way to write.)
+  - **There is no line below at all** — code at the very end of a buffer with no trailing
+    newline. That anchor is past EOF, which does not merely hide the note: a renderer asks
+    the rope for the line and the frame dies (`%rope-line: line 4 out of bounds`).
+
+In both, the right place is the end of the code's own line, so this is one rule rather than
+a rule plus a clamp. [[set-note]] then folds a hint for that same line into the answer, since
+they would otherwise be the two texts overpainting."
+  (let (here (line-of rope pos)
+        below (inc here))
+    (if (and (< below (line-count rope)) (string/blank? (line-text rope below)))
+      below
+      here)))
+
+(sig eol-notes (buffer -> (or nil map)))
+(defn eol-notes (buf)
+  "The buffer's end-of-line notes while they are positionally current, else nil."
+  ;; as `eol-notes-any` below: an annotation's value is `any` in std, so the guard is
+  ;; what proves the map this declares
+  (let (notes (annotation-value buf :eol-notes))
+    (if (map? notes) notes nil)))
+
+(sig eol-notes-any (buffer -> (or nil map)))
+(defn eol-notes-any (buf)
+  "The notes REGARDLESS of positional currency — for the PRODUCER, which re-anchors
+them as it rebuilds (a note whose line has shifted is still the right note; it just
+needs a new `:line`). Renderers must use `eol-notes`, which hides notes that would
+paint at the wrong line."
+  ;; an annotation's `:value` is whatever the producer stored (std/editor/buffer keeps
+  ;; it as `any`); the notes producer stores a map, and the guard says so
+  (let (notes (:value (annotation buf :eol-notes)))
+    (if (map? notes) notes nil)))
+
+(defn eol-notes-stale? (buf)
+  "Whether the notes predate the buffer's current text (an edit dims them)."
+  (let (a (annotation buf :eol-notes)) (and a (:stale? a))))
+
+(defn eol-notes-hidden? (buf)
+  "The buffer HAS notes and [[eol-notes]] will not hand them to a renderer — the line count
+moved since they were stamped, so every result the reader had is gone from the screen.
+
+The question a live evaluator's `stale?` predicate has to ask alongside \"did the text
+move?\". Those two are not the same, and treating them as one is how a buffer gets STUCK
+showing nothing: a note stamped when a reply landed describes the rope of that moment, and
+if the text then returns to what the last launch parsed (type a newline, delete it again)
+the rope test says \"nothing to do\" while the notes are anchored to a line count the buffer
+no longer has. Nothing re-anchors them, nothing re-evaluates, and the results stay invisible
+until the next real edit. Asking this too is what re-arms the debounce."
+  (let (a (annotation buf :eol-notes))
+    (and a (not (:current? a)) (not (empty? (or (:value a) {}))))))
+
+(defn note-pending? (kind)
+  "Is this note kind \"no answer yet\" — the request is still out (`:running`), the region
+is mid-form and was never sent (`:incomplete`), or it is held until asked for (`:held`)?
+
+The margin glyph and the ghost-text face both branch on it, and both must: a pending note
+takes the dim voice and the `⋯` mark, never a verdict colour, because grey reads as \"not in
+yet\" while green or red reads as an answer that has landed. One predicate rather than the
+same two-way `or` in each renderer — a third pending flavour would otherwise be wired into
+one table and forgotten in the other, which is exactly how the playground's notes came to
+paint as results."
+  (or (= kind :running) (= kind :incomplete) (= kind :held)))
+
+(defn note-glyph (note)
+  "The one-character mark for a note — `·` a result, `✓` a pass, `✗` a failure, `⚠` an
+advisory, `⋯` an answer still out.
+
+The single spelling, asked for by kind. It used to be spelled twice — once by the margin
+and again inside each note's own `:text` — so a raise painted `✗   ✗ ** (FunctionClauseError)
+…`: the glyph beside the glyph, in a note already short of room. A note now carries its
+MESSAGE and nothing else, and every renderer that wants a mark asks here."
+  (let (kind (if (:warn note) :warn (:kind note)))
+    (cond
+      (= kind :pass) "✓"
+      ;; `:broken` says the same thing as `:fail` — this will not run — and says it in the
+      ;; pending VOICE (see `ed-eol-note-face`), because a form you are still typing has
+      ;; not failed, it has not run yet
+      (or (= kind :fail) (= kind :broken)) "✗"
+      (note-pending? kind) "⋯"
+      (= kind :warn) "⚠"
+      else "·")))
+
+(defn hint-key (key &optional (index nil))
+  "The key owner `key`'s HINT is stored under, one per `index`. Derived rather than chosen
+by the caller so that [[set-note]] can always find and clear the hints that no longer apply
+— and keyed apart from the result because they sit on different lines and are rebuilt
+together.
+
+`index` is nil for a form with ONE derived note (a type at its opening line) and 0, 1, 2 …
+for a form that derives one per thing it defines — a `defmodule` with a note against each
+`def` inside it. Both shapes answer [[owner-of]] the same way, so ordering does not care
+which a producer used."
+  (if (nil? index) [:hint key] [:hint key index]))
+
+(defn owner-of (key)
+  "Whose note `key` holds — itself, or the owner its hint was derived for. [[hint-key]]'s
+inverse, so a reader can order a hint with the thing it describes rather than beside it."
+  (if (and (vector? key) (= (first key) :hint)) (second key) key))
+
+(defn- by-owner (entries)
+  ;; `[key note]` pairs in owner order — a hint sorting with the owner it describes, since
+  ;; `owner-of` is `hint-key`'s inverse. Every producer keys by an index into what it derived
+  ;; notes FROM (a form, a box, a region), so numeric order is source order, which is what
+  ;; makes two notes on one line read left to right the way the code does. A non-numeric
+  ;; owner sorts after those, by its printed form, so the order is total whatever a future
+  ;; producer keys by; the annotation is a map, and map order is not an order.
+  (let (owner (fn (kv) (owner-of (first kv)))
+        ints (seq/filter entries (fn (kv) (int? (owner kv)))))
+    (append (seq/sort-by ints owner)
+      (seq/sort-by (seq/filter entries (fn (kv) (not (int? (owner kv)))))
+        (fn (kv) (pr-str (owner kv)))))))
+
+(defn- line-reading-order (entries)
+  ;; one line's `[key note]` entries as notes in reading order: the hint first (it describes
+  ;; the code right there), then the results in owner order
+  (let (notes (map (by-owner entries) second))
+    (append (seq/filter notes (fn (n) (= (:kind n) :hint)))
+      (seq/filter notes (fn (n) (not (= (:kind n) :hint)))))))
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; the store only ever holds what the body below built, `{:lines :by-line}`.
+(check-allow :trusted
+  (defmemo note-index 4 (all)
+    "The notes map `all` indexed by line: `{:lines (ascending distinct lines) :by-line {line
+-> notes in reading order}}`. Remembered on the map itself — the annotation's own value, the
+same cell every frame until a producer re-stamps it — so the ghost text asking per visible
+line and the echo row asking for the cursor's line read the index back rather than scanning
+every note for every line (`:diag-by-line`'s shape, for the notes). A note with no int
+`:line` is in neither."
+    (let (grouped (fold all
+                    {}
+                    (fn (acc kv)
+                      (let (line (:line (second kv)))
+                        (if (int? line) (assoc acc line (cons kv (get acc line '()))) acc)))))
+      {:lines (sort (keys grouped))
+       :by-line (into {} (map grouped (fn ([line entries]) [line (line-reading-order entries)])))})))
+
+(defn notes-on-line (buf line)
+  "EVERY current note anchored on 0-based `line`, in reading order: the hint first (it
+describes the code right there), then the results in owner order. `()` when the notes are
+not positionally current.
+
+Plural because a line can carry more than one — two forms written on one line, or a form
+whose answer had nowhere below it to go — and every reader of this annotation has to survive
+that. A reader that takes only the first silently drops the rest; a renderer that draws them
+all at the same column paints them on top of each other. Read off the line index
+(`note-index`), so asking per visible line costs a lookup, not a scan of every note."
+  ;; a buffer with no notes — nearly every one — answers before the index
+  (let (all (eol-notes buf))
+    (if (or (nil? all) (empty? all)) '() (get (:by-line (note-index all)) line '()))))
+
+(defn error-spans (buf)
+  "`([from to] …)` — the 0-based line span (inclusive) of every current note that says its
+code RAN and failed (`:error?`): from the form's first line (`:from`) to the line its answer
+sits on. `()` when there is none.
+
+What a checker advisory asks before it paints: **the runtime outranks the checker.** A form
+whose run already failed has its error on screen, and the checker's ⚠ for the same form —
+`does not compile: defn: expected at least 1 argument` beside `defn: expected at least 1
+argument` under it — only says it twice. The tutorial's own merge drops it for the same
+reason (`tutor-merge-warning`); this is that rule for every buffer the view paints."
+  (let (all (eol-notes buf))
+    (if (or (nil? all) (empty? all))
+      '()
+      (seq/keep (vals all)
+        (fn (note)
+          (let (to (:line note))
+            (when (and (:error? note) (int? to)) [(or (:from note) to) to])))))))
+
+(defn note-lines (buf)
+  "The distinct lines carrying a current note, ascending — what a renderer iterates so it
+visits each line once and can lay that line's notes out side by side.
+
+A note with no line (one stored without `set-note`, which stamps it) is skipped rather than
+handed on: the renderer compares lines, and one malformed note threw out of the whole
+frame, blanking the editor behind a `render error`."
+  ;; no notes is the common case and the view asks every frame
+  (let (all (eol-notes buf))
+    (if (or (nil? all) (empty? all)) '() (:lines (note-index all)))))
+
+(defn note-text (note)
+  "One note's full text, its `:warn` advisory included — what a reader with room for the
+whole thing shows. Shared so the ghost text, the echo row and any later reader cannot
+disagree about what a note says.
+
+`:warn` carries TWO things and only one of them is text. The tutor stores the advisory it
+wants shown beside a result (`(assoc note :warn (:text w))`, a string); the checker's
+diagnostics store a plain flag (`:warn true`) that `mark-note-glyph` and `ed-eol-note-face`
+read to pick the ⚠ and its colour. Appending it unconditionally printed the flag —
+`⚠ unbound symbol: acc   true` — so only a STRING is text to append."
+  (if (string? (:warn note)) (str (:text note) "   " (:warn note)) (:text note)))
+
+(defn eol-note-at (buf line)
+  "The line's notes as ONE string (`\": int  => 42\"`), or nil when it carries none — the
+echo-area form of [[notes-on-line]], for the row that reports what is on the cursor's line."
+  (let (notes (notes-on-line buf line))
+    (when (not (empty? notes))
+      (string/join (map notes note-text) "  "))))
+
+(defn- without-hints (notes key)
+  ;; every derived hint currently stored for `key`, dropped — however many there are and
+  ;; whichever shape keyed them. Rebuilt-not-patched: a form that defined three functions
+  ;; and now defines two must not keep the third's note sitting on a line it no longer owns.
+  (fold (keys notes)
+    notes
+    (fn (acc k)
+      (if (and (vector? k) (= (first k) :hint) (= (second k) key)) (dissoc acc k) acc))))
+
+(defn- hint-entries (buf key note at hint-at)
+  ;; `([hint-key note] …)` — the derived notes this note wants placed away from its answer.
+  ;;
+  ;; `:hints` is the general form: one `{:line :text}` per thing the form defined, each at
+  ;; its OWN line, which is what puts a type against every `def` inside a `defmodule`
+  ;; instead of piling all their names onto the `defmodule` line. `:hint` is the same
+  ;; mechanism with one entry at the form's opening line, and is kept because that is what
+  ;; a plain expression wants: it has one type and one place to say it.
+  ;;
+  ;; A `:hints` line is CHECKED against the buffer, which `:hint`'s never needed to be: a
+  ;; lone hint's line is derived from an offset in this very rope, while these come back
+  ;; from the child, which was sent the form as it stood some milliseconds ago. Delete two
+  ;; lines while a reply is in flight and its notes name lines the buffer no longer has —
+  ;; and a note anchored past EOF does not merely fail to show, it takes the FRAME down
+  ;; (`%rope-line: line 7 out of bounds`) the next time a renderer asks the rope for that
+  ;; line. The stale ones are dropped; the next launch re-derives them all anyway.
+  (let (lines (buffer-line-count buf)
+        hints (:hints note))
+    (cond
+      (not (empty? hints))
+        (seq/keep (seq/enumerate hints)
+          (fn ([i h])
+            (let (line (:line h))
+              (when (and (:text h) (int? line) (>= line 0) (< line lines))
+                [(hint-key key i) {:kind :hint :text (:text h) :line line}]))))
+      (and (:hint note) hint-at (not (= hint-at at)))
+        (list [(hint-key key) {:kind :hint :text (:hint note) :line hint-at}])
+      else '())))
+
+(defn set-note (buf key note at &optional (hint-at nil))
+  "Store `note` under `key` anchored on 0-based line `at`, re-stamping the annotation against
+the current text.
+
+A note's DERIVED text — the types it wants shown at the code rather than under it — is
+placed as its own note(s) under [[hint-key]], so the answer and the types can never move one
+another. Two shapes: `:hint` is one string at `hint-at` (an expression's type, at the form's
+opening line), and `:hints` is a vector of `{:line :text}`, one per thing the form defined,
+each at its own line (a `defmodule`'s functions, against their own `def`s). When a lone
+hint's line coincides with the answer's (a region whose answer [[answer-line]] put at the
+end of its own line, having nowhere blank below) it rejoins the note's text instead of
+becoming a second note at the same cell. With no hints, any stale ones for `key` are dropped.
+
+The hints travel INSIDE the note rather than as more arguments so that a producer
+re-anchoring its notes after an edit re-derives all of them from one entry, and cannot leave
+one stranded on a line its owner has moved off. The note's own text is kept under `:answer`,
+so re-stamping a note that was already joined (`\"=> 3  : int\"`) joins the hint to the answer
+again — not to the joined text, which appended another `: int` on every re-anchor.
+
+Merges onto [[eol-notes-any]] (not [[eol-notes]]): a sibling owner's note must survive even
+when the lines have shifted since it was written, or whoever writes second silently deletes
+the first one's work."
+  (let (hint (:hint note)
+        share? (and hint (empty? (:hints note)) hint-at (= hint-at at))
+        answer (or (:answer note) (:text note))
+        notes (assoc (without-hints (or (eol-notes-any buf) {}) key)
+                key
+                  (assoc note
+                    :answer answer
+                    :text (if share? (str answer "  " hint) answer)
+                    :line at
+                    ;; the form it answers starts here — `error-spans` reads the span
+                    :from (or hint-at at))))
+    (annotate
+      ;; …and the note's INLAY rows, which are not end-of-line text at all: they take rows
+      ;; of their own above the lines they describe (`wrap/inlay-lines`). Stored under
+      ;; the same owner key, so one producer rebuilding its rows leaves a sibling's alone,
+      ;; and dropped entirely when this note has none.
+      (annotate buf
+        :inlay-lines (let (store (raw-inlays buf) rows (:inlays note))
+          (if (empty? rows) (dissoc store key) (assoc store key (vec rows)))))
+      :eol-notes (fold (if share? '() (hint-entries buf key note at hint-at))
+        notes
+        (fn (acc entry) (let ([k v] entry) (assoc acc k v)))))))

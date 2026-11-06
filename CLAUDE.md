@@ -122,8 +122,14 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             Emacs's file-name-handler-alist: a row claims a typed path by
                             `:prefix` and a buffer by `:mark`, and answers `:find-file`,
                             `:write-file`, `:save`, `:revert`, `:file-of`; a `:later-entry` +
-                            `:save-all` for a save that lands after the questions). The core
-                            names no feature: a
+                            `:save-all` for a save that lands after the questions), who SHOWS a
+                            directory, a file that is not text and a new frame
+                            (`register-presenter`: dired, hexl, frames), what an event marks
+                            before the timers (`register-input-step`: the web mirror) and what
+                            runs once its edits reach the buffer processes
+                            (`register-tail-step`: collab), a paste a program takes whole
+                            (`register-paste-taker`) and a key kept out of a macro
+                            (`register-macro-guard`: both passwd). The core names no feature: a
                             module registers its rows when it loads, each row CLAIMED for the
                             file that registered it (`ownership/claim!`), so a package's rows
                             go back with the package. Also the OUTPUT CAP
@@ -978,6 +984,9 @@ src/results.blsp            the results-buffer abstraction behind *Tests* / *Run
                             `ed-append-follow` — the streaming append that follows the tail
                             only in a pane already at the bottom, then caps the buffer
                             (`model/ed-cap-output-at`)
+src/eolnotes.blsp           END-OF-LINE NOTES: derived text shown at a line, never inserted —
+                            a playground's results, a verdict, a type hint — as one owner-keyed
+                            buffer annotation the margin, the ghost text and the echo row read
 src/testadapter.blsp        one result vocabulary, two runners: Brood's structured
                             test/*report-sink* lines and ExUnit's `mix test --trace` text
                             both decode into the same {:group :name :passed :where …}, so
