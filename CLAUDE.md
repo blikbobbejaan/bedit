@@ -806,14 +806,15 @@ src/folds.blsp              outline FOLDING in an editable buffer (org's TAB): a
                             covers, and the row table gives the hidden lines no rows — so the
                             view, cursor, scroll and mouse never see them; point landing
                             inside one opens it
-src/isearch.blsp            incremental search + query-replace (C-s/C-r/M-%) modal mini-loops: regexp
-                            (C-M-s / C-M-r, M-r) and word (M-s w) search, M-c case toggle, C-M-%
-                            with `\1` groups; the `3/17` match count (a timer of its own, a slice of
-                            the rope per turn, never on a key) and every visible match lit
-                            (`lazy-ranges`), over std regex's rope search (brood ADR-540). With
-                            the region active, M-% / C-M-% stay inside it (`Query replace in
-                            region:`): its end moves with each replacement, and a regexp is
-                            searched with it as the bound (brood ADR-554). M-x replace-string /
+src/isearch.blsp            incremental search (C-s / C-r), a modal mini-loop: regexp
+                            (C-M-s / C-M-r, M-r) and word (M-s w) search, M-c case toggle; the `3/17`
+                            match count (a timer of its own, a slice of the rope per turn, never on
+                            a key) and every visible match lit (`lazy-ranges`), over std regex's rope
+                            search (brood ADR-540)
+src/query-replace.blsp      query-replace (M-%, C-M-%), a modal mini-loop on isearch's case rule and
+                            lazy highlight: C-M-% has `\1` groups. With the region active, M-% /
+                            C-M-% stay inside it (`Query replace in region:`): its end moves with
+                            each replacement, and a regexp is searched with it as the bound (brood ADR-554). M-x replace-string /
                             replace-regexp are `!` at the first match (`replace-all`): the same
                             search, `\&` / `\1` and case rule, one undo group
 src/eval-command.blsp       eval Brood source from a buffer (the C-x C-e core)

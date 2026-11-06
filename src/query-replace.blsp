@@ -1,0 +1,353 @@
+(defmodule query-replace
+  "Query-replace (`M-%`, `C-M-%` by regexp): a modal mini-loop that runs *beside* the keymap,
+as isearch does. When `:query-replace` is set on the model, `input/ed-update` routes keys
+here instead of dispatching them; each match is lit and answered y/n/!/./q. The case rule
+is the search's (`isearch/search-fold?`) and the window's other matches are lit through
+`isearch/lazy-ranges`. Also the replace family that does not ask, as data over text."
+  (:use editor/buffer) ; buffer-search-forward, goto-char, point/length
+  (:use isearch :only [search-fold? regexp-fold?]) ; a replace folds case as a search does
+  (:use theme) ; face-isearch — the match at point
+  (:use model)) ; ed-current-buf / ed-set-buf
+
+;; `:query-replace` carries `{:from :to :regexp? :match :found :count}`; each match is highlighted with a transient
+;; overlay (and every other one in the window lit, as in a search) and the user answers
+;; y/n/!/./q. Two minibuffer prompts (from, then to) precede it — see
+;; `commands/cmd-query-replace` and `cmd-query-replace-regexp`.
+;;
+;; A regexp's replacement may refer to what matched: `\&` is the whole match, `\1`…`\9` its
+;; groups and `\\` a backslash (Emacs's syntax, [[expand-replacement]]).
+
+;; The query-replace state, as the commands below read it. `:match` is nil between the
+;; start and the first `qr-goto`; every replace runs at a match, and `qr-match` says so.
+(deftype qr (record &open :from string :to string :match (or nil int) :count int))
+(sig qr-state (model -> qr))
+(defn- qr-state (m)
+  "The query-replace in progress — which there is, for every key `qr-key` folds."
+  (or (:query-replace m) (error "no query-replace in progress")))
+(sig qr-match (qr -> int))
+(defn- qr-match (qr)
+  "The current match's start — set by `qr-goto` before any replace can run."
+  (or (:match qr) (error "query-replace is not at a match")))
+
+(defn- qr-fold? (qr)
+  "Does this replace ignore case — the search rule for its kind."
+  (if (:regexp? qr) (regexp-fold? (:from qr)) (search-fold? (:from qr))))
+
+(defn- qr-prompt (qr)
+  "The echo-area prompt for a query-replace at a match."
+  (str "Query replacing "
+    (if (:regexp? qr) "regexp " "")
+    (:from qr)
+    " with "
+    (:to qr)
+    ": (y/n/!/./q)"))
+
+(defn- qr-limit (qr buf)
+  "Where the replace's matches must end by: its region's end (`:limit`, carried along as
+replacements change the text's length) when it was started over a region, else the end of
+the buffer."
+  (or (:limit qr) (buffer-length buf)))
+
+(defn- qr-find (qr buf pos)
+  "The next match of the replace at or after `pos`, as `regex/find`'s map
+(`{:start :end :text :groups}`), or nil — one that ENDS by [[qr-limit]], so a replace over
+the region never reaches past it. A regexp is searched with that limit as its bound (brood
+ADR-554: a greedy match stops at the region's end, as Emacs's `re-search-forward` BOUND
+does, while `$` and `\\b` there still read the text beyond); a literal match cannot be
+shortened, so one ending past the limit is simply none."
+  (let (fold? (qr-fold? qr)
+        from (:from qr)
+        limit (qr-limit qr buf))
+    (cond
+      (> pos limit) nil
+      (:regexp? qr)
+        (regex/rope-find from (buffer-rope buf) pos {:fold? fold? :empty? true :bound limit})
+      else
+        (when-let (start (buffer-search-forward buf from pos fold?))
+          (let (end (+ start (string/length from)))
+            (when (<= end limit)
+              {:start start :end end :text (text/slice (buffer-rope buf) start end) :groups []}))))))
+
+(defn expand-replacement (to found)
+  "The replacement template `to` with its references filled in from `found` (a match map,
+as `regex/find` answers): `\\&` the whole match, `\\1`…`\\9` a group (empty when it did not
+take part), `\\\\` a backslash — Emacs's `replace-match` syntax. Any other text is itself.
+
+    (query-replace/expand-replacement \"\\\\2, \\\\1\" (regex/find \"(\\\\w+) (\\\\w+)\" \"jane doe\"))   ;=> \"doe, jane\"
+    (query-replace/expand-replacement \"<\\\\&>\" (regex/find \"o+\" \"foo\"))                       ;=> \"<oo>\""
+  (regex/replace "\\\\([&0-9\\\\])"
+    to
+    (fn (reference)
+      (let (what (:text (first (:groups reference))))
+        (cond
+          (= what "&") (:text found)
+          (= what "\\") "\\"
+          (= what "0") (:text found)
+          else
+            (let (group (nth (:groups found) (- (string/char->int what) (string/char->int "1")) nil))
+              (if (nil? group) "" (:text group))))))))
+
+(defn- qr-replacement (qr found)
+  "The text that replaces the match `found`: a regexp's template expanded
+([[expand-replacement]]), then — when the search folded and the template was typed in lower
+case — given the case of the text it replaces ([[replacement-for]])."
+  (let (to (:to qr)
+        expanded (if (:regexp? qr) (expand-replacement to found) to))
+    (if (= to (string/fold-case to))
+      (replacement-for (:text found) expanded (qr-fold? qr))
+      expanded)))
+
+(defn qr-finish (m)
+  "End query-replace: clear the state + the match overlay, and report the count."
+  (let (qr (qr-state m)
+        n (:count qr))
+    (assoc m
+      :query-replace nil
+      :overlays nil
+      :isearch-lazy nil
+      :echo (str "Replaced " n " occurrence" (if (= n 1) "" "s")))))
+
+;; Where a replace looks next is Emacs's `perform-replace` rule (replace.el), and it decides
+;; what a pattern that can match nothing (`x*`, `^`, `$`) replaces. The next match may be
+;; ADJACENT to this one only when this one was non-empty and the match starting where it ends
+;; is non-empty too — judged in the text before the replacement goes in, since that can change
+;; what matches. Otherwise the search steps one character on first, so an empty match is
+;; never taken twice nor right after a replacement — and a step never lands on the end of the
+;; buffer. `x*` → `-` over `xxa` is `-a`, over `xxaxx` `-a-` (what `emacs --batch` gives).
+
+(defn- qr-adjacent? (qr buf found)
+  "May the match after `found` (a match in `buf`, before it is replaced) start right where
+it ends? Only when `found` is non-empty, and for a regexp only when the match there is
+non-empty too (`perform-replace`'s `match-again`)."
+  (and (not (= (:start found) (:end found)))
+    (or (not (:regexp? qr))
+      (let (next (regex/rope-find (:from qr)
+                   (buffer-rope buf)
+                   (:end found)
+                   {:fold? (qr-fold? qr) :empty? true :bound (qr-limit qr buf)}))
+        (and next (= (:start next) (:end found)) (not (= (:start next) (:end next))))))))
+
+(sig qr-next (any any any int -> (or nil int)))
+(defn- qr-next (qr buf adjacent? pos)
+  "Where the next search starts, in `buf` (as it is now), from `pos` just past the last match
+or its replacement: `pos` itself when the next match may be adjacent ([[qr-adjacent?]]),
+else a character on — nil at the end of the buffer (or of the region the replace is confined
+to, [[qr-limit]]), or when the step would reach it: `perform-replace`'s loop runs while
+point is short of its limit."
+  (let (limit (qr-limit qr buf))
+    (cond
+      (>= pos limit) nil
+      adjacent? pos
+      (< (inc pos) limit) (inc pos)
+      else nil)))
+
+(sig qr-goto (model (or nil int) -> model))
+(defn- qr-goto (m pos)
+  "Highlight the next match at or after `pos` (a transient overlay, point at its start, the
+other matches in the window lit), or finish if there is none — or no `pos` at all, past an
+empty match at the buffer's end ([[qr-next]])."
+  (let (qr (qr-state m)
+        buf (ed-current-buf m)
+        found (when (int? pos) (qr-find qr buf pos)))
+    (if (nil? found)
+      (qr-finish m)
+      (assoc (ed-set-buf m (goto-char buf (:start found)))
+        :overlays [{:start (:start found) :end (:end found) :face face-isearch}]
+        :isearch-lazy
+          (merge {:pattern (if (:regexp? qr) (:from qr) (regex/escape (:from qr)))
+                  :fold? (qr-fold? qr)}
+            ;; over a region, only the matches the replace will reach are lit
+            (if (:limit qr) {:within [(:region-start qr) (:limit qr)]} {}))
+        :echo (qr-prompt qr)
+        ;; the question stands until answered: a `message` meanwhile shows beside it
+        :query-replace
+          (assoc (dissoc qr :message) :match (:start found) :found found :prompt (qr-prompt qr))))))
+
+(defn replacement-for (matched to fold?)
+  "The text to put in place of `matched`, given the replacement `to`.
+
+Emacs' `case-replace`, and the half of case-insensitive replace that is easy to forget:
+if the search ignored case then the text you matched may be capitalised differently from
+what you typed, and copying the replacement in verbatim would change the case of prose you
+never meant to touch. Replacing `foo` with `bar` across `Foo is FOO` should give
+`Bar is BAR`, not `bar is bar`.
+
+Only when the pattern of the MATCH is unambiguous — all upper, or capitalised — and only
+when the replacement was typed in lower case, which is the signal that no particular case
+was intended. Anything else is left exactly as written: `fooBar` typed as a replacement is
+a name, not a sentence."
+  (cond
+    (not fold?) to
+    (not (= to (string/fold-case to))) to
+    (= matched "") to
+    (= to "") to
+    ;; ALL CAPS in, all caps out — but only when there is a letter to be sure about, so
+    ;; `---` does not count as upper case
+    (and (= matched (string/upper matched)) (not (= matched (string/fold-case matched))))
+      (string/upper to)
+    ;; Capitalised in, capitalised out
+    (and (= (string/char-at matched 0) (string/upper (string/char-at matched 0)))
+      (not (= (string/char-at matched 0) (string/fold-case (string/char-at matched 0)))))
+      (str (string/upper (string/char-at to 0)) (string/substring to 1))
+    else to))
+
+(sig qr-replace (model -> (tuple model (or nil int))))
+(defn- qr-replace (m)
+  "Replace the current match with its replacement ([[qr-replacement]]) and return
+`[model' next-search-pos]` (the model with its count bumped, point just past the inserted
+text — and a region's end moved by what the replacement added or removed, so the replace
+stays confined to the text the region held). A buffer that refuses the edit (read-only) ends
+the replace there."
+  (let (qr (qr-state m)
+        start (qr-match qr)
+        found (:found qr)
+        end (:end found)
+        to (qr-replacement qr found)
+        adjacent? (qr-adjacent? qr (ed-current-buf m) found)
+        [m2 replaced?] (ed-try-edit m (fn (b) (replace-region b start end to)))
+        grown (- (string/length to) (- end start))
+        moved (if (:limit qr) (assoc qr :limit (+ (:limit qr) grown)) qr))
+    (if replaced?
+      [(assoc m2 :query-replace (assoc moved :count (inc (:count qr))))
+        (qr-next moved (ed-current-buf m2) adjacent? (+ start (string/length to)))]
+      [(assoc m2 :query-replace (assoc qr :match nil)) (buffer-length (ed-current-buf m2))])))
+
+(defn- qr-matches (qr buf pos acc)
+  "Every match at or after `pos`, non-overlapping, as a reversed list of `[start end
+replacement]` — the matches `!` will replace and what each becomes, found before any of
+them is."
+  (let (found (when (int? pos) (qr-find qr buf pos)))
+    (if (nil? found)
+      acc
+      (qr-matches qr
+        buf
+        (qr-next qr buf (qr-adjacent? qr buf found) (:end found))
+        (cons [(:start found) (:end found) (qr-replacement qr found)] acc)))))
+
+(sig qr-replace-at (buffer (list (tuple int int string)) -> buffer))
+(defn- qr-replace-at (buf replacements)
+  "`buf` with each `[start end text]` of `replacements` (ascending, found in `buf` before any
+edit) put in. Front to back, each span shifted by what the replacements before it added or
+removed, so point ends after the last one."
+  (first (fold replacements
+           [buf 0]
+           (fn (acc replacement)
+             (let ([b shift] acc
+                   [start end text] replacement)
+               [(replace-region b (+ start shift) (+ end shift) text)
+                 (+ shift (- (string/length text) (- end start)))])))))
+
+(defn- qr-all (m)
+  "Replace the current match and every one after it, then finish (`!`). All of them are
+ONE edit in one `undo-group`, so a single undo puts every occurrence back — never the
+2×N steps of replacing them one by one."
+  (let (qr (qr-state m)
+        match (:match qr))
+    (if (nil? match)
+      (qr-finish m)
+      (let (replacements (reverse (qr-matches qr (ed-current-buf m) match '()))
+            [m2 replaced?] (ed-try-edit m
+                             (fn (b) (undo-group b (fn (g) (qr-replace-at g replacements))))))
+        (qr-finish (if replaced?
+                     (assoc m2
+                       :query-replace (assoc qr :count (+ (:count qr) (count replacements))))
+                     (assoc m2 :query-replace qr)))))))
+
+(sig replace-all (buffer string string map -> (tuple buffer int)))
+(defn replace-all (buf from to options)
+  "`[buf' count]`: every match of `from` in `buf` between `options`' `:low` and `:high`
+replaced by `to` without asking — `replace-string` and `replace-regexp`, which are `!` at
+query-replace's first match: the same rope search (a regexp bounded by `:high`, so `$` and
+`\\b` at the span's end read the text beyond it — brood ADR-554), the same `\\&` / `\\1`
+references when `:regexp?`, the same case rule, and the edit ONE undo group. Point ends
+after the last replacement, as Emacs's does. No match, or an empty `from`, is `[buf 0]`.
+
+    (editor/buffer/buffer-text (first (query-replace/replace-all (editor/buffer/make-buffer \"a.c abc\") \"a.c\" \"X\" {:low 0 :high 7})))   ;=> \"X abc\""
+  (let (qr {:from from
+            :to to
+            :regexp? (= true (:regexp? options))
+            :match nil
+            :count 0
+            :region-start (:low options)
+            :limit (:high options)}
+        replacements (if (= from "") '() (reverse (qr-matches qr buf (:low options) '()))))
+    (if (empty? replacements)
+      [buf 0]
+      [(undo-group buf (fn (group) (qr-replace-at group replacements))) (count replacements)])))
+
+(def *qr-keys* ["y" "n" " " "!" "." "q"])
+
+(defn qr-control-key? (input)
+  "Whether an active query-replace consumes `input`: an answer key (y/n/space/!/./q)
+or Enter/Esc/C-g/Delete. Any other key finishes the replace and is dispatched normally."
+  (or (and (string? input) (includes? *qr-keys* input))
+    (includes? [:enter :escape :ctrl-g :delete] input)))
+
+(defn qr-start (m from to &optional (options {}))
+  "Begin query-replace of `from` → `to` from point; jump to the first match. `options`:
+`:regexp?` makes `from` a regexp and lets `to` refer to its groups (C-M-%); `:region [low
+high]` confines it to that span of the text (Emacs's query-replace with the region active):
+it starts at `low` rather than point, the region is deactivated so the matches show, and no
+match may end past `high` — which moves as replacements change the text's length
+([[qr-limit]])."
+  (let (region (:region options)
+        buf (ed-current-buf m)
+        state {:from from :to to :regexp? (= true (:regexp? options)) :match nil :count 0})
+    (cond
+      (= from "") (message m "(nothing to replace)")
+      (and (:regexp? options) (regex/incomplete? from))
+        (message m (str "Invalid regexp: " from " [incomplete input]"))
+      (nil? region) (qr-goto (assoc m :query-replace state) (buffer-point buf))
+      else
+        (let ([low high] region)
+          (qr-goto (assoc (ed-set-buf m (clear-mark (goto-char buf low)))
+                     :query-replace (assoc state :region-start low :limit high))
+            low)))))
+
+(defn qr-handle (m input)
+  "Fold one query-replace answer key: y/space replace+advance, n/Delete skip, ! all,
+. replace-one-and-stop, q/Enter/Esc/C-g stop."
+  (let (qr (qr-state m))
+    (cond
+      (or (= input "y") (= input " ")) (let ([m2 pos] (qr-replace m)) (qr-goto m2 pos))
+      (or (= input "n") (= input :delete))
+        (let (buf (ed-current-buf m)
+              found (:found qr))
+          (qr-goto m (qr-next qr buf (qr-adjacent? qr buf found) (:end found))))
+      (= input "!") (qr-all m)
+      (= input ".") (let ([m2 _] (qr-replace m)) (qr-finish m2))
+      else (qr-finish m)))) ; q / Enter / Esc / C-g
+;; ---- the non-interactive replace family (M-x) --------------------------------
+;; `query-replace` (M-%) asks at every match; these do not ask at all, which is the whole
+;; point of them — `replace-string` over a region you have just selected, `flush-lines` to
+;; drop the noise out of a log, `how-many` to answer "is it worth a rename". Emacs binds
+;; none of them to a key either; they live on M-x and are reached by name.
+;;
+;; All five work FROM POINT to the end (Emacs's rule), or over the region when one is
+;; active — so "just this function" is a selection away, and the whole buffer is `M-<`
+;; first. Each reports what it did, because a replace that silently matched nothing is
+;; indistinguishable from one that silently did the wrong thing.
+
+;; The two below are PURE text transforms (the replace itself is [[replace-all]], above, on
+;; the buffer: it must search the text in place). Their model-side wrappers (the commands, the
+;; region span, the undo-grouped edit) live in `commands`, which already uses this module —
+;; so they cannot live here without a cycle, and the split is the right one anyway: what
+;; the text becomes is testable without a model.
+
+(sig filter-lines (string string bool -> (tuple string int)))
+(defn filter-lines (text pattern keep?)
+  "`[text' dropped]` — `text` with the lines matching `pattern` kept (`keep?`) or removed.
+
+A trailing newline is preserved when the input had one: these run over the tail of a
+buffer, and silently eating the final newline is a diff nobody asked for."
+  (let (nl? (string/ends-with? text "\n")
+        body (if nl? (string/substring text 0 (dec (string/length text))) text)
+        lines (string/split body "\n")
+        hit? (fn (l) (not (nil? (regex/find pattern l))))
+        kept (seq/filter lines (fn (l) (if keep? (hit? l) (not (hit? l)))))
+        out (string/join kept "\n"))
+    [(if (and nl? (not (empty? kept))) (str out "\n") out) (- (count lines) (count kept))]))
+
+(defn count-matches-in (text pattern)
+  "How many non-overlapping matches of `pattern` are in `text`."
+  (count (regex/find-all pattern text)))
