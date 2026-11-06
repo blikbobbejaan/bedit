@@ -1084,11 +1084,17 @@ the kill ring is left alone — nothing was killed."
         (if killed? (ed-push-kill m2 text (> (buffer-point moved) p0)) m2)))))
 
 (defn ed-capitalize (s)
-  "`s` with its first character upper-cased and the rest lower-cased."
-  (if (= s "")
-    s
-    (str (string/upper (string/substring s 0 1))
-      (string/lower (string/substring s 1 (string/length s))))))
+  "`s` with its first LETTER or digit upper-cased and the rest lower-cased; what comes before
+it (the space M-c starts on when point is between words) is kept. Upper-casing the first
+character left \" two\" unchanged, so M-c before a space did nothing."
+  (let (found (regex/find "[[:alnum:]]" s)
+        at (when found (:start found)))
+    (if (not (int? at))
+      s
+      (do
+        (str (string/substring s 0 at)
+          (string/upper (string/substring s at (inc at)))
+          (string/lower (string/substring s (inc at) (string/length s))))))))
 
 (defn ed-xform-word (m f)
   "Apply the string transform `f` to the word from point forward, leaving point
@@ -1118,14 +1124,31 @@ after it (M-u / M-l / M-c)."
   (ed-edit m (fn (b) (backward-line (insert (beginning-of-line b) "\n")))))
 
 ;; kill (into the kill ring)
+(defn- ed-line-start-move (count)
+  "A point move to the start of the line `count` lines from point's (0 is its own line's
+start), clamped to the buffer: the end of the buffer past its last line."
+  (fn (buffer)
+    (let (rope (buffer-rope buffer)
+          target (+ (buffer-current-line buffer) count))
+      (goto-char buffer
+        (cond
+          (< target 0) 0
+          (>= target (text/line-count rope)) (buffer-length buffer)
+          else (text/line->char rope target))))))
+
 (defcommand cmd-kill-line
   (m key)
   "Kill from point to end of line (C-k); at end of line, kill the newline. With the init
 file's `:kill-whole-line` (Emacs's `kill-whole-line`), at the START of a line kill the line
-and its newline, so no empty line is left behind."
-  (let (b (ed-current-buf m))
+and its newline, so no empty line is left behind. With a prefix argument N (Emacs's), kill
+through N line starts — N whole lines from point, newlines included; 0 kills back to the
+line's start, and a negative N back N lines. Repeating it N times killed one line and its
+newline for `C-u 2`, and nothing for `C-u 0`."
+  (let (b (ed-current-buf m)
+        count (current-prefix-arg m))
     (ed-kill-span m
       (cond
+        (int? count) (ed-line-start-move count)
         (= (buffer-char-after b) "\n") forward-char
         (and (= true (:kill-whole-line m)) (= (buffer-column b) 0))
           (fn (bb) (forward-char (end-of-line bb)))
@@ -1247,9 +1270,29 @@ rule (one space, but none next to a delimiter) lives in `bufferops/join-line`."
               (fn (acc line) (join-line (ed-goto-line-col acc line 0))))))))))
 
 ;; case
-(defcommand cmd-upcase-word (m key) (ed-xform-word m string/upper))
-(defcommand cmd-downcase-word (m key) (ed-xform-word m string/lower))
-(defcommand cmd-capitalize-word (m key) (ed-xform-word m ed-capitalize))
+(defn ed-xform-words (m f)
+  "[[ed-xform-word]] under the prefix argument N, Emacs's: N words from point, point after
+them; a negative N the |N| words BEFORE point, point left where it is (`M-- M-u` upcases the
+word just typed). Repeating the command changed the NEXT word for `M--`."
+  (let (arg (current-prefix-arg m)
+        count (if (int? arg) arg 1))
+    (if (>= count 0)
+      (fold (range count) m (fn (acc _) (ed-xform-word acc f)))
+      (let (b (ed-current-buf m)
+            point (buffer-point b)
+            start (fold (range (- 0 count)) b (fn (acc _) (backward-word acc)))
+            from-start (ed-set-buf m (goto-char b (buffer-point start)))
+            changed (fold (range (- 0 count)) from-start (fn (acc _) (ed-xform-word acc f))))
+        (ed-set-buf changed (goto-char (ed-current-buf changed) point))))))
+
+(defcommand cmd-upcase-word (m key) (ed-xform-words m string/upper))
+(defcommand cmd-downcase-word (m key) (ed-xform-words m string/lower))
+(defcommand cmd-capitalize-word (m key) (ed-xform-words m ed-capitalize))
+(register-prefix-consuming 'commands/cmd-kill-line)
+(register-prefix-consuming 'commands/cmd-upcase-word)
+(register-prefix-consuming 'commands/cmd-downcase-word)
+(register-prefix-consuming 'commands/cmd-capitalize-word)
+(register-prefix-consuming 'commands/cmd-yank)
 
 ;; ---- read-only toggle (C-x C-q) -----------------------------------------------
 
@@ -1742,9 +1785,32 @@ adopts the user's clipboard if another app copied something newer — ASKED for
 (`ed-clipboard-ask`), so a served session's yank does not stop the loop for the round trip
 to its client: the spot is marked now and the text goes in when the answer comes
 ([[ed-yank-answered]]). A read-only buffer says so and records no span."
-  (let ([marked spot] (ed-yank-mark-spot m))
-    ;; the previous yank's span is not this one's: M-y must never reach it from here on
-    (ed-clipboard-ask (dissoc marked :yank) 'commands/ed-yank-answered spot)))
+  (let (count (current-prefix-arg m)
+        raw? (= true (:raw (:prefix-arg m))))
+    (if (and (int? count) (not raw?) (not (= count 1)))
+      ;; C-u N C-y: the Nth most recent kill, Emacs's, and M-y goes on from it
+      (ed-yank-nth m (dec count))
+      (let ([marked spot] (ed-yank-mark-spot m))
+        ;; the previous yank's span is not this one's: M-y must never reach it from here on;
+        ;; a bare C-u leaves point before the text instead of after it
+        (ed-clipboard-ask (dissoc marked :yank)
+          'commands/ed-yank-answered
+          (if raw? (assoc spot :point-before? true) spot))))))
+
+(defn- ed-yank-nth (m index)
+  "Insert the kill ring's entry `index` (0 the newest) at point, its span kept for M-y — what
+`C-u N C-y` yanks. Said when the ring holds fewer."
+  (let (ring (or (:kill-ring m) []))
+    (if (or (< index 0) (>= index (count ring)))
+      (message m
+        (str "the kill ring holds " (count ring) " entr" (if (= (count ring) 1) "y" "ies")))
+      (let (start (buffer-point (ed-current-buf m))
+            text (nth ring index)
+            [inserted yanked?] (ed-try-edit (dissoc m :yank) (fn (bb) (insert-replacing m bb text))))
+        (if yanked?
+          (assoc inserted
+            :yank {:start start :end (buffer-point (ed-current-buf inserted)) :index index})
+          inserted)))))
 
 (defn ed-yank-mark-spot (m)
   "`[m' spot]` — where a yank whose text is not known yet will go: a marker at point in the
@@ -1814,9 +1880,13 @@ at the spot C-y marked, Emacs-like, and point stays where the user's typing left
                       (first (buffer-region-bounds b))
                       (buffer-point b))
               [m2 yanked?] (ed-try-edit cleared (fn (bb) (insert-replacing cleared bb text))))
-          (if yanked?
-            (assoc m2 :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})
-            m2))
+          (cond
+            (not yanked?) m2
+            ;; a bare C-u C-y: point at the start of the text, Emacs's
+            (:point-before? spot)
+              (assoc (ed-set-buf m2 (goto-char (ed-current-buf m2) start))
+                :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})
+            else (assoc m2 :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})))
       else (ed-yank-at-spot m1 spot text))))
 
 (defn ed-paste-text (m text)
