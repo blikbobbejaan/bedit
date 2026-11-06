@@ -455,6 +455,8 @@ src/window-commands.blsp    the window commands: tiled splits, windmove and Emac
                             windmove-swap-states-* (C-S-arrows and s-S-arrows), window-swap-states,
                             the C-x 4 prefix; a side window's `:side` mark stays with its PLACE
                             (`ed-keep-sides`)
+src/textops.blsp            the commands that rewrite text in bulk: case, whitespace, the replace
+                            family, tabify, reversing and deduplicating lines, align-regexp
 src/lifecycle.blsp          the file and session commands: write and revert a file, reload the config,
                             quit with its questions (`ed-map-y-or-n`, what is still running)
 src/project-commands.blsp   C-x p f over a file list cached per root, refreshed off the loop; C-x p p

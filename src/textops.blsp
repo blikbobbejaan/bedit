@@ -1,0 +1,447 @@
+(defmodule textops
+  "The commands that rewrite text in bulk: case and whitespace, the replace family (M-x
+replace-string, flush-lines, keep-lines, how-many), tabify, reversing and deduplicating lines,
+align-regexp. `isearch` asks at each match; these ask once and do it all, one undo group."
+  (:use editor/buffer)
+  (:use interactive) ; defcommand
+  (:use model)
+  (:use commands :only [ed-map-lines ed-active-region])
+  (:use minibuffer :only [ed-mb-edit])
+  (:use conventions :only [indentation tab-width]))
+
+;; ---- case the region (C-x C-u / C-x C-l) ------------------------------------
+
+(defn ed-xform-region (m f)
+  "Apply string transform `f` to the active region in place; a no-op-with-message
+when there's no region (the region case commands)."
+  (let (b (ed-current-buf m) bounds (buffer-region-bounds b))
+    (if (nil? bounds)
+      (message m *no-region-message*)
+      (let (txt (f (buffer-region b)))
+        (ed-edit m (fn (bb) (replace-region bb (first bounds) (second bounds) txt)))))))
+
+(defcommand cmd-upcase-region
+  (m key)
+  "Upper-case the region (C-x C-u)."
+  (ed-xform-region m string/upper))
+(defcommand cmd-downcase-region
+  (m key)
+  "Lower-case the region (C-x C-l)."
+  (ed-xform-region m string/lower))
+
+;; ---- whitespace around point (M-SPC / M-\) ----------------------------------
+
+(defn ed-collapse-ws (m seq/keep)
+  "Replace the run of spaces/tabs surrounding point with `keep` (`\" \"` for
+just-one-space M-SPC, `\"\"` for delete-horizontal-space M-\\) — `editor/buffer`'s
+`collapse-whitespace`, which `join-line` squeezes its seam with too."
+  (ed-edit m (fn (b) (collapse-whitespace b seq/keep))))
+
+(defcommand cmd-just-one-space
+  (m key)
+  "Collapse the whitespace around point to a single space (Emacs `just-one-space`;
+M-SPC runs `cmd-cycle-spacing`, whose first press is exactly this)."
+  (ed-collapse-ws m " "))
+
+;; `cycle-spacing` — what M-SPC does in a modern Emacs (29 took the key from
+;; `just-one-space`). One key, pressed repeatedly, walks the three answers you might
+;; want for the gap you are standing in: ONE space, then NONE, then *what was there* —
+;; so an over-eager squeeze is undone by pressing the same key again rather than by
+;; remembering an undo. The cycle restarts wherever the previous command wasn't this one,
+;; which is what makes it feel like a per-gap toggle instead of a global mode.
+;;
+;; The restore step is why this needs state: the original run and where point stood in it
+;; are gone from the buffer after the first press. Both ride the model (`:cycle-spacing`),
+;; keyed by the position the run starts at, so a stale stash can never apply to a
+;; different gap.
+
+(def- ed-cycle-spacing-phases [:one-space :none :restore])
+
+(defn- ed-cycle-spacing-next (st lo)
+  "The phase for this press: the one after `st`'s, or the first when there is no live
+stash for the run at `lo` (a different gap, or a different command in between)."
+  (if (or (nil? st) (not (= (:lo st) lo)))
+    :one-space (let (i (index-of ed-cycle-spacing-phases (:phase st)))
+      ;; past the end it starts over, so holding the key keeps cycling
+      (nth ed-cycle-spacing-phases (math/rem (inc (or i 0)) (count ed-cycle-spacing-phases))))))
+
+(defcommand cmd-cycle-spacing
+  (m key)
+  "Cycle the whitespace around point (M-SPC): one space, then none, then what was
+there before you started — Emacs 29's `cycle-spacing`, which replaced `just-one-space`
+on this key. Pressing any other command in between starts the cycle fresh.
+
+The restore step puts the run back exactly, point included, so M-SPC is safe to lean
+on: nothing you cycle through is lost."
+  (let (b (ed-current-buf m)
+        [lo hi] (editor/buffer/whitespace-run-at b)
+        st (when (= (:last-command m) 'textops/cmd-cycle-spacing) (:cycle-spacing m))
+        phase (ed-cycle-spacing-next st lo)
+        ;; the run as it stood when the cycle began — captured on the first press,
+        ;; carried unchanged after that (the buffer no longer holds it)
+        orig (if (= phase :one-space)
+               ;; the run off the rope — a whitespace run, not worth a whole-buffer copy
+               {:text (text/slice (buffer-rope b) lo hi) :offset (- (buffer-point b) lo)}
+               (:orig st))
+        stash {:phase phase :lo lo :orig orig})
+    (assoc (if (= phase :restore)
+             ;; back to the original text AND the original point inside it
+             (ed-edit m
+               (fn (bb)
+                 (let ([l h] (editor/buffer/whitespace-run-at bb)
+                       o (or orig {:text "" :offset 0}) ; set on the first press; never absent here
+                       restored (replace-region bb l h (:text o)))
+                   (goto-char restored (+ l (:offset o))))))
+             (ed-collapse-ws m (if (= phase :one-space) " " "")))
+      :cycle-spacing stash)))
+(defcommand cmd-delete-horizontal-space
+  (m key)
+  "Delete all whitespace around point (M-\\)."
+  (ed-collapse-ws m ""))
+
+;; (cycle-spacing's stash lives on the model as `:cycle-spacing`; nothing else reads it,
+;; and `:last-command` is what decides whether it is still live.)
+
+;; ---- the replace family (M-x) ------------------------------------------------
+;; `query-replace` (M-%, `isearch`) asks at every match; these do not ask at all, which is
+;; the point of them: `replace-string` over a region you just selected, `flush-lines` to
+;; drop the noise out of a log, `how-many` to decide whether a rename is worth it. Emacs
+;; puts none of them on a key either — they live on M-x and are reached by name.
+;;
+;; All of them act FROM POINT to the end (Emacs's rule) or over the REGION when one is
+;; active, so "just this function" is a selection away and the whole buffer is `M-<`
+;; first. Each reports what it did: a replace that silently matched nothing looks exactly
+;; like one that silently did the wrong thing.
+;;
+;; The text transforms themselves are pure and live in `isearch` beside query-replace's,
+;; so `replace-string` and `M-%` cannot disagree about what replacing means.
+
+(defn ed-replace-span (m)
+  "`[from to]` — what the replace commands act on: the active region, else point to the
+end of the buffer."
+  (let (buf (ed-current-buf m))
+    (or (ed-active-region m) [(buffer-point buf) (buffer-length buf)])))
+
+(defn- ed-in-region-label (m)
+  "` in region` when the replace about to be asked for is confined to the region, else `\"\"`
+— what Emacs's prompts say (`Replace string in region: `)."
+  (if (ed-active-region m) " in region" ""))
+
+(defn ed-replace-in-span (m from to regexp? verb)
+  "Replace throughout `ed-replace-span` and report the count — the body `replace-string`
+and `replace-regexp` share. The buffer is searched in place (`isearch/replace-all`, which
+query-replace's `!` is too), so a `^` or `$` at the span's edge is judged by the text around
+it, never by the edge of a copy."
+  (cond
+    (= from "") (message m "(nothing to replace)")
+    (and regexp? (regex/incomplete? from))
+      (ed-ding (message m (str "Invalid regexp: " from " [incomplete input]")))
+    else
+      (let ([low high] (ed-replace-span m)
+            [edited ran? n] (ed-try-edit-with m
+                              (fn (b)
+                                (isearch/replace-all b
+                                  from
+                                  to
+                                  {:regexp? regexp? :low low :high high}))))
+        (cond
+          (not ran?) edited
+          (= n 0) (message m (str "no matches for `" from "`"))
+          else (message edited (str verb " " n " occurrence" (if (= n 1) "" "s")))))))
+
+(defn- ed-filter-lines-in-span (m pattern keep? verb)
+  "`flush-lines` / `keep-lines` over `ed-replace-span`, reporting how many lines went."
+  (if (= pattern "")
+    (message m "(no pattern)")
+    (let ([lo hi] (ed-replace-span m)
+          before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
+          [after dropped] (isearch/filter-lines before pattern keep?))
+      (if (= dropped 0)
+        (message m (str "no lines " verb))
+        (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
+          (str dropped " line" (if (= dropped 1) "" "s") " " verb))))))
+
+(defn- ed-two-part-prompt (m first-prompt second-prompt then)
+  "Ask two things in a row — `from`, then `to` — and hand both to `then`. The shape
+`query-replace` already uses, named so the three commands that need it do not each
+re-nest the minibuffer by hand."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit first-prompt "")
+       :on-complete (fn (mm a)
+                      (assoc mm
+                        :minibuffer
+                          {:edit (ed-mb-edit (second-prompt a) "")
+                           :on-complete (fn (m2 b) (then m2 a b))}))}))
+
+(defcommand cmd-replace-string
+  (m key)
+  "Replace every occurrence of a string, from point — or within the region when one is active,
+which the prompt says (M-x replace-string). LITERAL — the text you type is the text it looks
+for, brackets and dots and all."
+  (let (where (ed-in-region-label m))
+    (ed-two-part-prompt m
+      (str "Replace string" where ": ")
+      (fn (from) (str "Replace string" where " `" from "` with: "))
+      (fn (mm from to) (ed-replace-in-span mm from to false "replaced")))))
+
+(defcommand cmd-replace-regexp
+  (m key)
+  "Replace every match of a regexp, from point — or within the region when one is active,
+which the prompt says (M-x replace-regexp). The replacement may refer to what matched, as
+C-M-%'s does: `\\&` the whole match, `\\1`…`\\9` its groups, `\\\\` a backslash."
+  (let (where (ed-in-region-label m))
+    (ed-two-part-prompt m
+      (str "Replace regexp" where ": ")
+      (fn (from) (str "Replace regexp" where " `" from "` with: "))
+      (fn (mm from to) (ed-replace-in-span mm from to true "replaced")))))
+
+(defcommand cmd-flush-lines
+  (m key)
+  "Delete the lines matching a regexp, from point (M-x flush-lines)."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "Flush lines matching: " "")
+       :on-complete (fn (mm p) (ed-filter-lines-in-span mm p false "flushed"))}))
+
+(defcommand cmd-keep-lines
+  (m key)
+  "Keep only the lines matching a regexp, from point (M-x keep-lines) — flush-lines'
+opposite, and the one you want when the signal is rarer than the noise."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "Keep lines matching: " "")
+       :on-complete (fn (mm p) (ed-filter-lines-in-span mm p true "dropped"))}))
+
+(defcommand cmd-how-many
+  (m key)
+  "Count the matches of a regexp from point (M-x how-many / count-matches) — the question
+you ask before a rename, and the one that changes nothing."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "How many matches for regexp: " "")
+       :on-complete (fn (mm p)
+                      (if (= p "")
+                        (message mm "(no pattern)")
+                        (let ([lo hi] (ed-replace-span mm)
+                              n (isearch/count-matches-in (text/slice (buffer-rope (ed-current-buf mm))
+                                                            lo hi)
+                                  p))
+                          (message mm (str n " match" (if (= n 1) "" "es") " for `" p "`")))))}))
+
+;; ---- the small daily set -----------------------------------------------------
+;; Commands Emacs has had forever that bedit had not. Each is a few lines because the
+;; primitives were all here — `ed-map-region-lines` for the line-wise ones,
+;; `ed-replace-span` for the text-wise ones — which is the argument for having built
+;; those seams rather than one-off loops.
+
+(defn ed-untabify-text (text width)
+  "`text` with each tab expanded to the spaces that reach the next `width` stop.
+
+Column-aware, not a blind `\\t` -> N spaces: a tab advances to the next multiple of
+`width`, so its expansion depends on where in the line it sits. Replacing each tab with a
+fixed run is the version that silently shifts every line containing two of them."
+  (string/join
+    (map (string/split text "\n")
+      (fn (line)
+        (fold (string/->list line)
+          ""
+          (fn (acc ch)
+            (if (= ch "\t")
+              ;; the gap to the next stop, as an int the checker can see — `-` over two
+              ;; ints still reads `number` to it, and `string/repeat` wants an int
+              (let (gap (- width (math/mod (string/length acc) width))
+                    n (if (int? gap) gap width))
+                (str acc (string/repeat " " n)))
+              (str acc ch))))))
+    "\n"))
+
+(defn ed-tabify-text (text width)
+  "`text` with runs of spaces that span a tab stop replaced by tabs — LEADING whitespace
+only.
+
+Emacs tabifies the whole line by default and it is almost always wrong: spaces inside a
+string literal or lining up a trailing comment are spaces on purpose, and turning them
+into tabs changes what the file MEANS in the first case and how it looks everywhere. The
+indentation is the part anyone wants converted."
+  (string/join (map (string/split text "\n")
+                 (fn (line)
+                   (let (body (string/triml line)
+                         lead (- (string/length line) (string/length body))
+                         tabs (math/quot lead width)
+                         rest (math/mod lead width))
+                     (if (= tabs 0)
+                       line
+                       (str (string/repeat "\t" tabs) (string/repeat " " rest) body)))))
+    "\n"))
+
+(defn- ed-retab (m f verb)
+  "Apply a whitespace transform over `ed-replace-span` and report."
+  (let ([lo hi] (ed-replace-span m)
+        before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
+        after (f before (tab-width (ed-current-buf m))))
+    (if (= before after)
+      (message m (str "nothing to " verb))
+      (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
+        (str verb "ed")))))
+
+(defcommand cmd-untabify
+  (m key)
+  "Expand tabs to spaces over the region, or from point (M-x untabify)."
+  (ed-retab m ed-untabify-text "untabify"))
+
+(defcommand cmd-tabify
+  (m key)
+  "Turn leading spaces into tabs over the region, or from point (M-x tabify)."
+  (ed-retab m ed-tabify-text "tabify"))
+
+(defn ed-dedupe-lines (text)
+  "`[text' dropped]` — `text` with CONSECUTIVE duplicate lines collapsed to one.
+
+Consecutive, like `uniq` and like Emacs's own `delete-duplicate-lines` on a sorted
+region. Global dedup would reorder nothing but would quietly delete a line far from the
+one it matched, which is not something you can eyeball afterwards."
+  (let (out (ed-map-lines text
+              ;; newest kept line first, reversed once: `conj` onto a vector copied it per line
+              (fn (lines)
+                (reverse (fold lines nil (fn (acc l) (if (= (first acc) l) acc (cons l acc))))))))
+    [out (- (count (string/split text "\n")) (count (string/split out "\n")))]))
+
+(defcommand cmd-delete-duplicate-lines
+  (m key)
+  "Collapse consecutive duplicate lines over the region, or from point (M-x
+delete-duplicate-lines)."
+  (let ([lo hi] (ed-replace-span m)
+        before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
+        [after dropped] (ed-dedupe-lines before))
+    (if (= dropped 0)
+      (message m "no duplicate lines")
+      (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
+        (str dropped " duplicate line" (if (= dropped 1) "" "s") " deleted")))))
+
+(defn ed-reverse-lines (text)
+  "`text` with its lines in the opposite order, keeping a trailing newline if there was one."
+  (ed-map-lines text reverse))
+
+(defcommand cmd-reverse-region
+  (m key)
+  "Reverse the order of the region's lines (M-x reverse-region)."
+  (let (buf (ed-current-buf m)
+        rb (buffer-region-bounds buf))
+    (if (nil? rb)
+      (message m "no region (set the mark first)")
+      (let ([lo hi] rb
+            before (text/slice (buffer-rope buf) lo hi))
+        (message (ed-edit m
+                   (fn (b) (goto-char (replace-region b lo hi (ed-reverse-lines before)) lo)))
+          "region reversed")))))
+
+(defn ed-cursor-position-text (buf)
+  "The `C-x =` line: the character under point, its codepoint, and where point is.
+
+`what-cursor-position` is the command you run when a file has something invisible in it —
+a non-breaking space, a stray BOM, a tab you cannot tell from spaces — so the CODEPOINT
+is the part that matters, not the character."
+  (let (pos (buffer-point buf)
+        len (buffer-length buf)
+        line (inc (buffer-current-line buf))
+        col (- pos (text/line->char (buffer-rope buf) (buffer-current-line buf)))
+        ch (if (>= pos len) nil (text/slice (buffer-rope buf) pos (inc pos)))
+        pct (if (= len 0) 100 (math/quot (* pos 100) len)))
+    (str (if (nil? ch)
+           "point at end of buffer"
+           (str "char: "
+             (if (= ch "\n") "\\n" ch)
+             "  (U+"
+             (string/upper (string/format "%04x" (first (string/->codepoints ch))))
+             ")"))
+      "   line " line " col " col "   point " pos " of " len " (" pct "%)")))
+
+(defcommand cmd-what-cursor-position
+  (m key)
+  "Describe the character under point and where point is (C-x =)."
+  (message m (ed-cursor-position-text (ed-current-buf m))))
+
+;; ---- align-regexp ------------------------------------------------------------
+;; Emacs `align-regexp`: line up a column across the region. The one command in this
+;; batch with real work in it, because "line up on this" is under-specified until you say
+;; WHICH occurrence and what to do with lines that have none.
+;;
+;; The rules here, all of which Emacs also settles and none of which is obvious:
+;;   * the FIRST match on each line is the anchor. Aligning on a later one needs a more
+;;     specific pattern, which you have to write anyway to say which you meant.
+;;   * a line with no match is passed through untouched. It is a blank line, or a comment,
+;;     or the one line that is not part of the table — and padding it to a column it has
+;;     no field at would be inventing structure.
+;;   * padding goes BEFORE the match, and existing space before it is collapsed first, so
+;;     running the command twice is the same as running it once. An align that only ever
+;;     adds is one you cannot re-run after an edit, which is when you want it most.
+
+(defn align-column (lines pattern)
+  "The column the matches should line up at: one past the widest prefix among the lines
+that match, measured in DISPLAY cells so a tab or a wide glyph counts what it paints."
+  (fold lines
+    0
+    (fn (acc line)
+      (let (hit (regex/find pattern line))
+        (if (nil? hit)
+          acc
+          (math/max acc
+            (inc (string/display-width (string/trimr (string/substring line 0 (:start hit)))))))))))
+
+(defn align-line (line pattern col)
+  "`line` with its first match of `pattern` pushed out to display column `col`, or the
+line unchanged when it does not match."
+  (let (hit (regex/find pattern line))
+    (if (nil? hit)
+      line
+      (let (before (string/trimr (string/substring line 0 (:start hit)))
+            after (string/substring line (:start hit) (string/length line))
+            pad (math/max 1 (- col (string/display-width before))))
+        (str before (string/repeat " " pad) after)))))
+
+(sig align-text (string string -> string))
+(defn align-text (text pattern)
+  "`text` with every line's first match of `pattern` aligned to a common column.
+
+Idempotent: the prefix is right-trimmed before padding, so aligning an already-aligned
+block changes nothing."
+  (let (nl? (string/ends-with? text "\n")
+        body (if nl? (string/substring text 0 (dec (string/length text))) text)
+        lines (string/split body "\n")
+        col (align-column lines pattern)
+        out (string/join (map lines (fn (l) (align-line l pattern col))) "\n"))
+    (if nl? (str out "\n") out)))
+
+(defcommand cmd-align-regexp
+  (m key)
+  "Align the region's lines on a regexp (M-x align-regexp) — `=` to line up assignments,
+`:` a map, `|` a table. The first match on each line is the anchor; a line that does not
+match is left alone."
+  (let (buf (ed-current-buf m)
+        rb (buffer-region-bounds buf))
+    (if (nil? rb)
+      (message m "no region (set the mark first)")
+      (let ([lo hi] rb)
+        (assoc m
+          :minibuffer
+            {:edit (ed-mb-edit "Align regexp: " "")
+             :on-complete (fn (mm p)
+                            (if (= p "")
+                              (message mm "(no pattern)")
+                              (let (before (text/slice (buffer-rope (ed-current-buf mm)) lo hi)
+                                    after (align-text before p))
+                                (if (= before after)
+                                  (message mm "already aligned")
+                                  (message (ed-edit mm
+                                             (fn (b) (goto-char (replace-region b lo hi after) lo)))
+                                    (str "aligned on `" p "`"))))))})))))
+
+;; a guest may run these (src/guest.blsp)
+(interactive/declare-trait :guest
+  '(textops/cmd-align-regexp textops/cmd-cycle-spacing
+     textops/cmd-delete-duplicate-lines textops/cmd-delete-horizontal-space
+     textops/cmd-downcase-region textops/cmd-flush-lines textops/cmd-how-many
+     textops/cmd-just-one-space textops/cmd-keep-lines textops/cmd-replace-regexp
+     textops/cmd-replace-string textops/cmd-reverse-region textops/cmd-tabify textops/cmd-untabify
+     textops/cmd-upcase-region textops/cmd-what-cursor-position))

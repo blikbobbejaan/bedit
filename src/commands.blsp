@@ -1257,99 +1257,6 @@ rule (one space, but none next to a delimiter) lives in `editor/buffer/join-line
 (defcommand cmd-downcase-word (m key) (ed-xform-word m string/lower))
 (defcommand cmd-capitalize-word (m key) (ed-xform-word m ed-capitalize))
 
-;; ---- case the region (C-x C-u / C-x C-l) ------------------------------------
-
-(defn ed-xform-region (m f)
-  "Apply string transform `f` to the active region in place; a no-op-with-message
-when there's no region (the region case commands)."
-  (let (b (ed-current-buf m) bounds (buffer-region-bounds b))
-    (if (nil? bounds)
-      (message m *no-region-message*)
-      (let (txt (f (buffer-region b)))
-        (ed-edit m (fn (bb) (replace-region bb (first bounds) (second bounds) txt)))))))
-
-(defcommand cmd-upcase-region
-  (m key)
-  "Upper-case the region (C-x C-u)."
-  (ed-xform-region m string/upper))
-(defcommand cmd-downcase-region
-  (m key)
-  "Lower-case the region (C-x C-l)."
-  (ed-xform-region m string/lower))
-
-;; ---- whitespace around point (M-SPC / M-\) ----------------------------------
-
-(defn ed-collapse-ws (m seq/keep)
-  "Replace the run of spaces/tabs surrounding point with `keep` (`\" \"` for
-just-one-space M-SPC, `\"\"` for delete-horizontal-space M-\\) — `editor/buffer`'s
-`collapse-whitespace`, which `join-line` squeezes its seam with too."
-  (ed-edit m (fn (b) (collapse-whitespace b seq/keep))))
-
-(defcommand cmd-just-one-space
-  (m key)
-  "Collapse the whitespace around point to a single space (Emacs `just-one-space`;
-M-SPC runs `cmd-cycle-spacing`, whose first press is exactly this)."
-  (ed-collapse-ws m " "))
-
-;; `cycle-spacing` — what M-SPC does in a modern Emacs (29 took the key from
-;; `just-one-space`). One key, pressed repeatedly, walks the three answers you might
-;; want for the gap you are standing in: ONE space, then NONE, then *what was there* —
-;; so an over-eager squeeze is undone by pressing the same key again rather than by
-;; remembering an undo. The cycle restarts wherever the previous command wasn't this one,
-;; which is what makes it feel like a per-gap toggle instead of a global mode.
-;;
-;; The restore step is why this needs state: the original run and where point stood in it
-;; are gone from the buffer after the first press. Both ride the model (`:cycle-spacing`),
-;; keyed by the position the run starts at, so a stale stash can never apply to a
-;; different gap.
-
-(def- ed-cycle-spacing-phases [:one-space :none :restore])
-
-(defn- ed-cycle-spacing-next (st lo)
-  "The phase for this press: the one after `st`'s, or the first when there is no live
-stash for the run at `lo` (a different gap, or a different command in between)."
-  (if (or (nil? st) (not (= (:lo st) lo)))
-    :one-space (let (i (index-of ed-cycle-spacing-phases (:phase st)))
-      ;; past the end it starts over, so holding the key keeps cycling
-      (nth ed-cycle-spacing-phases (math/rem (inc (or i 0)) (count ed-cycle-spacing-phases))))))
-
-(defcommand cmd-cycle-spacing
-  (m key)
-  "Cycle the whitespace around point (M-SPC): one space, then none, then what was
-there before you started — Emacs 29's `cycle-spacing`, which replaced `just-one-space`
-on this key. Pressing any other command in between starts the cycle fresh.
-
-The restore step puts the run back exactly, point included, so M-SPC is safe to lean
-on: nothing you cycle through is lost."
-  (let (b (ed-current-buf m)
-        [lo hi] (editor/buffer/whitespace-run-at b)
-        st (when (= (:last-command m) 'commands/cmd-cycle-spacing) (:cycle-spacing m))
-        phase (ed-cycle-spacing-next st lo)
-        ;; the run as it stood when the cycle began — captured on the first press,
-        ;; carried unchanged after that (the buffer no longer holds it)
-        orig (if (= phase :one-space)
-               ;; the run off the rope — a whitespace run, not worth a whole-buffer copy
-               {:text (text/slice (buffer-rope b) lo hi) :offset (- (buffer-point b) lo)}
-               (:orig st))
-        stash {:phase phase :lo lo :orig orig})
-    (assoc (if (= phase :restore)
-             ;; back to the original text AND the original point inside it
-             (ed-edit m
-               (fn (bb)
-                 (let ([l h] (editor/buffer/whitespace-run-at bb)
-                       o (or orig {:text "" :offset 0}) ; set on the first press; never absent here
-                       restored (replace-region bb l h (:text o)))
-                   (goto-char restored (+ l (:offset o))))))
-             (ed-collapse-ws m (if (= phase :one-space) " " "")))
-      :cycle-spacing stash)))
-(defcommand cmd-delete-horizontal-space
-  (m key)
-  "Delete all whitespace around point (M-\\)."
-  (ed-collapse-ws m ""))
-
-;; (cycle-spacing's stash lives on the model as `:cycle-spacing`; nothing else reads it,
-;; and `:last-command` is what decides whether it is still live.)
-
 ;; ---- read-only toggle (C-x C-q) -----------------------------------------------
 
 (defcommand cmd-toggle-read-only
@@ -2427,139 +2334,6 @@ Emacs — no `../` needed. Last-used files (recentf) sort to the top, then by na
         ; the current buffer's dir, not the launch cwd
         (if (:recent-files m) (recent-files) [])))) ; recency only in the live editor
 
-;; ---- the replace family (M-x) ------------------------------------------------
-;; `query-replace` (M-%, `isearch`) asks at every match; these do not ask at all, which is
-;; the point of them: `replace-string` over a region you just selected, `flush-lines` to
-;; drop the noise out of a log, `how-many` to decide whether a rename is worth it. Emacs
-;; puts none of them on a key either — they live on M-x and are reached by name.
-;;
-;; All of them act FROM POINT to the end (Emacs's rule) or over the REGION when one is
-;; active, so "just this function" is a selection away and the whole buffer is `M-<`
-;; first. Each reports what it did: a replace that silently matched nothing looks exactly
-;; like one that silently did the wrong thing.
-;;
-;; The text transforms themselves are pure and live in `isearch` beside query-replace's,
-;; so `replace-string` and `M-%` cannot disagree about what replacing means.
-
-(defn ed-replace-span (m)
-  "`[from to]` — what the replace commands act on: the active region, else point to the
-end of the buffer."
-  (let (buf (ed-current-buf m))
-    (or (ed-active-region m) [(buffer-point buf) (buffer-length buf)])))
-
-(defn- ed-in-region-label (m)
-  "` in region` when the replace about to be asked for is confined to the region, else `\"\"`
-— what Emacs's prompts say (`Replace string in region: `)."
-  (if (ed-active-region m) " in region" ""))
-
-(defn ed-replace-in-span (m from to regexp? verb)
-  "Replace throughout `ed-replace-span` and report the count — the body `replace-string`
-and `replace-regexp` share. The buffer is searched in place (`isearch/replace-all`, which
-query-replace's `!` is too), so a `^` or `$` at the span's edge is judged by the text around
-it, never by the edge of a copy."
-  (cond
-    (= from "") (message m "(nothing to replace)")
-    (and regexp? (regex/incomplete? from))
-      (ed-ding (message m (str "Invalid regexp: " from " [incomplete input]")))
-    else
-      (let ([low high] (ed-replace-span m)
-            [edited ran? n] (ed-try-edit-with m
-                              (fn (b)
-                                (isearch/replace-all b
-                                  from
-                                  to
-                                  {:regexp? regexp? :low low :high high}))))
-        (cond
-          (not ran?) edited
-          (= n 0) (message m (str "no matches for `" from "`"))
-          else (message edited (str verb " " n " occurrence" (if (= n 1) "" "s")))))))
-
-(defn- ed-filter-lines-in-span (m pattern keep? verb)
-  "`flush-lines` / `keep-lines` over `ed-replace-span`, reporting how many lines went."
-  (if (= pattern "")
-    (message m "(no pattern)")
-    (let ([lo hi] (ed-replace-span m)
-          before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
-          [after dropped] (isearch/filter-lines before pattern keep?))
-      (if (= dropped 0)
-        (message m (str "no lines " verb))
-        (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
-          (str dropped " line" (if (= dropped 1) "" "s") " " verb))))))
-
-(defn- ed-two-part-prompt (m first-prompt second-prompt then)
-  "Ask two things in a row — `from`, then `to` — and hand both to `then`. The shape
-`query-replace` already uses, named so the three commands that need it do not each
-re-nest the minibuffer by hand."
-  (assoc m
-    :minibuffer
-      {:edit (ed-mb-edit first-prompt "")
-       :on-complete (fn (mm a)
-                      (assoc mm
-                        :minibuffer
-                          {:edit (ed-mb-edit (second-prompt a) "")
-                           :on-complete (fn (m2 b) (then m2 a b))}))}))
-
-(defcommand cmd-replace-string
-  (m key)
-  "Replace every occurrence of a string, from point — or within the region when one is active,
-which the prompt says (M-x replace-string). LITERAL — the text you type is the text it looks
-for, brackets and dots and all."
-  (let (where (ed-in-region-label m))
-    (ed-two-part-prompt m
-      (str "Replace string" where ": ")
-      (fn (from) (str "Replace string" where " `" from "` with: "))
-      (fn (mm from to) (ed-replace-in-span mm from to false "replaced")))))
-
-(defcommand cmd-replace-regexp
-  (m key)
-  "Replace every match of a regexp, from point — or within the region when one is active,
-which the prompt says (M-x replace-regexp). The replacement may refer to what matched, as
-C-M-%'s does: `\\&` the whole match, `\\1`…`\\9` its groups, `\\\\` a backslash."
-  (let (where (ed-in-region-label m))
-    (ed-two-part-prompt m
-      (str "Replace regexp" where ": ")
-      (fn (from) (str "Replace regexp" where " `" from "` with: "))
-      (fn (mm from to) (ed-replace-in-span mm from to true "replaced")))))
-
-(defcommand cmd-flush-lines
-  (m key)
-  "Delete the lines matching a regexp, from point (M-x flush-lines)."
-  (assoc m
-    :minibuffer
-      {:edit (ed-mb-edit "Flush lines matching: " "")
-       :on-complete (fn (mm p) (ed-filter-lines-in-span mm p false "flushed"))}))
-
-(defcommand cmd-keep-lines
-  (m key)
-  "Keep only the lines matching a regexp, from point (M-x keep-lines) — flush-lines'
-opposite, and the one you want when the signal is rarer than the noise."
-  (assoc m
-    :minibuffer
-      {:edit (ed-mb-edit "Keep lines matching: " "")
-       :on-complete (fn (mm p) (ed-filter-lines-in-span mm p true "dropped"))}))
-
-(defcommand cmd-how-many
-  (m key)
-  "Count the matches of a regexp from point (M-x how-many / count-matches) — the question
-you ask before a rename, and the one that changes nothing."
-  (assoc m
-    :minibuffer
-      {:edit (ed-mb-edit "How many matches for regexp: " "")
-       :on-complete (fn (mm p)
-                      (if (= p "")
-                        (message mm "(no pattern)")
-                        (let ([lo hi] (ed-replace-span mm)
-                              n (isearch/count-matches-in (text/slice (buffer-rope (ed-current-buf mm))
-                                                            lo hi)
-                                  p))
-                          (message mm (str n " match" (if (= n 1) "" "es") " for `" p "`")))))}))
-
-;; ---- the small daily set -----------------------------------------------------
-;; Commands Emacs has had forever that bedit had not. Each is a few lines because the
-;; primitives were all here — `ed-map-region-lines` for the line-wise ones,
-;; `ed-replace-span` for the text-wise ones — which is the argument for having built
-;; those seams rather than one-off loops.
-
 (defcommand cmd-indent-region
   (m key)
   "Reindent every line of the region to its mode's column (C-M-\\). With no region, the
@@ -2572,66 +2346,6 @@ either way rather than complaining about the selection you forgot to make."
           (ed-edit m (fn (b) (ed-reindent-line-at b (buffer-current-line b) held)))
           (let ([first last] rl) (ed-reindent-region m first last)))))))
 
-(defn ed-untabify-text (text width)
-  "`text` with each tab expanded to the spaces that reach the next `width` stop.
-
-Column-aware, not a blind `\\t` -> N spaces: a tab advances to the next multiple of
-`width`, so its expansion depends on where in the line it sits. Replacing each tab with a
-fixed run is the version that silently shifts every line containing two of them."
-  (string/join
-    (map (string/split text "\n")
-      (fn (line)
-        (fold (string/->list line)
-          ""
-          (fn (acc ch)
-            (if (= ch "\t")
-              ;; the gap to the next stop, as an int the checker can see — `-` over two
-              ;; ints still reads `number` to it, and `string/repeat` wants an int
-              (let (gap (- width (math/mod (string/length acc) width))
-                    n (if (int? gap) gap width))
-                (str acc (string/repeat " " n)))
-              (str acc ch))))))
-    "\n"))
-
-(defn ed-tabify-text (text width)
-  "`text` with runs of spaces that span a tab stop replaced by tabs — LEADING whitespace
-only.
-
-Emacs tabifies the whole line by default and it is almost always wrong: spaces inside a
-string literal or lining up a trailing comment are spaces on purpose, and turning them
-into tabs changes what the file MEANS in the first case and how it looks everywhere. The
-indentation is the part anyone wants converted."
-  (string/join (map (string/split text "\n")
-                 (fn (line)
-                   (let (body (string/triml line)
-                         lead (- (string/length line) (string/length body))
-                         tabs (math/quot lead width)
-                         rest (math/mod lead width))
-                     (if (= tabs 0)
-                       line
-                       (str (string/repeat "\t" tabs) (string/repeat " " rest) body)))))
-    "\n"))
-
-(defn- ed-retab (m f verb)
-  "Apply a whitespace transform over `ed-replace-span` and report."
-  (let ([lo hi] (ed-replace-span m)
-        before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
-        after (f before (tab-width (ed-current-buf m))))
-    (if (= before after)
-      (message m (str "nothing to " verb))
-      (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
-        (str verb "ed")))))
-
-(defcommand cmd-untabify
-  (m key)
-  "Expand tabs to spaces over the region, or from point (M-x untabify)."
-  (ed-retab m ed-untabify-text "untabify"))
-
-(defcommand cmd-tabify
-  (m key)
-  "Turn leading spaces into tabs over the region, or from point (M-x tabify)."
-  (ed-retab m ed-tabify-text "tabify"))
-
 (defn ed-map-lines (text f)
   "`text` with its lines replaced by `(f lines)` and joined back — the lines split WITHOUT
 the trailing newline, which is put back when there was one. The shape every line-wise
@@ -2642,147 +2356,6 @@ trailing newline an empty last line, which then sorts to the top or reverses to 
         out (string/join (f (string/split body "\n")) "\n"))
     (if nl? (str out "\n") out)))
 
-(defn ed-dedupe-lines (text)
-  "`[text' dropped]` — `text` with CONSECUTIVE duplicate lines collapsed to one.
-
-Consecutive, like `uniq` and like Emacs's own `delete-duplicate-lines` on a sorted
-region. Global dedup would reorder nothing but would quietly delete a line far from the
-one it matched, which is not something you can eyeball afterwards."
-  (let (out (ed-map-lines text
-              ;; newest kept line first, reversed once: `conj` onto a vector copied it per line
-              (fn (lines)
-                (reverse (fold lines nil (fn (acc l) (if (= (first acc) l) acc (cons l acc))))))))
-    [out (- (count (string/split text "\n")) (count (string/split out "\n")))]))
-
-(defcommand cmd-delete-duplicate-lines
-  (m key)
-  "Collapse consecutive duplicate lines over the region, or from point (M-x
-delete-duplicate-lines)."
-  (let ([lo hi] (ed-replace-span m)
-        before (text/slice (buffer-rope (ed-current-buf m)) lo hi)
-        [after dropped] (ed-dedupe-lines before))
-    (if (= dropped 0)
-      (message m "no duplicate lines")
-      (message (ed-edit m (fn (b) (goto-char (replace-region b lo hi after) lo)))
-        (str dropped " duplicate line" (if (= dropped 1) "" "s") " deleted")))))
-
-(defn ed-reverse-lines (text)
-  "`text` with its lines in the opposite order, keeping a trailing newline if there was one."
-  (ed-map-lines text reverse))
-
-(defcommand cmd-reverse-region
-  (m key)
-  "Reverse the order of the region's lines (M-x reverse-region)."
-  (let (buf (ed-current-buf m)
-        rb (buffer-region-bounds buf))
-    (if (nil? rb)
-      (message m "no region (set the mark first)")
-      (let ([lo hi] rb
-            before (text/slice (buffer-rope buf) lo hi))
-        (message (ed-edit m
-                   (fn (b) (goto-char (replace-region b lo hi (ed-reverse-lines before)) lo)))
-          "region reversed")))))
-
-(defn ed-cursor-position-text (buf)
-  "The `C-x =` line: the character under point, its codepoint, and where point is.
-
-`what-cursor-position` is the command you run when a file has something invisible in it —
-a non-breaking space, a stray BOM, a tab you cannot tell from spaces — so the CODEPOINT
-is the part that matters, not the character."
-  (let (pos (buffer-point buf)
-        len (buffer-length buf)
-        line (inc (buffer-current-line buf))
-        col (- pos (text/line->char (buffer-rope buf) (buffer-current-line buf)))
-        ch (if (>= pos len) nil (text/slice (buffer-rope buf) pos (inc pos)))
-        pct (if (= len 0) 100 (math/quot (* pos 100) len)))
-    (str (if (nil? ch)
-           "point at end of buffer"
-           (str "char: "
-             (if (= ch "\n") "\\n" ch)
-             "  (U+"
-             (string/upper (string/format "%04x" (first (string/->codepoints ch))))
-             ")"))
-      "   line " line " col " col "   point " pos " of " len " (" pct "%)")))
-
-(defcommand cmd-what-cursor-position
-  (m key)
-  "Describe the character under point and where point is (C-x =)."
-  (message m (ed-cursor-position-text (ed-current-buf m))))
-
-;; ---- align-regexp ------------------------------------------------------------
-;; Emacs `align-regexp`: line up a column across the region. The one command in this
-;; batch with real work in it, because "line up on this" is under-specified until you say
-;; WHICH occurrence and what to do with lines that have none.
-;;
-;; The rules here, all of which Emacs also settles and none of which is obvious:
-;;   * the FIRST match on each line is the anchor. Aligning on a later one needs a more
-;;     specific pattern, which you have to write anyway to say which you meant.
-;;   * a line with no match is passed through untouched. It is a blank line, or a comment,
-;;     or the one line that is not part of the table — and padding it to a column it has
-;;     no field at would be inventing structure.
-;;   * padding goes BEFORE the match, and existing space before it is collapsed first, so
-;;     running the command twice is the same as running it once. An align that only ever
-;;     adds is one you cannot re-run after an edit, which is when you want it most.
-
-(defn align-column (lines pattern)
-  "The column the matches should line up at: one past the widest prefix among the lines
-that match, measured in DISPLAY cells so a tab or a wide glyph counts what it paints."
-  (fold lines
-    0
-    (fn (acc line)
-      (let (hit (regex/find pattern line))
-        (if (nil? hit)
-          acc
-          (math/max acc
-            (inc (string/display-width (string/trimr (string/substring line 0 (:start hit)))))))))))
-
-(defn align-line (line pattern col)
-  "`line` with its first match of `pattern` pushed out to display column `col`, or the
-line unchanged when it does not match."
-  (let (hit (regex/find pattern line))
-    (if (nil? hit)
-      line
-      (let (before (string/trimr (string/substring line 0 (:start hit)))
-            after (string/substring line (:start hit) (string/length line))
-            pad (math/max 1 (- col (string/display-width before))))
-        (str before (string/repeat " " pad) after)))))
-
-(sig align-text (string string -> string))
-(defn align-text (text pattern)
-  "`text` with every line's first match of `pattern` aligned to a common column.
-
-Idempotent: the prefix is right-trimmed before padding, so aligning an already-aligned
-block changes nothing."
-  (let (nl? (string/ends-with? text "\n")
-        body (if nl? (string/substring text 0 (dec (string/length text))) text)
-        lines (string/split body "\n")
-        col (align-column lines pattern)
-        out (string/join (map lines (fn (l) (align-line l pattern col))) "\n"))
-    (if nl? (str out "\n") out)))
-
-(defcommand cmd-align-regexp
-  (m key)
-  "Align the region's lines on a regexp (M-x align-regexp) — `=` to line up assignments,
-`:` a map, `|` a table. The first match on each line is the anchor; a line that does not
-match is left alone."
-  (let (buf (ed-current-buf m)
-        rb (buffer-region-bounds buf))
-    (if (nil? rb)
-      (message m "no region (set the mark first)")
-      (let ([lo hi] rb)
-        (assoc m
-          :minibuffer
-            {:edit (ed-mb-edit "Align regexp: " "")
-             :on-complete (fn (mm p)
-                            (if (= p "")
-                              (message mm "(no pattern)")
-                              (let (before (text/slice (buffer-rope (ed-current-buf mm)) lo hi)
-                                    after (align-text before p))
-                                (if (= before after)
-                                  (message mm "already aligned")
-                                  (message (ed-edit mm
-                                             (fn (b) (goto-char (replace-region b lo hi after) lo)))
-                                    (str "aligned on `" p "`"))))))})))))
 ;; ---- M-x: run any interactive command by name -------------------------------
 
 ;; Memoised because M-x opens far more often than anything registers: rejecting every
@@ -3220,7 +2793,7 @@ text and the mark after it, so the inserted text is the region."
 ;; Everything here but what reaches past the buffers a session was given: opening and
 ;; writing other files, the project and server commands, reloading the config.
 (interactive/declare-trait :guest
-  '(commands/cmd-align-regexp commands/cmd-back-to-indentation
+  '(commands/cmd-indent-region commands/cmd-back-to-indentation
      commands/cmd-backward-char commands/cmd-backward-kill-sentence commands/cmd-backward-kill-sexp
      commands/cmd-backward-kill-word commands/cmd-backward-list commands/cmd-backward-paragraph
      commands/cmd-backward-sentence commands/cmd-backward-sexp commands/cmd-backward-up-list
@@ -3229,50 +2802,44 @@ text and the mark after it, so the inserted text is the region."
      commands/cmd-brood-mode commands/cmd-browse-kill-ring commands/cmd-buffer-menu-refresh
      commands/cmd-buffer-menu-select commands/cmd-capitalize-word commands/cmd-clear-rectangle
      commands/cmd-close-delimiter commands/cmd-comment-dwim commands/cmd-copy-rectangle-as-kill
-     commands/cmd-copy-region commands/cmd-count-words commands/cmd-cycle-spacing
-     commands/cmd-dabbrev-expand commands/cmd-dedent commands/cmd-delete-backward
-     commands/cmd-delete-blank-lines commands/cmd-delete-char commands/cmd-delete-duplicate-lines
-     commands/cmd-delete-horizontal-space commands/cmd-delete-rectangle
-     commands/cmd-delete-trailing-whitespace commands/cmd-describe-indentation
-     commands/cmd-downcase-region commands/cmd-downcase-word commands/cmd-down-list
+     commands/cmd-copy-region commands/cmd-count-words commands/cmd-dabbrev-expand
+     commands/cmd-dedent commands/cmd-delete-backward commands/cmd-delete-blank-lines
+     commands/cmd-delete-char commands/cmd-delete-rectangle commands/cmd-delete-trailing-whitespace
+     commands/cmd-describe-indentation commands/cmd-downcase-word commands/cmd-down-list
      commands/cmd-duplicate-line commands/cmd-electric-backspace commands/cmd-electric-close
      commands/cmd-emacs-mode commands/cmd-end-kbd-macro commands/cmd-end-of-buffer
      commands/cmd-end-of-defun commands/cmd-end-of-line commands/cmd-exchange-point-and-mark
-     commands/cmd-execute-extended-command commands/cmd-execute-kbd-macro commands/cmd-flush-lines
-     commands/cmd-forward-char commands/cmd-forward-list commands/cmd-forward-paragraph
-     commands/cmd-forward-sentence commands/cmd-forward-sexp commands/cmd-forward-word
-     commands/cmd-fuzzy-find-line commands/cmd-goto-char commands/cmd-goto-line
-     commands/cmd-how-many commands/cmd-indent-line commands/cmd-indent-or-complete
-     commands/cmd-indent-region commands/cmd-indent-sexp commands/cmd-isearch-backward
+     commands/cmd-execute-extended-command commands/cmd-execute-kbd-macro commands/cmd-forward-char
+     commands/cmd-forward-list commands/cmd-forward-paragraph commands/cmd-forward-sentence
+     commands/cmd-forward-sexp commands/cmd-forward-word commands/cmd-fuzzy-find-line
+     commands/cmd-goto-char commands/cmd-goto-line commands/cmd-indent-line
+     commands/cmd-indent-or-complete commands/cmd-indent-sexp commands/cmd-isearch-backward
      commands/cmd-isearch-backward-regexp commands/cmd-isearch-forward
      commands/cmd-isearch-forward-regexp commands/cmd-isearch-forward-word commands/cmd-join-line
-     commands/cmd-just-one-space commands/cmd-keep-lines commands/cmd-keyboard-quit
-     commands/cmd-kill-line commands/cmd-kill-rectangle commands/cmd-kill-region
-     commands/cmd-kill-ring-insert commands/cmd-kill-ring-refresh commands/cmd-kill-sentence
-     commands/cmd-kill-sexp commands/cmd-kill-whole-line commands/cmd-kill-word
-     commands/cmd-list-buffers commands/cmd-mark-defun commands/cmd-mark-paragraph
-     commands/cmd-mark-sexp commands/cmd-mark-sexp-backward commands/cmd-mark-whole-buffer
-     commands/cmd-mark-word commands/cmd-mark-word-backward commands/cmd-move-to-window-line
-     commands/cmd-narrow-to-defun commands/cmd-narrow-to-paragraph commands/cmd-narrow-to-region
-     commands/cmd-negative-argument commands/cmd-newline commands/cmd-newline-and-indent
-     commands/cmd-next-buffer commands/cmd-next-line commands/cmd-occur commands/cmd-open-delimiter
-     commands/cmd-open-line commands/cmd-open-line-above commands/cmd-open-line-below
-     commands/cmd-open-rectangle commands/cmd-pop-jump commands/cmd-previous-buffer
-     commands/cmd-previous-line commands/cmd-project-switch-buffer commands/cmd-query-replace
-     commands/cmd-query-replace-regexp commands/cmd-raise-sexp commands/cmd-recenter
-     commands/cmd-redo commands/cmd-repeat commands/cmd-replace-regexp commands/cmd-replace-string
-     commands/cmd-reverse-region commands/cmd-scroll-down commands/cmd-scroll-up
-     commands/cmd-self-insert commands/cmd-set-fill-column commands/cmd-set-mark
-     commands/cmd-sexp-kill commands/cmd-shift-motion commands/cmd-slurp-backward
-     commands/cmd-slurp-forward commands/cmd-sort-lines commands/cmd-splice-sexp
-     commands/cmd-start-kbd-macro commands/cmd-string-rectangle commands/cmd-switch-buffer
-     commands/cmd-tabify commands/cmd-text-mode commands/cmd-toggle-read-only
-     commands/cmd-transpose-chars commands/cmd-transpose-lines commands/cmd-transpose-sexps
-     commands/cmd-transpose-words commands/cmd-undo commands/cmd-universal-argument
-     commands/cmd-untabify commands/cmd-upcase-region commands/cmd-upcase-word commands/cmd-up-list
-     commands/cmd-vim-mode commands/cmd-what-cursor-position commands/cmd-widen
-     commands/cmd-wrap-round commands/cmd-yank commands/cmd-yank-pop commands/cmd-yank-rectangle
-     commands/cmd-zap-to-char))
+     commands/cmd-keyboard-quit commands/cmd-kill-line commands/cmd-kill-rectangle
+     commands/cmd-kill-region commands/cmd-kill-ring-insert commands/cmd-kill-ring-refresh
+     commands/cmd-kill-sentence commands/cmd-kill-sexp commands/cmd-kill-whole-line
+     commands/cmd-kill-word commands/cmd-list-buffers commands/cmd-mark-defun
+     commands/cmd-mark-paragraph commands/cmd-mark-sexp commands/cmd-mark-sexp-backward
+     commands/cmd-mark-whole-buffer commands/cmd-mark-word commands/cmd-mark-word-backward
+     commands/cmd-move-to-window-line commands/cmd-narrow-to-defun commands/cmd-narrow-to-paragraph
+     commands/cmd-narrow-to-region commands/cmd-negative-argument commands/cmd-newline
+     commands/cmd-newline-and-indent commands/cmd-next-buffer commands/cmd-next-line
+     commands/cmd-occur commands/cmd-open-delimiter commands/cmd-open-line
+     commands/cmd-open-line-above commands/cmd-open-line-below commands/cmd-open-rectangle
+     commands/cmd-pop-jump commands/cmd-previous-buffer commands/cmd-previous-line
+     commands/cmd-project-switch-buffer commands/cmd-query-replace commands/cmd-query-replace-regexp
+     commands/cmd-raise-sexp commands/cmd-recenter commands/cmd-redo commands/cmd-repeat
+     commands/cmd-scroll-down commands/cmd-scroll-up commands/cmd-self-insert
+     commands/cmd-set-fill-column commands/cmd-set-mark commands/cmd-sexp-kill
+     commands/cmd-shift-motion commands/cmd-slurp-backward commands/cmd-slurp-forward
+     commands/cmd-sort-lines commands/cmd-splice-sexp commands/cmd-start-kbd-macro
+     commands/cmd-string-rectangle commands/cmd-switch-buffer commands/cmd-text-mode
+     commands/cmd-toggle-read-only commands/cmd-transpose-chars commands/cmd-transpose-lines
+     commands/cmd-transpose-sexps commands/cmd-transpose-words commands/cmd-undo
+     commands/cmd-universal-argument commands/cmd-upcase-word commands/cmd-up-list
+     commands/cmd-vim-mode commands/cmd-widen commands/cmd-wrap-round commands/cmd-yank
+     commands/cmd-yank-pop commands/cmd-yank-rectangle commands/cmd-zap-to-char))
 
 ;; ---- what the core must know of these commands (`interactive/declare-trait`) ------------
 ;; a typing run: consecutive repeats amalgamate into one undo step, and their settling arms
