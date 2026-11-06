@@ -1,0 +1,949 @@
+(defmodule lsp-protocol
+  "The Language Server Protocol, pure: what each answer means (completion, symbols, locations,
+hover, signatures, code actions, edits), positions on the wire (0-based lines and UTF-16
+code units, [[lsp-column->units]] and [[lsp-units->column]]), the document sync
+([[lsp-sync-document]]), what each request kind puts on the wire, and the state machine a
+connection is ([[lsp-ingest]], [[lsp-issue]]): transitions returning the new state plus the IO
+to perform. No process and no server, so all of it is testable without one
+(tests/lsp_test.blsp); `lsp` is the thin IO shell around it."
+  (:use editor/buffer) ; buffer-rope / buffer-text — a buffer's text in wire terms
+  (:use lsp-requests)) ; the request-kind records + the LspRequest ability (wire + shape impls below)
+
+;; How much of a server's log line is worth showing. The echo area is one row, and a
+;; server's log is written for a log file — Expert's startup narration includes the whole
+;; `PATH` and a fifteen-line list of ebin directories.
+(def *lsp-notice-width* 110)
+
+(defn lsp-path->uri (path)
+  "The `file://` URI of `path`, each segment percent-encoded: a server compares URIs as
+strings and sends them encoded, so `/my project/a.ex` has to go out as `my%20project`
+or its answers name a file this client never opened. On Windows `C:\\x` is
+`file:///C:/x` (std's `path/to-file-uri`)."
+  (if (nil? path)
+    nil ; a buffer with no file has no URI; the request carries null and the server says so
+    (path/to-file-uri path)))
+(sig lsp-path->uri ((or string nil) -> (or string nil)))
+
+;; ---- the wire ---------------------------------------------------------------
+;; JSON-RPC over `Content-Length` framing is std's `jsonrpc` — the builders, the frame, and
+;; the byte-accurate stream decoder (a body is cut by UTF-8 bytes, and sliced natively,
+;; both of which this file learned the hard way before the module existed).
+;;
+;; The protocol runs BOTH ways, and the half a client forgets is the server's requests. A
+;; server may ask the client things — `client/registerCapability` is the common one, and
+;; every server that registers its file watchers dynamically sends it — and it is a
+;; REQUEST, so the server waits for the answer. Never answering does not degrade anything
+;; gracefully: the server blocks, and from outside it looks like a server that initialised
+;; perfectly and then ignored every request, which is exactly how Expert appeared.
+
+(def *lsp-server-requests-handled*
+  ;; Server→client requests this client answers with a plain `null` result — an
+  ;; acknowledgement, which is what the protocol specifies for each. Registration is
+  ;; genuinely a no-op here: this client has no dynamic capability table and no file
+  ;; watcher, so "registered" and "ignored" are the same state — but SAYING so is not
+  ;; optional, because the server is blocked until we do.
+  #{"client/registerCapability"
+    "client/unregisterCapability" "workspace/semanticTokens/refresh" "workspace/codeLens/refresh"
+    "workspace/inlayHint/refresh" "workspace/diagnostic/refresh"
+    ;; we advertise `window.workDoneProgress`, so a server asks before it reports progress
+    ;; on a token of its own; the token needs no bookkeeping here — every `$/progress` is
+    ;; narrated by what it says, whatever token it carries
+    "window/workDoneProgress/create"})
+
+;; ---- pure protocol: completion-result shapes --------------------------------
+
+;; An item's LABEL is what the popup would show, not what goes in the buffer, and a server
+;; that answers for `XB.T` labels the module `Tool` and the function `call/2`. What it means
+;; to insert is its `textEdit` (new text over a range of the line), else its `insertText`,
+;; else the label — and either may be a SNIPPET. Read as labels, Tab on `XB.T` replaced the
+;; whole word with `Tool`. So an item becomes an ENTRY, `{:text :column}` — the plain text to
+;; insert and the UTF-16 column its edit starts at (nil without an edit) — and the source,
+;; which knows the line, turns each into a candidate for the whole word before point
+;; ([[lsp-completion-candidate]]).
+
+(defn lsp-snippet-text (snippet)
+  "The plain text a snippet `insertText` inserts up to its first tab stop or placeholder,
+its `\\$`, `\\}` and `\\\\` escapes resolved — `call(${1:a}, ${2:b})` is `call(`.
+
+bedit expands no snippets (it advertises `snippetSupport false`, which a server may ignore).
+Stopping at the first stop puts point where the snippet would have: inside the call, ready
+for its arguments. The placeholder's own text (`a`) is a NAME to type over, and inserted as
+code it would be wrong code.
+
+    (lsp-protocol/lsp-snippet-text \"call(${1:a}, ${2:b})\")   ;=> \"call(\"
+    (lsp-protocol/lsp-snippet-text \"Tool\")   ;=> \"Tool\"
+    (lsp-protocol/lsp-snippet-text \"cost\\\\$$0\")   ;=> \"cost$\""
+  (letrec (scan (fn (chars acc)
+                  (cond
+                    (empty? chars) acc
+                    (= (first chars) "$") acc
+                    (and (= (first chars) "\\") (contains? #{"$" "}" "\\"} (second chars)))
+                      (scan (rest (rest chars)) (str acc (second chars)))
+                    else (scan (rest chars) (str acc (first chars))))))
+    (scan (string/->list snippet) "")))
+
+(defn- lsp-completion-entry (item)
+  ;; `{:text :column}` for one CompletionItem, or nil when it inserts nothing. A `textEdit`
+  ;; is a TextEdit (`:range`) or an InsertReplaceEdit (`:insert` / `:replace`); its range is
+  ;; on the cursor's line, ending at point, so only where it STARTS is needed
+  (let (edit (:textEdit item)
+        raw (cond
+              edit (:newText edit)
+              (string? (:insertText item)) (:insertText item)
+              else (:label item))
+        text (cond
+               (not (string? raw)) nil
+               (= (:insertTextFormat item) 2) (lsp-snippet-text raw)
+               else raw)
+        column (when edit (map/get-in edit [(if (:range edit) :range :insert) :start :character])))
+    (when (and text (not (= text "")))
+      {:text text :column (when (int? column) column)})))
+
+(defn lsp-completion-entries (result)
+  "The entries `{:text :column}` of a `textDocument/completion` `result` — a
+`CompletionItem[]` (a vector), a `{:items [...] :isIncomplete b}` object, or `nil`: each
+item's text to insert (its `textEdit`, else `insertText`, else `label`, a snippet cut at its
+first stop by [[lsp-snippet-text]]) and the UTF-16 column its edit starts at, nil without
+one. What [[lsp-completion-candidate]] turns into a candidate."
+  (let (items (cond
+                (nil? result) '()
+                (vector? result) result
+                else (:items result '())))
+    (seq/distinct (seq/keep items lsp-completion-entry))))
+
+(defn lsp-completion-answer (result)
+  "`{:entries :incomplete}` for a `textDocument/completion` `result`: the entries
+([[lsp-completion-entries]]) and whether the server said the list is NOT the whole answer
+(`isIncomplete`) — in which case typing more must ask it again, where a complete list can
+be narrowed by filtering it (`complete-at-point`'s cache). A bare `CompletionItem[]` is
+complete by the protocol's definition."
+  {:entries (lsp-completion-entries result)
+   :incomplete (and (map? result) (= true (:isIncomplete result)))})
+
+(defn- lsp-utf16->index (s units)
+  ;; the char index in `s` at which `units` UTF-16 code units have passed (LSP's column
+  ;; unit: a character beyond the Basic Multilingual Plane is two), capped at its length
+  (first (fold (string/->codepoints s)
+           [0 0]
+           (fn (acc code)
+             (let ([index seen] acc)
+               (if (>= seen units) acc [(inc index) (+ seen (if (> code 65535) 2 1))]))))))
+
+(defn- lsp-prefix-qualifier (prefix separators)
+  ;; `prefix` up to and including its last separator — `XB.` of `XB.T` — or ""
+  (letrec (back (fn (i)
+                  (cond
+                    (< i 0) ""
+                    (contains? separators (string/char-at prefix i))
+                      (string/substring prefix 0 (inc i))
+                    else (back (dec i)))))
+    (back (dec (string/length prefix)))))
+
+(defn lsp-completion-candidate (line start entry separators)
+  "The whole word an `entry` ([[lsp-completion-entries]]) completes the word before point
+to, or nil when it cannot say — `line` the cursor's line up to point, `start` where the word
+begins in it, `separators` the buffer's segment separators. Every completion source answers
+whole words from `start`, which is what lets them merge and Tab step a segment at a time.
+
+- An edit starting at or after `start` keeps the line between them: `Tool` over the `T` of
+  `XB.T` is `XB.Tool`. One starting before `start` must begin with the text it rewrites.
+- Without an edit, text extending the word is the word; any other replaces the word's last
+  segment, as a client whose word stops at `.` would read it: `Tool` for `XB.T` is
+  `XB.Tool`, `call/2` for `XB.Tool.c` is `XB.Tool.call/2`, which Tab stops before the
+  `/2` of.
+
+    (lsp-protocol/lsp-completion-candidate \"  XB.T\" 2 {:text \"Tool\" :column 5} #{\".\"})   ;=> \"XB.Tool\"
+    (lsp-protocol/lsp-completion-candidate \"XB.T\" 0 {:text \"Tool\" :column nil} #{\".\"})   ;=> \"XB.Tool\"
+    (lsp-protocol/lsp-completion-candidate \"XB.T\" 0 {:text \"XB.Tool\" :column nil} #{\".\"})   ;=> \"XB.Tool\""
+  (let (text (:text entry)
+        column (:column entry)
+        prefix (string/substring line start (string/length line)))
+    (if (nil? column)
+      (if (string/starts-with? text prefix)
+        text
+        (str (lsp-prefix-qualifier prefix separators) text))
+      (let (from (lsp-utf16->index line column))
+        (if (>= from start)
+          (str (string/substring line start from) text)
+          (let (lead (string/substring line from start))
+            (when (string/starts-with? text lead)
+              (string/substring text (string/length lead) (string/length text)))))))))
+
+;; ---- pure protocol: documentSymbol shapes (imenu, M-g i) --------------------
+;; `textDocument/documentSymbol` returns either a flat `SymbolInformation[]` (each with a
+;; `:location {:range …}`) or a hierarchical `DocumentSymbol[]` (each with `:range` +
+;; `:selectionRange` and nested `:children`). We flatten both to a list of
+;; `{:name :kind :line :char}`, qualifying a child's name with its parent's (Emacs-style
+;; `Class.method`) so the imenu list is unique and readable. Positions are 0-based
+;; (LSP units); the command converts them to a buffer offset.
+
+(def *lsp-symbol-kinds*
+  ;; LSP SymbolKind (integer) → short display tag. Unmapped kinds show "?".
+  {1 "file"
+   2 "module"
+   3 "namespace"
+   4 "package"
+   5 "class"
+   6 "method"
+   7 "property"
+   8 "field"
+   9 "ctor"
+   10 "seq"
+   11 "interface"
+   12 "fn"
+   13 "var"
+   14 "const"
+   15 "string"
+   16 "number"
+   17 "bool"
+   18 "array"
+   19 "object"
+   20 "key"
+   21 "null"
+   22 "enum-member"
+   23 "struct"
+   24 "event"
+   25 "operator"
+   26 "type-param"})
+
+(defn lsp-symbol-kind-name (kind)
+  "The short display tag for an LSP SymbolKind integer (`*lsp-symbol-kinds*`), or \"?\"."
+  (get *lsp-symbol-kinds* kind "?"))
+
+(defn- lsp-symbol-pos (sym)
+  "The 0-based `[line char]` to jump to for `sym` — its `:selectionRange` start (a
+hierarchical DocumentSymbol), else its `:range` start, else its `:location`'s range start
+(a flat SymbolInformation). `[0 0]` if none is present."
+  (let (span (or (:selectionRange sym) (:range sym) (map/get-in sym [:location :range]))
+        start (when span (:start span)))
+    [(:line start 0) (:character start 0)]))
+
+(defn- lsp-flatten-symbols (syms prefix acc)
+  "Fold `syms` (a DocumentSymbol/SymbolInformation vector) into `acc` as `{:name :kind
+:line :char}` entries, depth-first, qualifying each child's name with `prefix` (its parent
+chain). `acc` is built reversed."
+  (fold syms
+    acc
+    (fn (a sym)
+      (let ([line char] (lsp-symbol-pos sym)
+            qname (if (= prefix "") (:name sym) (str prefix "." (:name sym)))
+            entry {:name qname :kind (:kind sym) :line line :char char})
+        (lsp-flatten-symbols (:children sym []) qname (cons entry a))))))
+
+(defn lsp-document-symbols (result)
+  "The `textDocument/documentSymbol` `result` (a vector of DocumentSymbol or
+SymbolInformation, or nil) flattened to a list of `{:name :kind :line :char}`, parents
+before children, in document order."
+  (if (nil? result) '() (reverse (lsp-flatten-symbols result "" '()))))
+
+;; ---- pure protocol: location / hover / edit shapes (goto, refs, hover, rename) ----
+
+(defn lsp-uri->path (uri)
+  "The filesystem path of a `file:` `uri`, percent-decoded (the inverse of
+`lsp-path->uri`, std's `path/from-file-uri`: `file:///c%3A/x` is `C:/x` on Windows, a
+host is a UNC path); `uri` unchanged if it is not a `file:` URI."
+  (or (path/from-file-uri uri) uri))
+
+(defn- lsp-location (loc)
+  "Normalise one LSP `Location` (`:uri`+`:range`) or `LocationLink` (`:targetUri`+
+`:targetSelectionRange`/`:targetRange`) to `{:path :line :char}` (0-based)."
+  (let (uri (or (:uri loc) (:targetUri loc) "")
+        span (or (:range loc) (:targetSelectionRange loc) (:targetRange loc))
+        start (when span (:start span)))
+    {:path (lsp-uri->path uri) :line (:line start 0) :char (:character start 0)}))
+
+(defn lsp-locations (result)
+  "The `textDocument/definition`/`references` `result` — a single `Location`/`LocationLink`,
+a vector of them, or nil — as a list of `{:path :line :char}`."
+  (cond
+    (nil? result) '()
+    (vector? result) (map result lsp-location)
+    else (list (lsp-location result))))
+
+(defn- lsp-marked (x)
+  "The text of one hover content item — a plain string, or a `{:value …}` (MarkupContent /
+MarkedString object)."
+  (cond (string? x) x (map? x) (:value x "") else ""))
+
+(defn lsp-hover-text (result)
+  "The plain text of a `textDocument/hover` `result` — its `:contents`, which is a string, a
+`{:value …}`, or a vector of either (joined by blank lines). `\"\"` when empty/nil."
+  (if (nil? result)
+    ""
+    (let (c (:contents result))
+      (cond
+        (nil? c) ""
+        (string? c) c
+        (vector? c) (string/join (seq/reject (map c lsp-marked) empty?) "\n\n")
+        else (lsp-marked c)))))
+
+;; ---- pure protocol: signature help (the argument hints as you type) ----------
+;; `textDocument/signatureHelp` is `{:signatures [{:label :parameters [{:label …}]}]
+;;  :activeSignature :activeParameter}`. What the reader wants out of it is one line —
+;; the signature being called, with the argument the cursor is sitting on picked out —
+;; and that is the whole of what this produces.
+
+(def *signature-mark* ["‹" "›"])
+;; The active parameter is MARKED rather than faced: the echo row is one `text` op with
+;; one face (see `echoarea/ed-echo-line`), so there is nowhere to put a highlight. Guillemets
+;; because they are light enough to read through and rare enough in source that
+;; `‹conn›` is unambiguously our mark and not part of the signature.
+
+(defn- lsp-param-span (label param)
+  "The `[start end]` character span of `param` (a `SignatureInformation.parameters` entry)
+within the signature's `label` — the protocol's own offsets when it gives them, else the
+first occurrence of the parameter's own label text. Nil when neither locates it.
+
+Both forms are in the wild and a client has to read both: Expert and rust-analyzer send
+offsets, gopls and several TypeScript servers send the substring."
+  (let (l (:label param))
+    (cond
+      ;; the offsets are UTF-16 units into the label, like every LSP column
+      (vector? l)
+        (when (= (count l) 2)
+          [(lsp-utf16->index label (first l)) (lsp-utf16->index label (second l))])
+      (string? l)
+        (let (i (index-of label l))
+          (when i [i (+ i (string/length l))]))
+      else nil)))
+
+(defn- lsp-mark-param (label span)
+  "`label` with the characters in `span` wrapped in [[*signature-mark*]]; `label`
+unchanged when `span` is nil or does not lie inside it."
+  (let ([open close] *signature-mark*
+        n (string/length label))
+    (if (nil? span)
+      label
+      (let ([s e] span)
+        (if (or (< s 0) (> e n) (>= s e))
+          label
+          (str (string/substring label 0 s)
+            open
+            (string/substring label s e)
+            close
+            (string/substring label e n)))))))
+
+(defn lsp-signature-text (result)
+  "The one line a `textDocument/signatureHelp` `result` is worth showing — the active
+signature's label with the active parameter marked — or `\"\"` when the server has nothing
+to say (which is its answer whenever point is not inside a call).
+
+`activeParameter` is read from the signature first and the help second: LSP 3.16 let a
+`SignatureInformation` carry its own, and a server that sends both means the inner one."
+  (if (nil? result)
+    ""
+    (let (sigs (or (:signatures result) [])
+          i (or (:activeSignature result) 0)
+          sig (nth sigs (if (and (>= i 0) (< i (count sigs))) i 0) nil))
+      (if (nil? sig)
+        ""
+        (let (label (str (:label sig ""))
+              params (or (:parameters sig) [])
+              active (or (:activeParameter sig) (:activeParameter result))
+              param (when (and active (>= active 0) (< active (count params))) (nth params active))
+              ;; more than one signature is worth knowing about — otherwise the reader has
+              ;; no way to tell that the arity they are typing towards is not the only one
+              more (if (> (count sigs) 1) (str "  (" (+ 1 i) "/" (count sigs) ")") ""))
+          (str (if param (lsp-mark-param label (lsp-param-span label param)) label) more))))))
+
+;; ---- pure protocol: code actions (the fix-it list at point) -------------------
+;; `textDocument/codeAction` answers a list whose entries are either a `Command`
+;; (`{:title :command :arguments}` — ask the server to do it) or a `CodeAction`
+;; (`{:title :kind :edit :command}` — edits we apply ourselves, a command, or both).
+;; Normalised here to one shape so the editor side never has to tell them apart.
+
+(defn lsp-code-action-list (result)
+  "The `textDocument/codeAction` `result` as a list of
+`{:title :kind :edit :command :arguments}` — `:edit` a normalised workspace edit (nil when
+the action carries none) and `:command`/`:arguments` the server-side call to make instead
+(nil when it carries edits).
+
+An action with neither is dropped: it is a title with nothing behind it, and offering it
+in the picker would promise a fix that cannot happen."
+  (if (nil? result)
+    '()
+    (seq/keep result
+      (fn (a)
+        (let (cmd (:command a)
+              ;; a `Command`'s own `:command` is a string; a `CodeAction`'s is a nested
+              ;; Command object — the one field that tells the two forms apart
+              [name args] (cond
+                            (string? cmd) [cmd (or (:arguments a) [])]
+                            (map? cmd) [(:command cmd) (or (:arguments cmd) [])]
+                            else [nil []])
+              edit (when (:edit a) (lsp-workspace-edit (:edit a))))
+          (when (or name (and edit (not (empty? edit))))
+            {:title (str (:title a ""))
+             :kind (:kind a)
+             :edit edit
+             :command name
+             :arguments args}))))))
+
+(defn- lsp-text-edit (e)
+  "Normalise one `TextEdit` (`:range {:start :end}` + `:newText`) to
+`{:start-line :start-char :end-line :end-char :text}` (0-based)."
+  (let (span (:range e) s (:start span) en (:end span))
+    {:start-line (:line s 0)
+     :start-char (:character s 0)
+     :end-line (:line en 0)
+     :end-char (:character en 0)
+     :text (:newText e "")}))
+
+(defn lsp-text-edits (result)
+  "A `TextEdit[]` (`textDocument/formatting`, or null) as a list of normalised edits
+(`lsp-text-edit`)."
+  (if (nil? result) '() (map result lsp-text-edit)))
+
+(defn lsp-workspace-edit (result)
+  "A `WorkspaceEdit` (`textDocument/rename` result) as `{path -> [edit …]}` (paths, not
+uris; edits normalised). Handles both the `:changes` map and the `:documentChanges` array
+shapes; `{}` when nil."
+  (if (nil? result)
+    {}
+    (let (changes (:changes result)
+          docs (:documentChanges result))
+      (cond
+        changes
+        ;; JSON object keys parse to keywords, so a `:changes` uri arrives as `:file:///a`,
+        ;; not a string — coerce back with `->string` before stripping the scheme.
+          (reduce (keys changes)
+            {}
+            (fn (acc uri)
+              (assoc acc
+                (lsp-uri->path (if (keyword? uri) (->string uri) uri))
+                  (map (get changes uri) lsp-text-edit))))
+        docs
+          (reduce docs
+            {}
+            (fn (acc dc)
+              (assoc acc
+                (lsp-uri->path (map/get-in dc [:textDocument :uri])) (map (:edits dc) lsp-text-edit))))
+        else {}))))
+
+;; ---- pure connection logic (state -> [state effects]) -----------------------
+;; The connection process's state:
+;;   {:proc handle :buf "" :next-id N :pending {jsonrpc-id -> [reply-to corr]}
+;;    :opened {uri -> true} :version V}
+;; `lsp-ingest` and `lsp-issue` are pure transitions returning the new
+;; state plus the IO the shell must perform (messages to send / frames to write), so
+;; correlation and framing are testable without a process or a server.
+
+(defn- lsp-did-open (uri lang text)
+  (jsonrpc/notification "textDocument/didOpen"
+    {:textDocument {:uri uri :languageId lang :version 1 :text text}}))
+
+(defn lsp-close-document (state uri)
+  "Pure: the server stops being told about `uri` (its buffer is gone, or its project left
+the server): `didClose` when it was opened, and the uri forgotten, so a later sync opens it
+afresh. `[state' frames]`."
+  (if (get (:opened state) uri)
+    [(assoc state :opened (dissoc (:opened state) uri) :tokens (dissoc (or (:tokens state) {}) uri))
+      [(jsonrpc/notification "textDocument/didClose" {:textDocument {:uri uri}})]]
+    [state []]))
+
+(defn- lsp-did-change (uri version changes)
+  ;; `changes` is the `contentChanges` vector: one `{:text}` for the whole document, or
+  ;; ranged `{:range :text}` edits applied in order
+  (jsonrpc/notification "textDocument/didChange"
+    {:textDocument {:uri uri :version version} :contentChanges changes}))
+
+;; ---- the document sync: whole text, or the edits since the last one ---------------
+;; Sending the document is what made a Tab cost a second on a big file: the connection
+;; JSON-encodes all of it (341 ms for a 44k-line buffer, measured) and the server re-reads
+;; all of it, on every completion request and every idle beat after an edit. The buffer
+;; already logs what each edit DID (`buffer-splices-since`), so the editor can send that
+;; instead — a keystroke is a one-character change, whatever the file's size.
+;;
+;; Changes only make sense against the text the server HAS, and only the connection knows
+;; what that is. So every sync carries a TOKEN (a fresh ref) naming the text it leaves the
+;; server holding, and an incremental one names its BASE; the connection applies it only
+;; when the base is the token it holds for that uri. Anything else — a reconnected server,
+;; a full sync a lookup made meanwhile, a model the editor threw away after syncing — is
+;; refused, and the editor is told (`[:lsp-resync uri conn]`) to send the whole text next time.
+;; A refused change costs one full sync; an applied wrong one would corrupt the server's
+;; copy of the file until it was reopened.
+
+(defn lsp-incremental-sync? (caps)
+  "Does a server with capabilities `caps` accept ranged `didChange` edits — a
+`textDocumentSync` of 2 (Incremental), as a number or as `{:change 2}`?"
+  (let (sync (get (or caps {}) :textDocumentSync))
+    (= 2 (if (map? sync) (get sync :change) sync))))
+
+(defn- lsp-utf16-length (s)
+  "`s`'s length in UTF-16 code units — LSP's column unit: a character beyond the Basic
+Multilingual Plane (an emoji) is two."
+  (fold (string/->codepoints s) 0 (fn (acc code) (+ acc (if (> code 65535) 2 1)))))
+
+(defn- lsp-line-text (rope line)
+  ;; line `line` (0-based) of `rope`, "" past its end — a server may name a line the buffer
+  ;; no longer has
+  (if (and (>= line 0) (< line (text/line-count rope))) (text/line rope line) ""))
+
+(sig lsp-column->units (rope int int -> int))
+(defn lsp-column->units (rope line column)
+  "The LSP column (UTF-16 code units) of char `column` on 0-based `line` of `rope` — what
+every position the editor SENDS must be in: past an emoji, a character column is one short
+per emoji. The line is cut at its length.
+
+    (lsp-protocol/lsp-column->units (text/from-string \"a😀b\") 0 2)   ;=> 3"
+  (let (text (lsp-line-text rope line))
+    (lsp-utf16-length (string/substring text 0 (math/min (math/max 0 column) (string/length text))))))
+
+(sig lsp-units->column (rope int int -> int))
+(defn lsp-units->column (rope line units)
+  "The char column on 0-based `line` of `rope` at LSP column `units` (UTF-16 code units) —
+what every position a server SENDS is in, so an edit, a jump or a diagnostic past an emoji
+lands where the server meant rather than one character on per emoji. Capped at the line.
+
+    (lsp-protocol/lsp-units->column (text/from-string \"a😀b\") 0 3)   ;=> 2"
+  (lsp-utf16->index (lsp-line-text rope line) (math/max 0 units)))
+
+(defn lsp-buffer-units (buf)
+  "The LSP column of point in `buf` ([[lsp-column->units]] of its line and column)."
+  (lsp-column->units (buffer-rope buf) (buffer-current-line buf) (buffer-column buf)))
+
+(defn lsp-localize-diagnostics (items rope)
+  "Diagnostics in bedit's shape ([[lsp-diagnostic]], 1-based) with each `:col` turned from
+the server's UTF-16 units into a char column of `rope`, the buffer they are about — so the
+underline sits on the token past an emoji, not one character on per emoji."
+  (into []
+    (map items
+      (fn (item)
+        ;; a server's numbers arrive as JSON numbers: whole ones, read as integers
+        (let (line (math/floor (dec (:line item))))
+          (assoc item :col (inc (lsp-units->column rope line (math/floor (dec (:col item)))))))))))
+
+(defn- lsp-rope-position (rope offset)
+  "The LSP `{:line :character}` of char `offset` in `rope`."
+  (let (line (text/char->line rope offset)
+        line-start (text/line->char rope line))
+    (lsp-pos line (lsp-utf16-length (text/slice rope line-start offset)))))
+
+(defn lsp-content-changes (before after)
+  "The ranged `contentChanges` that turn buffer `before`'s text into `after`'s — one
+`{:range {:start :end} :text}` per edit the buffer logged, in order, each positioned
+against the text the previous one left (which is how LSP applies them) — or nil when the
+log cannot account for the change (an undo snapshot, a wholesale replace, more edits than
+it keeps: `buffer-splices-since`), for the caller to send the whole text instead."
+  (let (splices (buffer-splices-since before after))
+    (when (not (empty? splices))
+      (second (fold splices
+                [(buffer-rope before) []]
+                (fn (acc splice)
+                  (let ([rope changes] acc
+                        [lo hi replacement] splice)
+                    [(text/insert (text/delete rope lo hi) lo replacement)
+                      (conj changes
+                        {:range {:start (lsp-rope-position rope lo)
+                                 :end (lsp-rope-position rope hi)}
+                         :text replacement})])))))))
+
+(defn lsp-sync-document (state uri lang sync)
+  "Pure: bring the server's copy of `uri` up to date. `sync` is `{:text :token}` — the whole
+document: `didOpen` the first time a uri is seen (tagged with `lang`, the LSP languageId),
+else a full-text `didChange` — or `{:changes :base :token}`, ranged edits against the text
+that `:base` names ([[lsp-content-changes]]), applied only when that is the text the server
+holds and refused otherwise (no frame; the uri is queued under `:resyncs` for the shell to
+report). Either way the uri then holds `:token` (nil for a sync nobody will build on).
+Returns `[state' frames]`. The one sync behind both a bare `:sync` and every request about a
+document."
+  (let (opened (:opened state)
+        version (:version state)
+        tokens (or (:tokens state) {})
+        changes (:changes sync))
+    (cond
+      (nil? changes)
+        [(assoc state
+           :version (+ version 1)
+           :opened (assoc opened uri true)
+           :tokens (assoc tokens uri (:token sync)))
+          [(if (get opened uri)
+             (lsp-did-change uri version [{:text (:text sync)}])
+             (lsp-did-open uri lang (:text sync)))]]
+      (and (get opened uri) (not (nil? (:base sync))) (= (get tokens uri) (:base sync)))
+        [(assoc state :version (+ version 1) :tokens (assoc tokens uri (:token sync)))
+          [(lsp-did-change uri version changes)]]
+      else
+        [(assoc state
+           :tokens (dissoc tokens uri)
+           :resyncs (conj (or (:resyncs state) []) uri))
+          []])))
+
+;; ---- what each request kind puts on the wire ------------------------------------
+;; The `LspRequest` method/params halves (see `lsp-requests`). A REQUEST is the map the
+;; editor sent — `{:uri :lang :text :line :char}` for a question about the text at point,
+;; plus whatever one kind needs (`:diags`, `:new-name`), or `{:command :arguments}` for one
+;; that is about no document at all.
+
+(defn- lsp-pos (line char) {:line line :character char})
+
+(defn- lsp-doc (request) {:textDocument {:uri (:uri request)}})
+
+(defn- lsp-doc-at (request)
+  ;; `{:textDocument {:uri …}}` plus the `:position` every cursor-located request carries
+  (assoc (lsp-doc request) :position (lsp-pos (:line request) (:char request))))
+
+(defn- lsp-request-frame (id kind request)
+  "The framed JSON-RPC request for `kind` (an `LspRequest` record) built from `request`."
+  (jsonrpc/request id (lsp-request-method kind) (lsp-request-params kind request)))
+
+(defn lsp-issue (state corr reply-to kind request)
+  "Pure: the frames + next state for one request of `kind` (an `LspRequest` record). A
+request carrying the document's `:text` syncs it first ([[lsp-sync-document]]) — the
+editor's own requests carry none, having synced incrementally just before asking
+(`lsp-commands/ed-lsp-push-text`), so asking costs the request and not the document;
+then the request itself ([[lsp-request-frame]]), recording `[reply-to corr kind]` under
+its jsonrpc id so the response is routed back and shaped per `kind` (`lsp-shape`). The one
+transition behind every request — completion, symbols, definition, references, hover,
+signature, code actions, commands, formatting, rename. Returns `[state' frames]`."
+  (let ([synced sync-frames] (if (and (contains? request :uri) (contains? request :text))
+                               (lsp-sync-document state
+                                 (:uri request)
+                                 (:lang request)
+                                 {:text (:text request) :token nil})
+                               [state []])
+        id (:next-id synced)
+        state2 (assoc synced
+                 :next-id (+ id 1)
+                 :pending (assoc (:pending synced) id [reply-to corr kind])))
+    [state2 (conj sync-frames (lsp-request-frame id kind request))]))
+
+;; The connection's half of the `LspRequest` ability (see `lsp-requests`), one impl per
+;; kind, beside the shaping helpers: what goes on the wire, and the raw server result ->
+;; `[reply-tag value]`. The ids are written qualified — a bare id would qualify to THIS
+;; module.
+(impl LspRequest
+  lsp-requests/lsp-completion
+  (lsp-request-method (_) "textDocument/completion")
+  (lsp-request-params (_ request) (lsp-doc-at request))
+  (lsp-request-shape (_ result) [:lsp-completion (lsp-completion-answer result)]))
+(impl LspRequest
+  lsp-requests/lsp-symbols
+  (lsp-request-method (_) "textDocument/documentSymbol")
+  (lsp-request-params (_ request) (lsp-doc request))
+  (lsp-request-shape (_ result) [:lsp-symbols (lsp-document-symbols result)]))
+(impl LspRequest
+  lsp-requests/lsp-definition
+  (lsp-request-method (_) "textDocument/definition")
+  (lsp-request-params (_ request) (lsp-doc-at request))
+  (lsp-request-shape (_ result) [:lsp-definition (lsp-locations result)]))
+(impl LspRequest
+  lsp-requests/lsp-references
+  (lsp-request-method (_) "textDocument/references")
+  (lsp-request-params (_ request)
+    (assoc (lsp-doc-at request) :context {:includeDeclaration true}))
+  (lsp-request-shape (_ result) [:lsp-references (lsp-locations result)]))
+(impl LspRequest
+  lsp-requests/lsp-hover
+  (lsp-request-method (_) "textDocument/hover")
+  (lsp-request-params (_ request) (lsp-doc-at request))
+  (lsp-request-shape (_ result) [:lsp-hover (lsp-hover-text result)]))
+(impl LspRequest
+  lsp-requests/lsp-signature
+  (lsp-request-method (_) "textDocument/signatureHelp")
+  (lsp-request-params (_ request) (lsp-doc-at request))
+  (lsp-request-shape (_ result) [:lsp-signature (lsp-signature-text result)]))
+(impl LspRequest
+  lsp-requests/lsp-code-actions
+  (lsp-request-method (_) "textDocument/codeAction")
+  (lsp-request-params (_ request)
+    (let (at (lsp-pos (:line request) (:char request)))
+      (assoc (lsp-doc request)
+        ;; an empty range AT point: the actions offered for where the cursor is. (A region
+        ;; would widen it to "extract this" territory — a later feature, not a wider range
+        ;; smuggled in here.)
+        :range {:start at :end at}
+        ;; the diagnostics on the line go WITH it — how a server knows which quickfix
+        :context {:diagnostics (or (:diags request) [])})))
+  (lsp-request-shape (_ result) [:lsp-code-actions (lsp-code-action-list result)]))
+(impl LspRequest
+  lsp-requests/lsp-execute-command
+  ;; no document: the server is being asked to run something it already offered, not to
+  ;; look at text — so the request carries no `:uri` and `lsp-issue` syncs nothing
+  (lsp-request-method (_) "workspace/executeCommand")
+  (lsp-request-params (_ request)
+    {:command (:command request) :arguments (or (:arguments request) [])})
+  ;; `workspace/executeCommand` answers with whatever the command returns, usually null:
+  ;; the EDITS come separately, as a `workspace/applyEdit` request from the server
+  ;; ([[lsp-answer-server]]). So this reply is only ever "it ran".
+  (lsp-request-shape (_ result) [:lsp-command-done result]))
+(impl LspRequest
+  lsp-requests/lsp-formatting
+  (lsp-request-method (_) "textDocument/formatting")
+  (lsp-request-params (_ request)
+    (assoc (lsp-doc request) :options {:tabSize 2 :insertSpaces true}))
+  (lsp-request-shape (_ result) [:lsp-text-edits (lsp-text-edits result)]))
+(impl LspRequest
+  lsp-requests/lsp-rename
+  (lsp-request-method (_) "textDocument/rename")
+  (lsp-request-params (_ request) (assoc (lsp-doc-at request) :newName (:new-name request)))
+  (lsp-request-shape (_ result) [:lsp-workspace-edit (lsp-workspace-edit result)]))
+
+(defn- lsp-shape (kind result)
+  "The `[reply-tag value]` for a response of the given request `kind` (an `LspRequest`
+record — `lsp-request-shape`), shaping the raw `result` into what the waiting command
+wants."
+  (lsp-request-shape kind result))
+
+(def *lsp-message-levels*
+  ;; LSP's `MessageType`, the `type` of a `window/logMessage` or `window/showMessage`.
+  ;; A word rather than the number, because the word is what the log line says.
+  {1 "error" 2 "warning" 3 "info" 4 "log" 5 "debug"})
+
+(def *lsp-echoed-show-levels*
+  ;; Which `window/showMessage` levels reach the echo area. `showMessage` is the server
+  ;; ASKING for the reader's attention, so every level that is a sentence for a person does;
+  ;; `log` and `debug` are the protocol's own name for "not for the reader".
+  #{"error" "warning" "info"})
+
+(defn lsp-notice-line (raw)
+  "The ONE line of a server's message `raw` worth an echo area, clipped to
+`*lsp-notice-width*` — or nil for one that says nothing.
+
+A server's log is written for a log file: Expert's startup includes the whole `PATH` and a
+fifteen-line list of ebin directories, and the echo area is one row. The first line is the
+sentence; the rest is the attachment, kept whole in `*lsp-log*`."
+  (when raw
+    (let (line (first (string/split (str raw) "\n")))
+      (when (not (= (string/trim line) ""))
+        (if (> (string/length line) *lsp-notice-width*)
+          (str (string/substring line 0 (- *lsp-notice-width* 1)) "…")
+          line)))))
+
+(defn lsp-notice (msg)
+  "What a server SAID, as `{:channel :level :text :line}` — or nil for a message that says
+nothing (a progress `end` with no message, any other notification).
+
+`:channel` is which of the protocol's three voices it came in, and it decides where the
+words go (see [[lsp-notice-echo?]]):
+
+- `:log` — `window/logMessage`, the server's LOG. Expert forwards its whole Logger here,
+  the indexer's `[error] Could not expand alias: {:%, [line: 36 …` included — internal
+  noise about the server's own work, at level error, many times a second while it indexes.
+- `:show` — `window/showMessage`, the server asking to tell the reader something.
+- `:progress` — `$/progress`, work the reader is waiting on. This is how Expert narrates
+  its startup (`Starting engine node`): it answers nothing until its engine node is up, and
+  with the narration dropped the first half-minute is a server that looks broken.
+
+`:text` is the whole message, for the log; `:line` the one line an echo area can hold."
+  (let (params (or (:params msg) {})
+        value (or (:value params) {})
+        method (:method msg)
+        channel (case method
+                  "window/logMessage" :log
+                  "window/showMessage" :show
+                  "$/progress" :progress
+                  nil)
+        ;; a progress `begin` carries :title, a `report` :message, an `end` either
+        raw (if (= channel :progress) (or (:title value) (:message value)) (:message params))
+        line (when channel (lsp-notice-line raw)))
+    (when line
+      {:channel channel
+       :level (if (= channel :progress) "info" (get *lsp-message-levels* (:type params) "info"))
+       :text (str raw)
+       :line line})))
+
+(defn lsp-notice-echo? (notice)
+  "Whether a server's `notice` ([[lsp-notice]]) belongs in the echo area, the way eglot
+and lsp-mode decide it: progress and a `showMessage` the reader is meant to see do; the
+LOG never does, at any level — it goes to `*lsp-log*` only.
+
+Echoing the log is what flooded the echo area while editing Elixir: Expert's indexer logs
+an error for every struct literal whose alias it cannot expand, and each one replaced
+whatever the reader was looking at — even in a dired buffer nowhere near the file."
+  (case (:channel notice)
+    :progress true
+    :show (contains? *lsp-echoed-show-levels* (:level notice))
+    false))
+
+(defn lsp-notice-log-line (notice)
+  "The `*lsp-log*` line for a server's `notice`: the channel and level, then the WHOLE
+message — the log is where the attachment the echo area clipped off is kept."
+  (str "["
+    (case (:channel notice) :log "log" :show "show" :progress "progress" "lsp")
+    " "
+    (:level notice)
+    "] "
+    (:text notice)))
+
+(def *lsp-severity-labels*
+  ;; LSP severities are numbers; bedit's diagnostics carry no severity field, so the word
+  ;; goes in the message — which is also how the Brood checker's own findings read
+  ;; (`warning: unbound symbol: x`), so one buffer's notes cannot be told from another's
+  ;; by their shape.
+  {1 "error: " 2 "warning: " 3 "note: " 4 "hint: "})
+
+(defn lsp-diagnostic (d)
+  "One LSP `Diagnostic` in bedit's own shape — `{:line :col :message}`, **1-based**, which
+is what `model/ed-diag-index` and the view's token underline read. LSP counts lines and
+characters from 0, so both are shifted by one; getting that wrong puts every mark one line
+above the code it is about."
+  (let (start (map/get-in d [:range :start] {})
+        sev (get *lsp-severity-labels* (:severity d) ""))
+    {:line (inc (or (:line start) 0))
+     :col (inc (or (:character start) 0))
+     ;; the NUMBER travels too, not only the word baked into the message. Everything that
+     ;; has to tell an error from an advice — the margin glyph, the mode-line chip, the
+     ;; report row — asks `results/diagnostic-error?`, and with only the prefix to go on it
+     ;; called every server finding a warning.
+     :severity (:severity d)
+     :message (str sev (or (:message d) ""))}))
+
+(defn lsp-diagnostics-notice (params)
+  "A `textDocument/publishDiagnostics` payload as `[path items raw]` — the file it is
+about, its diagnostics in bedit's shape, and the server's own untouched objects. An empty
+list is meaningful and is kept: it is how a server says a file is now CLEAN, and dropping
+it leaves the last errors on screen after they have been fixed.
+
+The raw objects are kept because a quickfix is asked for by handing the diagnostic BACK
+(`textDocument/codeAction`'s context): a server matches the fix to the finding by the
+object it published, so bedit's flattened `{:line :col :message}` — which is all the view
+needs — cannot ask for one."
+  (let (raw (into [] (or (:diagnostics params) [])))
+    [(lsp-uri->path (or (:uri params) "")) (into [] (map raw lsp-diagnostic)) raw]))
+
+(defn lsp-diagnostics-at-line (raw line)
+  "The raw LSP diagnostics whose range covers 0-based `line` — the `context.diagnostics`
+for a code-action request at point, which is how a server knows which quickfixes to offer."
+  (into []
+    (seq/filter (or raw [])
+      (fn (d)
+        (let (start (map/get-in d [:range :start] {})
+              end (map/get-in d [:range :end] {}))
+          (and (<= (or (:line start) 0) line) (>= (or (:line end) 0) line)))))))
+
+(defn- lsp-opened-path? (state path)
+  ;; whether `path` is a document this connection opened, compared DECODED: a server may spell
+  ;; a file's URI differently from `lsp-path->uri` (rust-analyzer leaves `+` and `@`
+  ;; unescaped), and comparing the raw strings dropped every diagnostic for such a file
+  (any? (keys (or (:opened state) {})) (fn (uri) (= (lsp-uri->path uri) path))))
+
+(defn lsp-publish (state msg)
+  "Queue a server's diagnostics for the editor, on the state's `:diags` — only for a document
+this connection has OPENED, and only the newest publication per file.
+
+A server indexing a project publishes about files nobody has open — Expert walks every
+module of an umbrella app, rust-analyzer its whole workspace — and the editor keeps
+diagnostics only for open buffers anyway. Forwarding each one cost the editor a full loop
+turn to throw it away, hundreds a second while indexing, and the keys and clicks queued
+behind them: the editor froze until the indexer finished. A file opened later is published
+again when its `didOpen` arrives, so nothing the reader could see is lost; and within one
+batch a later publication for a file replaces the earlier, which says nothing the newer
+one does not."
+  (let (params (or (:params msg) {})
+        notice (lsp-diagnostics-notice params)
+        path (first notice))
+    (if (not (lsp-opened-path? state path))
+      state
+      (assoc state
+        :diags
+          (conj (into [] (seq/reject (or (:diags state) []) (fn (d) (= (first d) path)))) notice)))))
+
+(defn- lsp-queue-notice (state notice)
+  "Queue `notice` (a [[lsp-notice]] map) for the editor on the state's `:notices` (the
+shell sends it). Kept out of `:outbox`, which is frames for the SERVER — these go the
+other way."
+  (if (nil? notice) state (assoc state :notices (conj (or (:notices state) []) notice))))
+
+(defn- lsp-narrate (state msg)
+  "Queue what a server's notification SAID for the editor ([[lsp-notice]]); the editor
+decides whether it reaches the echo area or only the log ([[lsp-notice-echo?]])."
+  (lsp-queue-notice state (lsp-notice msg)))
+
+(defn lsp-error-notice (kind error)
+  "The `*lsp-log*` notice for a server's error RESPONSE to one of our requests of `kind`
+(an `LspRequest` record) — logged, never echoed.
+
+Most requests are not the reader's: the idle beat asks for signature help as point moves,
+and a server busy indexing refuses those by the dozen. The waiting command still gets its
+reply — an empty result, so a lookup the reader DID ask for says `no definition found` in
+its own voice — and the server's reason is kept here, where someone debugging it can read
+it, instead of nowhere."
+  (let (method (lsp-request-method kind)
+        text (str method " failed: " (or (:message error) "") " (code " (:code error) ")"))
+    {:channel :log :level "error" :text text :line (lsp-notice-line text)}))
+
+(defn- lsp-apply-edit-request (state msg)
+  "A server's `workspace/applyEdit` — the edits a code action's command produced. Queued
+for the editor on `:edits`, and answered `{:applied true}` at once.
+
+Answered optimistically, and that is a decision rather than a shortcut: the edit is
+applied by the editor loop, which is a different process, so the only honest alternative
+is to block this connection until it reports back — and a connection that stops reading
+its server mid-action is how a client deadlocks. The edits go through the same rope guard
+every other applied edit does, so `true` here means \"accepted\", which is what the field
+is worth in every client."
+  (let (id (:id msg)
+        params (or (:params msg) {})
+        edit (lsp-workspace-edit (:edit params)))
+    (assoc state
+      :edits (append (or (:edits state) []) [edit])
+      :outbox (append (or (:outbox state) []) [(jsonrpc/response id {:applied true})]))))
+
+(defn- lsp-answer-server (state msg)
+  "Queue this client's answer to a request the SERVER made, on the state's `:outbox` (the
+shell writes it). `workspace/applyEdit` carries work and is handled; the rest are
+acknowledged; anything else gets MethodNotFound, which is a real answer and unblocks the
+server just as well as agreement would."
+  (let (id (:id msg)
+        method (:method msg))
+    (cond
+      (= method "workspace/applyEdit") (lsp-apply-edit-request state msg)
+      ;; we advertise `workspace.configuration`, so the server asks — one result per item
+      ;; it asked about, and `null` is "no setting, use your default". MethodNotFound here
+      ;; answered a capability we had claimed.
+      (= method "workspace/configuration")
+        (assoc state
+          :outbox
+            (append (or (:outbox state) [])
+              [(jsonrpc/response id
+                 (into [] (map (map/get-in msg [:params :items] []) (fn (_) nil))))]))
+      else
+        (let (frame (if (contains? *lsp-server-requests-handled* method)
+                      (jsonrpc/response id nil)
+                      (jsonrpc/error-response id
+                        (:method-not-found jsonrpc/*error-codes*)
+                        (str "bedit does not implement " method))))
+          (assoc state :outbox (append (or (:outbox state) []) [frame]))))))
+
+(defn lsp-dispatch (acc msg)
+  ;; Fold step: route one decoded message. Three kinds arrive on this stream and they are
+  ;; told apart by which fields they carry:
+  ;;
+  ;;   :id + :method  a REQUEST from the server — it is waiting on us, so it is answered
+  ;;   :id            a response to one of ours — shaped and sent to its waiter
+  ;;   :method        a notification (publishDiagnostics, logMessage) — nothing to do
+  ;;
+  ;; The first was missing entirely, and its absence does not look like a missing feature:
+  ;; the server simply stops, because it is blocked on an answer that never comes.
+  (let ([state replies] acc
+        id (:id msg)
+        entry (when id (map/get-in state [:pending id])))
+    (cond
+      (and id (:method msg)) [(lsp-answer-server state msg) replies]
+      ;; a notification: nothing to answer, but the server may be telling us where the
+      ;; errors are, or saying something (see [[lsp-notice]] — and [[lsp-notice-echo?]] for
+      ;; why most of it is the server's log and never reaches the echo area)
+      (= (:method msg) "textDocument/publishDiagnostics") [(lsp-publish state msg) replies]
+      (nil? id) [(lsp-narrate state msg) replies]
+      (nil? entry) [state replies]
+      else
+        (let (reply-to (first entry)
+              corr (second entry)
+              kind (nth entry 2)
+              [tag value] (lsp-shape kind (:result msg))
+              ;; an error response still answers its waiter (as an empty result); the
+              ;; server's reason goes to the log, not the echo area ([[lsp-error-notice]])
+              state (if (:error msg)
+                      (lsp-queue-notice state (lsp-error-notice kind (:error msg)))
+                      state))
+          [(assoc state :pending (dissoc (:pending state) id))
+            (cons [reply-to [tag corr value]] replies)]))))
+
+(defn lsp-ingest (state chunk)
+  "Pure: fold a stdout `chunk` into the connection. Appends it to the frame buffer,
+decodes every complete message, and routes each. Returns `[state' replies]` where each
+reply is `[pid message]` for the shell to `send`."
+  (let (buf (str (:buf state) chunk)
+        [msgs remaining] (jsonrpc/decode buf))
+    (fold msgs [(assoc state :buf remaining) '()] lsp-dispatch)))

@@ -716,6 +716,9 @@ src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — mu
                             for the mode, else the mode's `:completion-auto` facet — off in
                             text-mode (prose completes on demand, C-M-i), on in prog-mode and the
                             line-lexed config formats
+src/lsp-protocol.blsp       the protocol, pure: what each answer means, positions in UTF-16 units, the
+                            document sync, what each request puts on the wire, and the connection
+                            as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
                             hover, rename, format, imenu, and `publishDiagnostics` folded into
                             the model's diagnostics, so every language gets the underline / ⚠ note
