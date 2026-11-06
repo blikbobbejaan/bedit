@@ -379,10 +379,12 @@ src/view.blsp               pure view: model -> render frame (editor/display ops
                             line's feature chips come from the statusbar registry, and what
                             else paints is a row in `model`: `register-highlight-source`
                             (`{:rank :run :deps}`, a pane's ranges: rainbow, glyphless,
-                            whitespace, spell, isearch; `:deps` is every input off the buffer,
-                            in the pane's memo key, or paint goes stale —
-                            tests/view_memo_test), `register-pane-layer` (`{:rank :slot :run}`:
-                            the pulse, the header line) and `register-frame-overlay`
+                            whitespace, spell, isearch, other participants' selections; `:deps` is
+                            every input off the buffer, in the pane's memo key, or paint goes
+                            stale — tests/view_memo_test), `register-pane-layer` (`{:rank :slot
+                            :run :deps}`: the pulse, the header line, and in the `:with-text`
+                            slot — memoised with the text, scrolling with it — other
+                            participants' carets) and `register-frame-overlay`
                             (`{:rank :run}`: the minibuffer list, avy, which-key, the popup, the
                             transient, the menu, the tooltips). A row's module is `:use`d from
                             `main`: an unloaded row paints nothing (tests/registries_test
@@ -1248,6 +1250,9 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             collab registry and restarts with every document it had open linked
                             again (`ed-collab-reopen`)
 src/collab.blsp             shared-buffer collaboration: presence carets, delta merges, follow/mirror
+src/collabview.blsp         collab presence as the panes paint it: other participants' selections
+                            (a highlight source) and carets with their name tags (a `:with-text`
+                            pane layer)
 tests/*_test.blsp           pure model/view tests, one suite per area (no window needed)
 tests/window_paint_test     what the window PAINTS, read from pixels: the real view for a model
                             painted by brood's window painter into memory (`gui/render-frame`,

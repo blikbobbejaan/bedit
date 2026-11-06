@@ -1,0 +1,122 @@
+(defmodule collabview
+  "Collab PRESENCE as the panes paint it: on a shared buffer, every other participant's
+selection tinted in their colour (a highlight source) and their caret, with a name tag while
+it moves (a `:with-text` pane layer, scrolling with the text, under our own caret). Out of
+`view`, which names no feature: both are rows this module registers."
+  (:use editor/buffer) ; buffer-rope / buffer-length / buffer-line-count
+  (:use editor/display :only [frect rect text]) ; the caret bar and the name tag
+  (:use model) ; register-highlight-source / register-pane-layer
+  (:use panes :only [ed-rows-offset-row]) ; which row a caret's character was painted on
+  (:use view :only [geometry-span ed-cells-between]) ; the pane's spans and cell columns
+  (:use theme)) ; the accent hues a participant is coloured with
+
+;; On a shared buffer (`--serve --collab`), the model's `:hosted` slot carries every
+;; OTHER participant's cursor (`:cursors` — pid → offset, edit-adjusted markers pushed
+;; by the buffer process) and name (`:names`). Each renders as a coloured caret bar at
+;; its cell plus a small name tag on the row above (Google-Docs / Live Share style),
+;; colour stable per name.
+
+(def- ed-participant-palette
+  ;; caret/tag accents for remote participants — the theme's accent hues
+  [*blue* *green* *peach* *mauve* *red* *teal* *yellow*])
+
+(defn- ed-participant-color (name)
+  "A stable accent colour for participant `name` (a char-code hash into the palette)."
+  (nth ed-participant-palette
+    (math/mod (fold (string/->list (or name "guest")) 0 (fn (acc c) (+ acc (string/char->int c))))
+      (count ed-participant-palette))))
+
+(defn ed-pane-shared (m pane)
+  "The shared-buffer slot (`:hosted`) of `pane`'s buffer — its other participants'
+`:cursors`, `:marks`, `:names` and `:tag-ttl` — or nil for an ordinary buffer."
+  (map/get-in m [:hosted (map/get-in pane [:payload :buffer])]))
+
+(defn ed-remote-selection-ranges (m pane)
+  "`[lo hi face]` highlight ranges for OTHER participants' active selections on
+`pane`'s buffer (cursor ↔ mark, tinted in the owner's colour) — appended to the
+pane's highlight ranges, so they paint through the ordinary run tiler. `()` when the
+buffer isn't shared or no one has a region."
+  (let (shared (ed-pane-shared m pane)
+        cursors (or (:cursors shared) {})
+        names (or (:names shared) {}))
+    (seq/keep (%map-pairs (or (:marks shared) {}))
+      (fn ([pid mark])
+        (let (cur (get cursors pid))
+          (when cur
+            [(math/min cur mark)
+              (math/max cur mark)
+              {:bg (ed-participant-color (get names pid "guest"))}]))))))
+
+(defn- ed-remote-caret-cell (buf geometry pos)
+  "`[row column]` of a remote caret at offset `pos` — the body row it is painted on and its
+cell from the text's left edge — or nil when it is off the shown rows or columns. Rows go
+through `ed-rows-offset-row`, the cursor's own question, so a remote caret lands on the
+row its character was painted on, wrapped or not."
+  (let (rope (buffer-rope buf)
+        pos (math/max 0 (math/min pos (buffer-length buf)))
+        ;; the EOF phantom-line clamp, as ed-visual-column
+        line (math/min (text/char->line rope pos) (dec (buffer-line-count buf)))
+        bol (text/line->char rope line)
+        at (ed-rows-offset-row (:rows geometry)
+             (:top geometry)
+             line
+             (- pos bol)
+             (:hscroll geometry)
+             (math/max 1 (:text-height geometry))))
+    (when at
+      (let ([row from] at
+            column (ed-cells-between rope bol (+ bol (math/min from (- pos bol))) pos))
+        (when (and (>= column 0) (< column (second (geometry-span geometry :row)))) [row column])))))
+
+(defn- ed-remote-caret-ops (m geometry cell name tagged?)
+  "The caret bar at body `cell` in `name`'s colour (a sub-cell `frect` in the GUI, a filled
+cell in the terminal), with — when `tagged?` (the caret moved recently) — the quiet name tag:
+dim coloured text, no box, above the caret (below it on the top row), clamped into the pane."
+  (let ([row column] cell
+        color (ed-participant-color name)
+        cy (+ (:y geometry) row)
+        cx (+ (first (geometry-span geometry :text)) column)
+        bar (if (:gui m)
+              (frect (* 1.0 cx) (* 1.0 cy) 0.16 1.0 {:bg color} 0.9)
+              (rect cy cx 1 1 {:bg color})))
+    (if tagged?
+      (let ([x width] (geometry-span geometry :body)
+            tag-row (if (> row 0) (dec cy) (inc cy))
+            tag-col (math/max x (math/min cx (- (+ x width) (string/length name)))))
+        (list bar (text tag-row tag-col name {:fg color})))
+      (list bar))))
+
+(sig ed-remote-cursor-ops (model pane buffer pane-geometry -> any))
+(defn ed-remote-cursor-ops (m pane buf geometry)
+  "Render ops for the other participants' carets on `pane`'s buffer: for each remote
+cursor within the viewport, a coloured caret bar at its cell (`ed-remote-caret-ops`). The
+owner's NAME shows only while their caret recently moved (`:tag-ttl`, re-armed per push and
+ticked down on the blink beat). `()` when the pane's buffer isn't a shared slot or no one
+else is on it — every ordinary pane pays one map lookup. Laid out in the `geometry`'s
+`:text-height` rows."
+  (let (shared (ed-pane-shared m pane)
+        names (or (:names shared) {})
+        ttls (or (:tag-ttl shared) {}))
+    (mapcat (%map-pairs (or (:cursors shared) {}))
+      (fn ([pid pos])
+        (let (cell (ed-remote-caret-cell buf geometry pos))
+          (if (nil? cell)
+            '()
+            (ed-remote-caret-ops m
+              geometry
+              cell
+              (get names pid "guest")
+              (> (or (get ttls pid) 0) 0))))))))
+
+(defn remote-selection-source (m pane buf context)
+  "The highlight source: [[ed-remote-selection-ranges]]."
+  (ed-remote-selection-ranges m pane))
+
+(defn remote-deps (m pane buf)
+  "What both rows read off the model: the pane's shared-buffer slot."
+  (ed-pane-shared m pane))
+
+(register-highlight-source :remote-selections
+  {:rank 60 :run 'collabview/remote-selection-source :deps 'collabview/remote-deps})
+(register-pane-layer :remote-carets
+  {:rank 10 :slot :with-text :run 'collabview/ed-remote-cursor-ops :deps 'collabview/remote-deps})
