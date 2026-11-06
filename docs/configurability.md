@@ -163,16 +163,13 @@ already use, so the renderer reads every colour by name from one place and a **t
 pure data**. Add `register-theme`; `:theme` becomes a setting. Shipping a light theme
 becomes a data-only change.
 
-### Command properties — generalize the two registries into one (not built)
+### Command properties — `interactive/declare-trait` (built, in part)
 
-The editor already invented per-command property registries *twice*
-(`*prefix-consuming*`, `*command-inverse*`) — but then *also* hand-maintains
-`input/*repeat-commands*`, `input/*view-resume-keys*`, `input/ed--shift-deactivators`,
-`model/*typing-commands*`, and `commands/ed--kill-commands` as separate global lists.
-These are all "properties of a command." Generalize to **`command-put` / `command-get`**
-(declared next to each command, exactly as the inverse/prefix registries already are)
-and fold the five lists in. Bonus: a user (or a package) can then mark *their own*
-command repeatable / a kill command / shift-deactivating.
+What the core must know of a command it does not name is a TRAIT, declared by symbol beside
+the command: `:typing`, `:kill`, `:repeat`, `:completion-auto`, `:guest`. Bonus: a user (or a
+package) can mark *their own* command repeatable or a kill command. Still separate lists:
+`*prefix-consuming*`, `*command-inverse*`, `input/*view-resume-keys*`,
+`input/ed--shift-deactivators`.
 
 ## Prime-directive split (what's Brood vs. what's the editor)
 
