@@ -1,0 +1,356 @@
+(defmodule charset
+  "The text encodings a file may be in besides UTF-8 (Emacs's coding systems): the single-byte
+ones, which are data (`charset-tables`), and UTF-16. A buffer in one keeps its text as any other
+and remembers `:coding` beside `:eol` and `:bom`; this module is the bytes on either side of
+that, and `detect` is how a file read as bytes comes to have one. UTF-8 is no coding here, as LF
+is no `:eol`: a buffer of it carries no key.
+
+The single-byte codings are lossless on every byte, so a file opened and saved unchanged comes
+back byte for byte. Mail reads its charsets here too (`mail-message`)."
+  (:use charset-tables) ; *single-byte*
+  (:use editor/buffer)) ; file-text-encode / mark-buffer-saved / buffer-stamp-file
+
+(def- *rows* (into {} (map *single-byte* (fn (row) [(:coding row) row]))))
+
+(def- *byte-of*
+  (into {}
+    (map *single-byte*
+      (fn (row)
+        [(:coding row)
+          (into {} (map (seq/zip (:high row) (range 128 256)) (fn ([code byte]) [code byte])))]))))
+
+(def- *coding-names*
+  (fold *single-byte*
+    {"utf-8" :utf-8
+     "utf8" :utf-8
+     "us-ascii" :utf-8
+     "ascii" :utf-8
+     "utf-16le" :utf-16-le
+     "utf-16-le" :utf-16-le
+     "utf-16be" :utf-16-be
+     "utf-16-be" :utf-16-be}
+    (fn (names row)
+      (fold (:names row) names (fn (known name) (assoc known name (:coding row)))))))
+
+(defn coding-named (name)
+  "The coding a charset `name` (MIME, `.editorconfig`, a person's) means, whatever its case:
+`:utf-8`, or one [[decode]] takes; nil for a name this does not know.
+
+    (charset/coding-named \"Latin1\")   ;=> :latin-1
+    (charset/coding-named \"cp1251\")   ;=> :windows-1251
+    (charset/coding-named \"shift-jis\")   ;=> nil"
+  (when (string? name) (get *coding-names* (string/lower name))))
+
+(defn label (coding)
+  "`coding` as the mode line and the echo area spell it.
+
+    (charset/label :windows-1252)   ;=> \"windows-1252\"
+    (charset/label :utf-16-le)   ;=> \"UTF-16LE\""
+  (case coding
+    :utf-16-le "UTF-16LE"
+    :utf-16-be "UTF-16BE"
+    (or (:label (get *rows* coding)) "UTF-8")))
+
+(defn codings ()
+  "The names a person is offered for a coding (`filecoding`), one per coding.
+
+    (first (charset/codings))   ;=> \"UTF-8\""
+  (append ["UTF-8"] (map *single-byte* :label) ["UTF-16LE" "UTF-16BE"]))
+
+;; ---- decoding ----------------------------------------------------------------
+
+(defn- decode-single (octets high)
+  (string/codepoints-> (map octets (fn (byte) (if (< byte 128) byte (nth high (- byte 128)))))))
+
+(defn- high-surrogate? (unit) (and (>= unit 55296) (< unit 56320)))
+(defn- low-surrogate? (unit) (and (>= unit 56320) (< unit 57344)))
+
+(defn- utf-16-unit (bytes i big-endian?)
+  (let (first-byte (nth bytes i) second-byte (nth bytes (inc i)))
+    (if big-endian?
+      (+ (* first-byte 256) second-byte)
+      (+ (* second-byte 256) first-byte))))
+
+(defn- utf-16-codes (bytes i big-endian? codes)
+  "The code points of UTF-16 `bytes` from `i`, reversed onto `codes`, or nil at a surrogate
+with no partner."
+  (let (size (count bytes))
+    (if (>= i size)
+      codes
+      (let (unit (utf-16-unit bytes i big-endian?))
+        (cond
+          (low-surrogate? unit) nil
+          (not (high-surrogate? unit)) (utf-16-codes bytes (+ i 2) big-endian? (cons unit codes))
+          (>= (+ i 3) size) nil
+          else
+            (let (low (utf-16-unit bytes (+ i 2) big-endian?))
+              (if (low-surrogate? low)
+                (utf-16-codes bytes
+                  (+ i 4)
+                  big-endian?
+                  (cons (+ 65536 (* (- unit 55296) 1024) (- low 56320)) codes))
+                nil)))))))
+
+(defn- decode-utf-16 (octets big-endian?)
+  (let (bytes (vec octets))
+    (if (= (math/mod (count bytes) 2) 1)
+      nil
+      (let (codes (utf-16-codes bytes 0 big-endian? '()))
+        (if (nil? codes) (if (empty? bytes) "" nil) (string/codepoints-> (reverse codes)))))))
+
+(defn decode (octets coding)
+  "`octets` (a bytes value or a byte list) as text in `coding`, or nil when they are not valid
+in it (only UTF-8 and UTF-16 can be invalid). A byte-order mark stays as U+FEFF, for
+`editor/buffer/file-text-decode` to take off and remember.
+
+    (charset/decode [99 97 102 233] :latin-1)   ;=> \"café\"
+    (charset/decode [128] :windows-1252)   ;=> \"€\"
+    (charset/decode [164] :latin-9)   ;=> \"€\"
+    (charset/decode [105 0] :utf-16-le)   ;=> \"i\"
+    (charset/decode [0 105] :utf-16-be)   ;=> \"i\""
+  (case coding
+    :utf-16-le (decode-utf-16 octets false)
+    :utf-16-be (decode-utf-16 octets true)
+    (let (row (get *rows* coding))
+      (if row
+        (decode-single octets (:high row))
+        (check-allow :discarded-catch (try (string/bytes-> octets) (catch _ nil)))))))
+
+;; ---- encoding ----------------------------------------------------------------
+
+(defn- single-byte (code coding)
+  "The byte `code` is in single-byte `coding`, or nil when it has none."
+  (if (< code 128) code (get (get *byte-of* coding) code)))
+
+(defn- utf-16-pair (unit big-endian?)
+  (let (high (math/quot unit 256) low (math/mod unit 256))
+    (if big-endian? [high low] [low high])))
+
+(defn- utf-16-bytes (code big-endian?)
+  (if (< code 65536)
+    (utf-16-pair code big-endian?)
+    (let (offset (- code 65536))
+      (append (utf-16-pair (+ 55296 (math/quot offset 1024)) big-endian?)
+        (utf-16-pair (+ 56320 (math/mod offset 1024)) big-endian?)))))
+
+(defn- encode-single (codes coding i out)
+  "The bytes of `codes` in `coding`, reversed onto `out`, or a failure naming the first code
+with none."
+  (cond
+    (empty? codes) (reverse out)
+    else
+      (let (byte (single-byte (first codes) coding))
+        (if (nil? byte)
+          (failure/with {:at i}
+            "`"
+            (string/codepoints-> (list (first codes)))
+            "` has no form in "
+            (label coding))
+          (encode-single (rest codes) coding (inc i) (cons byte out))))))
+
+(defn encode (text coding)
+  "`text` as the bytes of `coding` (a list of byte ints), or a failure with `:at`, the
+character offset of the first one the coding cannot write.
+
+    (charset/encode \"café\" :latin-1)   ;=> (99 97 102 233)
+    (charset/encode \"€\" :windows-1252)   ;=> (128)
+    (charset/encode \"i\" :utf-16-be)   ;=> (0 105)
+    (failure? (charset/encode \"€\" :latin-1))   ;=> true"
+  (let (codes (string/->codepoints text))
+    (case coding
+      :utf-16-le (mapcat codes (fn (code) (utf-16-bytes code false)))
+      :utf-16-be (mapcat codes (fn (code) (utf-16-bytes code true)))
+      (encode-single codes coding 0 '()))))
+
+;; ---- a file's bytes ----------------------------------------------------------
+
+(def- *sample-size* 65536)
+
+(defdyn *default-coding* :windows-1252)
+;; What bytes that are neither UTF-8 nor a recognised script read as: init.blsp's `:file-coding`,
+;; set by `config/apply-file-coding`. Bytes alone cannot tell Polish from French.
+
+(defn single-byte-coding? (name)
+  "Whether `name` is a single-byte coding: what `:file-coding` may be.
+
+    (charset/single-byte-coding? \"cp1250\")   ;=> true
+    (charset/single-byte-coding? \"utf-16le\")   ;=> false"
+  (contains? *rows* (coding-named name)))
+
+(defn set-default-coding (name)
+  "Read text that names no coding of its own as the single-byte coding `name` from now on. False
+for a name that is none, leaving the default as it was."
+  (let (coding (coding-named name))
+    (if (single-byte-coding? name)
+      (do (defdyn *default-coding* coding) true)
+      false)))
+
+(defn- control-byte? (byte)
+  ;; what no text file holds: C0 controls other than \t \n \f \r and ESC (`file`'s own rule)
+  (and (< byte 32) (not (includes? [9 10 12 13 27] byte))))
+
+(defn- undefined-byte? (byte coding)
+  "Whether `coding` leaves `byte` undefined: the table maps it to itself in the C1 range. Text in
+the coding never has one, and random bytes do."
+  (and (>= byte 128)
+    (< byte 160)
+    (= (nth (:high (get *rows* coding)) (- byte 128)) byte)))
+
+(defn- high-profile (sample)
+  "What `sample` says about its non-ASCII bytes: `{:high :adjacent :counts}`: how many there are,
+how many follow another, and how often each occurs."
+  (let ([_ high adjacent counts] (fold sample
+                                   [false 0 0 {}]
+                                   (fn ([previous high adjacent counts] byte)
+                                     (if (< byte 128)
+                                       [false high adjacent counts]
+                                       [true
+                                         (inc high)
+                                         (if previous (inc adjacent) adjacent)
+                                         (assoc counts byte (inc (get counts byte 0)))]))))
+    {:high high :adjacent adjacent :counts counts}))
+
+(def- *scripts*
+  (seq/keep *single-byte*
+    (fn (row)
+      (when (not (= (:common row) ""))
+        {:coding (:coding row)
+         :bytes (map (string/->codepoints (:common row))
+                  (fn (code) (get (get *byte-of* (:coding row)) code)))}))))
+
+(def- *script-minimum* 8)
+;; High bytes a script is judged on: under this, a few letters of anything can look like one.
+
+(defn- script-coding (profile)
+  "The coding whose script `profile` reads as, or nil. Text in Cyrillic, Greek, Hebrew or Arabic
+runs its high bytes together, where accented Latin text leaves them apart among ASCII, so half of
+them must follow another; then the coding whose commonest letters they most are, if at least a
+third are. Random bytes are spread over every byte value and reach neither."
+  (let (high (:high profile) counts (:counts profile))
+    (when (and (>= high *script-minimum*) (>= (* 2 (:adjacent profile)) high))
+      (let (scored (map *scripts*
+                     (fn (script)
+                       [(fold (:bytes script)
+                          0
+                          (fn (total byte) (+ total (get counts byte 0))))
+                         (:coding script)]))
+            [score coding] (last (sort scored)))
+        (when (>= (* 3 score) high) coding)))))
+
+(defn- guess-coding (octets)
+  "The coding bytes that are not UTF-8 are in, or nil for a binary: a NUL anywhere or a control
+byte is one, a script ([[script-coding]]) wins, and otherwise it is `*default-coding*`, unless a
+byte it leaves undefined or more than a third of them past ASCII says it cannot be text."
+  (let (sample (vec (bytes/slice octets 0 (math/min *sample-size* (bytes/length octets))))
+        profile (high-profile sample)
+        high (:high profile)
+        script (script-coding profile)
+        default *default-coding*)
+    (cond
+      (or (>= (bytes/index-of octets (bytes 0)) 0) (any? sample control-byte?)) nil
+      script script
+      (any? (keys (:counts profile)) (fn (byte) (undefined-byte? byte default))) nil
+      (and (> high 3) (> (* 3 high) (count sample))) nil
+      else default)))
+
+(defn- utf-16-mark (octets)
+  "The UTF-16 coding `octets` declare by a byte-order mark, or nil. FF FE 00 00 is UTF-32's
+mark, which this does not read."
+  (let (size (bytes/length octets) first-byte (when (> size 1) (bytes/at octets 0)))
+    (cond
+      (< size 2) nil
+      (and (= first-byte 254) (= (bytes/at octets 1) 255)) :utf-16-be
+      (and (= first-byte 255)
+        (= (bytes/at octets 1) 254)
+        (not (and (> size 3) (= (bytes/at octets 2) 0) (= (bytes/at octets 3) 0))))
+        :utf-16-le
+      else nil)))
+
+(defn- decoded (octets coding)
+  (let (text (decode octets coding)) (when text {:text text :coding coding})))
+
+(defn detect (octets &optional (wanted nil))
+  "What a file's bytes `octets` are: `{:text}` for UTF-8, `{:text :coding}` for another
+coding, nil for a binary. `wanted` is the charset the file is declared to be in
+(`.editorconfig`'s), believed first; then a UTF-16 byte-order mark; then UTF-8; and bytes that
+are none of those are guessed ([[guess-coding]]), a binary among them. Every single-byte coding
+takes every byte and gives them back on a save, so a wrong guess costs a look, not the file:
+C-x RET r overrules it.
+
+    (charset/detect (bytes 104 105))   ;=> {:text \"hi\"}
+    (charset/detect (bytes 99 97 102 233))   ;=> {:text \"café\", :coding :windows-1252}
+    (charset/detect (bytes 104 105) \"latin1\")   ;=> {:text \"hi\", :coding :latin-1}
+    (charset/detect (bytes 104 0 233))   ;=> nil"
+  (let (declared (coding-named wanted)
+        marked (utf-16-mark octets)
+        utf-8 (decode octets :utf-8))
+    (cond
+      (and declared (not (= declared :utf-8))) (decoded octets declared)
+      marked (decoded octets marked)
+      utf-8 {:text utf-8}
+      else (let (coding (guess-coding octets)) (when coding (decoded octets coding))))))
+
+(defn read-text (path coding)
+  "The file at `path` as text in `coding` (nil for UTF-8). Raises when it is not.
+
+    (charset/read-text \"notes.txt\" :latin-1)   ;~> the text of a Latin-1 file"
+  (if (nil? coding)
+    (file/slurp path)
+    (or (decode (file/slurp-bytes path) coding)
+      (error "not " (label coding) ": " path))))
+
+(defn with-coding (buf coding)
+  "`buf` remembering that its file is in `coding`: a key only for what is not UTF-8.
+
+    (:coding (charset/with-coding {} :latin-1))   ;=> :latin-1
+    (contains? (charset/with-coding {:coding :latin-1} :utf-8) :coding)   ;=> false"
+  (if (or (nil? coding) (= coding :utf-8)) (dissoc buf :coding) (assoc buf :coding coding)))
+
+(defn- line-at (text at)
+  (inc (count (seq/filter (string/->list (string/substring text 0 at)) (fn (c) (= c "\n"))))))
+
+(defn file-content (buf)
+  "What `buf`'s file should hold: its text with its line ending and byte-order mark, in its
+`:coding` — a string for UTF-8, else bytes, ready for any write — or a failure when the text
+holds a character the coding cannot write. The one way every save (`save`, a root file's
+through `sudo`) turns a buffer into a file.
+
+    (charset/file-content (editor/buffer/make-buffer \"hi\"))   ;=> \"hi\""
+  (let (text (file-text-encode (buffer-text buf) (buffer-eol buf) (buffer-bom? buf))
+        coding (get buf :coding))
+    (if (nil? coding)
+      text
+      (let (encoded (encode text coding))
+        (if (failure? encoded)
+          (failure (error-message encoded)
+            " (line "
+            (line-at text (:at (fields encoded)))
+            "; C-x RET f picks another)")
+          (bytes/concat encoded))))))
+
+(defn save (buf)
+  "`editor/buffer/save-buffer` in `buf`'s `:coding`. Raises, leaving the file as it was, when
+the text holds a character the coding cannot write ([[file-content]]).
+
+    (charset/save buf)   ;~> buf, stamped and unmodified, its file written in its coding"
+  (if (nil? (get buf :coding))
+    (save-buffer buf)
+    (let (content (file-content buf))
+      (if (failure? content)
+        (error (error-message content))
+        (do
+          (file/replace (get buf :file) content)
+          (mark-buffer-saved (buffer-stamp-file buf)))))))
+
+(defn tool-view (text coding eol bom)
+  "`text`, of a file in `coding` written with `eol` and `bom`, as a program's captured output
+shows that file: its bytes read as UTF-8, whatever does not read replaced. A VCS's copy of the
+file reaches the editor that way, and comparing it to the buffer's text would mark every line
+with an accent changed; compared to this, a line differs exactly when its bytes do. `text`
+itself when the coding cannot write it, since that line differs anyway.
+
+    (charset/tool-view \"é\\n\" :latin-1 :lf false)   ;=> \"\\u{fffd}\\n\""
+  (let (encoded (encode (file-text-encode text eol bom) coding))
+    (if (failure? encoded)
+      text
+      (:text (file-text-decode (string/bytes-> (bytes/concat encoded) :lossy))))))

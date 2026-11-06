@@ -97,12 +97,15 @@ or the failure).
   (let (opts {:user (:user job) :password password})
     (if (and (nil? password) (sudo/password-required? {:user (:user job)}))
       {:needs-password true}
-      (if (= (:kind job) :open)
-        {:bytes (sudo/read-bytes (:path job) opts)}
-        {:written (sudo/write (:path job) (:text job) opts)}))))
+      (if (= (:kind job) :save)
+        {:written (sudo/write (:path job) (:content job) opts)}
+        {:bytes (sudo/read-bytes (:path job) opts)}))))
 
 (defn- job-doing (job)
-  (str (if (= (:kind job) :open) "opening " "saving ") (:path job) " as " (:user job)))
+  (str (case (:kind job) :open "opening " :revert "reverting " "saving ")
+    (:path job)
+    " as "
+    (:user job)))
 
 (defn- sudo-wait (m step job note)
   "`job` put on the queue (`:sudo-waiting`) to `step` — `:launch` it, or `:ask` for its
@@ -237,7 +240,7 @@ modified and C-/ goes back to the file's."
         (math/min (buffer-point old) (string/length text))))
     (if old (goto-char buf (math/min (buffer-point old) (buffer-length buf))) buf)))
 
-(defn- sudo-opened (m job text)
+(defn- sudo-opened (m job text coding)
   "An open's text has landed: the file in a sudo buffer, shown where the `Loading…` one was
 selected, which goes — as does a buffer already visiting the file plainly, whose unsaved text
 the new one keeps. Then the job's continuation."
@@ -248,7 +251,7 @@ the new one keeps. Then the job's continuation."
                             (fn (b) (and (= (buffer-file b) path) (not (= true (:sudo b)))))))
                     (if (< i 0) nil i))
         old (when old-index (ed-buf-at m old-index))
-        buf (assoc (carry-text (sudo-buffer path user text) old)
+        buf (assoc (charset/with-coding (carry-text (sudo-buffer path user text) old) coding)
               :name (file-display-name path (:project-root m)))
         opened (ed-open-buffer m buf)
         without-placeholder (drop-placeholder opened path)
@@ -263,15 +266,16 @@ the new one keeps. Then the job's continuation."
                                    (str (if (nil? text) "new file " "opened ") path " as " user))))))
 
 (defn- sudo-open-bytes (m job bytes)
-  "An open's bytes have landed: nil (no file yet) or UTF-8 text opens as an editable sudo
-buffer ([[sudo-opened]]); anything else opens as the read-only hex view a plain find-file
-gives a binary (`pool/ed-open-binary`) — never as text with its undecodable bytes replaced,
-which a save would write back over the file. A refusal is said."
+  "An open's bytes have landed: nil (no file yet) or text in any coding (`charset/detect`) opens
+as an editable sudo buffer ([[sudo-opened]]); a binary opens as the read-only hex view a plain
+find-file gives one (`pool/ed-open-binary`) — never as text with its undecodable bytes
+replaced, which a save would write back over the file. A refusal is said."
   (if (failure? bytes)
     (sudo-failed m job (error-message bytes))
-    (let (text (when bytes
-                 (check-allow :discarded-catch (try (string/bytes-> bytes) (catch _ :not-text)))))
-      (if (= text :not-text)
+    (let (read (if bytes
+                 (charset/detect bytes (editorconfig/declared-charset (:path job)))
+                 {:text nil}))
+      (if (nil? read)
         (let (shown (ed-open-binary (drop-placeholder m (:path job))
                       (:path job)
                       (:project-root m)
@@ -279,8 +283,8 @@ which a save would write back over the file. A refusal is said."
           ((or (:then job) identity) (message shown
                                        (str "opened "
                                          (:path job)
-                                         " as hex — not UTF-8 text, so read-only"))))
-        (sudo-opened m job text)))))
+                                         " as hex — not text, so read-only"))))
+        (sudo-opened m job (:text read) (:coding read))))))
 
 ;; check-allow: `then` is the caller's continuation (`identity`, or recover-session's), whose
 ;; result the checker cannot see; every caller hands one that answers a model
@@ -340,18 +344,19 @@ continues there); `abandon-note` follows the reason when it does not (\" — qui
             (str "sudo: another sudo command is still running — save when it is done"
               (or abandon-note "")))
         else
-          (let ([prepared-model prepared] (ed-save-prepare m i))
-            (sudo-launch prepared-model
-              {:kind :save
-               :path (buffer-file prepared)
-               :user (or (:sudo-user b) "root")
-               :text (file-text-encode (buffer-text prepared)
-                       (buffer-eol prepared)
-                       (buffer-bom? prepared))
-               :rope (buffer-rope prepared)
-               :then then
-               :abandon-note abandon-note}
-              nil))))))
+          (let ([prepared-model prepared] (ed-save-prepare m i)
+                content (charset/file-content prepared))
+            (if (failure? content)
+              (message prepared-model (str (error-message content) (or abandon-note "")))
+              (sudo-launch prepared-model
+                {:kind :save
+                 :path (buffer-file prepared)
+                 :user (or (:sudo-user b) "root")
+                 :content content
+                 :rope (buffer-rope prepared)
+                 :then then
+                 :abandon-note abandon-note}
+                nil)))))))
 (sig ed-sudo-save (model int &optional any any -> model))
 
 ;; check-allow: as above — `then` is the caller's
@@ -375,6 +380,37 @@ C-x s do with the sudo buffers they were told to save."
 
 ;; ---- the job's fold, its C-g, its exit question --------------------------------------
 
+(defn- sudo-reverted (m job bytes)
+  "A revert's bytes have landed ([[ed-sudo-revert]]): the buffer holds the file as it is, read
+in the job's `:coding`, one undoable edit, or the hex view for `:hex`. Another file or a refusal
+is said, the buffer left as it was."
+  (let (i (sudo-buffer-index m (:path job) (:user job))
+        coding (:coding job)
+        text (when (and (bytes? bytes) (not (= coding :hex)))
+               (charset/decode bytes (or coding :utf-8))))
+    (cond
+      (nil? i) m
+      (failure? bytes) (sudo-failed m job (str "revert failed: " (error-message bytes)))
+      (not (bytes? bytes)) (sudo-failed m job (str (:path job) " is gone"))
+      (= coding :hex) (ed-show-as-hex m i bytes)
+      (nil? text) (message m (str (:path job) " is not " (charset/label coding)))
+      else
+        (message (ed-revert-at (ed-set-buf-at m i (charset/with-coding (ed-buf-at m i) coding))
+                   i text)
+          (str "reverted " (:path job))))))
+
+(defn ed-sudo-revert (m i coding)
+  "Read pool buffer `i`, a sudo buffer, again through sudo, OFF the loop: the file in `coding`
+(nil for the one it has, `:hex` for the hex view) replaces its text, one undoable edit. What
+M-x revert-buffer and C-x RET r do for a file only root can read."
+  (let (b (ed-buf-at m i))
+    (sudo-launch m
+      {:kind :revert
+       :path (buffer-file b)
+       :user (or (:sudo-user b) "root")
+       :coding (or coding (:coding b))}
+      nil)))
+
 (defn ed-apply-sudo (m r)
   "Fold a finished sudo job's answer `r` ([[sudo-work]]; nil when its task failed or timed
 out): ask for the password it needs, open the file, mark the save landed — or say why not."
@@ -388,6 +424,7 @@ out): ask for the password it needs, open the file, mark the save landed — or 
       (nil? r) (sudo-failed m1 job (str (job-doing job) " failed or timed out"))
       (:needs-password r) (sudo-ask m1 job)
       (= (:kind job) :open) (sudo-open-bytes m1 job (:bytes r))
+      (= (:kind job) :revert) (sudo-reverted m1 job (:bytes r))
       (failure? (:written r))
         (sudo-failed m1 job (str "save failed: " (error-message (:written r))))
       else (sudo-saved m1 job))))

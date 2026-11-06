@@ -166,8 +166,8 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             stops it): an open shows `Loading…` at once, a save stays modified
                             until its write lands (`pool/ed-save-prepare` / `ed-save-landed`), and
                             C-x C-c / C-x s save root files after their questions and go on when
-                            the last lands. A file is read as BYTES (`sudo/read-bytes`): not
-                            UTF-8, it opens as the read-only hex view; a large one is asked about
+                            the last lands. A file is read as BYTES (`sudo/read-bytes`) and goes through
+                            `charset` as any file does; a binary opens as the read-only hex view; a large one is asked about
                             first (`pool/ed-file-of-spec`); one buffer per file AND user (the
                             registry `:key` names the user); killing `Loading…` cancels the open.
                             Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
@@ -477,7 +477,25 @@ src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string
                             comments break
 src/registers.blsp          registers (C-x r SPC / j / s / i) behind a `Register` ability, and
                             bookmarks (C-x r m / b)
-src/hexl.blsp               hexl-mode: a non-UTF-8 file opened as a read-only hex view (pool's
+src/charset.blsp            the encodings a file may be in besides UTF-8 (Emacs's coding systems):
+                            the single-byte ones as DATA (`charset-tables`, one row each, generated
+                            from iconv by tools/gen-charset-tables.sh) and UTF-16. `detect` says what a
+                            file's bytes are: the charset its `.editorconfig` declares, a UTF-16 mark,
+                            UTF-8, a binary (a NUL or a control byte: the hex view), a SCRIPT (Cyrillic,
+                            Greek, Hebrew, Arabic: high bytes running together, mostly the row's
+                            `:common` letters; KOI8-R told from windows-1251 that way), else init.blsp's
+                            `:file-coding`, which is what tells Polish from French. Every byte comes
+                            back on a save. No multi-byte legacy coding (Shift-JIS, GBK, Big5). A buffer in one
+                            remembers `:coding` beside `:eol` and `:bom` (the registry `:meta` carries
+                            it, the mode line shows it); `charset/save` writes it and refuses a
+                            character it has no form for, leaving the file (`file-content`, which a
+                            root file's save shares). `tool-view` is the text as a program's captured
+                            output shows the file, which is what the diff gutter compares with
+src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (read the file again as
+                            another coding or the hex view): how a file reads is a guess, and this
+                            overrules it either way. A file edited as root reads through sudo
+                            (`sudoedit/ed-sudo-revert`, M-x revert-buffer too)
+src/hexl.blsp               hexl-mode: a binary file opened as a read-only hex view (pool's
                             find-file reaches it late-bound); the mode's `:no-write` facet is
                             what makes C-x C-s / C-x C-w refuse it
 src/pool.blsp               the buffer pool and where its buffers are shown — open / select /

@@ -19,6 +19,7 @@ the reverse: the two things find-file needs from above it — the hex view of a 
   (:use projects) ; project-root / file-display-name / remember-* — the project a file is in
   (:use autosave) ; auto-save sidecars + auto-revert
   (:use conventions :only [prepare-for-save]) ; .editorconfig's trailing whitespace / final newline
+  (:use charset :only [label]) ; a file's coding: loaded with the pool, as a release needs
   (:use model)) ; the pool + layout accessors, ed-stamp, message, ed-mb-edit
 ;; collab (unshare a killed slot), hosted (drop / rekey a slot), editor/layers (close hooks,
 ;; buffer types) and text (line->char) are referenced qualified below and auto-load.
@@ -91,14 +92,34 @@ it acting on whichever buffer was current."
           question
           (fn (mm k) (if (ed-yes-key? k) (opener mm path) (message mm "not opened"))))))))
 
+(defn- file-truename (path)
+  "The real path of the file `path` names, links followed, or nil when there is no such file.
+Emacs's `file-truename`."
+  (when (file/exists? path)
+    (let (real (check-allow :discarded-catch (try (os/canonicalize path) (catch _ nil))))
+      (when (string? real) real))))
+
+(defn- ed-buffer-index-by-truename (m path)
+  "The pool index of a buffer visiting the file `path` is really (Emacs's
+`find-file-existing-other-name`): the two names of a symlink are one file, and two buffers
+on it would each save over the other. nil when none is. A buffer edited as root is another
+buffer on purpose (`sudoedit`, one per file and user)."
+  (let (truename (file-truename path))
+    (when truename
+      (let (i (seq/index-where (:buffers m)
+                (fn (b)
+                  (let (file (buffer-file b))
+                    (and file (not (:sudo b)) (= (file-truename file) truename))))))
+        (if (< i 0) nil i)))))
+
 (defn ed-read-file (path)
-  "The file at `path`, read ONCE: `{:text}` when its bytes decode as UTF-8, else `{:bytes}`
+  "The file at `path`, read ONCE: `{:text :coding}` when it is text (`charset/detect`, which
+reads the charset its `.editorconfig` declares), else `{:bytes}`
 (a binary, for the hex view). It used to be read twice — a decode to ask whether it was
 text, then the read that built the buffer. Raises when the file cannot be read."
   (let (bytes (file/slurp-bytes path)
-        ;; the decode failing IS the answer (a binary), so the error is the verdict
-        text (check-allow :discarded-catch (try (string/bytes-> bytes) (catch e nil))))
-    (if (nil? text) {:bytes bytes} {:text text})))
+        declared (editorconfig/declared-charset path))
+    (or (charset/detect bytes declared) {:bytes bytes})))
 
 ;; ---- dired lives in src/dired.blsp, the hex view in src/hexl.blsp -----------------
 ;; Both build on this module (the find-file prompt, the default directory, the line
@@ -642,7 +663,7 @@ for M-, to come back to."
 fresh buffer backed by it (so Ctrl-S creates it). A relative or `~` path is resolved
 to absolute (`path-absolute`) first, so the prompt can stay short/relative while the
 buffer's `:file`, dedup, and project-relative name all key off a canonical path. A
-directory opens in dired (Emacs `find-file` on a directory), a file that is not UTF-8 as
+directory opens in dired (Emacs `find-file` on a directory), a binary as
 a hex view (`ed-open-binary`). A TRAMP sudo path — `/sudo::/etc/hosts` — opens the file
 as root (`sudoedit/ed-sudo-find-file`, which may ask for the password first)."
   (cond
@@ -668,30 +689,40 @@ as root (`sudoedit/ed-sudo-find-file`, which may ask for the password first)."
                 (remember-project-file! resolved
                   (string/substring path (string/length (str resolved "/")))))
             m (if (nil? root) m (assoc m :project-root root))
-            idx (ed-buffer-index-by-file m path))
-        (if idx
-          (ed-select m idx)
+            idx (ed-buffer-index-by-file m path)
+            same-file (when (nil? idx) (ed-buffer-index-by-truename m path)))
+        (cond
+          idx (ed-select m idx)
+          same-file
+            (message (ed-select m same-file)
+              (str path " and " (buffer-file (ed-buf-at m same-file)) " are the same file"))
           ;; read-or-new (vim/emacs find-file) via the shared toolkit primitive; the
           ;; try guards a read error (e.g. a permission denial on an existing file). The
           ;; display name is project-relative inside a project, else the basename
           ;; (`file-display-name`) — `:file` keeps the full path for saving / dedup.
-          ;; A file that exists but is not UTF-8 (an ELF, an image) opens as a hex view
+          ;; A binary file (an ELF, an image) opens as a hex view
           ;; (`ed-open-binary`, Emacs hexl-mode) instead of failing on the decode. The
           ;; file is read ONCE (`ed-read-file`): the decode that tells text from binary
           ;; is the text the buffer is built from.
-          (let (exists? (file/exists? path)
-                contents (when exists? (try (ed-read-file path) (catch e {:error e}))))
-            (cond
-              (:error contents) (message m (str "open failed: " (error-message (:error contents))))
-              (:bytes contents) (ed-open-binary m path root (:bytes contents))
-              else (ed-open-text m path root (:text contents))))))))
+          else
+            (let (exists? (file/exists? path)
+                  contents (when exists? (try (ed-read-file path) (catch e {:error e}))))
+              (cond
+                (:error contents)
+                  (message m (str "open failed: " (error-message (:error contents))))
+                (:bytes contents) (ed-open-binary m path root (:bytes contents))
+                else (ed-open-text m path root (:text contents) (:coding contents))))))))
 (sig ed-find-file (model string -> model))
 
-(defn- ed-open-text (m path root text)
+(defn- ed-open-text (m path root text coding)
   "The pool with `path` open in a new buffer holding `text` (its contents, already read —
-nil for a file that does not exist yet), selected, and the open said in the echo area."
+nil for a file that does not exist yet) in `coding` (nil for UTF-8), selected, and the open
+said in the echo area."
   (try
-    (let (opened-buf (assoc (if (nil? text) (find-file-buffer path) (buffer-from-file path text))
+    (let (opened-buf (assoc (charset/with-coding (if (nil? text)
+                                                   (find-file-buffer path)
+                                                   (buffer-from-file path text))
+                              coding)
                        :name (file-display-name path root))
           ;; save-place: back where you left it (live editor only, like recentf)
           placed (if (:save-place m) (saveplace/restore-place opened-buf) opened-buf)
@@ -705,6 +736,7 @@ nil for a file that does not exist yet), selected, and the open said in the echo
       (message opened
         (or recovery
           (str (if (nil? text) (str "new file " path) (str "opened " path))
+            (if coding (str " as " (charset/label coding)) "")
             ;; a tree-sitter language with no grammar loaded says how to get one
             (grammars/missing-note (ed-current-buf opened))
             (if so-long-note (str " — " so-long-note) "")))))
@@ -853,7 +885,7 @@ them a second time."
 (defn ed-save-buf-at (m i)
   "Write pool buffer `i` to its file: the plain save every path shares — `C-x C-s` on the
 current buffer, and `save-some-buffers` on any other at quit. The buffer comes back unmodified
-(`save-buffer` sets its baseline) and its `#filename#` auto-save sidecar is deleted on success;
+(`charset/save` sets its baseline) and its `#filename#` auto-save sidecar is deleted on success;
 reports the outcome in the echo area either way. The diff-hl gutter is NOT recomputed
 here: a save writes the working tree but touches neither the buffer text nor HEAD, so
 the buffer-vs-HEAD diff is unchanged (and any prior edit already refreshed it via the
@@ -868,7 +900,7 @@ A buffer edited AS ROOT (`:sudo`, sudoedit.blsp) is written through sudo instead
 (`sudoedit/ed-sudo-save`, which may ask for the password first)."
   (if (= true (:sudo (ed-buf-at m i)))
     (ed-save-as-root m i)
-    (ed-save-buf-with m i save-buffer "")))
+    (ed-save-buf-with m i charset/save "")))
 (sig ed-save-buf-with (model int any string -> model))
 (defn ed-save-buf-with (m i write note)
   "[[ed-save-buf-at]]'s save of pool buffer `i` with the file written by `write` — `(write
@@ -947,3 +979,31 @@ stays modified, its newer text unwritten. `note` follows the `saved …` the ech
           (when proc (buffer-edit proc (self) (fn (pb) (mark-buffer-saved (buffer-stamp-file pb)))))))
       (message (dissoc (ed-set-buf-at m i saved) :status)
         (str "saved " f note (if current? "" " (edited since — still modified)"))))))
+
+(defn ed-reopen-as-text (m path coding)
+  "The hex view of `path` replaced by the file as text in `coding`, for a binary that was not
+one (`filecoding`). Says so when the file is not valid in it."
+  (let (text (charset/decode (file/slurp-bytes path) coding)
+        index (ed-buffer-index-by-file m path))
+    (if (nil? text)
+      (message m (str path " is not " (charset/label coding)))
+      (ed-open-text (if (nil? index) m (ed-kill-buffer-at m index))
+        path
+        (:project-root m)
+        text
+        (if (= coding :utf-8) nil coding)))))
+
+(defn ed-show-as-hex (m i bytes)
+  "Pool buffer `i` replaced by the hex view of its file, whose `bytes` these are, for a text
+that was not one (`filecoding`). A buffer with unsaved text is the caller's to refuse."
+  (let (path (buffer-file (ed-buf-at m i)))
+    (if (nil? path)
+      (message m "this buffer visits no file")
+      (ed-open-binary (ed-kill-buffer-at m i) path (:project-root m) bytes))))
+
+(check-allow :trusted
+  (defn ed-revert-as-root (m i coding)
+    "Read pool buffer `i`, edited as root, again through sudo (`sudoedit/ed-sudo-revert`, which
+may ask for the password first). Loads `sudoedit` on first use."
+    (do (require-one 'sudoedit) ((reflect/eval 'sudoedit/ed-sudo-revert) m i coding))))
+(sig ed-revert-as-root (model int any -> model))
