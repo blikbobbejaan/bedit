@@ -19,6 +19,7 @@ self-editing editor)."
   (:use scroll) ; ed-scroll / ed-max-top / ed-long-lines — keeping point on screen
   (:use guest)
   (:use clipboard)
+  (:use minibuffer)
   (:use model) ; message, the minibuffer field, current-buffer accessors, the registries
   (:use panes) ; ed-selected-text-rows (split-aware viewport) + ed-mouse (event folding)
   (:use hittest) ; ed-modeline-click / ed-modeline-hover / ed-diag-hover / ed-link-hover / ed-menu-hit — pointer hit-tests
@@ -391,157 +392,8 @@ otherwise resolve and run the key through the active keymap (`ed-dispatch-key`).
         (assoc m2 :echo (str "C-u " (map/get-in m2 [:prefix-arg :count]) "-")))
       (ed-arm-repeat-mode (ed-dispatch-key m input) input))))
 
-;; ---- the minibuffer (modal: when active, all input is the minibuffer's) ------
-;; A one-line prompt that REUSES the REPL line editor: `:minibuffer :edit` is a
-;; `std/lineedit` state (the same pure core std/observer's minibuffer drives), so
-;; the prompt gets emacs editing for free — C-a/C-e, C-f/C-b, M-f/M-b, C-k/C-u/C-w/
-;; M-d, C-y yank, C-t, ↑/↓ history, C-r reverse-search. Keys are fed to
-;; `lineedit-handle`; we intercept only **Tab** (per-prompt completion via the
-;; minibuffer's `:complete-fn`, not lineedit's symbol completion) and **Esc / C-g**
-;; (abort). Enter makes lineedit set `:done :submit`, and we run `:on-complete` with
-;; the text; C-c (`:cancel`) closes. (The text/point/prompt accessors live in `model`.)
-
-(defn- mb-preview (m cand)
-  "Fire the active minibuffer's optional `:on-preview` hook with the currently-selected
-candidate `cand`, returning the updated model. The hook previews the selection (e.g. imenu
-jumps point to that symbol) *without* closing the prompt; absent hook or nil candidate is a
-no-op. The post-step `ed-scroll` then brings the previewed point into view."
-  (let (hook (map/get-in m [:minibuffer :on-preview]))
-    (if (or (nil? hook) (nil? cand)) m (hook m cand))))
-
-(defn- mb-close (m)
-  "The model with the minibuffer closed — the ONE place a prompt goes away, so the things a
-prompt owns are released exactly once. Today that is its ranking session
-(`model/ed-mb-stop-ranker`): a process that outlives its prompt is a leak, and a prompt is
-closed from four places (abort, Enter on a selection, Enter on the typed text, lineedit's
-own `:submit`), which is three too many to remember it in."
-  (ed-minibuffer-closed m))
-
-(defn- mb-abort (m)
-  "Close the minibuffer, first firing its optional `:on-abort` hook so a previewing prompt
-can restore the position it started from (the imenu cancel-returns-home behaviour)."
-  (let (hook (map/get-in m [:minibuffer :on-abort])
-        m2 (if (nil? hook) m (hook m)))
-    (assoc (mb-close m2) :echo "quit")))
-
-(defn- mb-with-edit (m edit)
-  "The model with the minibuffer's line replaced by lineedit state `edit`. The selection
-goes back to where a fresh list starts (`mb-sel`: the first row, or the prompt itself): the
-line changed, so the candidate list did too."
-  (assoc m :minibuffer (dissoc (assoc (:minibuffer m) :edit edit) :sel)))
-
-(defn- mb-set-line (m text)
-  "The model with the minibuffer's line replaced by `text`, point at its end."
-  (mb-with-edit m (ed-mb-set-text (map/get-in m [:minibuffer :edit]) text)))
-
-(defn- mb-choices (mb)
-  "The candidates a selection can be made among: the candidate list of a prompt that
-accepts a selection (Vertico-style — M-x, C-x b, C-x p f), else `()`."
-  (if (:accept-selection mb) (mb-candidates mb) ()))
-
-(defn- mb-chosen (mb choices)
-  "The candidate the selection rests on, clamped to the list (it can be a row past the end
-after the list shrank) — or nil when there is nothing to choose among, or the selection is
-on the prompt itself (`mb-sel` -1), so the typed text is what is meant."
-  (let (sel (mb-sel mb))
-    (if (or (empty? choices) (< sel 0)) nil (nth choices (math/min sel (dec (count choices)))))))
-
-(defn- mb-moved-sel (mb size motion)
-  "The row a list-motion key moves the selection to. From the prompt (-1), `C-p` goes to the
-last row as Vertico's does; everything else is `editor/list-motion`'s."
-  (let (sel (mb-sel mb))
-    (if (and (< sel 0) (= motion :previous))
-      (dec size)
-      (editor/list-motion/motion-index sel size motion))))
-
-(defn- mb-select (m choices index)
-  "Move the selection to row `index` of `choices`, firing `:on-preview` with the candidate
-there so a previewing prompt (imenu) tracks the highlight."
-  (mb-preview (map/assoc-in m [:minibuffer :sel] index) (nth choices index)))
-
-(defn- mb-yank (m)
-  "C-y pastes the EDITOR's kill ring (and the OS clipboard) into the line — the minibuffer
-is where a search string or a path gets pasted; the line editor's own C-y knows only what
-C-k/C-w cut from the line, which is never what a paste means."
-  (let ([m1 text] (ed-kill-head m))
-    (if (nil? text)
-      (message m1 "kill ring is empty")
-      (mb-with-edit m1 (editor/lineedit/lineedit-insert (map/get-in m1 [:minibuffer :edit]) text)))))
-
-(defn- mb-complete (m choices)
-  "Tab on a Vertico prompt with candidates fills the **selected** candidate (the highlighted
-row), not the common prefix of the typed text — so Tab on a hovered directory completes THAT
-directory (its trailing \"/\" then re-lists its contents = expands it) instead of snapping
-the selection back to the top. With no candidates (a freshly typed path), fall back to the
-prompt's own `:complete-fn`; a prompt with nothing to complete against (compile, a preset
-name) leaves the text as typed — Tab used to call a nil `:complete-fn` and echo an error."
-  (let (mb (:minibuffer m)
-        chosen (mb-chosen mb choices))
-    (mb-set-line m
-      (if (nil? chosen) ((or (:complete-fn mb) identity) (mb-text mb)) chosen))))
-
-(defn- mb-submit (m text)
-  "Close the prompt and run its `:on-complete` with `text`, remembering `text` as an answer
-to this prompt (`savehist/remember!`, a no-op unless savehist is on) — unless the prompt is
-marked `:no-history` (a credential)."
-  (when (not (:no-history (:minibuffer m))) (savehist/remember! (mb-prompt (:minibuffer m)) text))
-  ;; an answered prompt is a command too (`:command-count`): `M-g g 60 RET` jumps as surely as
-  ;; `M->` does, and pulse tells a jump from the mouse by the count
-  ((map/get-in m [:minibuffer :on-complete]) (assoc (mb-close m)
-                                               :command-count (inc (or (:command-count m) 0)))
-    text))
-
-(defn- mb-line-edit (m input)
-  "Every other key drives lineedit's pure editor: on `:submit` (Enter) run `:on-complete`
-with the text, on `:cancel` close, else keep editing (typing resets the selection)."
-  (let (edit (editor/lineedit/lineedit-handle (map/get-in m [:minibuffer :edit]) input)
-        done (:done edit))
-    (cond
-      (nil? done) (mb-with-edit m edit)
-      (= done :submit) (mb-submit m (:text edit))
-      else (mb-abort m))))
-
-(defn minibuffer-handle (m input)
-  "Fold one key into the active minibuffer. C-y pastes the kill ring; Tab completes
-(`mb-complete`); Esc / C-g abort (firing `:on-abort`); a list-motion key (`editor/list-motion`
-— C-n/↓, C-p/↑, M-< / M->) moves the selection and fires `:on-preview`; Enter accepts the
-selected candidate, else the typed text; every other key drives lineedit's pure editor
-(`mb-line-edit`)."
-  ;; No forced re-rank on Tab/Enter/↑/↓ any more. It existed because a large source was
-  ;; DEBOUNCED onto the idle beat and could be showing a stale list when you acted on it —
-  ;; so a selection move ranked the whole set synchronously, which on a 27k-file project
-  ;; cost 210 ms per ↓ and made holding it useless. A session ranks off the loop, so the
-  ;; list is never more than one in-flight answer behind and a selection move is free.
-  (let (mb (:minibuffer m)
-        choices (mb-choices mb)
-        motion (editor/list-motion/motion-of input))
-    (cond
-      ;; a masked read (a password) offers nothing to act on: embark would hand the typed
-      ;; secret to a copy or an insert
-      (and (:masked mb) (includes? [(keyword "ctrl-.") (keyword "ctrl-;")] input)) m
-      ;; embark from the minibuffer: act on the selected candidate
-      (= input (keyword "ctrl-.")) (embark/embark-act m)
-      (= input (keyword "ctrl-;")) (embark/embark-dwim m)
-      (= input :ctrl-y) (mb-yank m)
-      (= input :tab) (mb-complete m choices)
-      (ed-cancel-key? input) (mb-abort m)
-      ;; a selection move needs a list to move in: with none, C-n/C-p/↑/↓ fall through to
-      ;; lineedit's history. M-< / M-> jump to the ends of the LIST, the way they jump to
-      ;; the ends of a buffer — falling through to lineedit read them as ordinary text, so a
-      ;; long imenu could only be crossed a row at a time.
-      (and motion (not (empty? choices)))
-        (mb-select m choices (mb-moved-sel mb (count choices) motion))
-      ;; Enter accepts the *selected candidate* (Vertico prompt with candidates), else the
-      ;; typed text (find-file, or no candidates).
-      (= input :enter)
-        (let (chosen (mb-chosen mb choices))
-          (mb-submit m (if (nil? chosen) (mb-text mb) chosen)))
-      else (mb-line-edit m input))))
-
-;; `ed-cancel-key?` moved to `model` — it is key vocabulary, like `ed-key-label`, and
-;; `transient` needs it too. It cannot live here: `input` owns the overlay that drives a
-;; transient menu, so a transient module reaching back into `input` for one predicate
-;; would close a cycle around the whole dispatcher.
+;; `ed-cancel-key?` lives in `keyhelp`: it is key vocabulary, like `ed-key-label`, and
+;; `transient` needs it too.
 
 ;; ---- transient input overlays (one registry; std's fallthrough policy) ------
 ;; The minibuffer, the completion popup, incremental search, and query-replace are
@@ -1613,3 +1465,28 @@ functions, the view's pane, a click)."
 ;; a narrow sig on an interior node with untyped callers just moves the width reports
 ;; upstream (measured: four interior sigs took --strict from 368 back up to 438).
 (sig ed-update (model any int int -> model))
+
+(defn ed-post-step (m input)
+  "The post-event step run after `input/ed-update` folds an event in. The eldoc hint and
+the advisory type-check are **debounced onto idle timers** (ADR-102; Emacs's idle-timer
+model) — recomputing them per keystroke makes a large buffer crawl. So this recomputes
+nothing directly; it reconciles `:timers` (`ed-sync-timers`) with the new model
+state — arming the eldoc/diagnostics debounce, the which-key delay, and the undo-pause
+boundary when each is due — and the timers' firing (in `input/ed-timer-fire`) does the
+work; then runs the registered post-step hooks (`ed-run-post-steps`). Finally refreshes
+the open minibuffer's memoized candidate list (`ed-cache-mb-candidates`) so the view/input
+read it cheaply."
+  (let (
+        ;; while a web mirror is running, a real keystroke/click marks the snapshot dirty
+        ;; so the idle beat republishes it once (debounced off the hot key path —
+        ;; `ed-sync-timers` arms `:idle-recompute`, `web-publish!` fires there). Timer and
+        ;; system events don't dirty it, so the mirror only refreshes after actual
+        ;; edits/moves.
+        touched (if (and (:server m) (ed-real-input? input)) (assoc m :web-dirty true) m)
+        stepped (ed-run-post-steps (ed-sync-timers touched))
+        mb (:minibuffer stepped))
+    ;; Bring the candidate list up to date with the typed text: a small source ranks here on
+    ;; the keystroke (instant), a large one ASKS its ranking session and folds the answer
+    ;; when it arrives (`ed-cache-mb-candidates`). Either way this is O(1) on the event when
+    ;; the text has not changed, which is every frame, tick and selection move.
+    (if (or (nil? mb) (not (mb-source? mb))) stepped (ed-cache-mb-candidates stepped))))

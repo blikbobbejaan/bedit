@@ -1,0 +1,503 @@
+(defmodule minibuffer
+  "The minibuffer: a one-line prompt over lineedit's pure editor, with a list under it.
+
+Modal: while `:minibuffer` is set, every key is the minibuffer's (`minibuffer-handle`). The
+candidates rank on the keystroke for a small source, in a session off the loop for a large
+one, and a prompt can open once its candidates are ready. A prompt closes in ONE place
+(`mb-close`), so what it owns is released exactly once."
+  (:use completion) ; completion-rank — the fuzzy rank, capped to what it shows
+  (:use clipboard :only [ed-kill-head]) ; C-y pastes the kill ring
+  (:use keyhelp :only [ed-cancel-key?])
+  (:use model))
+
+;; ---- the minibuffer (a one-line prompt over lineedit's pure editor core) -----
+;; The `:minibuffer` field is `{:edit <lineedit-state> :on-complete :complete-fn
+;; :candidates-fn}`. `:edit` is a `std/lineedit` state, so the prompt reuses the
+;; REPL line editor's editing (motion, kill-ring, yank, history, reverse-search) —
+;; the same core std/observer's minibuffer drives. `minibuffer/minibuffer-handle` feeds
+;; keys to `lineedit-handle`; these accessors read the editor's text/point/prompt.
+
+(defn ed-mb-set-text (edit s)
+  "The lineedit state `edit` with its text replaced by `s`, point at the end."
+  (assoc edit :text s :point (string/length s) :hist-idx -1))
+
+(defn ed-mb-edit (prompt initial)
+  "A fresh minibuffer line-editor state showing `prompt`, prefilled with `initial`
+text (point at end). Stored as the minibuffer's `:edit`. Its history (↑ / M-p) is what
+`prompt` was answered with before (`savehist/history-for`; empty unless savehist is on)."
+  (ed-mb-set-text (editor/lineedit/lineedit-init prompt (savehist/history-for prompt)) initial))
+
+(defn mb-text (mb) "The minibuffer's current input text." (map/get-in mb [:edit :text]))
+(defn mb-shown-text (mb)
+  "The minibuffer's input as the echo line SHOWS it: the text, or a `*` per character for
+a masked read (`passwd/ed-read-passwd`), as Emacs's `read-passwd` shows one. Everything
+painted from the input reads this."
+  (let (text (mb-text mb))
+    (if (:masked mb) (string/repeat "*" (string/length text)) text)))
+(sig mb-point (any -> int))
+(defn mb-point (mb)
+  "The minibuffer cursor index (into its input), 0 before the line editor has one."
+  (let (point (map/get-in mb [:edit :point]))
+    (if (int? point) point 0)))
+(defn mb-prompt (mb) "The minibuffer prompt string." (map/get-in mb [:edit :prompt]))
+(sig mb-sel (any -> int))
+(defn mb-sel (mb)
+  "The selected candidate index (Vertico-style): the row a selection move put it on; with
+none, -1 — the PROMPT itself, so Enter takes the typed text — when the prompt's
+`:preselect-prompt?` holds for that text (Vertico's `vertico-preselect 'directory`: a path
+prompt whose line names a directory opens the directory), else the first row."
+  (let (sel (:sel mb)
+        prompt? (:preselect-prompt? mb))
+    (cond
+      (int? sel) sel
+      (and prompt? (prompt? (mb-text mb))) -1
+      else 0)))
+(defn mb-source? (mb)
+  "True if `mb` produces candidates from a fixed `:rank-source` (fuzzy-ranked, narrowable), a
+`:candidates-fn` (computed each keystroke) or an `:async-source` (computed off the loop)."
+  (or (:rank-source mb) (:candidates-fn mb) (:async-source mb)))
+
+(defn mb-rank-options (mb)
+  "The `std/fuzzy` options minibuffer `mb` ranks with: its `:category` (`:file` ranks paths
+by their file name) and its `:rank-boost` (`{candidate n}` — the history or frecency a
+prompt was opened with). The same map whether it ranks inline or in a session, so the two
+can never order a prompt differently."
+  {:category (:category mb) :boost (:rank-boost mb)})
+
+(defn- mb-rank (mb text)
+  "The candidate list for minibuffer `mb` at input `text`: a `:rank-source` prompt is
+fuzzy-ranked to its `:rank-cap` (`completion/completion-rank`, which only ever does the
+work the cap needs — see there), a `:candidates-fn` prompt computes its own, and a prompt
+with neither has none.
+
+There is no narrowing cache here. There used to be: each keystroke ranked the *previous*
+result rather than the whole source, which is exact (a longer query can only drop matches)
+but only helps when the previous result is small — and a short query over a project matches
+nearly every path, so it saved nothing on the one source where it mattered. Ranking to a
+cap made it worthless AND wrong: the cached ranking would be the capped twenty, and
+narrowing from those would drop matches that belong in the next twenty."
+  (cond
+    (:rank-source mb)
+      (completion-rank text (:rank-source mb) (or (:rank-cap mb) 20) (mb-rank-options mb))
+    (:candidates-fn mb) ((:candidates-fn mb) text)
+    else ()))
+
+(def ed-minibuffer-max 10) ; most list rows the echo area grows to (Emacs vertico-count)
+(defn ed-which-key-count (m)
+  "Number of pending which-key continuation rows (0 when the panel isn't showing — no
+pending prefix, not yet revealed, or a minibuffer/menu is open)."
+  (let (km (:pending m))
+    (if (or (nil? km) (not (:which-key m)) (:minibuffer m) (:menu m))
+      0
+      (count (%map-pairs km)))))
+
+(sig ed-list-rows (int int -> int))
+(defn- ed-list-rows (n rows)
+  "Echo-area height for an `n`-row list below the prompt: 0 → 1 (just the prompt), else
+1 + the list capped to `ed-minibuffer-max` and the screen."
+  (if (= n 0) 1 (+ 1 (math/min ed-minibuffer-max n (math/max 1 (- rows 4))))))
+
+;; `map`, not `model`: it reads `:minibuffer` and the which-key count alone, and the layout
+;; tests hand it a bare `{}` — which the `model` record's required fields refuse at run time
+;; (ADR-380).
+(sig ed-echo-rows (map int -> int))
+(defn ed-echo-rows (m rows)
+  "How many bottom screen rows the echo area occupies. It grows **downward** from below
+the mode line (Emacs-style): 1 (the prompt/message row) plus a list — Plume's candidate
+list for an open selection prompt, or the which-key continuations for a pending prefix.
+`ed-body-layout` reserves this many rows so the pane + its mode line sit above; `view`
+lays the prompt + list into them."
+  (let (mb (:minibuffer m))
+    (if (and mb (:accept-selection mb))
+      (ed-list-rows (count (mb-candidates mb)) rows)
+      (ed-list-rows (ed-which-key-count m) rows))))
+
+(defn mb-candidates (mb)
+  "The current candidate list for minibuffer `mb` — fuzzy-ranked from its `:rank-source`,
+or its `:candidates-fn` applied to the typed text, or `()` with neither.
+**Memoized on the input text** via `:cand-cache` (refreshed by `ed-cache-mb-candidates`
+each event): the view reads this every frame and input reads it on every selection move,
+so without the memo a large candidate set (e.g. a whole project's files) would be
+re-ranked several times per keystroke and again on every idle tick. The shared seam the
+view (the vertical list) and input (selection + accept) both read. A cache miss ranks
+fresh."
+  (let (cache (:cand-cache mb))
+    (cond
+      ;; a fresh hit (the cache is for the current text) — the common case
+      (and cache (= (:for cache) (mb-text mb))) (:cands cache)
+      ;; a big source being ranked OFF the loop: show what the session last answered. Never
+      ;; rank inline here — this is called from the view and from every selection move, and
+      ;; ranking on either is what made holding ↓ cost 210ms a step on a 27k-file project.
+      (and cache (or (:ranker mb) (:async-source mb))) (:cands cache)
+      ;; an off-loop source with no answer yet lists nothing until its first one lands
+      (:async-source mb) ()
+      ;; otherwise (small source, or no cache yet) recompute now — instant, and what the
+      ;; per-keystroke and direct-text-set paths rely on
+      else (mb-rank mb (mb-text mb)))))
+
+;; ---- ranking a big candidate set off the loop (std/fuzzy's `ranker`, ADR-374) ----
+;; A prompt over a whole project hands its candidates to a ranking SESSION — a process that
+;; owns the set — and then asks it a query per keystroke instead of ranking here. The loop
+;; sends and returns; the answer arrives as a `[:fuzzy-ranked …]` event and folds into the
+;; cache like any other async reply (`input/ed-ev-ranked`).
+;;
+;; This replaces a debounce, which is what the same problem looked like while the ranking
+;; still had to happen HERE: defer it to the idle beat, show a stale list meanwhile, and pay
+;; the whole cost in one lump the moment typing paused (measured 163 ms on the idle beat, and
+;; 210 ms on a single ↓, which forced a fresh rank). Off the loop there is nothing to defer:
+;; every keystroke asks, the session drops the queries it has been overtaken on, and the
+;; newest answer lands when it lands. Typing is never blocked by finding — which is the
+;; distinction the whole thing turns on.
+
+(defdyn *mb-session-min* 800)
+;; A `:rank-source` bigger than this gets a ranking session; smaller ones rank inline on the
+;; keystroke, where a session's process + the copy of the set would cost more than it saves.
+
+(defn mb-session? (mb)
+  "Whether minibuffer `mb`'s candidate source is big enough to rank off the loop — a fixed
+`:rank-source` past `*mb-session-min*` (a `:candidates-fn` prompt computes its own way)."
+  (let (src (:rank-source mb))
+    (and src (> (count src) *mb-session-min*))))
+
+(defn ed-mb-ensure-ranker (m)
+  "Give the open minibuffer a `fuzzy/ranker` session over its `:rank-source` if it wants one
+and has none. Lazy, and on the per-event path rather than at every prompt's call site: a
+prompt is a plain map built in a dozen places (`commands`, `mincomplete`, `interactive`), and
+none of them should have to know about sessions to get one. A small source, a prompt that
+computes its own candidates, or a headless model (a test, a `--headless` daemon — nowhere for
+the reply to land) gets none and keeps ranking inline."
+  (let (mb (:minibuffer m))
+    (if (or (nil? mb) (:ranker mb) (not (mb-session? mb)) (ed-headless?))
+      m
+      (assoc m
+        :minibuffer (assoc mb :ranker (fuzzy/ranker (:rank-source mb) (mb-rank-options mb)))))))
+
+(defn ed-mb-stop-ranker (m)
+  "Stop the open minibuffer's ranking session, if it has one. Called wherever the prompt
+closes (`minibuffer/mb-close`), so a session never outlives the prompt that owns it."
+  (let (session (map/get-in m [:minibuffer :ranker]))
+    (do (when session (fuzzy/ranker-stop session)) m)))
+
+(defn ed-minibuffer-closed (m)
+  "`m` with the open prompt gone — its ranking session stopped ([[ed-mb-stop-ranker]]) — and a
+[[message]] that was showing beside it, said since the last key, moved to the echo area,
+where it would have gone with no prompt open."
+  (let (said (map/get-in m [:minibuffer :message])
+        closed (assoc (ed-mb-stop-ranker m) :minibuffer nil))
+    (if (nil? said) closed (assoc closed :echo said))))
+
+(defn ed-apply-ranked (m session query hits)
+  "Fold a ranking session's reply into the open minibuffer's `:cand-cache`. Dropped unless
+`session` is the prompt's own — a reply from a session whose prompt has already closed (or
+been replaced) must not overwrite the new one's list. The session answers only the newest
+query it was asked, so `query` is stamped as what the cache is FOR: if the reader has typed
+on since, `ed-cache-mb-candidates` sees the mismatch on the next event and asks again."
+  (if (not (= (map/get-in m [:minibuffer :ranker]) session))
+    m
+    (map/assoc-in m [:minibuffer :cand-cache] {:for query :cands hits})))
+
+(defn mb-cands-stale? (m)
+  "True if an open candidate prompt's cached list is for a different input than the current
+text — an answer is outstanding. With a session that means one has been asked for and not
+arrived; without one it is never true, since an inline source is kept current on the event."
+  (let (mb (:minibuffer m))
+    (and mb
+      (mb-source? mb)
+      (not (= (map/get-in mb [:cand-cache :for]) (mb-text mb))))))
+
+(defn ed-mb-reask (m)
+  "Re-ask the ranking session for the current text if an answer is still outstanding — the
+idle beat's safety net. Everything else here assumes a question gets an answer; this is the
+one place that does not, so a reply lost to a dead session (or a prompt that somehow asked
+before its session existed) recovers on the next quiet moment rather than showing a stale
+list until the reader gives up and retypes. A no-op when the cache is current."
+  (if (mb-cands-stale? m)
+    (ed-cache-mb-candidates (assoc m :minibuffer (dissoc (:minibuffer m) :asked)))
+    m))
+
+;; the minibuffer is the model's own, so this job is the one row the model registers itself
+(register-idle-job :minibuffer-rerank
+  {:order 70 :run 'minibuffer/ed-mb-reask :stale? 'minibuffer/mb-cands-stale?})
+
+;; ---- candidates computed off the loop (consult's async sources) ----------------
+;; A prompt whose candidates come from a PROGRAM run on the typed text — consult-ripgrep's
+;; `rg` over the project — names it as `:async-source`, a `(text) -> candidates` function.
+;; Each new text runs it in a task (`:mb-async`), cancelling the one it overtook, and the
+;; list keeps the last answer until the new one lands. A headless model (a test) runs it
+;; inline, as a session-ranked prompt ranks inline there.
+
+(defn- ed-mb-ask-async (m mb text)
+  ;; run `mb`'s `:async-source` on `text`: in a task, once per text, the previous run
+  ;; cancelled; inline when headless
+  (cond
+    (= (:asked mb) text) m
+    (ed-headless?)
+      (assoc m
+        :minibuffer (assoc mb :asked text :cand-cache {:for text :cands ((:async-source mb) text)}))
+    else
+      (let (source (:async-source mb)
+            _ (when (:mb-async m) (task/cancel (:mb-async m))))
+        (assoc m
+          :minibuffer (assoc mb :asked text)
+          :mb-async (task/task (fn () {:for text :cands (source text)}))))))
+
+(defn ed-apply-mb-async (m answer)
+  "Fold an `:async-source` run's `answer` (`{:for text :cands …}`, nil when it failed) into
+the open prompt when it is still the text the prompt last asked about; the selection goes
+back to the first row, since the rows under it changed. A prompt closed or retyped since
+drops it."
+  (let (m1 (dissoc m :mb-async)
+        mb (:minibuffer m1))
+    (if (or (nil? answer) (nil? mb) (nil? (:async-source mb)) (not (= (:asked mb) (:for answer))))
+      m1
+      (assoc m1 :minibuffer (assoc (dissoc mb :sel) :cand-cache answer)))))
+
+(register-task-reply :mb-async 'minibuffer/ed-apply-mb-async nil nil {:cancel-on-quit? true})
+
+;; ---- a prompt that opens once its candidates are ready ---------------------------
+;; A command whose candidates come from a SLOW call that does not depend on the typed
+;; text — a build tool asked for its tasks (`mix help` takes seconds) — used to make that
+;; call inside the keypress, and the editor froze until it answered. It hands the call to
+;; [[ed-open-when-ready]] instead: the call runs in a task, the activity chip names the
+;; wait, keys keep working, and the prompt opens when the answer lands.
+
+;; Each CALLER waits in its own slot (`key`): a project search and a project-task listing
+;; are different questions, and with one shared slot starting either cancelled the other.
+;; A second call from the SAME caller overtakes its first, which is the point of a slot.
+
+(defn ed-ready-slot (key)
+  "The model field caller `key`'s [[ed-open-when-ready]] call waits in — `:ready-wait` for
+`:default`, else `:ready-wait-<key>` — with its open and label beside it, and its row in the
+task-reply table (registered here, so a caller needs no setup).
+
+    (minibuffer/ed-ready-slot :search)   ;=> :ready-wait-search"
+  (let (slot (if (= key :default) :ready-wait (keyword (str "ready-wait-" (->string key))))
+        label-field (second (ed-ready-fields slot)))
+    (do
+      ;; the activity chip reads the label from the label field (a keyword label is a field)
+      (register-task-reply slot
+        'minibuffer/ed-apply-ready-event
+        :ready/failed label-field
+        {:cancel-on-quit? true :folds-event? true})
+      slot)))
+
+(defn- ed-ready-fields (slot)
+  "The fields beside `slot`: `[open-field label-field]` — `:ready-open` / `:ready-label` for
+the default slot, `<slot>-open` / `<slot>-label` for a caller's own."
+  (if (= slot :ready-wait)
+    [:ready-open :ready-label]
+    [(keyword (str (->string slot) "-open")) (keyword (str (->string slot) "-label"))]))
+
+;; check-allow: `open` is an opaque caller-supplied `(model candidates) -> model`; the
+;; declaration is the contract (ADR-341's `:trusted`)
+(check-allow :trusted
+  (sig ed-open-when-ready (model string fn fn &optional any -> model))
+  (defn ed-open-when-ready (m label produce open &optional (key :default))
+    "Run `produce` (a `() -> candidates` thunk that closes over what it needs, never the
+model) off the loop, then fold `(open m candidates)`: the prompt opens when the slow call
+answers. `label` names the wait in the activity chip; `key` names the CALLER, whose calls
+share one slot — a second overtakes its first, another caller's runs beside it. C-g
+cancels, a failed call says so; a headless model (a test) runs it inline."
+    (if (ed-headless?)
+      (open m (produce))
+      (let (slot (ed-ready-slot key)
+            [open-field label-field] (ed-ready-fields slot))
+        (do
+          (when (get m slot) (task/cancel (get m slot)))
+          (assoc m slot (task/task produce) open-field open label-field label))))))
+
+(defn ed-apply-ready (m answer &optional (slot :ready-wait))
+  "Fold an [[ed-open-when-ready]] call's `answer` (waiting in `slot`) through the `open` it
+was given; a call that failed (`:ready/failed`) is reported under its label instead."
+  (let ([open-field label-field] (ed-ready-fields slot)
+        open (get m open-field)
+        label (get m label-field)
+        m1 (dissoc m slot open-field label-field))
+    (cond
+      (nil? open) m1
+      (= answer :ready/failed) (assoc m1 :echo (str label ": failed"))
+      else (open m1 answer))))
+
+(defn ed-apply-ready-event (m event)
+  "Route a finished [[ed-open-when-ready]] task's reply `event` to the slot whose handle it
+answers ([[ed-apply-ready]]); a task that did not finish folds as `:ready/failed`."
+  (let (handle (nth event 1)
+        slot (seq/find (keys (ed-task-reply-table))
+               (fn (k)
+                 (and (string/starts-with? (->string k) "ready-wait") (= (get m k) handle)))))
+    (if (nil? slot)
+      m
+      (ed-apply-ready m (if (= (first event) :task-done) (nth event 2) :ready/failed) slot))))
+
+(ed-ready-slot :default)
+
+(defn ed-cache-mb-candidates (m)
+  "Bring the open minibuffer's `:cand-cache` (`{:for <text> :cands …}`) up to date with the
+typed text — by ASKING its ranking session when it has one (the answer folds in later,
+`ed-apply-ranked`), else by ranking inline. Run once per event by `ed-post-step`; a no-op
+with no minibuffer, no candidate source, or unchanged text.
+
+The `:asked` stamp is what keeps one keystroke to one question: the session already drops a
+query it has been overtaken on, but without this the view and every selection move would
+re-ask for the same text while the first answer was still in flight."
+  (let (m1 (ed-mb-ensure-ranker m)
+        mb (:minibuffer m1)
+        text (if (nil? mb) nil (mb-text mb)))
+    (cond
+      (or (nil? mb) (not (mb-source? mb))) m1
+      (= (map/get-in mb [:cand-cache :for]) text) m1
+      (:async-source mb) (ed-mb-ask-async m1 mb text)
+      (:ranker mb)
+        (if (= (:asked mb) text)
+          m1
+          (do
+            (fuzzy/rank-async (:ranker mb) text (or (:rank-cap mb) 20))
+            (assoc m1 :minibuffer (assoc mb :asked text))))
+      else (assoc m1 :minibuffer (assoc mb :cand-cache {:for text :cands (mb-rank mb text)})))))
+
+;; ---- the minibuffer (modal: when active, all input is the minibuffer's) ------
+;; A one-line prompt that REUSES the REPL line editor: `:minibuffer :edit` is a
+;; `std/lineedit` state (the same pure core std/observer's minibuffer drives), so
+;; the prompt gets emacs editing for free — C-a/C-e, C-f/C-b, M-f/M-b, C-k/C-u/C-w/
+;; M-d, C-y yank, C-t, ↑/↓ history, C-r reverse-search. Keys are fed to
+;; `lineedit-handle`; we intercept only **Tab** (per-prompt completion via the
+;; minibuffer's `:complete-fn`, not lineedit's symbol completion) and **Esc / C-g**
+;; (abort). Enter makes lineedit set `:done :submit`, and we run `:on-complete` with
+;; the text; C-c (`:cancel`) closes.
+
+(defn- mb-preview (m cand)
+  "Fire the active minibuffer's optional `:on-preview` hook with the currently-selected
+candidate `cand`, returning the updated model. The hook previews the selection (e.g. imenu
+jumps point to that symbol) *without* closing the prompt; absent hook or nil candidate is a
+no-op. The post-step `ed-scroll` then brings the previewed point into view."
+  (let (hook (map/get-in m [:minibuffer :on-preview]))
+    (if (or (nil? hook) (nil? cand)) m (hook m cand))))
+
+(defn- mb-close (m)
+  "The model with the minibuffer closed — the ONE place a prompt goes away, so the things a
+prompt owns are released exactly once. Today that is its ranking session
+(`minibuffer/ed-mb-stop-ranker`): a process that outlives its prompt is a leak, and a prompt is
+closed from four places (abort, Enter on a selection, Enter on the typed text, lineedit's
+own `:submit`), which is three too many to remember it in."
+  (ed-minibuffer-closed m))
+
+(defn- mb-abort (m)
+  "Close the minibuffer, first firing its optional `:on-abort` hook so a previewing prompt
+can restore the position it started from (the imenu cancel-returns-home behaviour)."
+  (let (hook (map/get-in m [:minibuffer :on-abort])
+        m2 (if (nil? hook) m (hook m)))
+    (assoc (mb-close m2) :echo "quit")))
+
+(defn- mb-with-edit (m edit)
+  "The model with the minibuffer's line replaced by lineedit state `edit`. The selection
+goes back to where a fresh list starts (`mb-sel`: the first row, or the prompt itself): the
+line changed, so the candidate list did too."
+  (assoc m :minibuffer (dissoc (assoc (:minibuffer m) :edit edit) :sel)))
+
+(defn- mb-set-line (m text)
+  "The model with the minibuffer's line replaced by `text`, point at its end."
+  (mb-with-edit m (ed-mb-set-text (map/get-in m [:minibuffer :edit]) text)))
+
+(defn- mb-choices (mb)
+  "The candidates a selection can be made among: the candidate list of a prompt that
+accepts a selection (Vertico-style — M-x, C-x b, C-x p f), else `()`."
+  (if (:accept-selection mb) (mb-candidates mb) ()))
+
+(defn- mb-chosen (mb choices)
+  "The candidate the selection rests on, clamped to the list (it can be a row past the end
+after the list shrank) — or nil when there is nothing to choose among, or the selection is
+on the prompt itself (`mb-sel` -1), so the typed text is what is meant."
+  (let (sel (mb-sel mb))
+    (if (or (empty? choices) (< sel 0)) nil (nth choices (math/min sel (dec (count choices)))))))
+
+(defn- mb-moved-sel (mb size motion)
+  "The row a list-motion key moves the selection to. From the prompt (-1), `C-p` goes to the
+last row as Vertico's does; everything else is `editor/list-motion`'s."
+  (let (sel (mb-sel mb))
+    (if (and (< sel 0) (= motion :previous))
+      (dec size)
+      (editor/list-motion/motion-index sel size motion))))
+
+(defn- mb-select (m choices index)
+  "Move the selection to row `index` of `choices`, firing `:on-preview` with the candidate
+there so a previewing prompt (imenu) tracks the highlight."
+  (mb-preview (map/assoc-in m [:minibuffer :sel] index) (nth choices index)))
+
+(defn- mb-yank (m)
+  "C-y pastes the EDITOR's kill ring (and the OS clipboard) into the line — the minibuffer
+is where a search string or a path gets pasted; the line editor's own C-y knows only what
+C-k/C-w cut from the line, which is never what a paste means."
+  (let ([m1 text] (ed-kill-head m))
+    (if (nil? text)
+      (message m1 "kill ring is empty")
+      (mb-with-edit m1 (editor/lineedit/lineedit-insert (map/get-in m1 [:minibuffer :edit]) text)))))
+
+(defn- mb-complete (m choices)
+  "Tab on a Vertico prompt with candidates fills the **selected** candidate (the highlighted
+row), not the common prefix of the typed text — so Tab on a hovered directory completes THAT
+directory (its trailing \"/\" then re-lists its contents = expands it) instead of snapping
+the selection back to the top. With no candidates (a freshly typed path), fall back to the
+prompt's own `:complete-fn`; a prompt with nothing to complete against (compile, a preset
+name) leaves the text as typed — Tab used to call a nil `:complete-fn` and echo an error."
+  (let (mb (:minibuffer m)
+        chosen (mb-chosen mb choices))
+    (mb-set-line m
+      (if (nil? chosen) ((or (:complete-fn mb) identity) (mb-text mb)) chosen))))
+
+(defn- mb-submit (m text)
+  "Close the prompt and run its `:on-complete` with `text`, remembering `text` as an answer
+to this prompt (`savehist/remember!`, a no-op unless savehist is on) — unless the prompt is
+marked `:no-history` (a credential)."
+  (when (not (:no-history (:minibuffer m))) (savehist/remember! (mb-prompt (:minibuffer m)) text))
+  ;; an answered prompt is a command too (`:command-count`): `M-g g 60 RET` jumps as surely as
+  ;; `M->` does, and pulse tells a jump from the mouse by the count
+  ((map/get-in m [:minibuffer :on-complete]) (assoc (mb-close m)
+                                               :command-count (inc (or (:command-count m) 0)))
+    text))
+
+(defn- mb-line-edit (m input)
+  "Every other key drives lineedit's pure editor: on `:submit` (Enter) run `:on-complete`
+with the text, on `:cancel` close, else keep editing (typing resets the selection)."
+  (let (edit (editor/lineedit/lineedit-handle (map/get-in m [:minibuffer :edit]) input)
+        done (:done edit))
+    (cond
+      (nil? done) (mb-with-edit m edit)
+      (= done :submit) (mb-submit m (:text edit))
+      else (mb-abort m))))
+
+(defn minibuffer-handle (m input)
+  "Fold one key into the active minibuffer. C-y pastes the kill ring; Tab completes
+(`mb-complete`); Esc / C-g abort (firing `:on-abort`); a list-motion key (`editor/list-motion`
+— C-n/↓, C-p/↑, M-< / M->) moves the selection and fires `:on-preview`; Enter accepts the
+selected candidate, else the typed text; every other key drives lineedit's pure editor
+(`mb-line-edit`)."
+  ;; No forced re-rank on Tab/Enter/↑/↓ any more. It existed because a large source was
+  ;; DEBOUNCED onto the idle beat and could be showing a stale list when you acted on it —
+  ;; so a selection move ranked the whole set synchronously, which on a 27k-file project
+  ;; cost 210 ms per ↓ and made holding it useless. A session ranks off the loop, so the
+  ;; list is never more than one in-flight answer behind and a selection move is free.
+  (let (mb (:minibuffer m)
+        choices (mb-choices mb)
+        motion (editor/list-motion/motion-of input))
+    (cond
+      ;; a masked read (a password) offers nothing to act on: embark would hand the typed
+      ;; secret to a copy or an insert
+      (and (:masked mb) (includes? [(keyword "ctrl-.") (keyword "ctrl-;")] input)) m
+      ;; embark from the minibuffer: act on the selected candidate
+      (= input (keyword "ctrl-.")) (embark/embark-act m)
+      (= input (keyword "ctrl-;")) (embark/embark-dwim m)
+      (= input :ctrl-y) (mb-yank m)
+      (= input :tab) (mb-complete m choices)
+      (ed-cancel-key? input) (mb-abort m)
+      ;; a selection move needs a list to move in: with none, C-n/C-p/↑/↓ fall through to
+      ;; lineedit's history. M-< / M-> jump to the ends of the LIST, the way they jump to
+      ;; the ends of a buffer — falling through to lineedit read them as ordinary text, so a
+      ;; long imenu could only be crossed a row at a time.
+      (and motion (not (empty? choices)))
+        (mb-select m choices (mb-moved-sel mb (count choices) motion))
+      ;; Enter accepts the *selected candidate* (Vertico prompt with candidates), else the
+      ;; typed text (find-file, or no candidates).
+      (= input :enter)
+        (let (chosen (mb-chosen mb choices))
+          (mb-submit m (if (nil? chosen) (mb-text mb) chosen)))
+      else (mb-line-edit m input))))

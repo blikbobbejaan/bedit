@@ -105,7 +105,7 @@ src/startup.blsp            the ONE startup path the window and `--serve` share:
                             (`font-warning`, from `gui/font-info`'s `:not-found`, brood ADR-442):
                             the echo area and *Messages* at startup, M-x reload-config, a served
                             window's console — never a silent DejaVu
-src/model.blsp              the ui-run model: buffer pool, panes, minibuffer, *Messages*,
+src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             the timers — and the REGISTRIES the rest plugs into: idle-beat jobs
                             (`register-idle-job`), off-loop task replies, inbound `[:tag …]`
                             event handlers, feature timers, process deaths
@@ -130,6 +130,11 @@ src/model.blsp              the ui-run model: buffer pool, panes, minibuffer, *M
                             STANDING QUESTION (a y/n read, a query-replace, a minibuffer prompt):
                             it shows beside it in brackets until the next key, as Emacs's
                             minibuffer message, and lands in *Messages* as always
+src/minibuffer.blsp         the minibuffer: a one-line prompt over std's lineedit with a list under
+                            it, modal (`minibuffer-handle`); ranks on the key for a small source,
+                            in a session off the loop for a large one; a prompt that opens once its
+                            candidates are ready. The accessors (`mb-text`, `mb-candidates`) and
+                            the echo area's height (`ed-echo-rows`) the layout reads
 src/clipboard.blsp          the kill ring and what it shares text with: kills mirror to the OS
                             CLIPBOARD; a mouse drag sets only PRIMARY (`ed-drag-select`, brood
                             ADR-553 — the clipboard and kill ring stay put unless
@@ -383,7 +388,7 @@ src/savehist.blsp           minibuffer answers kept per prompt across sessions (
                             `:savehist`): seeds the prompt's ↑ / M-p history; off until `main` turns it on
 src/passwd.blsp             a password a program asks for (Emacs read-passwd + comint's
                             password watch): `ed-read-passwd`, a MASKED minibuffer read (`*`s
-                            via `model/mb-shown-text`, no history, no savehist, no embark, no
+                            via `minibuffer/mb-shown-text`, no history, no savehist, no embark, no
                             macro recording; slow-turn tags of typed keys are `:text`), and
                             `password-prompt?`, comint's prompt regexp (case-folded `(?i)` and
                             `[[:alpha:]]`, brood ADR-573) — the fallback for the
