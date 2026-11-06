@@ -278,6 +278,11 @@ src/ownership.blsp          WHO registered each registry row: every `register-*`
                             run under the claimant of their symbol's namespace
                             (`with-symbol-claimant`, `own-namespace!`), so a row its code
                             registers as it runs is the package's too
+src/package-store.blsp      what is on disk under ~/.config/bedit/packages: installed packages, their
+                            manifests, source files, modules and declared settings. Files only
+src/package-ledger.blsp     what a loaded package did to the image, so it can be taken back:
+                            `note-loaded` records a load, `retire-package` undoes one (below).
+                            No network, no buffers, no model
 src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
                             hive packages that `:enhances bedit` at RUNTIME, into
                             ~/.config/bedit/packages (the elpa model) — never the build's _deps.
