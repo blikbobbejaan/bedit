@@ -1,0 +1,359 @@
+(defmodule modeline
+  "A pane's mode line: its segments (name, mode, scroll, line:col, the registered chips), the
+bar painted from them, and the hover tooltips. `hittest` asks the same segments and the same
+layout the bar was drawn with, so a click lands on the glyphs it is about."
+  (:use editor/buffer)
+  (:use model)
+  (:use minibuffer :only [ed-echo-rows]) ; the pointer's layout sits above the echo area
+  (:use panes) ; ed-body-layout / ed-pane-buf / ed-pane-top — the bar's geometry
+  (:use projects) ; project-name — the bracketed project label
+  (:use statusbar) ; the status-bar segment model + layout + zones + hover tooltip
+  (:use theme)
+  (:use ui-kit :only [ed-push-op])
+  (:use editor/ui) ; ui-memo — memoised view fragments (ADR-336)
+  (:use editor/display) ; frect — the bar's hairlines
+  (:use memo)) ; defmemo — the pointer's layout
+
+(def *modeline-hairline* 0.035) ; the status-bar rules — a hair finer than `view`'s dividers
+
+;; ---- a pane: its buffer body + its mode line --------------------------------
+
+;; `ed-pane-buf` / `ed-zoom-ratio` live in `panes` (this module `(:use panes)`).
+
+(defn- ed-project-label (m)
+  "`  [name]` of the model's current project (`:project-root`'s directory name), or
+`\"\"` when there is none — shown on the selected pane's mode line."
+  (let (root (:project-root m))
+    (if (nil? root) "" (str "  [" (project-name root) "]"))))
+
+(defn- ed-edit-state-label (m)
+  "The typing-mode name for the modal `:edit-state` — `NORMAL` / `INSERT` /
+`VISUAL` — spelled out on the selected pane's mode line, or `\"\"` under the Emacs
+profile (which has no modal state). Named rather than abbreviated (`<N>`): which
+mode you're in decides what every key does, so it's the one thing on the bar that
+should never need decoding."
+  (case (:edit-state m)
+    :insert "INSERT"
+    :visual "VISUAL"
+    :normal "NORMAL"
+    ""))
+
+(defn- ed-edit-state-face (m)
+  "The mode chip's colour: insert green (you are typing — the state where keys go
+into the buffer), visual mauve (a region is live), both bold; normal the plain bar colour,
+since it is the resting state and the bar keeps colour for a state that needs saying."
+  (case (:edit-state m)
+    :insert {:fg *green* :bold true}
+    :visual {:fg *mauve* :bold true}
+    {}))
+
+(sig ed-scroll-pct (int int int -> string))
+(defn ed-scroll-pct (top vrows linecount)
+  "Emacs-style scroll-position label for the mode line: `All` when the whole buffer
+fits, `Top` at the start, `Bot` when the last line shows, else `NN%` — the fraction of
+lines scrolled above the window."
+  (cond
+    (and (= top 0) (>= (+ top vrows) linecount)) "All"
+    (= top 0) "Top"
+    (>= (+ top vrows) linecount) "Bot"
+    else (str (math/quot (* 100 top) (math/max 1 (- linecount vrows))) "%")))
+
+(defn- ed-layer-segments (m buf)
+  "The buffer's layer `:modeline` contributions (`model/ed-layer-modeline-segments`) lifted
+into segments via `statusbar/coerce-seg` — a layer may return a `seg` map or a bare string
+(auto id + a `—` separator), so per-buffer mode chrome keeps working alongside the git
+segments. `map` over the contributions with their index gives each string a stable id."
+  (let (raw (ed-layer-modeline-segments m buf))
+    (map (seq/enumerate raw) (fn ([i contribution]) (coerce-seg contribution i)))))
+
+(sig ed-statusbar-segments (model pane buffer -> any))
+
+(def *spinner-frames* ["⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"])
+;; Braille dots: they occupy one cell in every font that has them, and they animate
+;; without the width of the line changing — an ASCII `|/-\` spinner is the same width but
+;; reads as noise beside text, and anything wider shifts the segments after it on every
+;; frame.
+
+(defn ed-activity-seg (m)
+  "The activity segment, or nil when nothing announced is running: a spinner frame and
+what is running — `⠹ fetching`, or `⠹ 2 jobs` when several are.
+
+The editor does a lot off the loop now — a pull, a fetch, a status on a repo where `git
+status` takes five seconds, a shell command, a project scan — and until this it said
+nothing while any of it ran, beyond a one-shot echo the next message overwrote. Work you
+asked for that produces no sign of itself is indistinguishable from a key that did not
+register, which is the feeling the whole async effort was supposed to remove.
+
+Naming the job matters more than the motion: `⠹` alone says the editor is busy, `⠹ pull`
+says what it is waiting for and therefore whether the wait is reasonable."
+  (let (jobs (ed-activity m))
+    (if (empty? jobs)
+      nil
+      (seg :activity
+        (str (nth *spinner-frames* (math/mod (:spin m 0) (count *spinner-frames*)))
+          " "
+          (if (= (count jobs) 1) (first jobs) (str (count jobs) " jobs")))
+        {:sep "  "
+         :face face-activity
+         :tooltip (into [] (map jobs (fn (j) (str "running: " j))))}))))
+(defn- ed-zoom-seg (pane)
+  "A zoomed pane's size as a chip, or nil — and the chip is the way back: one click and the
+pane is at the window's size again (`C-x C-0` from the keys). On the pane itself — a zoom is
+per pane, like a narrowing — so a split reads which side is zoomed, and the click lands on
+that side."
+  (let (zoom (get (:payload pane) :zoom))
+    (when zoom
+      (seg :zoom
+        (str "⌕ " (:px zoom) "px")
+        {:sep "  —  "
+         :face {:fg *peach*}
+         :on-click 'appearance/cmd-text-scale-reset
+         :cursor :pointer
+         :tooltip (fn (mm)
+                    [(str "zoomed to " (:px zoom) " px — this pane only")
+                      "click for 100% (C-x C-0) · Ctrl+wheel / C-x C-= C-- to step"])}))))
+
+(defn- ed-pane-segments (pane buf)
+  "The segments every pane's bar carries: buffer name, mode, scroll %, line:col, then the
+per-pane facts — a narrowing (narrowing is per-pane, and visible is the whole point of it
+not being a hidden buffer-global mode), a zoom, and a file whose lines end in CRLF. How a
+buffer shows its long lines is not here, too fine a fact for the bar: M-x visual-line-mode
+and toggle-truncate-lines echo it. A modified file buffer shows `●` after its name, in the
+state accent; the selected pane's name is in the code's colour (`face-modeline-name`)."
+  ;; consed from the end, the absent facts skipped by `ed-push-op`, rather than a list
+  ;; `append`ed to a `seq/reject` of three: every pane's bar runs this every frame.
+  ;; The selected pane's name in the code's own colour: the one bright thing on a recessed bar
+  (cons (seg :name
+          (str "  " (if (read-only? buf) "RO " "") (buffer-name buf))
+          (if (:selected pane) {:face face-modeline-name} {}))
+    (ed-push-op
+      (cons (seg :mode (str "(" (ed-buf-mode-name buf) ")") {:sep "  "})
+        (cons (seg :scroll
+                (ed-scroll-pct (ed-pane-top pane buf)
+                  (math/max 1 (dec (nth (:rect pane) 3)))
+                  (buffer-line-count buf))
+                {:sep "  —  "})
+          (cons (seg :pos (str (inc (buffer-current-line buf)) ":" (buffer-column buf)) {:sep "  "})
+            (ed-push-op
+              (ed-push-op (ed-push-op (ed-push-op '() (ed-zoom-seg pane))
+                            (when (get (:payload pane) :restrict)
+                              (seg :narrow "⊸ Narrowed" {:sep "  —  "})))
+                ;; a file with CRLF line endings, which the save writes back (std's `buffer-eol`)
+                (when (= (buffer-eol buf) :crlf)
+                  (seg :eol
+                    "CRLF"
+                    {:sep "  " :tooltip "this file's lines end in CRLF (\\r\\n); saving keeps them"})))
+              ;; a file not in UTF-8, which the save writes back (`charset`)
+              (when (:coding buf)
+                (seg :coding
+                  (charset/label (:coding buf))
+                  {:sep "  " :tooltip "this file is not UTF-8; saving keeps its coding"}))))))
+      ;; a file buffer whose text its file lacks: the state accent (Emacs's `**`)
+      (when (and (buffer-file buf) (buffer-modified? buf))
+        (seg :modified
+          "●"
+          {:sep " " :face face-modeline-state :tooltip "modified — C-x C-s saves it"})))))
+
+(defn- ed-edit-state-seg (m)
+  "The typing-mode chip (vim): NORMAL / INSERT / VISUAL, coloured by state — insert is green
+so \"I am typing into the buffer\" is readable at a glance, not decoded from a letter."
+  (seg :edit-state
+    (ed-edit-state-label m)
+    {:sep "  —  "
+     :face (ed-edit-state-face m)
+     :tooltip (fn (mm)
+                (list (str "typing mode: " (ed-edit-state-label mm))
+                  "i / a / o enter INSERT · ESC returns to NORMAL"
+                  "v enters VISUAL · C-x v v leaves vim for emacs keys"))}))
+
+(defn- ed-chip-merge (own registered acc)
+  "The chip entries `own` and `registered` — each already in rank order — merged by rank
+(an own chip first on a tie), their non-empty segments consed onto the reversed `acc` and
+reversed once at the end."
+  (let (take-own? (and (not (empty? own))
+                    (or (empty? registered) (<= (:rank (first own)) (:rank (first registered))))))
+    (if (and (empty? own) (empty? registered))
+      (reverse acc)
+      (let (entry (if take-own? (first own) (first registered))
+            s (:segment entry)
+            next-acc (if (and s (not (= "" (:text s)))) (cons s acc) acc))
+        (if take-own?
+          (ed-chip-merge (rest own) registered next-acc)
+          (ed-chip-merge own (rest registered) next-acc))))))
+
+(defn- ed-chip-segments (m pane buf)
+  "The selected pane's chips: the view's own four — the status, a macro being recorded,
+the typing mode, the project — then the ones features registered (`statusbar/register-modeline-segment` — the
+presence chip in `collab`, the running app in `apprun`, the findings in `results`, the
+attached node in `attach`), merged by rank. The view's ranks are 10 / 15 / 20 / 30; the
+registered ones sit after them. Empty ones are dropped.
+
+Both lists arrive in rank order (the registry's order is remembered per registration,
+`statusbar/modeline-chip-order`), so they are MERGED rather than appended, sorted, mapped
+and filtered: four passes and a sort over the same seven chips on every frame."
+  (ed-chip-merge
+    (list {:rank 10 :segment (seg :status (if (= "" (:status m)) "" (str "  —  " (:status m))))}
+      ;; a keyboard macro being recorded (Emacs's `Def`): a state, so the accent
+      {:rank 15
+       :segment (seg :macro
+                  (if (vector? (:macro-recording m)) "Def" "")
+                  {:sep "  —  "
+                   :face face-modeline-state
+                   :tooltip "recording a keyboard macro — C-x ) ends it"})}
+      {:rank 20 :segment (ed-edit-state-seg m)}
+      {:rank 30 :segment (seg :project (ed-project-label m))})
+    (modeline-registered-segments m pane buf)
+    '()))
+
+(defn ed-statusbar-segments (m pane buf)
+  "The ordered status-bar segments for `pane`: an always-on left group (`ed-pane-segments`:
+buffer name, mode, scroll %, line:col, narrowing, wrap, zoom), then — on the **selected**
+pane only — the chips (`ed-chip-segments`: status, modal edit state, project, and the ones
+features registered), the activity spinner, the cached VC segments (`:vcs-segments`, built
+off the loop by the idle beat), and the buffer's layer segments. The one list both
+`ed-pane-modeline` (render) and `hittest/ed-modeline-segment-at` (mouse hit-test) build from,
+so a segment is clickable/hoverable exactly where it's drawn."
+  (let (core (ed-pane-segments pane buf))
+    (if (:selected pane)
+      (append core
+        (ed-chip-segments m pane buf)
+        ;; the spinner sits with the git segments: right-hand group, where the things
+        ;; that change on their own live
+        (seq/reject (list (ed-activity-seg m)) nil?)
+        (or (:vcs-segments m) '())
+        (ed-layer-segments m buf))
+      core)))
+(defn- ed-on-modeline? (pane col row)
+  "Whether screen cell `[col row]` is on `pane`'s mode line — the bottom row of its rect."
+  (let ([x y w h] (:rect pane))
+    (and (= row (+ y (dec h))) (>= col x) (< col (+ x w)))))
+
+(defn- ed-modeline-hairlines (x row w gui?)
+  "The top + bottom hairlines that frame a mode line as a distinct band (GUI only); both
+sit flush on the row's edges — not over the text — so the labels keep their full height."
+  (if gui?
+    [(frect (* 1.0 x) (* 1.0 row) (* 1.0 w) *modeline-hairline* face-modeline-rule)
+      (frect (* 1.0 x)
+        (- (* 1.0 (inc row)) *modeline-hairline*)
+        (* 1.0 w)
+        *modeline-hairline*
+        face-modeline-rule)]
+    []))
+
+(defn- ed-modeline-layout-ops (m pane buf x row w base hovered-id gui?)
+  "The bar's ops from its segments (`ed-statusbar-segments`): the layout as a memoised
+fragment (ADR-336) of the segments and the bar's geometry. The segments are plain data
+rebuilt each turn and `=` across turns until something on the bar changes, so the layout —
+the expensive half — is reused."
+  (let (segments (ed-statusbar-segments m pane buf)
+        ;; the memo's deps are the segments WITHOUT their closures (a `:tooltip` fn, an
+        ;; `:on-click` fn are fresh objects every turn and never `=`): what the LAYOUT
+        ;; reads is id, text, face and separator — the zones and tooltips are recomputed
+        ;; from the live segments at hit-test time, not from these ops
+        seg-deps (map segments (fn (s) [(:id s) (:text s) (:face s) (:sep s) (:cursor s)])))
+    (ui-memo [:modeline x row]
+      [seg-deps x row w base hovered-id gui?]
+      (fn ()
+        (append (:ops (statusbar-layout segments x row w base hovered-id gui?))
+          (ed-modeline-hairlines x row w gui?))))))
+
+(defn ed-pane-modeline (m pane buf)
+  "A pane's mode line as render ops: a solid bar on the bottom row of its rect, laid out from
+its **segments** (`ed-statusbar-segments`) by `statusbar/statusbar-layout` — buffer name ·
+mode · scroll% · line:col, plus the selected pane's status / diagnostics / git. The selected
+pane's bar is `face-modeline` (recessed: the mantle, secondary-tier text), an unselected pane's
+the quieter `face-modeline-inactive`; the segment under the pointer (`:hover`, on whichever
+pane's bar holds it) gets a subtle hover pill. Thin **top + bottom hairlines**
+(`face-modeline-rule`, GUI only) can rule the bar off as a band; by default they are the
+bar's own colour, so the surface step alone separates it.
+
+An UNSELECTED pane's bar is one more memoised fragment around that: it carries only the
+pane's own segments (`ed-pane-segments` — name, mode, scroll %, line:col, narrowing, wrap,
+zoom), a function of the pane and its buffer alone, so its deps are the pane, the buffer,
+the hovered segment, the `:gui` flag and the palette (`ed-palette-token` — the bar, its
+hairlines and the zoom chip are painted in theme faces). An idle pane's bar then costs one
+lookup instead of rebuilding its segments every frame to find them unchanged."
+  (let ([x y w h] (:rect pane)
+        row (+ y (dec h))
+        selected? (:selected pane)
+        base (if selected? face-modeline face-modeline-inactive)
+        ;; the hover pill on THIS bar only when the pointer is on it: the hover names its cell,
+        ;; and a chip id (`:zoom`) repeats across a split's bars
+        hover (:hover m)
+        hovered-id (when (and hover (ed-on-modeline? pane (:col hover) (:row hover))) (:id hover))
+        gui? (:gui m)
+        laid (fn () (ed-modeline-layout-ops m pane buf x row w base hovered-id gui?)))
+    (if selected?
+      (laid)
+      (ui-memo [:modeline-idle x row] [pane buf hovered-id gui? (ed-palette-token)] laid))))
+
+;; ---- hover tooltips ------------------------------------------------------------
+;; The hit-tests that SET `:hover` / `:diag-hover` / `:link-hover` take and return a model,
+;; so they live in `hittest`; what is here only reads those keys back and paints the card.
+
+(defn ed-modeline-pane-at (m cols rows col row)
+  "The pane whose MODE LINE holds screen cell `[col row]`, or nil. Every pane's bar is live,
+not just the selected one's: the per-pane chips (a zoom, a narrowing) sit on the pane they
+describe, so their click must land there."
+  (seq/find (:panes (ed-pointer-layout m cols rows)) (fn (p) (ed-on-modeline? p col row))))
+
+(defn ed-pointer-layout (m cols rows)
+  "`ed-body-layout`, laid out once per layout and body size (`ed-pointer-layout-at`): what
+the pointer's hit-tests read. A mouse move asks for the layout three times over — the bar's
+hover, the diagnostic hover, the link hover — and nothing about a move changes the pane
+tree, so each of those reads back the one already laid out."
+  (ed-header-layout (ed-pointer-layout-at (:layout m) [0 0 cols (- rows (ed-echo-rows m rows))])
+    (:header-line m)))
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; the store only ever holds what `pane-layout` built.
+(check-allow :trusted
+  (defmemo ed-pointer-layout-at 2 (tree rect)
+    "`pane-layout` of the pane `tree` over the body `rect`, remembered on both — the tree is
+the model's `:layout`, the same cell until a split, a selection or a scroll makes a new one."
+    (editor/pane/pane-layout tree rect)))
+
+(defn ed-diag-tooltip-ops (m cols rows)
+  "The hovered diagnostic's message as a floated card, or `()` — `display/tooltip`, the
+same one the status bar's segments use, above the hovered cell (below it on a pane's first
+line), kept off the pane's chrome by `statusbar/tooltip-card-ops`. Reads `:diag-hover`."
+  (let (h (:diag-hover m))
+    (if (or (nil? h) (empty? (:lines h)))
+      '()
+      (or (tooltip-card-ops (:row h)
+            (:col h)
+            (:lines h)
+            (ed-card-stage m cols rows [(:row h) (:col h)])
+            cols
+            rows
+            (:gui m))
+        '()))))
+
+(defn ed-modeline-tooltip-ops (m cols rows)
+  "The hovered status-bar segment's tooltip as render ops, or `()` — a small bordered card
+floated just above the selected pane's mode line at the hover column. Reads `:hover`
+(`{:id :col :row}`, set by the mouse handler); resolves the segment's `:tooltip` against `m`."
+  (let (hover (:hover m))
+    (if (nil? hover)
+      '()
+      ;; the hovered pane's bar (the hover names its own cell), the selected one's failing that
+      (let (pane (or (ed-modeline-pane-at m cols rows (:col hover) (:row hover))
+                   (ed-selected-pane (:panes (ed-pointer-layout m cols rows))))
+            [x y w ph] (:rect pane)
+            mrow (+ y (dec ph))
+            buf (ed-pane-buf m pane)
+            segs (ed-statusbar-segments m pane buf)
+            ops (statusbar-tooltip-ops segs
+                  (:id hover)
+                  m
+                  (:col hover)
+                  mrow
+                  cols
+                  rows
+                  (:gui m)
+                  (ed-card-stage m cols rows [y x])))
+        (or ops '())))))
+
+;; `ed-gutter-shown?` / `ed-gutter-width` (the gutter *geometry*) live in `panes`
+;; alongside the rest of the pane-layout geometry — both the view and mouse
+;; hit-testing need them, and `view` already `(:use panes)`. Only the gutter

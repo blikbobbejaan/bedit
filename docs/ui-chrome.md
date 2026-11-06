@@ -120,7 +120,7 @@ A finer hierarchy, if ever needed, is: **subtle** `*surface0*` · **default** `*
 | element        | code                              | GUI                          | terminal / tests |
 |----------------|-----------------------------------|------------------------------|------------------|
 | pane divider   | `view/ed-divider-ops`             | centred hairline `frect`     | solid `rect` bar |
-| status bar     | `view/ed-pane-modeline` → `statusbar/statusbar-layout` | `mantle` fill + segments (+ rules in the bar's colour) | `mantle` fill + segments |
+| status bar     | `modeline/ed-pane-modeline` → `statusbar/statusbar-layout` | `mantle` fill + segments (+ rules in the bar's colour) | `mantle` fill + segments |
 | segment hover  | `statusbar/sb--hover-block`       | bordered inset `frect` block (surface0 fill + surface1 rim, Emacs `mouse-face`) | solid highlight band |
 | completion card| `completion/completion-menu-ops` → `display/card-surface`+`card-pill` | rounded `frect` + pill | flat `rect` card |
 | tooltip        | `statusbar/statusbar-tooltip-ops` → `display/tooltip` | rounded bordered card | flat bordered card |

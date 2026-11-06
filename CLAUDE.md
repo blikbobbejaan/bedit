@@ -351,6 +351,11 @@ src/hittest.blsp            the mouse side of the view: every hit-test / hover f
                             a model and returns one (:hover, :diag-hover, :link-hover, a chip
                             click, the context menu's hit) — recomputed from the same widget /
                             segments / layout the view drew, so input never imports the renderer
+src/modeline.blsp           a pane's mode line: its segments (`ed-statusbar-segments`, the registered
+                            chips included), the bar painted from them, the pointer's layout and the
+                            hover tooltips. What `hittest` asks again, so `input` never imports the view
+src/overlayview.blsp        the cards over the panes as ui-kit widgets: the context menu and the
+                            transient menu, paint and zones in one pass
 src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mode, on with `:header-line`):
                             the file by its project and path, then the mode's `:breadcrumbs` at point
                             (an Org heading's path); the layout takes the pane's top row for it
