@@ -181,12 +181,12 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             machine only), `M-x sudo-edit` (the current file, its unsaved text kept),
                             `C-x C-w /sudo::PATH`. The buffer remembers (`:sudo`, `:sudo-user`, carried
                             to other frames and a restarted loop by `hosted-meta`): C-x C-s writes it
-                            through sudo in place (`pool/ed-save-buf-with`), the mode line says
+                            through sudo in place (`file-save/ed-save-buf-with`), the mode line says
                             `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
                             handed to sudo once and kept nowhere — sudo's own timestamp serves the
                             next save. Every sudo call is a task (`:sudo-proc`, one at a time, C-g
                             stops it): an open shows `Loading…` at once, a save stays modified
-                            until its write lands (`pool/ed-save-prepare` / `ed-save-landed`), and
+                            until its write lands (`file-save/ed-save-prepare` / `ed-save-landed`), and
                             C-x C-c / C-x s save root files after their questions and go on when
                             the last lands. A file is read as BYTES (`sudo/read-bytes`) and goes through
                             `charset` as any file does; a binary opens as the read-only hex view; a large one is asked about
@@ -581,8 +581,13 @@ src/pool.blsp               the buffer pool and where its buffers are shown — 
                             `pane-split-edge`, brood ADR-590, its pane marked `:side`; a new frame
                             is `frames/frames-spawn-showing`), `ed-pop-to-file`
                             (next-error), find-file + its path prompt, the default dir and
-                            project root, saving. What most modules `:use` instead of
+                            project root. What most modules `:use` instead of
                             `commands`: showing a report buffer needs none of the commands
+src/file-save.blsp          writing a pool buffer to its file: `ed-save-buf-at` (a buffer a file
+                            handler owns is the handler's), `.editorconfig`'s fix-ups first,
+                            the sidecar removed, a hosted slot's process told; and the two
+                            halves of a save that lands later (`ed-save-prepare` /
+                            `ed-save-landed`, sudoedit's)
 src/menu.blsp               the right-click context menu's model ops (open / move / run /
                             close); an item names its command by SYMBOL, resolved when it
                             runs, so a redefined command reaches the menu too

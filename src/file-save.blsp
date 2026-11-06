@@ -1,0 +1,147 @@
+(defmodule file-save
+  "Writing a pool buffer to its file: the plain save every path shares, the two halves of a
+save that lands later, and what a save tells the rest of the editor (the sidecar, a hosted
+slot's process, the project's file list). A buffer a file handler owns is that handler's to save
+(`model/register-file-handler`)."
+  (:use editor/buffer) ; buffer-file / buffer-rope / buffer-edit / mark-buffer-saved / buffer-stamp-file
+  (:use sidecar :only [ed-forget-auto-save]) ; a saved file's sidecar removed
+  (:use conventions :only [prepare-for-save]) ; .editorconfig's trailing whitespace / final newline
+  (:use model)) ; ed-buf-at / ed-set-buf-at / message / the file handlers
+
+;; check-allow: a handler's operation is resolved late; every one answers a model
+(sig ed-save-handled (model int any -> model))
+(check-allow :trusted
+  (defn- ed-save-handled (m i handler)
+    ;; pool buffer `i` saved by `handler`, which owns it
+    (ed-handler-call handler :save m m i)))
+
+(defn ed-project-files-forget (m path)
+  "The model with every cached project file list (`:project-files`, kept by
+`project-commands/ed-find-file-in-project`) that `path` lies under marked stale — what a save that
+CREATES a file does, since the next `C-x p f` must list it although git's index has not moved."
+  (let (cache (:project-files m))
+    (if (or (empty? cache) (not (string? path)))
+      m
+      (assoc m
+        :project-files
+          (fold cache
+            cache
+            (fn (acc [root entry])
+              (if (string/starts-with? path (str root "/"))
+                (assoc acc root (assoc entry :stale true))
+                acc)))))))
+
+(defn- ed-ship-save-edits (m i original prepared)
+  "`m` with the edits a save made before writing (`prepared` from `original`: the
+`.editorconfig` fix-ups) already sent to pool slot `i`'s buffer process, when it is hosted
+and they changed anything. The link remembers the buffer it brought the process up to
+(`:synced`), so the loop tail's `hosted/hosted-propagate` diffs from there and does not send
+them a second time."
+  (let (link (map/get-in m [:hosted i]))
+    (if (or (nil? (:proc link)) (= (buffer-rope original) (buffer-rope prepared)))
+      m
+      (map/assoc-in m
+        [:hosted i]
+        (assoc (editor/buffer-client/link-propagate-buffers link original prepared)
+          :synced prepared)))))
+
+(sig ed-save-buf-at (model int -> model))
+(defn ed-save-buf-at (m i)
+  "Write pool buffer `i` to its file: the plain save every path shares — `C-x C-s` on the
+current buffer, and `save-some-buffers` on any other at quit. The buffer comes back unmodified
+(`charset/save` sets its baseline) and its `#filename#` auto-save sidecar is deleted on success;
+reports the outcome in the echo area either way. The diff-hl gutter is NOT recomputed
+here: a save writes the working tree but touches neither the buffer text nor HEAD, so
+the buffer-vs-HEAD diff is unchanged (and any prior edit already refreshed it via the
+rope-keyed idle recompute). Leaving the cached `:vcs-line-status` in place keeps the bars
+steady — dropping it made them blink off and back on each save.
+
+The buffer is first made what its `.editorconfig` asks (`conventions/prepare-for-save`:
+trailing whitespace trimmed, a final newline added) — edits on the buffer, so what is
+written is what is shown.
+
+A buffer a file handler owns is that handler's to save (`model/register-file-handler`)."
+  (let (handler (ed-buffer-handler (ed-buf-at m i)))
+    (if (nil? handler)
+      (ed-save-buf-with m i charset/save "")
+      (ed-save-handled m i handler))))
+
+(defn- ed-denied-hint (buf reason)
+  ;; a file the user may not write: what a handler offers instead, Emacs's TRAMP. Not to a
+  ;; buffer a handler already writes, nor for any other failure.
+  (if (and (nil? (ed-buffer-handler buf)) (includes? (string/lower reason) "permission denied"))
+    (or (seq/find (seq/keep (ed-file-handlers) :denied-hint) string?) "")
+    ""))
+
+(sig ed-save-buf-with (model int any string -> model))
+(defn ed-save-buf-with (m i write note)
+  "[[ed-save-buf-at]]'s save of pool buffer `i` with the file written by `write` — `(write
+buffer)`, answering the buffer stamped and unmodified, or raising (`editor/buffer/save-buffer`
+for a plain file, a file handler's writer for one of its own) — and `note` appended to the
+`saved …` the echo area says. Everything else is the plain save's: the `.editorconfig`
+fix-ups first, the sidecar removed, a hosted slot's process told."
+  (let (original (ed-buf-at m i)
+        buf (prepare-for-save original))
+    (try
+      ;; `save-buffer` answers the buffer stamped with the file's new mtime, so the idle
+      ;; beat's change check (`ed-revert-changed-files`) knows text and file agree again
+      (let (f (buffer-file buf)
+            created? (and (string? f) (not (file/exists? f)))
+            saved (dissoc (write buf) :disk-warned)
+            m1 (dissoc (ed-set-buf-at m i saved) :status)
+            ;; the save's own edits reach a hosted slot's process BEFORE it is told the
+            ;; buffer is saved, below — left to the loop tail they would land after the
+            ;; mark and leave the process modified
+            m2 (ed-ship-save-edits (if created? (ed-project-files-forget m1 f) m1)
+                 i original buf))
+        (do
+          (ed-forget-auto-save original)
+          ;; A HOSTED slot's buffer process owns the buffer's state, and it has to hear about
+          ;; the save too. Only the pool copy used to be marked saved: the process went on
+          ;; answering "modified", so another frame showed the buffer unsaved and the next
+          ;; push could carry the flag back. Sent after every splice this slot already sent
+          ;; (a mailbox is FIFO), so it marks exactly the text that was written; tagged as
+          ;; ours so it folds back as an echo, not a foreign change.
+          (let (proc (map/get-in m [:hosted i :proc]))
+            (when proc
+              (buffer-edit proc (self) (fn (b) (mark-buffer-saved (buffer-stamp-file b))))))
+          (message m2 (str "saved " f note))))
+      (catch e
+        (message m
+          (str "save failed: " (error-message e) (ed-denied-hint original (error-message e))))))))
+
+;; ---- a save that lands later ----------------------------------------------------
+;; A file a handler writes OFF the loop (`model/register-file-handler`) is saved in two
+;; halves: the buffer made what its `.editorconfig` asks and its text taken now
+;; ([[ed-save-prepare]]), the buffer marked saved when the write has landed
+;; ([[ed-save-landed]]). Until then it stays modified; a write that fails leaves it so.
+
+(sig ed-save-prepare (model int -> any))
+(defn ed-save-prepare (m i)
+  "`[m' buffer]` — pool buffer `i` made what its `.editorconfig` asks before a save
+(`conventions/prepare-for-save`), the edits in slot `i` and shipped to its hosted process,
+and the buffer as it will be written. Nothing is written and nothing is marked saved."
+  (let (original (ed-buf-at m i)
+        prepared (prepare-for-save original))
+    [(ed-ship-save-edits (ed-set-buf-at m i prepared) i original prepared) prepared]))
+
+(sig ed-save-landed (model int any string -> model))
+(defn ed-save-landed (m i rope note)
+  "Pool buffer `i` once a write of its text `rope` has landed: marked saved and stamped with
+its file's new time, its sidecar removed and its hosted process told — when the buffer
+still holds that text. Edited while the write was out, only the baseline moves: the buffer
+stays modified, its newer text unwritten. `note` follows the `saved …` the echo area says."
+  (let (b (ed-buf-at m i)
+        f (buffer-file b)
+        current? (= (buffer-rope b) rope)
+        stamped (dissoc (buffer-stamp-file b) :disk-warned)
+        saved (if current? (mark-buffer-saved stamped) (assoc stamped :saved-rope rope)))
+    (do
+      (when current?
+        (ed-forget-auto-save b)
+        ;; the process marks the text it holds — the same text, the write's edits having
+        ;; reached it first (a mailbox is FIFO)
+        (let (proc (map/get-in m [:hosted i :proc]))
+          (when proc (buffer-edit proc (self) (fn (pb) (mark-buffer-saved (buffer-stamp-file pb)))))))
+      (message (dissoc (ed-set-buf-at m i saved) :status)
+        (str "saved " f note (if current? "" " (edited since — still modified)"))))))
