@@ -105,7 +105,7 @@ src/startup.blsp            the ONE startup path the window and `--serve` share:
                             (`font-warning`, from `gui/font-info`'s `:not-found`, brood ADR-442):
                             the echo area and *Messages* at startup, M-x reload-config, a served
                             window's console — never a silent DejaVu
-src/model.blsp              the ui-run model: buffer pool, panes, kill ring, minibuffer, *Messages*,
+src/model.blsp              the ui-run model: buffer pool, panes, minibuffer, *Messages*,
                             the timers — and the REGISTRIES the rest plugs into: idle-beat jobs
                             (`register-idle-job`), off-loop task replies, inbound `[:tag …]`
                             event handlers, feature timers, process deaths
@@ -123,17 +123,19 @@ src/model.blsp              the ui-run model: buffer pool, panes, kill ring, min
                             text shares (`ed-carry-position` / `ed-carry-panes`: positions move
                             as Emacs markers do — a head cut here, another frame's splice in
                             `hosted`, the layouts a feature keeps via `register-layout-keeper`),
-                            the PRIMARY selection read as an ask (`ed-primary-ask`: a task for
-                            the local window, the client for a served session), and `ed-ding`: a
+                            and `ed-ding`: a
                             command's FAILURE
                             (a motion at the edge, a failing search, a read-only refusal),
                             which is what stops a keyboard macro. `message` never covers a
                             STANDING QUESTION (a y/n read, a query-replace, a minibuffer prompt):
                             it shows beside it in brackets until the next key, as Emacs's
-                            minibuffer message, and lands in *Messages* as always. The
-                            clipboard seam: kills mirror to the OS CLIPBOARD; a mouse drag
-                            sets only PRIMARY (`ed-drag-select`, brood ADR-553 — the clipboard
-                            and kill ring stay put unless `:mouse-drag-copy-region`)
+                            minibuffer message, and lands in *Messages* as always
+src/clipboard.blsp          the kill ring and what it shares text with: kills mirror to the OS
+                            CLIPBOARD; a mouse drag sets only PRIMARY (`ed-drag-select`, brood
+                            ADR-553 — the clipboard and kill ring stay put unless
+                            `:mouse-drag-copy-region`); PRIMARY is read as an ask (`ed-primary-ask`:
+                            a task for the local window, the client for a served session); one
+                            ring for every frame (a shared agent)
 src/keyhelp.blsp            key / command LABELS for help text: `C-x C-e` spellings, where-is
                             over the live keymap, `\[command]` substitution, docstrings
 src/scroll.blsp             keeping point on screen: the scroll-margin clamp, horizontal scroll,
@@ -1109,10 +1111,10 @@ src/remote.blsp             --serve / --attach / --listen: the daemon/emacsclien
                             takes it back as it was. A session starts as the window does
                             (src/startup.blsp) and its kills and yanks go to the CLIENT's
                             clipboard over the link (`:client-clipboard`, brood ADR-539) — never
-                            the daemon's; a C-y ASKS (`model/ed-clipboard-ask`) and lands at the
+                            the daemon's; a C-y ASKS (`clipboard/ed-clipboard-ask`) and lands at the
                             spot it marked when the answer comes, the loop never waiting. Its
                             PRIMARY is the client's the same way (brood ADR-562): a drag sets it,
-                            a middle click asks for it (`model/ed-primary-ask`). A guest
+                            a middle click asks for it (`clipboard/ed-primary-ask`). A guest
                             keeps the host's config and loses recentf and save-place; a `--listen`
                             daemon keeps savehist off. A private session's buffers are hosted
                             as the window's are, in a registry the SESSION owns (`ed-served-host`,
