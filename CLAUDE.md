@@ -595,7 +595,12 @@ src/lisp-modes.blsp         the other Lisps: `deflisp` (a special-form set + a f
                             pattern over Brood's own reader) for elisp, Common Lisp,
                             Clojure, Scheme, Fennel; `lisp-indent-with` (Emacs's rule);
                             wos kernel source
-src/languages.blsp          `deflanguage` declares a tree-sitter language from ONE spec
+src/lang-scripts.blsp       Ruby, Elixir, HEEx, Python
+src/lang-systems.blsp       Rust, Go, go.mod, C, C#
+src/lang-web.blsp           JavaScript, TypeScript, TSX (each extending the last), CSS, HTML
+src/lang-config.blsp        HCL + Terraform, shell, JSON, TOML, YAML, Dockerfile, and the line-lexed
+                            formats. All four are `language-core` specs, one file a family
+src/language-core.blsp      `deflanguage` declares a tree-sitter language from ONE spec
                             (faces, indent, heredocs, injections, formatter) and generates its
                             whole service set — show-paren (`tsbrackets`) included — checked against
                             editor/treesit/language-contract, so an incomplete language

@@ -1,0 +1,563 @@
+(defmodule language-core
+  "The machinery of the non-Lisp language modes. `deflanguage` declares a tree-sitter language
+from ONE spec (faces, indent, heredocs, formatter) and generates its whole service set — Ruby, Elixir,
+Python, Rust, the brace languages, C#, CSS, HTML, go.mod, HCL / Terraform, shell, JSON, TOML,
+YAML and Dockerfile are its clients, each a face table and an indent spec; the last five
+keep their line lexer as the stand-in for a missing grammar (`:fallback`). `deflexer` is its
+sibling for the fontify-only layers over the `lex-*` modules. The languages themselves are the
+`lang-*` family files; a macro here names the module it expands in (`reflect/current-ns`).")
+;; editor/treesit, editor/highlight and the std lexers are referenced qualified below —
+;; each `mod/name` auto-loads its module.
+
+(defmacro deflanguage (name spec)
+  "Declare a tree-sitter language mode from ONE spec, and register it.
+
+    (deflanguage elixir
+      {:lang :elixir
+       :pattern \"[.](ex|exs)$\"
+       :faces elixir-face-table
+       :indent elixir-indent-spec
+       :heredocs *triple-quote-heredocs*
+       :comment \"# \"})
+
+Every language used to spell out the same five definitions — a `-fontify`, a
+`-fontify-restart`, an `-indent`, a layer naming all three, and the registration — of
+which only the tables differed. Three copies is where a language quietly gets less than
+the others: the mode was the place a service could be forgotten, and a forgotten service
+is invisible until someone presses the key. Here a language supplies DATA and gets the
+whole service set, or fails at load saying which part is missing.
+
+The services are generated as named globals rather than closures because
+`model/ed-mode-service` resolves a service SYMBOL late (`reflect/eval`) — which is what
+lets a redefined fontify take effect on the next frame without reloading the mode. A
+closure in the layer would be resolved once and frozen.
+
+`:format` is the language's formatter as a command vector — `[\"mix\" \"format\"]`, to which
+the file path is appended — or a vector of them, `[[\"terraform\" \"fmt\"] [\"tofu\" \"fmt\"]]`,
+when several programs format the language: the first installed one runs
+(`formatter/format-command-choice`). It becomes the `:format-command` service that `M-x
+format-buffer` and format-on-save consult, so neither names a language.
+
+`:definitions` says which nodes C-M-a / C-M-e / C-M-h treat as a definition —
+`{:kinds #{:function_item …}}`, or `:calls` for a language that defines with a call
+(`editor/treesit/register-definitions`). Ruby and Elixir are declared by std, whose
+grammars they are; a language that declares nothing moves by top-level form.
+
+`:grammar` is where the language's grammar lives and WHICH revision — `{:url … :revision …}`,
+with `:subdir` for a repository holding several — so `M-x grammar-install` can fetch and build
+exactly that one, and opening a file of the language without one says so
+(`grammars/declare-grammar`). The revision is the commit the spec's tables were written
+against: a grammar's repository moves on its own, and a later revision may rename a node the
+face table names. The names the tables use are registered too (`expect-grammar-names`), so an
+installed grammar of another revision that lacks one is reported and stood in for rather than
+used (`grammarcheck`, brood ADR-583). The pins are the commits each installed grammar was built
+from when the specs were last checked line by line (each rebuilt byte-identical to the library
+in use); moving one is a deliberate edit, made with the specs' tests passing against it.
+`:fingerprint` is that revision's SHAPE (`editor/treesit/grammar-fingerprint`: its ABI, node
+kinds and fields), so a library built by hand, with no install manifest to say its revision,
+is still known to be the pinned one when its shape matches — and known to differ when not.
+
+`:type` is the buffer type the mode registers as, when it is not the grammar's name: one
+grammar may serve two modes that differ in something else — HCL's parses Terraform and
+plain HCL, and only Terraform's files format with `terraform fmt`. Without it the type is
+`:lang`, and a second mode over the same grammar would take the first one's files.
+
+`:indent-tabs` true writes indentation as tabs (Go's gofmt'd sources), at the indenter's
+column. With `:indent-width`, `:tab-width` and `:fill-column` it is the language's
+CONVENTION (`conventions`): the indent width is the `:indent` spec's `:width` unless
+`:indent-width` says otherwise (`:tab` — one level is one tab, Go's), and a buffer's
+`.editorconfig` or the user's entry for the mode overrides any of them. The indenter counts
+a level as the buffer's width, not the spec's.
+
+`:fallback` names a line lexer by its `deflexer` stem (`'lex-shell/shell`) for a language
+that had one before it had a grammar. The grammar is a separate download, and a parsed mode
+without it colours nothing; with a fallback, a buffer opened while the grammar is missing is
+typed as the lexer's mode instead (`model/ed-grammar-fallback`), and becomes the parsed mode
+when `M-x grammar-install` or `grammar-reload` brings the grammar (`model/ed-grammars-arrived`).
+`:fallback-above` is a size in characters past which the lexer serves even with the grammar —
+JSON's, where a held tree of a large machine-written file costs more than it buys.
+
+`:injections` is the code EMBEDDED in the language (brood ADR-489): a vector of injection
+rules, `[{:content {:kind :template_literal :parent :heredoc_template} :lang-from
+:heredoc_identifier :aliases {\"BASH\" :bash}}]` — which nodes hold another language's text
+and how its language is named. The embedded language's faces are its own `deflanguage`'s,
+found when a frame asks (`spec-injections`); one with no spec or no grammar keeps this
+language's colours. Checked at registration like the face table.
+
+`:interpreters` lists the `#!` program names that select the mode for a file with no telling
+name, as `deflexer`'s does.
+
+`:fontify-restart` says where a windowed fontify may cut its lead-in, and comes from one of
+three declarations. `:heredocs` (paired markers, Elixir's `\"\"\"`) restarts at a column-0 line
+outside them (`editor/treesit/column0-restart`). `:restart {:item-start :opaque}` is the
+brace languages' rule (`column0-item-restart`): the column-0 line that LOOKS like an item
+start, unless something whose contents can be anything (a block comment, a raw string)
+opens above it. `:restart 'sym` names a hand-written one when the rule is neither — Ruby
+must also notice `=begin`. A language with none declines to restart, which is a fact about
+the language — `editor/treesit/language-contract` says which services are required and
+which are optional.
+
+The generated restart is `<name>-restart`, not `<name>-fontify-restart`: the obvious name is
+the one a language with a CUSTOM restart has already used, and generating it once silently
+replaced Ruby's — which then answered \"restart anywhere\" and coloured the prose inside its
+`=begin` blocks as code. A generated definition must not be able to take a hand-written
+name.
+
+The spec is evaluated ONCE, into `<name>-spec`, so a spec built from a shared base
+(`(merge js-spec {…})`) is one value every generated service reads."
+  (let (base (->string name)
+        generated (fn (suffix) (symbol (str base suffix)))
+        qualified (fn (suffix) (symbol (str (reflect/current-ns) "/" base suffix)))
+        spec-name (generated "-spec")
+        spec-ref (qualified "-spec"))
+    `(do
+       (def ~spec-name ~spec)
+       (defn ~(generated "-fontify") (text)
+         (editor/treesit/fontify text
+           (get ~spec-ref :lang)
+           (get ~spec-ref :faces)
+           true
+           (language-core/spec-injections ~spec-ref)))
+       ;; the embedded languages' injection spec, built per call: an injected language's
+       ;; faces are ITS spec's, and it may be registered after this one
+       (defn ~(generated "-ts-injections") () (language-core/spec-injections ~spec-ref))
+       ;; `tree`: the buffer's held tree for exactly `text`, when the caller has one
+       ;; (`commands/ed-indent-target`) — the indenter walks it instead of parsing `text`, which
+       ;; is then the buffer's rope: only the lines it inspects are read (brood ADR-483)
+       (defn ~(generated "-indent") (text bol &optional (tree nil))
+         (let (indent (get ~spec-ref :indent))
+           (if (= indent :content)
+             (language-core/content-indent text bol)
+             (editor/treesit/indent-column text
+               (get ~spec-ref :lang)
+               bol
+               (language-core/spec-indent indent)
+               tree))))
+       (defn ~(generated "-restart") (src pos)
+         (language-core/spec-restart ~spec-ref src pos))
+       ;; show-paren over the parse: the view's window of text, or the held tree
+       ;; (`:bracket-match-tree`, `tsbrackets/match-tree`) when the buffer keeps one
+       (defn ~(generated "-bracket-match") (text pos)
+         (tsbrackets/match-text text (get ~spec-ref :lang) pos))
+       ;; the face table as a global the `:ts-faces` service names, so a held tree is
+       ;; coloured with the table the fontify uses (`editor/treesit/fontify-tree`)
+       (def ~(generated "-ts-faces") (get ~spec-ref :faces))
+       (def ~(generated "-mode-layer")
+         (language-core/language-layer '~name
+           ~spec-ref
+           {:fontify '~(qualified "-fontify")
+            :indent '~(qualified "-indent")
+            :restart '~(qualified "-restart")
+            :faces '~(qualified "-ts-faces")
+            :injections '~(qualified "-ts-injections")
+            :bracket-match '~(qualified "-bracket-match")}))
+       ;; the line-lexer stand-in a buffer is typed as while the grammar is missing; nil
+       ;; for a language with no `:fallback`
+       (def ~(generated "-fallback-layer") (language-core/fallback-layer '~name ~spec-ref))
+       (language-core/declare-definitions ~spec-ref)
+       (language-core/register-spec ~spec-ref '~spec-ref)
+       (language-core/declare-grammar ~spec-ref)
+       (language-core/expect-grammar-names ~spec-ref)
+       (language-core/register-fallback ~spec-ref '~(qualified "-fallback-layer"))
+       (doseq (program (get ~spec-ref :interpreters []))
+         (modes/register-interpreter program (language-core/spec-type ~spec-ref)))
+       (modes/register-prog-mode '~(qualified "-mode-layer") (language-core/spec-type ~spec-ref)))))
+
+(defn spec-indent-width (spec)
+  "The indent width a `deflanguage` or `deflexer` spec declares as its language's convention:
+its `:indent-width` (a number, or `:tab` for one tab), else its indent spec's `:width`, else
+nil — a language with no say, which takes the user's default.
+
+    (language-core/spec-indent-width {:indent {:width 4}})   ;=> 4
+    (language-core/spec-indent-width {:indent-width :tab :indent {:width 8}})   ;=> :tab"
+  (or (get spec :indent-width)
+    (let (indent (get spec :indent)) (when (map? indent) (get indent :width)))))
+
+(defn spec-indent (indent)
+  "The indent spec a generated `deflanguage` indenter walks with: `indent` with its `:width`
+the buffer's indent width when the caller says one (`conventions/bound-indent-width`, bound by
+`commands/ed-indent-target`), else as declared."
+  (let (width (conventions/bound-indent-width))
+    (if (and (map? indent) (int? width)) (assoc indent :width width) indent)))
+
+(defn spec-type (spec)
+  "The buffer type a `deflanguage` spec registers as: its `:type`, else its `:lang`."
+  (or (get spec :type) (get spec :lang)))
+
+(defn fallback-type (spec)
+  "The buffer type of a `deflanguage`'s line-lexer stand-in — `:shell-lexer` for shell — or
+nil for a language with no `:fallback`."
+  (when (get spec :fallback) (keyword (str (->string (spec-type spec)) "-lexer"))))
+
+(defn fallback-layer (name spec)
+  "The layer a `deflanguage` with a `:fallback` lexer stem stands in with while its grammar
+is missing (`model/ed-grammar-fallback`): today's line-lexer mode, under the same name, and
+saying which grammar it wants (`:wants-grammar`) so `M-x grammar-install` offers it first.
+It keeps the language's formatter: `shfmt` formats a script whether or not it was parsed.
+Nil without a `:fallback`."
+  (when (get spec :fallback)
+    (assoc (lexer-layer name
+             {:pattern (get spec :pattern)
+              :lexer (get spec :fallback)
+              :comment (get spec :comment)
+              ;; the language's conventions are the stand-in's too
+              :indent-tabs (get spec :indent-tabs)
+              :indent-width (spec-indent-width spec)
+              :tab-width (get spec :tab-width)
+              :fill-column (get spec :fill-column)
+              :pairs (get spec :pairs)
+              :strings (get spec :strings)})
+      :wants-grammar (get spec :lang)
+      :format-command (get spec :format))))
+
+(defn register-fallback (spec layer-ref)
+  "Bind a `deflanguage`'s stand-in type to its fallback layer over text-mode. No file pattern
+names the type: a buffer reaches it only as the stand-in for the parsed mode."
+  (let (type (fallback-type spec))
+    (when type (modes/register-type type (list layer-ref 'modes/text-mode-layer)))))
+
+(defn content-indent (text bol)
+  "The indentation a `deflanguage` with `:indent :content` gives the line starting at `bol`
+of `text` (a string or a rope): its OWN, so TAB changes nothing — and, for a blank line
+(the RET case), the previous non-blank line's, so the content's indentation continues.
+YAML's: its columns are its data, and no tree can say where a line belongs.
+
+    (language-core/content-indent \"a:\\n    b: 1\\n\" 3)   ;=> 4
+    (language-core/content-indent \"a:\\n  b: 1\\n\\n\" 10)   ;=> 2"
+  (let (rope (if (string? text) (text/from-string text) text)
+        ;; a COLUMN: the leading whitespace's display width at the ambient tab width
+        own (fn (line)
+              (string/display-width (string/substring line
+                                      0
+                                      (- (string/length line) (string/length (string/triml line))))))
+        blank? (fn (line) (= (string/trim line) ""))
+        n (text/char->line rope bol)
+        line (text/line rope n))
+    (if (not (blank? line))
+      (own line)
+      (letrec (back (fn (i)
+                      (cond
+                        (< i 0) 0
+                        (blank? (text/line rope i)) (back (dec i))
+                        else (own (text/line rope i)))))
+        (back (dec n))))))
+
+(defn spec-restart (spec src pos)
+  "The `:fontify-restart` a `deflanguage` spec declares as data: a `:restart` map's item rule
+(`column0-item-restart`), else `:heredocs`' paired-marker rule, else `pos` itself — which is
+only reached for a language whose layer names no generated restart."
+  (let (rule (get spec :restart)
+        heredocs (get spec :heredocs))
+    (cond
+      (map? rule) (column0-item-restart src pos (:item-start rule) (:opaque rule))
+      (not (nil? heredocs)) (editor/treesit/column0-restart src pos heredocs)
+      else pos)))
+
+(defn declare-definitions (spec)
+  "Register a `deflanguage` spec's `:definitions` with `editor/treesit`. A spec without one
+leaves std's declaration alone — Ruby's and Elixir's live there."
+  (let (definitions (get spec :definitions))
+    (when (map? definitions)
+      (editor/treesit/register-definitions (get spec :lang) definitions))))
+
+(defn declare-grammar (spec)
+  "Record where a `deflanguage` spec's grammar lives (`:grammar` — a git URL, or `{:url
+:subdir}` for a repository holding several), so `M-x grammar-install` can fetch it and a
+file of the language opened without one can say how to get it."
+  (let (grammar (get spec :grammar))
+    (when (not (nil? grammar))
+      (grammars/declare-grammar (get spec :lang) grammar))))
+
+(defn spec-grammar-names (spec)
+  "The node kinds and fields of its grammar a `deflanguage` spec's tables name, as
+`{:kinds :fields}` (std's `editor/treesit/language-names`): its face table, injection rules,
+indent spec and definitions.
+
+    (language-core/spec-grammar-names {:faces {:comment :syntax/comment} :indent :content})   ;=> {:kinds #{:comment} :fields #{}}"
+  (editor/treesit/language-names {:faces (get spec :faces)
+                                  :injections (get spec :injections)
+                                  :indent (get spec :indent)
+                                  :definitions (get spec :definitions)}))
+
+(defn expect-grammar-names (spec)
+  "Record the names a `deflanguage` spec's tables use of its grammar (`spec-grammar-names`),
+so the grammar installed is checked for them before it is used (`grammarcheck`, brood
+ADR-583) — under the spec's buffer type, since one grammar may serve two modes."
+  (grammarcheck/expect-names (get spec :lang) (spec-type spec) (spec-grammar-names spec)))
+
+;; ---- injections: another language's code inside this one (brood ADR-489) ---------------
+;; A spec's `:injections` is the RULES of an ADR-489 injection spec: which nodes hold which
+;; language's text. The faces are not written there. Each embedded language colours with the
+;; table its own `deflanguage` declares, looked up when a frame asks, so the shell inside a
+;; Terraform heredoc follows shell-mode's table and a language registered later is found.
+
+(defn register-spec (spec spec-ref)
+  "Record that `spec-ref` (the `<name>-spec` global's symbol) is the spec of the tree-sitter
+language `(:lang spec)`, where `language-faces` finds an embedded language's table. Stored
+as the symbol and resolved per lookup, so a re-evaluated spec is the one read."
+  (ownership/claim! :languages/specs (get spec :lang) spec-ref))
+
+(defn language-faces (lang)
+  "The face table of the `deflanguage` whose grammar is `lang`, or nil when none is
+registered — an embedded language with no table keeps its host's colours."
+  (let (spec-ref (registry/lookup :languages/specs lang))
+    (when spec-ref (get (reflect/eval spec-ref) :faces))))
+
+(defn- rule-languages (rule)
+  ;; every language a rule can name: its fixed `:lang`, or its aliases' targets
+  (if (get rule :lang) [(get rule :lang)] (vals (or (get rule :aliases) {}))))
+
+(defn injection-spec (rules faces-of)
+  "The injection spec `{:rules :faces}` for `rules`, each named language's table from
+`(faces-of lang)`. A language with no table is left out: a rule fixed to it is dropped, an
+alias to it removed. Nil when no rule is left, which a fontify reads as no injections."
+  (let (faces (fold (mapcat rules rule-languages)
+                {}
+                (fn (acc lang)
+                  (if (contains? acc lang)
+                    acc
+                    (let (table (faces-of lang)) (if table (assoc acc lang table) acc)))))
+        kept (seq/keep rules
+               (fn (rule)
+                 (cond
+                   (get rule :lang) (when (contains? faces (get rule :lang)) rule)
+                   (get rule :aliases)
+                     (assoc rule
+                       :aliases
+                         (into {}
+                           (seq/filter (get rule :aliases)
+                             (fn ([_ lang]) (contains? faces lang)))))
+                   else rule))))
+    (when (not (empty? kept)) {:rules (vec kept) :faces faces})))
+
+(defn spec-injections (spec)
+  "The injection spec a `deflanguage` spec's `:injections` rules make with the registered
+languages' tables (`injection-spec`), or nil for a language that embeds none."
+  (let (rules (get spec :injections))
+    (when (not (empty? rules)) (injection-spec rules language-faces))))
+
+(defn injection-rule-problems (rules)
+  "What is malformed in a `deflanguage`'s `:injections` rules (`editor/treesit/injection-problems`),
+each named language given an empty table: whether the language has a real one is a question
+for the frame, when every language has registered."
+  (let (placeholder (into {} (map (mapcat rules rule-languages) (fn (lang) [lang {}]))))
+    (editor/treesit/injection-problems {:rules rules :faces placeholder})))
+
+(defn language-layer (name spec refs)
+  "The mode layer for a `deflanguage`, checked against `editor/treesit/language-contract`.
+`refs` names the generated services: `{:fontify :indent :restart :faces :injections
+:bracket-match}`.
+
+Raises on an incomplete language rather than registering one. A mode missing `:indent`
+would register happily and simply do nothing on RET — a failure that surfaces as a key
+which feels broken, in one language, much later. A malformed face table is refused the
+same way (`editor/treesit/face-table-problems`): the kernel would refuse it too, but at
+the first frame drawn, and a misspelt selector key (`:feild`) would otherwise be found
+by someone opening a file."
+  (let (rule (get spec :restart)
+        layer {:name name
+               :ts-lang (get spec :lang)
+               ;; the `{selector :syntax/face}` table, for colouring a HELD tree
+               ;; (`syntaxtree`, brood ADR-443): `:fontify` takes text, and a view that
+               ;; keeps the document's parse asks the tree with the same table instead
+               :ts-faces (:faces refs)
+               ;; a fn answering the injection spec the held tree is coloured with — the
+               ;; same one `:fontify` passes — for a language whose spec embeds others
+               :ts-injections (when (get spec :injections) (:injections refs))
+               :file-pattern (get spec :pattern)
+               :fontify (:fontify refs)
+               :indent (:indent refs)
+               ;; a hand-written one by name (Ruby's, which must also see `=begin`), the
+               ;; generated one for a rule declared as data, or none — a language with no
+               ;; safe cut declines, which is a fact about it rather than a hole in the mode
+               :fontify-restart (cond
+                                  (symbol? rule) rule
+                                  (or (map? rule) (get spec :heredocs)) (:restart refs)
+                                  else nil)
+               :comment-syntax (get spec :comment)
+               ;; `[open close]` for a language whose only comment is a block (CSS, HTML),
+               ;; which a line prefix cannot write
+               :comment-block (get spec :comment-block)
+               ;; the bracket pair at point, from the parse: a `(` in a string matches nothing
+               :bracket-match (:bracket-match refs)
+               :bracket-match-tree 'tsbrackets/match-tree
+               ;; The language's own formatter, as `[prog arg …]` with the file appended
+               ;; — `mix format <file>`. A service like any other, so `M-x format-buffer`
+               ;; and format-on-save ask the BUFFER what formats it and never name a
+               ;; language. Absent for a language with no formatter, which is a fact
+               ;; about the language.
+               :format-command (get spec :format)
+               ;; Go's tab-indented sources: the indenter answers a column, and a mode that
+               ;; indents with tabs writes it as tabs (`conventions/indentation`). The
+               ;; language's CONVENTIONS — false here is a statement (Python is spaces), which
+               ;; a user's `:default` does not override; their entry for the mode does
+               :indent-tabs (= true (get spec :indent-tabs))
+               :indent-width (spec-indent-width spec)
+               :tab-width (get spec :tab-width)
+               :fill-column (get spec :fill-column)
+               ;; the electric pairs its strings and brackets open (`electric`), nil for the
+               ;; default brackets and double quote
+               :electric-pairs (get spec :pairs)
+               ;; its strings and comments (`stringstate`), nil for its quote pairs as one-line strings
+               :string-syntax (get spec :strings)
+               ;; the line-lexer type a buffer stands in with while the grammar is missing,
+               ;; or past `:fallback-above` characters (`model/ed-grammar-fallback`)
+               :grammar-fallback (when (fallback-type spec)
+                                   {:type (fallback-type spec) :above (get spec :fallback-above)})}
+        gaps (editor/treesit/missing-services layer)
+        face-problems (editor/treesit/face-table-problems (get spec :faces))
+        injection-problems (injection-rule-problems (get spec :injections [])))
+    (when (not (empty? gaps))
+      (error "deflanguage " name ": missing required service(s) " (->string gaps)))
+    (when (not (empty? face-problems))
+      (error "deflanguage " name ": malformed face table: " (string/join face-problems "; ")))
+    (when (not (empty? injection-problems))
+      (error "deflanguage "
+        name
+        ": malformed injections: "
+        (string/join injection-problems "; ")))
+    layer))
+
+;; ---- the line-lexer modes: env, JSON5 and the configuration formats -------------------
+;; A language with no grammar here is lexed a line at a time by a pure module (`lex-dotenv`,
+;; `lex-configs`; shell's and Dockerfile's serve as `:fallback`s): its buffers keep every
+;; text-mode binding and gain colouring. The `:file-pattern` is matched against the file's
+;; basename, so a bare `.env` or `Makefile` triggers. Each restarts at the viewport's own line
+;; (`editor/highlight/line-restart`: no cross-line state worth a backscan) and keeps each
+;; line's spans as a memo (`:line-lexer`, brood ADR-471).
+
+(defmacro deflexer (name spec)
+  "Declare a line-lexer language mode from ONE spec, and register it — the sibling of
+`deflanguage` for a language lexed line by line rather than parsed.
+
+    (deflexer yaml
+      {:pattern \"[.]ya?ml$\"
+       :lexer 'lex-configs/yaml
+       :comment \"# \"})
+
+`:lexer` names the lexer by its stem: the module defines `<stem>-spans`, the whole-text
+`:fontify`, and `<stem>-line-lexer`, the `:line-lexer` the pane's line cache threads.
+`:comment` is the comment token `M-;` writes. `:interpreters` lists the `#!` program names
+that select the mode for a file with no telling name (`modes/register-interpreter`).
+
+Nine layers spelled the same six keys by hand, and one of them wrote `:comment` where every
+reader asks for `:comment-syntax` — so `M-;` in a shell script did nothing, silently. A
+spec's keys are the language's facts; the layer's are the editor's, and only this maps one
+to the other."
+  (let (base (->string name)
+        layer (symbol (str base "-mode-layer"))
+        layer-ref (symbol (str (reflect/current-ns) "/" base "-mode-layer")))
+    `(do
+       (def ~layer (language-core/lexer-layer '~name ~spec))
+       (doseq (program (get ~spec :interpreters []))
+         (modes/register-interpreter program (keyword '~name)))
+       (modes/register-language-mode '~layer-ref (keyword '~name)))))
+
+(defn lexer-layer (name spec)
+  "The mode layer a `deflexer` spec declares: `:fontify` and `:line-lexer` from the `:lexer`
+stem, the line restart, and `:comment-syntax`. Raises on a spec with no `:pattern` or
+`:lexer`, which would register a mode no file reaches or one that colours nothing."
+  (let ({:keys [pattern lexer comment]} spec)
+    (when (not (and (string? pattern) (symbol? lexer)))
+      (error "deflexer " name ": needs a :pattern string and a :lexer symbol: " (pr-str spec)))
+    {:name name
+     :file-pattern pattern
+     :fontify (symbol (str lexer "-spans"))
+     :line-lexer (symbol (str lexer "-line-lexer"))
+     :fontify-restart 'editor/highlight/line-restart
+     :comment-syntax comment
+     ;; the language's conventions (`conventions`), nil — no say — unless the spec has one
+     :indent-tabs (get spec :indent-tabs)
+     :indent-width (spec-indent-width spec)
+     :tab-width (get spec :tab-width)
+     :fill-column (get spec :fill-column)
+     :electric-pairs (get spec :pairs)
+     :string-syntax (get spec :strings)
+     ;; a config format is written like code — keys, names, values from the file — so its
+     ;; completion card opens on its own, unless the spec is prose (a commit message)
+     :completion-auto (get spec :completion-auto true)}))
+
+;; ---- electric pairs: what each language's strings open ----------------------------------
+;; A spec's `:pairs` is its `electric` pairs, the syntax table's string delimiters in Emacs's
+;; terms. Without one a language has `electric/*default-pairs*` — the brackets and `"` — which
+;; is right where `'` is not a string (Rust's lifetimes, JSON, HCL). A language whose `'` opens
+;; a string pairs it; one whose backtick does (a template, a raw string, a command) pairs that.
+(def *quote-pairs* [["(" ")"] ["[" "]"] ["{" "}"] ["\"" "\""] ["'" "'"]])
+(def *backtick-pairs* (conj *quote-pairs* ["`" "`"]))
+;; Python's triple quotes: `""` + `"` opens `"""|"""`
+(def *python-pairs* (into *quote-pairs* [["\"\"\"" "\"\"\""] ["'''" "'''"]]))
+
+;; A spec's `:strings` is its string and comment syntax (`stringstate`): which delimiters open a
+;; string, which may span lines, which do not escape, and the comment tokens — what tells a
+;; quote that opens a string from one that closes it, keeps a bracket inside a string out of the
+;; balance, and finds the docstring M-q fills, all with no grammar. Without one a language's
+;; quote pairs are one-line strings (`stringstate/pairs-syntax`), which is JSON's.
+(def *hash-strings* {:strings [{:open "\""} {:open "'"}] :comments ["#"]})
+(def *c-strings*
+  {:strings [{:open "\""} {:open "'"}] :comments ["//"] :block-comments [["/*" "*/"]]})
+(def *js-strings*
+  (assoc *c-strings* :strings [{:open "\""} {:open "'"} {:open "`" :multiline true}]))
+(def *go-strings*
+  (assoc *c-strings* :strings [{:open "\""} {:open "'"} {:open "`" :multiline true :raw true}]))
+(def *rust-strings*
+  ;; `'x'` is a character, `'a` a lifetime: a quote is a char literal only when one closes it
+  {:strings [{:open "\"" :multiline true}]
+   :char-literal "'"
+   :comments ["//"]
+   :block-comments [["/*" "*/"]]})
+(def *python-strings*
+  {:strings [{:open "\"\"\"" :multiline true}
+              {:open "'''" :multiline true}
+              {:open "\""}
+              {:open "'"}]
+   :comments ["#"]})
+(def *toml-strings*
+  {:strings [{:open "\"\"\"" :multiline true}
+              {:open "'''" :multiline true :raw true}
+              {:open "\""}
+              {:open "'" :raw true}]
+   :comments ["#"]})
+(def *ruby-strings*
+  {:strings [{:open "\"" :multiline true} {:open "'" :multiline true} {:open "`" :multiline true}]
+   :comments ["#"]})
+(def *elixir-strings*
+  {:strings [{:open "\"\"\"" :multiline true}
+              {:open "'''" :multiline true}
+              {:open "\"" :multiline true}
+              {:open "'" :multiline true}]
+   :comments ["#"]})
+(def *shell-strings*
+  {:strings [{:open "\"" :multiline true}
+              {:open "'" :multiline true :raw true}
+              {:open "`" :multiline true}]
+   :comments ["#"]
+   ;; `#` opens a comment only at a word's start: `${#x}` and `$#` are words
+   :comment-word-start true})
+(def *css-strings* {:strings [{:open "\""} {:open "'"}] :block-comments [["/*" "*/"]]})
+(def *html-strings* {:strings [{:open "\""} {:open "'"}] :block-comments [["<!--" "-->"]]})
+(def *hcl-strings* {:strings [{:open "\""}] :comments ["#" "//"] :block-comments [["/*" "*/"]]})
+
+;; ---- the restarts more than one language shares ---------------------------------------------
+
+;; Paired multi-line string markers — what the restart counts to decide whether a column-0
+;; line is real code or prose inside one (Elixir's `@moduledoc`, Python's docstrings).
+(def *triple-quote-heredocs* ["\"\"\"" "'''"])
+
+(defn- item-line-before (src pos item-start)
+  ;; the nearest column-0 line at or before `pos` that matches `item-start`, or 0
+  (let (candidate (editor/treesit/column0-before src pos)
+        eol (let (i (index-of src "\n" candidate)) (if (< i 0) (string/length src) i)))
+    (cond
+      (= candidate 0) 0
+      (regex/match? item-start (string/substring src candidate eol)) candidate
+      else (item-line-before src (dec candidate) item-start))))
+
+(defn column0-item-restart (src pos item-start opaque-opener)
+  "The fontify restart every brace language shares: the previous column-0 line that
+LOOKS like the start of an item (`item-start`, a regex over the line), unless something
+whose contents can be anything — a block comment, a raw or template string
+(`opaque-opener`) — opens above it in this window; then the whole lead-in. A language with
+no such thing passes nil."
+  (let (candidate (item-line-before src pos item-start)
+        opener (when opaque-opener (regex/find opaque-opener src)))
+    (if (and opener (< (get opener :start) candidate)) 0 candidate)))
