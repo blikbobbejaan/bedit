@@ -248,7 +248,9 @@ src/themes.blsp             the theme registry (M-x theme-select): a live picker
                             whole palette AND the window font — a theme is a plain map, so
                             adding one is data (theme.blsp is the palette; this is the registry).
                             Each names the whole ladder (subtext1, overlay2, lavender); `Catppuccin
-                            Mocha Calm` is the restrained-syntax option (Tonsky's Alabaster rules)
+                            Mocha Calm` is the restrained-syntax option (Tonsky's Alabaster rules:
+                            definitions coloured, calls plain, punctuation dimmed — the
+                            `:syntax/definition` and `:syntax/punctuation` faces, brood ADR-614)
 src/ownership.blsp          WHO registered each registry row: every `register-*` (model's idle jobs,
                             task replies, event / down / timer handlers, exit queries, post-steps,
                             layout keepers; statusbar chips; M-x commands; keymap profiles;
