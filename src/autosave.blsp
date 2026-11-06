@@ -34,20 +34,26 @@ its file; one saved since (unmodified now) drops out, so its next edit is writte
               (if (= (get written path) rope) with-all (map/assoc-in with-all [:due path] rope)))
             acc))))))
 
-(defn ed-auto-save-write (due &optional (sudo-users {}))
+(defn ed-auto-save-write (due &optional (sudo-users {}) (report nil) (failing #{}))
   "Write each `{path rope}` in `due` to the path's `#basename#` sidecar — the private one for
 a path in `sudo-users`, as its user ([[ed-auto-save-path]], made ready by
 [[ensure-private-sidecar]]) — the text built from
 the rope here, in the writer process `ed-auto-save!` spawns, so neither the text nor the
-disk is paid for on the editor's loop. A sidecar that cannot be written is logged and the
-rest still are. Returns nil."
+disk is paid for on the editor's loop. A sidecar that cannot be written is logged, and told to
+`report` (the editor's loop) as `[:auto-save-failed path reason]`; one in `failing` that is
+written again is told as `[:auto-save-ok path]`. The rest are written either way. Returns nil."
   (doseq (entry due)
     (let ([path rope] entry
           user (get sudo-users path))
       (try
-        (file/spit-private (if user (ensure-private-sidecar path user) (ed-auto-save-path path))
-          (text/->string rope))
-        (catch e (log/warn (str "auto-save of " path " failed: " (error-message e))))))))
+        (do
+          (file/spit-private (if user (ensure-private-sidecar path user) (ed-auto-save-path path))
+            (text/->string rope))
+          (when (and report (contains? failing path)) (send report [:auto-save-ok path])))
+        (catch e
+          (do
+            (log/warn (str "auto-save of " path " failed: " (error-message e)))
+            (when report (send report [:auto-save-failed path (error-message e)]))))))))
 
 (defn ed-auto-save! (m)
   "Write `#filename#` sidecars for the modified file-backed buffers that changed since the
@@ -61,7 +67,12 @@ not sent) and [[ed-auto-save-write]] builds each text there. Returns the model w
       m
       (let ({:keys [due all sudo]} (ed-auto-save-due m))
         (do
-          (when (not (empty? due)) (spawn (fn () (ed-auto-save-write due sudo))))
+          (when (not (empty? due))
+            ;; the writer tells the loop of a sidecar it could not write: a failed auto-save
+            ;; used to be a log line nobody saw, and recorded as written
+            (let (loop (self)
+                  failing (or (:auto-save-failing m) #{}))
+              (spawn (fn () (ed-auto-save-write due sudo loop failing)))))
           (assoc m :auto-saved-at now-ms :auto-saved all))))))
 
 (defn ed-auto-save-now! (m)
@@ -95,3 +106,27 @@ you stopped typing stayed unwritten until the next key."
 (register-idle-job :auto-save {:order 110 :run 'autosave/ed-auto-save!})
 ;; …and a timer of its own, so the round after the last edit runs without another key
 (register-timer-client :auto-save 'autosave/ed-auto-save-timer 'autosave/ed-auto-save!)
+
+;; ---- what the writer tells the loop -------------------------------------------------------
+
+(defn ed-ev-auto-save-failed (m input textrows cols rows)
+  "`[:auto-save-failed path reason]`: the writer could not write `path`'s sidecar. Said in the
+echo area once until it works again — the text is only in the editor, which is the thing to
+know — and the path is no longer counted written, so the next round tries again."
+  (let ([_ path reason] input
+        failing (or (:auto-save-failing m) #{})
+        retried (assoc m :auto-saved (dissoc (or (:auto-saved m) {}) path)))
+    (if (contains? failing path)
+      retried
+      (message (assoc retried :auto-save-failing (conj failing path))
+        (str "auto-save of "
+          path " failed: " reason " — the changes are only in the editor; C-x C-s saves them")))))
+
+(defn ed-ev-auto-save-ok (m input textrows cols rows)
+  "`[:auto-save-ok path]`: a sidecar that had failed was written again."
+  (let ([_ path] input)
+    (message (assoc m :auto-save-failing (set/disj (or (:auto-save-failing m) #{}) path))
+      (str "auto-save of " path " works again"))))
+
+(register-event-handler :auto-save-failed 'autosave/ed-ev-auto-save-failed)
+(register-event-handler :auto-save-ok 'autosave/ed-ev-auto-save-ok)
