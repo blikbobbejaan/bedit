@@ -220,6 +220,12 @@ src/linecache.blsp          the line-state highlight cache a LEXER mode keeps (b
                             lines it touched, exact at any depth — no lead-in, no restart. A
                             mode's `:line-band-pass` then sees the band: what spans lines, as
                             markdown's fences coloured as their language (brood ADR-489)
+src/config-paths.blsp       where the editor's files live and who it is: `*app-id*`, `config-dir`, the
+                            init file's path, the test-run guard. No setting is read here, so
+                            the state files and the package store stand below the settings table
+src/display-rules.blsp      `:display-buffer` rules as data: `*display-actions*`, the defaults, what
+                            makes a rule valid, an action read. Matching a buffer and acting
+                            on the panes are `pool`'s
 src/config.blsp             ~/.config/bedit/init.blsp — the declarative user config (data, not eval'd).
                             Every key is ONE `settings/define` (std `settings`, brood ADR-428):
                             its default, type and doc give the check, the fallback
@@ -545,7 +551,7 @@ src/pool.blsp               the buffer pool and where its buffers are shown — 
                             `:display-buffer` RULES first — `{:match name-regex | type-or-mode
                             :request :action :same-window | :other-window | :reuse | {:side
                             :size} | :new-frame}` — then the defaults, rules too,
-                            `config/*display-buffer-defaults*`; a side window is `editor/pane`'s
+                            `display-rules/*display-buffer-defaults*`; a side window is `editor/pane`'s
                             `pane-split-edge`, brood ADR-590, its pane marked `:side`; a new frame
                             is `frames/frames-spawn-showing`), `ed-pop-to-file`
                             (next-error), find-file + its path prompt, the default dir and
@@ -1242,16 +1248,16 @@ third process (the collab registry learning of a `[:down]`) needs waiting, and
 that polls (`ct-await-respawn`) rather than guessing a delay.
 
 **A test never touches the user's own config.** Every file the editor keeps lives under
-`config/config-dir`, which follows `$XDG_CONFIG_HOME` — and a test run points that at a
+`config-paths/config-dir`, which follows `$XDG_CONFIG_HOME` — and a test run points that at a
 scratch home of the run's own (brood ADR-602; `test/running?`, `test/scratch-dir`, which
-bedit reads as `config/under-test?`). That holds for `nest test` and for C-c t from inside
+bedit reads as `config-paths/under-test?`). That holds for `nest test` and for C-c t from inside
 the editor: both of its runners start their child with `sandbox/*test-runner-env*`
 (`BROOD_TEST_ARM=1`, brood ADR-608) — the cold runner's `nest run` and the warm test child —
 so the child arms before any test code loads; a new runner that runs tests must do the same
 (`tests/testrun_test.blsp` "a C-c t run gets a scratch home"). The REPL's history
 (`BROOD_HISTORY`) goes to the scratch home too. `persist-write!` and `ensure-init!` also
 refuse a path under the real `~/.config/bedit` while a test runs (compared normalized; a test
-of the guard binds `config/*user-config-base*` to a stand-in). A new
+of the guard binds `config-paths/*user-config-base*` to a stand-in). A new
 kind of persisted file goes under `config-dir` (or `editor-state-dir`), never `$HOME`
 directly; a test that wants its own file binds the module's dynvar (`*config-base*`,
 `bshell/*bshell-history-file*`).
