@@ -7,14 +7,13 @@ The model is a map threaded through the `ui-run` loop:
   :buffers   a vector of BUFFERS — the pool. Each is an immutable, mode-stamped
              buffer value (its point/mark/undo travel with it). One is always the
              `*Messages*` buffer. Panes reference a buffer by its pool index.
-  :layout    the PANE tree (`std/pane.blsp`): Emacs-style tiled splits, each
+  :layout    the PANE tree (`editor/pane`): Emacs-style tiled splits, each
              leaf a pane with payload `{:buffer <pool index> :top <scroll>}`.
              Exactly one pane is *selected* — the one being edited. Scroll is
              per-pane (`:top`); buffer TEXT is shared via the pool, so two panes
              on the same buffer see each other's edits.
   :kill-ring a list of killed/copied strings, newest first (C-w / M-w / C-y)
-  :minibuffer  nil, or `{:prompt :input :on-complete :complete-fn}` while a
-             minibuffer prompt is active (C-x b switch-buffer, C-x C-f find-file)
+  :minibuffer  nil, or the open prompt (`{:edit :on-complete …}`, `minibuffer`)
   :pending   the active prefix sub-keymap mid-chord (e.g. after C-x), else nil
   :echo      the one-line echo area (the latest message, newlines flattened)
   :status    the mode-line message
@@ -32,35 +31,29 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
   (:use editor/buffer) ; make-buffer / insert / end-of-buffer / buffer-name / accessors
   (:use editor/layers) ; init-buffer-layers (stamp a buffer's mode) + active-layers (mode line)
   (:use editor/pane) ; the pane-tree layout: pane-single / selected payload / update / map
-  ;; `:exclude [error]` — log's `error` would shadow the prelude's `error`.
-  (:use log :exclude [error]) ; backend — the log-routing backends (one per buffer)
-  ;; `:exclude [inspect]` — `io/inspect` WRITES; the root `inspect` is the ability op
-  ;; that RETURNS the string. Referring the writer bare here would shadow the op.
-  (:use io :exclude [inspect]) ; fn-port — the editor-targeting log sink (buffer-log-event)
   (:use keymaps) ; profile-layers — seed the model-scope keybinding profile (emacs default)
   (:use editorconfig :only [stamp-buffer]) ; a visited file's .editorconfig, read once
   (:use grammarcheck :only [sound?])) ; does the installed grammar have the names a mode uses
-;; editor/lineedit (minibuffer core) and json (runner event decode) are referenced
+;; json (runner event decode), log and io (the log-routing backends) are referenced
 ;; qualified below — each `mod/name` auto-loads its module.
 
-(defdyn *blink-ms* 530)
-(def *spinner-ms* 120) ; the activity-spinner beat — fast enough to read as motion, and
-;; armed only while a job is in flight, so an idle editor still runs one timer, not two
+;; ---- timings ------------------------------------------------------------------
+
 ;; The cursor-blink half-period (Emacs `blink-cursor-interval` ≈ 0.5s). The caret op
 ;; carries it (`editor/display/cursor-blink`, brood ADR-469) and the GUI window blinks the
 ;; caret on its own clock, restarting it shown on every key, click and caret move — so no
 ;; turn of the loop runs per toggle and the caret stays solid while you type.
+(defdyn *blink-ms* 530)
 
-(defdyn *blink-cursor-blinks* 10)
 ;; How many on/off cycles the caret blinks at rest before it stays solid (Emacs
 ;; `blink-cursor-blinks`, same default); the window counts them. A model's
 ;; `:blink-cursor-blinks` (the init file's setting, `config`) wins; 0 blinks forever.
+(defdyn *blink-cursor-blinks* 10)
 
-(def *diag-debounce-ms* 120)
-;; The tutorial's eval-on-type debounce (`:tutor-eval`): a shade slower than the diag
-;; beat — each firing round-trips the whole lesson to the sandbox subprocess, so it
-;; waits for a real pause, not a fast typist's inter-key gap.
-(def *tutor-eval-debounce-ms* 250)
+;; The activity-spinner beat — fast enough to read as motion, and armed only while a job is
+;; in flight, so an idle editor runs no timer for it.
+(def *spinner-ms* 120)
+
 ;; The idle beat (`:idle-recompute`) armed after activity settles — Emacs's idle-timer
 ;; model. It drives everything deferred off the per-key path: the eldoc hint, the advisory
 ;; type-check, the **minibuffer completion re-rank** for a large source (find-file / M-x —
@@ -70,28 +63,31 @@ pool (`ed-set-buf`), scrolling to the pane (`ed-set-top`)."
 ;; Every one-shot is `:idle?`, and `ui-run` holds an idle timer while a key is down, so a
 ;; held key never starts the beat: not between repeats, nor before the first. A beat
 ;; already sliced (`:idle-continue`, an `:every` ticker) still finishes between repeats.
+(def *diag-debounce-ms* 120)
 
-(def *which-key-delay-ms* 500)
+;; A live-evaluating buffer's eval-on-type debounce (the tutorial, the playgrounds): a shade
+;; slower than the idle beat — each firing round-trips the forms to a sandbox subprocess, so
+;; it waits for a real pause, not a fast typist's inter-key gap.
+(def *tutor-eval-debounce-ms* 250)
+
 ;; How long a prefix chord (e.g. C-x) must sit pending before the which-key panel
 ;; appears (Emacs `which-key-idle-delay`), so a fast chord like C-x C-f doesn't flash
 ;; it. Armed when a prefix is pending; the `:which-key` timer that follows reveals the panel.
+(def *which-key-delay-ms* 500)
 
-(defdyn *undo-pause-ms* 600)
 ;; After a typing/deletion command, a quiet this long closes the undo run (sets
 ;; :undo-break, so the next edit starts a fresh undo group — the Emacs `undo-boundary`
 ;; on a typing pause). Without it, a plain buffer with no eldoc/diagnostics debounce
 ;; would never tick mid-session and the whole burst would amalgamate into one undo step.
+(defdyn *undo-pause-ms* 600)
 
 ;; ---- construction -----------------------------------------------------------
 
 (sig ed-log-buffer (-> buffer))
 (defn ed-log-buffer (&optional (name "*Messages*"))
   "A fresh log/output buffer named `name` (default `*Messages*`) with undo turned off
-— append-only sinks don't want an undo history. `disable-undo` is a recent std/buffer
-addition; if the running `nest` predates it the call throws, so we degrade gracefully
-(the buffer just keeps an undo history)."
-  (let (b (make-buffer "" name))
-    (try (disable-undo b) (catch e b))))
+— append-only sinks don't want an undo history."
+  (disable-undo (make-buffer "" name)))
 
 ;; ---- a tree-sitter mode without its grammar -------------------------------------
 ;; A language whose mode is a tree-sitter grammar (`language-core/deflanguage`) colours nothing
@@ -510,10 +506,8 @@ functions. `brood-mode` is the first to supply these (see `modes`)."
   "A `:gutter-cell` service result normalised to a **list of `[text face]` chunks**. The
 service may return either a single `[text face]` pair (a plain line number) or a list of such
 chunks (a file buffer's diff-hl change bar *plus* the number — see `gutter/line-number-cell`).
-Decoding that two-forms shape used to live in each renderer separately, so the web mirror
-assumed the single form and crashed on the list — silently dropping the browser the moment you
-opened a file buffer. This is the single decoder both the native view (`panebody/ed-gutter-line-ops`)
-and the web mirror (`web/web-gutter-html`) share, so the two can never drift apart again."
+The one decoder both the native view (`panebody/ed-gutter-line-ops`) and the web mirror
+(`web/web-gutter-html`) share, so the two read the shape alike."
   (if (string? (first cell)) (list cell) cell))
 
 ;; ---- calling a hook in a module that may not have loaded ------------------------
@@ -533,28 +527,16 @@ row's symbol, called under its package's claimant if its module has loaded, else
     (fn () (apply reflect/call-if-bound sym fallback arguments))))
 
 ;; ---- the off-loop job table: what is in flight, and what to call it ----------
-;; It lives in `model` rather than in the dispatcher because it is MODEL vocabulary —
-;; which model field holds which handle — and two very different readers need it: the
-;; dispatcher (`events/ed-ev-task-reply`, to route a reply) and the view (the activity
-;; segment, to say what is running). `view` cannot reach into `input`: the dispatcher sits
-;; above everything it folds.
-;; How an off-the-loop job is declared. The table is keyed by the model field a launch parks
-;; its task handle on -> `[fold-fn failure-value label]`: the function that folds the answer
-;; in, what to fold instead when the task errored or timed out, and the LABEL the activity
-;; indicator shows while it is in flight (nil for one not worth announcing). Folds are
-;; SYMBOLS resolved at dispatch (`reflect/eval`), like the event handlers and for the same
-;; reason — redefining a fold hot-swaps it.
+;; MODEL vocabulary — which model field holds which handle — read by the dispatcher
+;; (`events/ed-ev-task-reply`, to route a reply) and the view (the activity segment, to say
+;; what is running). The table is keyed by the model field a launch parks its task handle on
+;; -> `[fold failure label options]`: the symbol that folds the answer in (resolved at
+;; dispatch, so redefining a fold hot-swaps it), what to fold instead when the task errored
+;; or timed out, and the LABEL the activity indicator shows while it is in flight. Every row
+;; is REGISTERED by the module that runs the job, when it loads ([[register-task-reply]]): a
+;; task can only be running once that module has loaded, and the model names none of the
+;; features that work off the loop.
 ;;
-;; A TABLE, because every row was the same three lines of `cond` with two words changed.
-;; Adding an off-the-loop recompute is a launch, a fold and a row — the branch it used to
-;; also need was pure ceremony, and the sixth copy of it is how a default gets forgotten.
-;;
-;; Every row is REGISTERED by the module that runs the job, when it loads
-;; ([[register-task-reply]]) — the diagnostics check, the diff-hl gutter, eldoc and the
-;; tree warm included. A task can only be running once the module that started it has
-;; loaded, so that is exactly when its row is first needed, and the model names none of
-;; the features that happen to work off the loop (X4).
-
 ;; Which jobs get a label, and why the rest do not: eldoc, the diagnostics check, the
 ;; diff-hl gutter, the status-bar git summary and the tree warm all finish inside a frame
 ;; or two and fire on the IDLE BEAT, i.e. constantly while you work. A chip that flickers
@@ -562,24 +544,17 @@ row's symbol, called under its package's claimant if its module has loaded, else
 ;; editor tells you something is happening. Labelled are the jobs that can take seconds
 ;; and that you asked for: a pull, a fetch, a status on a big repo, a shell command, a
 ;; project scan.
-
-;; Every table in this section is a `std/registry` (brood ADR-412), not a `defonce` global
-;; re-bound with `def`: a registration is one atomic write (two processes registering at once
-;; both land), it survives an `%isolate` restore, and the startup image carries it with the
-;; module that made it. A `def`-rebound global had none of the three.
-
-;; What C-g does to a job is ALSO on its row, for the same reason the fold is: the
-;; universal cancel used to name the four jobs it killed (and the `-checking` flags each
-;; kept beside its handle), so every feature that worked off the loop was a line in
-;; `commands`, and one that forgot to add itself (the shell command) was quietly
-;; uncancellable. A row opts in with `:cancel-on-quit?` and may name an `:on-quit` hook
-;; for the clean-up its feature alone knows (a re-stamped gutter, a cleared rope); the
-;; cancel itself — kill the task, free the slot — is the same for every job, so it lives
-;; once, in [[ed-cancel-quit-jobs]].
 ;;
-;; Not every job opts in. A git operation half-killed can leave a lock or a half-applied
-;; rebase; a format job rewrites the buffer when it lands; the status-bar summary and the
-;; tree warm are upkeep nobody is waiting on. C-g is for the work you would want to stop.
+;; What C-g does to a job is on its row too: a row opts in with `:cancel-on-quit?` and may
+;; name an `:on-quit` hook for the clean-up its feature alone knows (a re-stamped gutter, a
+;; cleared rope); the cancel itself — kill the task, free the slot — is the same for every
+;; job, so it lives once, in [[ed-cancel-quit-jobs]]. Not every job opts in: a git operation
+;; half-killed can leave a lock or a half-applied rebase; a format job rewrites the buffer
+;; when it lands; the status-bar summary and the tree warm are upkeep nobody is waiting on.
+;;
+;; Every `register-*` table in this file is a `std/registry` (brood ADR-412): a registration
+;; is one atomic write, it survives an `%isolate` restore, and the startup image carries it
+;; with the module that made it.
 
 (defn register-task-reply (slot fold failure label &optional (options {}))
   "Declare an off-the-loop job a feature runs: the model field `slot` its task handle is
@@ -733,12 +708,12 @@ model the previous one left. All of them at once — the headless path (tests, a
 a live loop runs the beat in slices ([[ed-run-idle-slice]])."
   (fold (ed-idle-jobs) m (fn (acc job) (ed-call-deferred acc (:run job) acc))))
 
-(defdyn *idle-slice-ms* 3)
 ;; How much of ONE loop turn the idle beat may take before it yields. The beat runs a dozen
 ;; jobs — the LSP push, eldoc, the check's launch, the git summary, auto-save, auto-revert —
 ;; and run as one turn it cost 6–18 ms on the loop (25 ms in a live window), all of which a
 ;; key pressed in the middle of it waited out. Sliced, a key waits for one slice: the loop
 ;; takes queued input before it fires a timer, so the next slice runs after the key.
+(defdyn *idle-slice-ms* 3)
 
 (sig ed-run-idle-slice (model int -> model))
 (defn ed-run-idle-slice (m from)
@@ -769,11 +744,12 @@ its candidates, `offloop/ed-open-when-ready`)."
         (if (and text (not (nil? (get m slot)))) text nil)))))
 
 (defn ed-busy? (m)
+  "Whether some announced job is in flight ([[ed-activity]]) — what keeps the spinner turning."
   (not (empty? (ed-activity m))))
+
 ;; ---- named timers (ADR-102): the model declares time-driven work as `:timers` ----
-;; `ed-sync-timers` reconciles `:timers` with the model state after each event (the
-;; declarative replacement for the old "shorten :tick-ms" arming cascade); the per-timer
-;; firing is dispatched in `input/ed-timer-fire`. `ed-set-timer`/`ed-drop-timer` are the
+;; `ed-sync-timers` reconciles `:timers` with the model state after each event; the
+;; per-timer firing is dispatched in `input/ed-timer-fire`. `ed-set-timer`/`ed-drop-timer` are the
 ;; imperative pair, for a timer whose arming is not a function of the model (the idle
 ;; beat's continuation, `:idle-continue`).
 
@@ -809,22 +785,6 @@ or an async event does neither."
 so does a value that is not a count."
   (let (limit (or (:blink-cursor-blinks m) *blink-cursor-blinks*))
     (if (and (int? limit) (> limit 0)) limit 0)))
-
-(sig ed-sync-timers (model -> model))
-
-(sig ed-buffer-displayed? (model string -> bool))
-(defn ed-buffer-displayed? (m nm)
-  "Whether the buffer named `nm` is showing in some pane right now — ON SCREEN, not merely
-open in the pool (`ed-buffer-index-by-name`, which a buried buffer also satisfies).
-
-The distinction is what makes a self-refreshing buffer affordable: work done for a buffer
-nobody can see is work the reader is paying for and will never look at, and a refresh that
-fires anyway is also a refresh that can steal the pane it is drawn into. Anything on a
-timer asks this first."
-  (let (idx (ed-buffer-index-by-name m nm))
-    (and (not (nil? idx))
-      (any? (pane-leaf-paths (:layout m))
-        (fn (path) (= idx (:buffer (pane-payload-at (:layout m) path))))))))
 
 ;; ---- motion: what moves on its own, and when it must not ------------------------
 ;; The editor's few animations — the settle ease after a trackpad scroll, the pulse after a
@@ -904,28 +864,24 @@ it runs when the timer goes off. Called when the feature's module loads."
   "Timer name -> `{:spec sym :fire sym}`, as the features registered them."
   (registry/entries :model/timer-clients))
 
-(defn- ed-live-eval-call (m sym fallback)
-  ;; A live-eval client's hook, through the shared deferred-call guard.
-  (ed-call-deferred m sym fallback))
-
 (defn ed-live-eval-stale? (m client)
   "Has `client`'s buffer moved since its last launch — i.e. should its debounce be armed?
 False for a client whose module has never been loaded, which is every one of them until
 somebody opens the buffer."
-  (ed-live-eval-call m (:stale? client) false))
+  (ed-call-deferred m (:stale? client) false))
 
 (defn ed-live-eval-launch (m timer)
   "Run the launch of whichever live-eval client owns `timer`, or leave `m` alone when no
 client does. What `input/ed-timer-fire` calls, so the set of languages that evaluate as
 you type is one table and not a chain of `cond` arms."
   (let (client (seq/find (ed-live-eval-clients) (fn (c) (= (:timer c) timer))))
-    (if client (ed-live-eval-call m (:launch client) m) m)))
+    (if client (ed-call-deferred m (:launch client) m) m)))
 
 (defn ed-live-eval-reanchor (m)
   "Move every live-evaluating buffer's notes with the text — on the EDIT itself, not the
 debounce, since a note is stored with the line it sits on and the whole set hides the
 moment the line count changes. O(1) per client until that client's own notes go stale."
-  (fold (ed-live-eval-clients) m (fn (acc client) (ed-live-eval-call acc (:reanchor client) acc))))
+  (fold (ed-live-eval-clients) m (fn (acc client) (ed-call-deferred acc (:reanchor client) acc))))
 
 (defn- ed-idle-one-shots (m)
   "Every managed idle one-shot as `[name delay-ms due?]` — the timer, how long the quiet
@@ -935,10 +891,9 @@ so none can be armed here and forgotten there.
 
 The idle beat is armed while any registered job has work pending ([[ed-idle-due?]]); the
 `:idle?` deadline debounces it — a repeating key resets the countdown. A pane resting between
-lines snaps once the scroll deltas stop (and not again while that ease runs). Every live-evaluating buffer's eval-on-type debounce
-is one timer each, so they arm and fire independently ([[ed-live-eval-clients]]); each is
-deferred-loaded — bound?-guarded + late-bound, the keymap idiom — so this core file never
-links any of them eagerly."
+lines snaps once the scroll deltas stop (and not again while that ease runs). Every
+live-evaluating buffer's eval-on-type debounce is one timer each, so they arm and fire
+independently ([[ed-live-eval-clients]])."
   (append
     [[:idle-recompute *diag-debounce-ms* (ed-idle-due? m)]
       [:scroll-settle
@@ -967,13 +922,13 @@ watch, the BEAM views' refresh — each asked whether it wants one now: name -> 
       (let (spec (ed-call-deferred m (:spec client) nil))
         (if spec (assoc acc name spec) acc)))))
 
+(sig ed-sync-timers (model -> model))
 (defn ed-sync-timers (m)
-  "Reconcile `:timers` (ADR-102) with the model after each event — the declarative
-replacement for the old arm-the-tick cascade. The
-idle one-shots — eldoc/diagnostics debounce (`:idle-recompute`), the which-key reveal
-delay, the undo-pause boundary — are present only while their work is pending
-(`ed-idle-one-shots`). Also clears the
-`:which-key` reveal flag once no prefix is pending (what `ed-which-key-arm` used to do)."
+  "Reconcile `:timers` (ADR-102) with the model after each event. The idle one-shots — the
+idle beat (`:idle-recompute`), the which-key reveal delay, the undo-pause boundary — are
+present only while their work is pending (`ed-idle-one-shots`); the spinner and the scroll
+glide tick only while they run; a feature's timer is there while it asks for one. Also
+clears the `:which-key` reveal flag once no prefix is pending."
   (let (m (if (:pending m) m (dissoc m :which-key))
         one-shots (ed-idle-one-shots m)
         managed (merge
@@ -1264,13 +1219,13 @@ registered for it. Called when its module loads."
 
 ;; check-allow: the presenter is resolved late, so its result is unknown to the checker; every
 ;; presenter of these roles answers a model, as `fallback` is one
+(sig ed-present (model keyword model & any -> model))
 (check-allow :trusted
   (defn ed-present (m role fallback & arguments)
     "`m` after the presenter registered for `role` shows `arguments`, or the model `fallback`
 when none is registered."
     (let (presenter (ed-presenter role))
       (if (nil? presenter) fallback (apply ed-call-hook presenter fallback m arguments)))))
-(sig ed-present (model keyword model & any -> model))
 
 (defn ed-prompt-free? (m)
   "Whether nothing modal holds the keys — no prompt, search, menu or one-key read — so a
@@ -1705,6 +1660,20 @@ is the honest `nil | int` for a caller that has a plan for absence."
   (or (ed-buffer-index-by-name m nm)
     (error (str "no buffer named " (pr-str nm) " in the pool"))))
 
+(sig ed-buffer-displayed? (model string -> bool))
+(defn ed-buffer-displayed? (m nm)
+  "Whether the buffer named `nm` is showing in some pane right now — ON SCREEN, not merely
+open in the pool (`ed-buffer-index-by-name`, which a buried buffer also satisfies).
+
+The distinction is what makes a self-refreshing buffer affordable: work done for a buffer
+nobody can see is work the reader is paying for and will never look at, and a refresh that
+fires anyway is also a refresh that can steal the pane it is drawn into. Anything on a
+timer asks this first."
+  (let (index (ed-buffer-index-by-name m nm))
+    (and (not (nil? index))
+      (any? (pane-leaf-paths (:layout m))
+        (fn (path) (= index (:buffer (pane-payload-at (:layout m) path))))))))
+
 (defn ed-update-named (m nm f)
   "The model with `f` applied to the pool buffer named `nm`, wherever it sits, and nothing
 else touched — a no-op when there is no such buffer.
@@ -1725,16 +1694,12 @@ A PROCESS-global fact, not a model one, which is why it takes no model. Everythi
 work off to another process has to ask it, because a fire-and-forget request has nowhere to
 come back to without a loop: the answer decides between sending and doing the work inline
 (diagnostics, eldoc, the git gutter) or between the sandbox and an in-image eval (the
-tutorial, the playground). It was spelled out at every one of those sites, twice as its own
-negation, which is how two features came to carry identical private `…-live?` functions.
+tutorial, the playground).
 
-Live when this code runs INSIDE a loop (`editor/ui/*loop*`, bound by `ui-run` for the loop's whole
-life) or when the editor process exists (`:editor`, registered before its loop starts, so the
-setup `main` does ahead of `ui-run` counts). It used to be the second alone, which is true of
-the first window only — a second frame and every `--serve` client's loop read as headless,
-and the playground there evaluated in the daemon's own image, with no timeout, where a `defn`
-rebinds the editor for every client (issues.md S6). Their answers come back to them now
-(`session/request` routes by the asking loop), so they are loops like any other."
+Live when this code runs INSIDE a loop (`editor/ui/*loop*`, bound by `ui-run` for the loop's
+whole life — a second frame and every `--serve` client's loop included) or when the editor
+process exists (`:editor`, registered before its loop starts, so the setup `main` does ahead
+of `ui-run` counts)."
   (and (nil? editor/ui/*loop*) (nil? (proc/whereis :editor))))
 
 (defn ed-loop-address ()
@@ -1743,9 +1708,8 @@ rebinds the editor for every client (issues.md S6). Their answers come back to t
 the work is handed over — a spawned worker does not inherit the binding, so it is captured
 at the send, not looked up by the worker.
 
-`:editor` alone is the first window. A shell, a compile or a test run started from a
-second frame (or a `--serve` client) sent its output there, and the frame that asked never
-heard back — the same mistake `ed-headless?` and `session/request` were cured of."
+`:editor` alone is the first window: a shell, a compile or a test run started from a second
+frame (or a `--serve` client) must answer the frame that asked."
   (or editor/ui/*loop* :editor))
 
 (defn ed-buffer-index-by-file (m path)
@@ -1785,25 +1749,11 @@ properties the line comes with (`{key spans}` relative to it — a program's col
     (set-read-only (insert (end-of-buffer (set-read-only buf false)) line properties) true)
     (insert (end-of-buffer buf) line properties)))
 
-;; ---- cutting an output buffer's head ------------------------------------------
-;; A log or a stream (*Messages*, *Tests*, *Run*, *compilation*, a shell) grows for as long
-;; as its producer talks, so it keeps only its newest lines (Emacs's `message-log-max`,
-;; `comint-buffer-maximum-size`). The cut is always whole lines from the top, and nothing
-;; that points into the text may notice it moved: the buffer's point and mark, a shell's
-;; `:input-start`, the off-text `:line-links` a results buffer jumps by (keyed by LINE), and
-;; every pane on it — its window point and mark, and its scroll, so a reader up in the
-;; scrollback keeps reading the same lines.
-
-(defdyn *output-max-lines* 10000)
-;; How many lines a streaming output buffer keeps when the model names none
-;; (`:output-max-lines`, the `:output-buffer-max-lines` setting). A cut takes it back to
-;; nine tenths of that, so a stream at the cap pays for a cut once per tenth.
-
 ;; ---- carrying positions through a change of the text ----------------------------
 ;; Everything that points into a buffer from outside its text — a pane's window point, mark
 ;; and scroll, the buffer's own point and mark, a shell's `:input-start`, a results buffer's
 ;; `:line-links` rows, a saved window layout — follows a change of the text as an Emacs
-;; marker does. One rule for every change: a head cut here, and a change another frame made
+;; marker does. One rule for every change: a head cut (below), and a change another frame made
 ;; that arrives as a splice (`hosted/hosted-apply-content`).
 
 (defn ed-carry-position (position lo hi inserted)
@@ -1833,10 +1783,10 @@ whether the line survived (false when all of it was inside the replaced text)."
         carried (ed-carry-position start lo hi inserted))
     [(text/char->line after (math/min carried (text/length after))) (not gone?)]))
 
-(def- carried-position-keys [:input-start])
 ;; The buffer fields that hold one char offset into its text, carried as markers: a shell's
 ;; (or a line-mode terminal's) input start. Its process mark is a real buffer marker, and
 ;; every marker is carried too (below).
+(def- carried-position-keys [:input-start])
 
 (defn ed-carry-buffer-fields (buf before lo hi inserted)
   "`buf` — a buffer after `[lo, hi)` of `before` was replaced by `inserted` chars — with what
@@ -1875,6 +1825,64 @@ to the text, and the edit that made `buf` carried them (brood ADR-579)."
                   (if kept? (assoc acc moved location) acc))
                 acc))))
       inputs)))
+
+(defn- ed-carry-pane (pane before after lo hi inserted)
+  "A pane's payload after `[lo, hi)` of its buffer's rope `before` was replaced by `inserted`
+chars (giving `after`): its window point and mark carried ([[ed-carry-position]]), its scroll
+kept on the text it showed — `:top`, and the `:top-row` line a wrapped pane starts part-way
+down, dropped when that line went ([[ed-carry-line]])."
+  (let (carry (fn (position) (ed-carry-position position lo hi inserted))
+        top (if (int? (:top pane)) (:top pane) 0)
+        moved (assoc pane
+                :point (carry (:point pane))
+                :mark (carry (:mark pane))
+                :top (first (ed-carry-line before after top lo hi inserted)))
+        top-row (:top-row pane))
+    (if (nil? top-row)
+      moved
+      (let ([line kept?] (ed-carry-line before after (first top-row) lo hi inserted))
+        (if kept? (assoc moved :top-row [line (second top-row)]) (dissoc moved :top-row))))))
+
+;; A window layout kept off the screen — winner's undo ring — holds window points and scroll
+;; too, and restoring one must show what it showed. A feature that keeps layouts registers
+;; how to carry them ([[register-layout-keeper]]); the core names none.
+
+(defn register-layout-keeper (name carry)
+  "A feature that keeps window layouts besides the live one: `carry` names a `(model
+buffer-name f) -> model` function applying the pane-payload function `f` to every kept window
+showing the buffer named `buffer-name`. Called when the feature's module loads."
+  (ownership/claim! :model/layout-keepers name carry))
+
+;; check-allow: a keeper is resolved late (`reflect/eval`), so its result is unknown to the
+;; checker; every keeper answers a model
+(sig ed-carry-panes (model int any any int int int -> model))
+(check-allow :trusted
+  (defn ed-carry-panes (m idx before after lo hi inserted)
+    "The model with every window on pool buffer `idx` — the live layout's, and each kept one's
+([[register-layout-keeper]]) — carried through `[lo, hi)` of rope `before` replaced by
+`inserted` chars, giving rope `after` ([[ed-carry-pane]]). What keeps a reader in the
+scrollback on the lines they read, in this frame and in any other, when the text above them
+changes."
+    (let (carry (fn (pane) (ed-carry-pane pane before after lo hi inserted))
+          name (buffer-name (ed-buf-at m idx))
+          shown (ed-map-panes m (fn (pane) (if (= (:buffer pane) idx) (carry pane) pane))))
+      (fold (vals (registry/entries :model/layout-keepers))
+        shown
+        (fn (acc keeper) ((reflect/eval keeper) acc name carry))))))
+
+;; ---- cutting an output buffer's head ------------------------------------------
+;; A log or a stream (*Messages*, *Tests*, *Run*, *compilation*, a shell) grows for as long
+;; as its producer talks, so it keeps only its newest lines (Emacs's `message-log-max`,
+;; `comint-buffer-maximum-size`). The cut is always whole lines from the top, and nothing
+;; that points into the text may notice it moved: the buffer's point and mark, a shell's
+;; `:input-start`, the off-text `:line-links` a results buffer jumps by (keyed by LINE), and
+;; every pane on it — its window point and mark, and its scroll, so a reader up in the
+;; scrollback keeps reading the same lines.
+
+;; How many lines a streaming output buffer keeps when the model names none
+;; (`:output-max-lines`, the `:output-buffer-max-lines` setting). A cut takes it back to
+;; nine tenths of that, so a stream at the cap pays for a cut once per tenth.
+(defdyn *output-max-lines* 10000)
 
 (sig ed-cut-head (buffer int -> buffer))
 (defn ed-cut-head (buf cut)
@@ -1930,50 +1938,6 @@ below `limit`."
 last line rather than starting another), every position kept ([[ed-cut-head]]). A no-op at
 or under `limit`; one cut at the head — a rope splice — when over."
   (let (cut (ed-head-cut-lines buf limit)) (if (nil? cut) buf (ed-cut-head buf cut))))
-
-(defn- ed-carry-pane (pane before after lo hi inserted)
-  "A pane's payload after `[lo, hi)` of its buffer's rope `before` was replaced by `inserted`
-chars (giving `after`): its window point and mark carried ([[ed-carry-position]]), its scroll
-kept on the text it showed — `:top`, and the `:top-row` line a wrapped pane starts part-way
-down, dropped when that line went ([[ed-carry-line]])."
-  (let (carry (fn (position) (ed-carry-position position lo hi inserted))
-        top (if (int? (:top pane)) (:top pane) 0)
-        moved (assoc pane
-                :point (carry (:point pane))
-                :mark (carry (:mark pane))
-                :top (first (ed-carry-line before after top lo hi inserted)))
-        top-row (:top-row pane))
-    (if (nil? top-row)
-      moved
-      (let ([line kept?] (ed-carry-line before after (first top-row) lo hi inserted))
-        (if kept? (assoc moved :top-row [line (second top-row)]) (dissoc moved :top-row))))))
-
-;; A window layout kept off the screen — winner's undo ring — holds window points and scroll
-;; too, and restoring one must show what it showed. A feature that keeps layouts registers
-;; how to carry them ([[register-layout-keeper]]); the core names none.
-
-(defn register-layout-keeper (name carry)
-  "A feature that keeps window layouts besides the live one: `carry` names a `(model
-buffer-name f) -> model` function applying the pane-payload function `f` to every kept window
-showing the buffer named `buffer-name`. Called when the feature's module loads."
-  (ownership/claim! :model/layout-keepers name carry))
-
-;; check-allow: a keeper is resolved late (`reflect/eval`), so its result is unknown to the
-;; checker; every keeper answers a model
-(sig ed-carry-panes (model int any any int int int -> model))
-(check-allow :trusted
-  (defn ed-carry-panes (m idx before after lo hi inserted)
-    "The model with every window on pool buffer `idx` — the live layout's, and each kept one's
-([[register-layout-keeper]]) — carried through `[lo, hi)` of rope `before` replaced by
-`inserted` chars, giving rope `after` ([[ed-carry-pane]]). What keeps a reader in the
-scrollback on the lines they read, in this frame and in any other, when the text above them
-changes."
-    (let (carry (fn (pane) (ed-carry-pane pane before after lo hi inserted))
-          name (buffer-name (ed-buf-at m idx))
-          shown (ed-map-panes m (fn (pane) (if (= (:buffer pane) idx) (carry pane) pane))))
-      (fold (vals (registry/entries :model/layout-keepers))
-        shown
-        (fn (acc keeper) ((reflect/eval keeper) acc name carry))))))
 
 (sig ed-cut-head-at (model int int -> model))
 (defn ed-cut-head-at (m idx cut)
@@ -2059,9 +2023,9 @@ the model."
 
 ;; ---- what the echo area says: the log's cap, a failure, a question standing -----
 
-(defdyn *message-log-max* 1000)
 ;; How many lines `*Messages*` keeps (Emacs `message-log-max`, same default): past that the
 ;; oldest go, so a session that runs for days does not carry every echo it ever showed.
+(defdyn *message-log-max* 1000)
 
 (defn ed-report-slow (report)
   "ui-run's watchdog hook (`:on-slow`, brood ADR-490): hand a slow turn's `report`
@@ -2180,8 +2144,7 @@ to happen and carries its own `(y or n)`."
 ;; ---- applying buffer ops to the current buffer ------------------------------
 ;; The editing core: every command that changes the text goes through `ed-try-edit`
 ;; (or `ed-edit`), so a read-only refusal is handled in ONE place and a command
-;; learns whether its edit happened. Here rather than in `commands` because isearch's
-;; query-replace is an editing command too, and `commands` uses isearch.
+;; learns whether its edit happened.
 
 (defn ed-apply (m f)
   "Apply a pure `buffer -> buffer` op `f` to the current buffer (movement/undo:
@@ -2207,6 +2170,18 @@ line. Any other error is re-raised untouched."
   (let ([edited ran _] (ed-try-edit-with m (fn (b) [(f b) nil])))
     [edited ran]))
 
+(defn ed-read-only-refusal? (error)
+  "Whether `error` is a read-only span refusing an edit: the mutator throws `:kind
+:read-only` (std/editor/buffer) — matched by KIND, not message text, so the wording can
+change without breaking this."
+  (and (map? error) (= (:kind error) :read-only)))
+
+(defn ed-read-only-refused (m)
+  "`m` after an edit a read-only span refused: failed ([[ed-ding]]), the echo saying where
+you CAN edit — the buffer's own `:read-only-hint`, else a neutral line."
+  (ed-ding (message m
+             (or (ed-mode-service (ed-current-buf m) :read-only-hint) "read-only text here"))))
+
 (defn ed-try-edit-with (m f)
   "[[ed-try-edit]] for an edit that answers something besides the buffer: `f` is `buffer ->
 [buffer extra]`, and the result is `[m' true extra]` when it ran, `[m' false nil]` when the
@@ -2219,42 +2194,16 @@ edit through here rather than through a buffer key."
       (let ([edited extra] (f (ed-current-buf m)))
         [(assoc (ed-set-buf m edited) :status "modified") true extra])
       (catch e
-        ;; A partial read-only span refused the edit: the mutator throws `:kind :read-only`
-        ;; (std/editor/buffer) — matched by KIND, not message text, so the wording can change
-        ;; without breaking this. The whole op is abandoned (immutable) and the buffer's own
-        ;; `:read-only-hint` says where you CAN edit; any other error re-raises untouched.
-        (if (and (map? e) (= (:kind e) :read-only))
-          [(ed-ding (message m
-                      (or (ed-mode-service (ed-current-buf m) :read-only-hint)
-                        "read-only text here")))
-            false nil]
-          (throw e))))))
+        ;; a partial read-only span refused the edit: the whole op is abandoned (immutable);
+        ;; any other error re-raises untouched
+        (if (ed-read-only-refusal? e) [(ed-read-only-refused m) false nil] (throw e))))))
 
 (defn ed-edit (m f)
   "Apply a pure `buffer -> buffer` edit `f` to the current buffer — `ed-try-edit`, for a
 command with nothing to do beyond the edit itself."
   (first (ed-try-edit m f)))
-;; ---- log routing: one logger, a filtered backend per destination buffer ------
-;; stdout (a raw `*out*` stream) and logging (structured, levelled records) are
-;; different pipes that converge only here — text appended to a named buffer. The
-;; logger (std/log) fans each record to its backends; we give it one backend per
-;; destination buffer, each a `:filter` on the record's `:meta :category`, so a
-;; component's logs land in its own buffer: uncategorised → *Messages* (the default),
-;; `{:category :lsp}` → *LSP*, etc. A backend's sink is a `process-port`-style `io`
-;; port that sends a `buffer-log-event` to the editor, which folds it into that
-;; buffer (`ed-append-named`) — the same share-nothing path `print` uses.
 
-;; ---- the async event contract (UiEvent) --------------------------------------
-;; Besides keys, the ui-run loop's mailbox receives async events from the editor's
-;; own producers (the compile worker, the project shell, the web mirror, the log
-;; backends below). Each is a RECORD implementing `UiEvent`: the producer module
-;; defines the record + impl and just sends it — no central handler table to edit
-;; (`ed-update` folds any `UiEvent` record via `ui-event-fold`). Declared here
-;; because every producer already `:use`s the model. Events whose producer we don't
-;; own — the GUI frontend's `[:resize]`/`[:mouse]`/`[:key-up]`, the runtime's
-;; `[:down]`, std's `[:buffer-updated]`/`[:io/write]`/`[:task-*]`/`[:client-opts]`,
-;; and the lsp replies interlocked with completion's bounded wait — stay tagged
-;; vectors in input's residual registry.
+;; ---- a runner's JSON event lines ----------------------------------------------------
 
 (defn ed-json-event-line (line)
   "The tagged JSON event object a runner subprocess printed on `line`, or nil —
@@ -2268,6 +2217,18 @@ runner (testrun / apprun) shares; classifying the event stays theirs."
                    (when (and (includes? line "\"event\":") (>= i 0))
                      (parse (string/substring line i (string/length line)))))))
     (when (map? parsed) parsed)))
+
+;; ---- the async event contract (UiEvent) --------------------------------------
+;; Besides keys, the ui-run loop's mailbox receives async events from the editor's
+;; own producers (the compile worker, the project shell, the web mirror, the log
+;; backends below). Each is a RECORD implementing `UiEvent`: the producer module
+;; defines the record + impl and just sends it — no central handler table to edit
+;; (`ed-update` folds any `UiEvent` record via `ui-event-fold`). Declared here
+;; because every producer already `:use`s the model. Events whose producer we don't
+;; own — the GUI frontend's `[:resize]`/`[:mouse]`/`[:key-up]`, the runtime's
+;; `[:down]`, std's `[:buffer-updated]`/`[:io/write]`/`[:task-*]`/`[:client-opts]`,
+;; and the lsp replies interlocked with completion's bounded wait — stay tagged
+;; vectors in `events`' table.
 
 (defability UiEvent
   "An app-produced async event on the ui-run mailbox: `ui-event-fold` folds it into
@@ -2301,6 +2262,15 @@ fold is more than that delegation (a generation guard, an inline body) keeps its
      (impl ~'UiEvent
        ~name
        (~'ui-event-fold (event m textrows cols rows) (~handler m event textrows cols rows)))))
+
+;; ---- log routing: one logger, a filtered backend per destination buffer ------
+;; stdout (a raw `*out*` stream) and logging (structured, levelled records) are
+;; different pipes that converge only here — text appended to a named buffer. The
+;; logger (std/log) fans each record to its backends; we give it one backend per
+;; destination buffer, each a `:filter` on the record's `:meta :category`, so a
+;; component's logs land in its own buffer: uncategorised → *Messages* (the default),
+;; `{:category :lsp}` → *LSP*, etc. A backend's sink is an `io` port that sends a
+;; `buffer-log-event` to the editor, which folds it into that buffer (`ed-append-named`).
 
 (defrecord buffer-log-event (buffer line)) ; a routed log line -> append to that buffer
 (impl UiEvent
@@ -2346,7 +2316,7 @@ supervised logger, so routes survive a restart."
         (ed-buffer-backend (:buffer rt)
           {:filter (fn (r) (= (ed-record-category r) (:category rt)))})))))
 
-;; ---- OS window title --------------------------------------------------------
+;; ---- a reduction count, short ------------------------------------------------------
 
 (defn ed-reds-human (n)
   "A reduction count short (`1.2M` / `194k` / `42`) — the app-run telemetry's work
@@ -2355,6 +2325,8 @@ metric."
     (>= n 1000000) (str (math/quot n 1000000) "." (math/quot (math/rem n 1000000) 100000) "M")
     (>= n 1000) (str (math/quot n 1000) "k")
     else (str n)))
+
+;; ---- OS window title --------------------------------------------------------
 
 (def *app-name*
   ;; The editor's display name, as a human reads it: the OS title bar's suffix, and
