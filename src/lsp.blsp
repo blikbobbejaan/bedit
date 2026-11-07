@@ -41,7 +41,6 @@ characters, so every column crosses [[lsp-column->units]] going out and
   (:use lsp-requests)) ; the request-kind records
 ;; ---- tunables (redefine live) -----------------------------------------------
 
-(def *lsp-timeout-ms* 1000) ; how long a Tab waits for the server before giving up
 ;; How long the handshake waits for the `initialize` response before giving up on it.
 ;;
 ;; Three minutes, because a real language server's `initialize` is not a handshake, it is a
@@ -371,38 +370,6 @@ its behalf would be worse than letting it say no itself."
   "Stop a connection: kill the server and end the connection process."
   (send conn [:shutdown]))
 
-(defn- lsp-complete-collect (corrs deadline acc)
-  "Receive the completion answers for `corrs` until each has come or `deadline` passes,
-merged into `acc` (`{:entries :incomplete}`); a server that never answered makes the merge
-incomplete, so nothing caches it."
-  (if (empty? corrs)
-    acc
-    (let (left (math/max 0 (- deadline (os/now))))
-      (receive
-        ([:lsp-completion corr answer] (if (includes? corrs corr)
-                                         (lsp-complete-collect (seq/reject corrs
-                                                                 (fn (asked) (= asked corr)))
-                                           deadline
-                                           {:entries (seq/distinct (append (:entries acc)
-                                                                     (:entries answer)))
-                                            :incomplete (or (:incomplete acc) (:incomplete answer))})
-                                         (lsp-complete-collect corrs deadline acc)))
-        (after left (assoc acc :incomplete true))))))
-
-(defn lsp-complete-all (asks timeout)
-  "Ask each `[conn request]` in `asks` for completions at its `request` (`{:uri :lang :line
-:char}`, with `:text` when that server's copy has to be brought up to date on the way), all
-at once, blocking up to `timeout` ms in all. Answers the merge `{:entries :incomplete}`
-([[lsp-completion-answer]]): entries in server order, each once. Safe to call only on an
-explicit trigger, not per keystroke."
-  (let (corrs (into []
-                (map asks
-                  (fn ([conn request])
-                    (let (corr (ref))
-                      (lsp-ask-async conn (lsp-completion) corr (self) request)
-                      corr)))))
-    (lsp-complete-collect corrs (+ (os/now) timeout) {:entries '() :incomplete false})))
-
 (defn lsp-close (conn uri)
   "Tell a running server the document `uri` is closed (`textDocument/didClose`)."
   (send conn [:close uri]))
@@ -420,8 +387,8 @@ explicit trigger, not per keystroke."
 ;; `[:lsp-hover corr s]`, …) lands on `reply-to`'s mailbox — the editor registers event
 ;; handlers for those tags and folds by corr against `:lsp-pending`
 ;; (lsp-commands/ed-ev-lsp-reply), so a lookup never blocks the loop: jump/show/apply
-;; happen when the answer ARRIVES. Completion keeps its bounded sync wait (the popup is
-;; modal UX — see `lsp-complete-all`).
+;; happen when the answer ARRIVES. Completion too: its replies merge into the popup
+;; ([[ed-ev-lsp-completion]]).
 
 (defn lsp-sync (conn uri lang sync)
   "Tell the server the document changed, asking nothing in return. `sync` is the
@@ -616,20 +583,14 @@ is not this buffer's (completion's prepare step normally synced it just before).
       (assoc request :text (buffer-text buffer)))))
 
 (defn lsp-complete-source (m)
-  "The LSP completion source (a `complete-at-point/*completion-sources*` entry): `[start prefix
-candidates opts]` from the buffer's servers that offer completion (the main one when none says),
-asked at once and merged; `nil` when none serves its file, the buffer has no file, or every
-server timed out. `complete` merges these with the mode and buffer-word sources.
+  "The LSP completion source (a `complete-at-point/*completion-sources*` entry). It never waits:
+it asks the buffer's servers that offer completion (the main one when none says), all at once,
+with the editor loop as the reply address, and answers `[start prefix () {:pending {…}}]` — the
+popup opens on what the other sources have, and each server's reply merges in as it lands
+([[ed-ev-lsp-completion]], `complete-at-point/complete-late-answer`). `nil` when none serves its
+file or the buffer has no file.
 
-`opts` is `{:cache true}` unless a server said its list was incomplete: the popup then
-narrows by filtering these candidates as you type, and asks the servers again only when the
-prefix stops extending this one (`complete-at-point/complete-at`). An EMPTY complete answer
-is an answer too — nothing for `foo` means nothing for `foob` — so it is returned, not nil,
-or every narrowing key would ask again.
-
-A connection whose process has died counts as off: this source runs on every Tab, and a
-pid nothing answers would spend `*lsp-timeout-ms*` per press waiting for a reply that
-cannot come."
+A connection whose process has died counts as off: nothing would answer it."
   (let (buffer (ed-current-buf m)
         file (buffer-file buffer)
         live (lsp-live-entries m file)
@@ -638,16 +599,49 @@ cannot come."
     (if (or (empty? asked) (nil? file))
       nil
       (let ([start prefix line] (lsp-symbol-at-point buffer)
-            answer (lsp-complete-all (map asked
-                                       (fn (entry)
-                                         [(:conn entry) (lsp-complete-request m entry file buffer)]))
-                     *lsp-timeout-ms*)
-            separators (complete-at-point/completion-separators m)
-            word-start (- (string/length line) (string/length prefix))
-            candidates (seq/distinct (seq/keep (:entries answer)
-                                       (fn (entry)
-                                         (lsp-completion-candidate line word-start entry separators)))))
-        (cond
-          (not (:incomplete answer)) [start prefix candidates {:cache true}]
-          (empty? candidates) nil
-          else [start prefix candidates])))))
+            corrs (into []
+                    (map asked
+                      (fn (entry)
+                        (let (corr (ref))
+                          (lsp-ask-async (:conn entry)
+                            (lsp-completion)
+                            corr
+                            (self)
+                            (lsp-complete-request m entry file buffer))
+                          corr)))))
+        [start
+          prefix
+          '()
+          {:pending {:corrs corrs
+                     :line line
+                     :word-start (- (string/length line) (string/length prefix))
+                     :separators (complete-at-point/completion-separators m)}}]))))
+
+(defn lsp-reply-candidates (waiting answer)
+  "The candidates a completion `answer` gives, built against the line the request `waiting`
+(the source's `:pending`) was about."
+  (seq/distinct (seq/keep (:entries answer)
+                  (fn (entry)
+                    (lsp-completion-candidate (:line waiting)
+                      (:word-start waiting)
+                      entry
+                      (:separators waiting))))))
+
+(defn ed-ev-lsp-completion (m input textrows cols rows)
+  "A server's completion reply (`[:lsp-completion corr answer]`): its candidates, built against
+the line the request was about, merged into the popup waiting on `corr`
+(`complete-at-point/complete-late-answer`) — dropped when none is. An incomplete list is not
+cached, so narrowing asks again."
+  (let ([_ corr answer] input
+        waiting (map/get-in m [:completion :pending 'lsp/lsp-complete-source]))
+    (if (or (nil? waiting) (not (includes? (:corrs waiting) corr)))
+      m
+      (let (candidates (lsp-reply-candidates waiting answer)
+            completion (:completion m))
+        (complete-at-point/complete-late-answer m
+          'lsp/lsp-complete-source
+          corr
+          [(:start completion)
+            (:prefix completion)
+            candidates
+            (if (:incomplete answer) {} {:cache true})])))))

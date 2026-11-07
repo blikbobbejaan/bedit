@@ -382,7 +382,13 @@ locally instead of asked. The `cache` answered is what the popup keeps for next 
   (let (here (when (not (empty? cache)) (complete-symbol-at-point m))
         answers (map sources (fn (s) (complete-ask-source m s cache here)))
         results (seq/reject answers nil?)
-        next-cache (complete-next-cache sources answers))
+        next-cache (complete-next-cache sources answers)
+        ;; a source still waiting on its answer (a language server: [[complete-late-answer]])
+        pending (fold (seq/zip sources answers)
+                  {}
+                  (fn (acc [sym answer])
+                    (let (waiting (when answer (:pending (answer-opts answer))))
+                      (if waiting (assoc acc sym waiting) acc)))))
     (if (empty? results)
       {:start (buffer-point (ed-current-buf m)) :prefix "" :items '() :cache next-cache :docs {}}
       ;; read by position, not a `[start prefix _]` pattern: an answer may carry a fourth
@@ -399,6 +405,7 @@ locally instead of asked. The `cache` answered is what the popup keeps for next 
                   (items-of (seq/filter agreeing late?)))
          :cache next-cache
          :docs docs
+         :pending pending
          :continue (:continue (answer-opts lead))}))))
 
 (defdyn *completion-prepare*
@@ -455,7 +462,10 @@ doc panel to carry over (it paints only while its candidate is the selected one)
        :continue (:continue found)
        :auto (:auto opts)
        :sources (:sources opts)
-       :info (:info opts)}))
+       :info (:info opts)
+       ;; `{source {:corrs …}}` still to answer, and `:tab` when Tab is waiting on them to act
+       :pending (:pending found)
+       :waiting (:waiting opts)}))
 
 (defn popup-stale? (m)
   "Has the popup stopped describing where you are?
@@ -526,6 +536,9 @@ the common prefix WHOLE — a path's `/` and `.` are not segments to stop at."
     (if (= prefix "")
       (message m "nothing to complete")
       (cond
+        ;; only a language server can answer, and it has not yet: act when it does
+        (and (empty? items) (not (empty? (:pending found))))
+          (message (popup-state m found {:waiting :tab}) "completing…")
         (empty? items) (message m (str "no completions for \"" prefix "\""))
         ;; one candidate, or a common prefix that extends what was typed: Tab goes to the end
         ;; of the next segment of it ([[complete-step]]), not the whole word
@@ -535,6 +548,64 @@ the common prefix WHOLE — a path's `/` and `.` are not segments to stop at."
             (if (> (string/length common) (string/length prefix))
               (complete-apply m start (step common))
               (popup-state m found)))))))
+
+;; ---- a source that answers later (a language server) ------------------------------------
+;; A source may answer `[start prefix () {:pending {:corrs […]}}]`: it has asked, and will
+;; deliver. The popup opens at once on what the other sources had (or, with nothing else, waits
+;; invisibly), and [[complete-late-answer]] merges each reply when it lands — only while the
+;; popup still describes where point is (a key that moved point closed it, and the reply is
+;; dropped). Nothing waits on the loop.
+
+(defn- tab-decision (m c items)
+  ;; what Tab does once a waiting popup's answers are in: one candidate inserted, a common
+  ;; prefix that extends the word inserted, else the popup
+  (let (prefix (:prefix c)
+        step (fn (word) (complete-step prefix word (completion-separators m))))
+    (cond
+      (empty? items) (message (assoc m :completion nil) (str "no completions for \"" prefix "\""))
+      (= (count items) 1) (complete-apply m (:start c) (step (first items)))
+      else
+        (let (common (lcp items))
+          (if (> (string/length common) (string/length prefix))
+            (complete-apply m (:start c) (step common))
+            (assoc m :completion (assoc c :items items :index 0 :waiting nil)))))))
+
+(defn complete-late-answer (m source corr answer)
+  "`m` with `source`'s late `answer` (`[start prefix items opts]`, its reply to request
+`corr`) merged into the open popup: its candidates added in presentation order, kept in the
+popup's cache when the source said it may be, and — when Tab was waiting on it — Tab's step
+taken now. Unchanged when no popup is waiting on `corr`, or it now describes another word."
+  (let (c (:completion m)
+        waiting (when c (get (:pending c) source)))
+    (if (or (nil? waiting)
+          (not (includes? (:corrs waiting) corr))
+          (not (= (first answer) (:start c))))
+      m
+      (let (prefix (:prefix c)
+            arrived (seq/filter (nth answer 2) (fn (item) (string/starts-with? item prefix)))
+            items (complete-order (into (into [] (:items c)) arrived))
+            left (seq/reject (:corrs waiting) (fn (asked) (= asked corr)))
+            gathered (into (or (:gathered waiting) []) (nth answer 2))
+            cacheable? (and (empty? left) (:cache (answer-opts answer)) (not (:incomplete waiting)))
+            pending (if (empty? left)
+                      (dissoc (:pending c) source)
+                      (assoc (:pending c)
+                        source
+                          (assoc waiting
+                            :corrs left
+                            :gathered gathered
+                            :incomplete
+                              (or (:incomplete waiting) (not (:cache (answer-opts answer)))))))
+            cache (if cacheable?
+                    (assoc (:cache c) source [(:start c) prefix gathered {:cache true}])
+                    (:cache c))
+            docs (merge (or (:docs c) {}) (or (:docs (answer-opts answer)) {}))
+            updated (assoc c :items items :pending pending :cache cache :docs docs))
+        (cond
+          (and (= (:waiting c) :tab) (empty? pending)) (tab-decision m updated items)
+          (= (:waiting c) :tab) (assoc m :completion updated)
+          (empty? items) (assoc m :completion (when (not (empty? pending)) updated))
+          else (assoc m :completion updated))))))
 
 ;; ---- popup navigation (input routes control keys here) ----------------------
 
@@ -557,6 +628,8 @@ in: it is a suggestion beside your typing, and RET there means the newline you w
 to type (Corfu's `corfu-preselect 'prompt`). RET dismisses it and goes through. Once C-n /
 C-p has selected a candidate, RET takes it, as it always does in a popup you asked for."
   (and (complete-control-key? input)
+    ;; a popup still waiting on its only source shows nothing, and owns no key
+    (not (empty? (:items (:completion m))))
     (not (and (= input :enter) (nil? (completion-selected m))))))
 
 (defn- auto-stamp (m)
@@ -599,8 +672,9 @@ completions for until you type again."
           :completion (assoc c :index (editor/list-motion/motion-index from n motion)))))))
 
 (defn- complete-reopen (m c found)
-  "The popup `c` was, reopened on `found` — or closed when `found` has nothing."
-  (if (or (= (:prefix found) "") (empty? (:items found)))
+  "The popup `c` was, reopened on `found` — or closed when `found` has nothing and nothing is
+still to answer."
+  (if (or (= (:prefix found) "") (and (empty? (:items found)) (empty? (:pending found))))
     (assoc m :completion nil)
     (popup-state m found {:auto (:auto c) :sources (:sources c) :info (:info c)})))
 
@@ -688,14 +762,6 @@ Esc/C-g cancel. M-< / M-> jump to the ends of the list, as they do everywhere el
   ;; "this is a path" when it loads.
   (list 'complete-at-point/completion-auto-prefix-trigger?))
 
-(defdyn *completion-auto-skip*
-  ;; Sources the AUTO popup does not ask (Tab still does). The language server: its request is
-  ;; answered synchronously on the UI loop (up to `lsp/*lsp-timeout-ms*`), and the auto popup
-  ;; asks on every pause in typing — and again per key while the server calls its list
-  ;; incomplete — so a slow server would stall typing. Off until the source is asynchronous
-  ;; (a request sent on the pause, the popup opened when the reply lands).
-  (list 'lsp/lsp-complete-source))
-
 (defn completion-auto-for? (setting buf)
   "Whether the auto popup is on in `buf` under `setting` (init.blsp's `:completion-auto`):
 a bool is that everywhere; a per-mode map answers by its entry for `buf`'s most specific
@@ -767,8 +833,10 @@ point."
   (>= (string/length (second (complete-symbol-at-point m))) (completion-auto-min-prefix m)))
 
 (defn- completion-auto-sources ()
-  "The sources the auto popup asks: [[*completion-sources*]] less [[*completion-auto-skip*]]."
-  (seq/reject *completion-sources* (fn (s) (includes? *completion-auto-skip* s))))
+  "The sources the auto popup asks: every one ([[*completion-sources*]]). A language server
+answers later, merged in when it lands ([[complete-late-answer]]), so asking it on a pause
+never stalls typing."
+  *completion-sources*)
 
 (defn completion-auto-open (m)
   "The auto timer fired: open the popup at point when a trigger says the text is worth it
