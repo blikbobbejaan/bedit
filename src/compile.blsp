@@ -14,21 +14,16 @@ and a dead one (e.g. after a crash) is replaced transparently."
   (:use interactive) ; defcommand
   (:use ansicolor :only [insert-output]) ; a stream's ANSI escapes decoded: its colours as text properties, its returns done
   (:use editor/buffer)) ; make-buffer / insert / end-of-buffer / buffer-text
-;; regex/matches? and ansi/decoder are referenced qualified below — each `mod/name`
-;; auto-loads its module.
 (def *compile-buf* "*compilation*")
 
 ;; ---- error line parser -------------------------------------------------------
 ;; The table of error formats (Emacs' `compilation-error-regexp-alist`) is
 ;; `results/*error-patterns*`: one parser for C-x ` here and for RET / click on any
-;; results row, which used to be two that disagreed.
-
-(defn- compile-parse-error-line (line)
-  "Parse a compiler error/warning location from `line` (`results/loc-at-line`), or nil."
-  (results/loc-at-line line))
+;; results row.
 
 (defn- compile-parse-errors (text)
-  (seq/reject (map (string/split text "\n") compile-parse-error-line) nil?))
+  ;; every error location `text` names, in order (`results/loc-at-line`)
+  (seq/keep (string/split text "\n") results/loc-at-line))
 
 ;; ---- buffer append (raw stream chunks, no forced newline) -------------------
 
@@ -57,11 +52,11 @@ it said. C-x ` walks the errors in what is kept."
         fresh (ed-stamp (assoc (make-buffer header *compile-buf* nil)
                           :read-only true
                           :type :compile-log))
-        idx (ed-buffer-index-by-name m *compile-buf*))
-    (if (nil? idx)
+        index (ed-buffer-index-by-name m *compile-buf*))
+    (if (nil? index)
       (ed-open-buffer m fresh)
-      (let (existing (nth (:buffers m) idx))
-        (ed-select (update m :buffers assoc idx (assoc fresh :dir (:dir existing))) idx)))))
+      (let (existing (nth (:buffers m) index))
+        (ed-select (update m :buffers assoc index (assoc fresh :dir (:dir existing))) index)))))
 
 ;; *compilation* rows are GNU-style `file:line[:col]: message` — exactly the shared
 ;; parser's shape, so the stock location-jump layer is the whole integration.
@@ -145,19 +140,20 @@ stay hot.)"
 (defn ed-ev-compile-done (m event textrows cols rows)
   "Compilation finished: append a summary, parse errors, store on model."
   (let (code (compile-done-event-code event)
-        idx (ed-buffer-index-by-name m *compile-buf*)
-        text (when idx (buffer-text (nth (:buffers m) idx)))
+        index (ed-buffer-index-by-name m *compile-buf*)
+        text (when index (buffer-text (nth (:buffers m) index)))
         errors (if text (compile-parse-errors text) '())
         summary (if (= code 0)
                   "\nCompilation finished\n"
                   (str "\nCompilation exited with code " code "\n"))
-        m1 (compile-append m summary)
-        m2 (assoc (dissoc m1 :compile-running) :compile-errors errors :compile-error-idx -1)
+        finished (assoc (dissoc (compile-append m summary) :compile-running)
+                   :compile-errors errors
+                   :compile-error-idx -1)
         echo (cond
                (= code 0) "Compilation finished"
                (empty? errors) (str "Compilation failed (exit " code ")")
                else (str (count errors) " error(s)")))
-    (ed-scroll (message m2 echo) textrows)))
+    (ed-scroll (message finished echo) textrows)))
 
 ;; ---- M-x compile ------------------------------------------------------------
 
@@ -174,9 +170,9 @@ compile default; `M-x compile` records that itself, so running the tests does no
 change what the next build offers."
   (let (root (or (:project-root m) (file/cwd))
         proc (spawn :compile (compile-loop))
-        m2 (compile-reset m cmd))
+        reset (compile-reset m cmd))
     (send proc [:compile-run cmd root (ed-loop-address)])
-    (message (assoc m2
+    (message (assoc reset
                :compile-proc proc
                :compile-running cmd
                :compile-errors '()
@@ -196,13 +192,13 @@ every run, so it is not the sign one is in flight."
   "Run a shell command in the project root, streaming output to `*compilation*` (M-x compile).
 The prompt is prefilled with what you last compiled here, else with what this
 project's toolchain builds with — `mix compile` in a mix project, `cargo build` in a
-cargo one — which is Emacs' buffer-local `compile-command` with projectile filling
-it in, rather than the bare `make` that used to be every project's answer."
+cargo one — Emacs' buffer-local `compile-command` with projectile filling it in;
+`make` where the toolchain names none."
   (let (default (or (:compile-last-cmd m) (toolchain/compile-command m) "make"))
     (assoc m
       :minibuffer
         {:edit (ed-mb-edit "Compile command: " default)
-         :on-complete (fn (m2 cmd) (assoc (compile-run m2 cmd) :compile-last-cmd cmd))})))
+         :on-complete (fn (prompted cmd) (assoc (compile-run prompted cmd) :compile-last-cmd cmd))})))
 
 ;; ---- M-x project-task -------------------------------------------------------
 
@@ -216,8 +212,8 @@ The list comes from the TOOL, the way `mix.el`'s `mix-execute-task` completes ov
 the tasks a project defines for itself, so `mix ecto.migrate` shows up in a project
 that has Ecto and nowhere else.
 
-The tool is asked OFF the loop (`ed-open-when-ready`): `mix help` takes seconds, and asked
-in the keypress it froze the editor until it answered. The prompt opens when it does."
+The tool is asked OFF the loop (`ed-open-when-ready`), since `mix help` takes seconds; the
+prompt opens when it answers."
   (let (lister (toolchain/task-lister m)
         label (toolchain/name-of m))
     (if (nil? lister)
@@ -225,18 +221,18 @@ in the keypress it froze the editor until it answered. The prompt opens when it 
       (offloop/ed-open-when-ready m
         (str "listing " label " tasks")
         lister
-        (fn (m1 tasks)
+        (fn (ready tasks)
           (if (empty? tasks)
-            (message m1 (str "no tasks to list for a " label " project"))
-            (assoc m1
+            (message ready (str "no tasks to list for a " label " project"))
+            (assoc ready
               :minibuffer
                 (ed-name-prompt (str label " task: ")
                   tasks
-                  (fn (m2 task)
-                    (let (cmd (toolchain/task-command m2 task))
+                  (fn (chosen task)
+                    (let (cmd (toolchain/task-command chosen task))
                       (if (nil? cmd)
-                        (message m2 (str "no way to run a task in a " label " project"))
-                        (compile-run m2 cmd))))))))))))
+                        (message chosen (str "no way to run a task in a " label " project"))
+                        (compile-run chosen cmd))))))))))))
 
 ;; ---- next-error / previous-error (C-x ` · M-g n / M-g p) --------------------
 ;; One walk parameterised by `step` (±1) — the cursor into `:compile-errors` moves either
@@ -248,24 +244,25 @@ in the keypress it froze the editor until it answered. The prompt opens when it 
 error's file/line, echoing `file:line`. A message-only no-op when there are no errors or
 the cursor would run off the end."
   (let (errors (:compile-errors m)
-        idx (+ step (or (:compile-error-idx m) -1)))
-    (if (or (nil? errors) (empty? errors) (< idx 0) (>= idx (count errors)))
+        index (+ step (or (:compile-error-idx m) -1)))
+    (if (or (nil? errors) (empty? errors) (< index 0) (>= index (count errors)))
       (message m (if (or (nil? errors) (empty? errors)) "No compilation errors" "No more errors"))
-      (let (err (or (nth errors idx) (error "no compilation error at the cursor")) ; in range by the test above
-            file (path/absolute (path/join (or (:project-root m) ".") (:file err)))
-            line (:line err)
-            col (if (int? (:col err)) (:col err) 1)
-            m1 (assoc (ed-find-file m file) :compile-error-idx idx))
-        ;; the column too, when the tool gave one — it used to be parsed and dropped
-        (message (ed-apply m1
-                   (fn (b)
-                     (let (target (math/max 0 (math/min (dec line) (dec (buffer-line-count b))))
+      (let (found (or (nth errors index) (error "no compilation error at the cursor")) ; in range by the test above
+            file (path/absolute (path/join (or (:project-root m) ".") (:file found)))
+            line (:line found)
+            column (if (int? (:col found)) (:col found) 1)
+            visited (assoc (ed-find-file m file) :compile-error-idx index))
+        ;; the column too, when the tool gave one
+        (message (ed-apply visited
+                   (fn (buffer)
+                     (let (target (math/max 0
+                                    (math/min (dec line) (dec (buffer-line-count buffer))))
                            at-line (fold (range target)
-                                     (beginning-of-buffer b)
-                                     (fn (bb _) (forward-line bb)))
+                                     (beginning-of-buffer buffer)
+                                     (fn (moved _) (forward-line moved)))
                            room (string/length (string/trimr (buffer-line-at at-line target))))
-                       (forward-char at-line (math/max 0 (math/min (dec col) room))))))
-          (str (:file err) ":" line))))))
+                       (forward-char at-line (math/max 0 (math/min (dec column) room))))))
+          (str (:file found) ":" line))))))
 
 (defcommand cmd-next-error
   (m key)
