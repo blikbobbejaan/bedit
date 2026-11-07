@@ -1,0 +1,213 @@
+(defmodule eolview
+  "End-of-line notes as the view paints them: the notes `eolnotes` keeps (a playground's results,
+a verdict, a diagnostic's message) and the inline completion preview, placed after a line's text
+within the columns left."
+  (:use editor/buffer)
+  (:use model)
+  (:use complete-at-point)
+  (:use theme)
+  (:use ui-kit)
+  (:use editor/display))
+
+(def *eol-note-gap* (ui-space-cells :note-gap))
+
+(def *eol-note-max-cols* 64)
+
+(def face-completion-preview
+  ;; The inline completion preview: the SAME dim as a pending note, and not italic. It is
+  ;; text you are about to write rather than a remark about your code, so it should read as
+  ;; your own line continuing in a lighter hand — italics would make it a different kind of
+  ;; thing sitting in the middle of an identifier.
+  {:fg *overlay0*})
+
+(defn ed-preview-op (m buf pane-selected? row col avail)
+  "The one op for the inline completion preview — the top candidate's remainder painted
+immediately after the cursor — or nil.
+
+Painted only for the selected pane, and only while the cached preview still describes the
+buffer as it stands (`:completion-preview-at`, the point-and-rope it was computed for).
+That guard is the whole difference between a suggestion and a lie: the preview is computed
+on the idle beat, so between the keystroke and the recompute the cached one describes text
+that has already moved on, and painting it there would put somebody else's word after your
+cursor."
+  (let (pv (ed-live-preview m buf pane-selected?))
+    (when (and pv (> avail 0))
+      (text row col (ui-clip (:text pv) avail) face-completion-preview))))
+
+(defn- ed-live-preview (m buf pane-selected?)
+  "The inline completion preview the pane paints, or nil: one for the selected pane, no
+minibuffer or input-method composition in the way, still stamped with `buf`'s point and
+rope. [[ed-preview-op]] paints it and [[ed-preview-push]] makes room for it."
+  (let (pv (:completion-preview m))
+    (when (and pane-selected?
+            pv
+            (nil? (:minibuffer m))
+            (nil? (:preedit m))
+            (= (:completion-preview-at m) [(buffer-point buf) (buffer-rope buf)]))
+      pv)))
+
+(defn ed-preview-push (m pane buf)
+  "`{line cols}`: the columns the live preview takes at the end of point's line, or `{}`.
+A preview is only ever offered at a line's end (`complete-at-point/completion-preview`),
+which is exactly where that line's notes sit, so the notes start after it — the tutorial's
+`✓ that's it` once read `-mothat's it` under a preview of `-mode`. Emacs's completion
+preview is an overlay that pushes an `after-string` along the same way."
+  (let (pv (ed-live-preview m buf (:selected pane)))
+    (if (nil? pv) {} {(buffer-current-line buf) (string/display-width (:text pv))})))
+
+(defn- ed-eol-note-face (kind stale)
+  (cond
+    ;; the dim, italic voice of a note that is not a verdict:
+    ;; - no-answer-yet (`note-pending?`) — whether the sandbox is still working (:running)
+    ;;   or the form isn't finished (:incomplete) — never reads as a stale verdict
+    ;; - broken reads as pending too: red is for code that RAN and failed, and a form is
+    ;;   unparseable for most of the keystrokes it takes to write one
+    ;; - a derived type (:hint) sitting at the code it describes — the inlay-hint voice, so
+    ;;   it never competes with the answer below it for being read first
+    (or (eolnotes/note-pending? kind) (= kind :broken) (= kind :hint)) {:fg *overlay0* :italic true}
+    (= kind :warn) {:fg *yellow*}
+    stale {:fg *overlay0*}
+    else {:fg (case kind :pass *green* :fail *red* *subtext*)}))
+
+(defn- ed-eol-note-avail (note room)
+  "The columns `note` may take of the `room` left on its row.
+
+A result or a derived type is a GLANCE — a remark about code you can already read — and
+capping it at [[*eol-note-max-cols*]] is what keeps the right of the screen legible.
+
+A FAILURE is not a remark, it is the answer, and the cap cost exactly the half worth having:
+`** (FunctionClauseError) no function clause matching in String.upcase/1` cut at 64 columns
+keeps the words every raise shares and drops the function that raised. So a raise takes the
+whole row. It still ends at the pane edge — the full text is one keystroke away in the echo
+row, and in `*Diagnostics*` (C-c !), which is where a message too long for any row belongs."
+  (if (= (:kind note) :fail) room (math/min room *eol-note-max-cols*)))
+
+(sig ed-eol-note-row-ops (any int any int int int int -> any))
+
+(defn- ed-eol-note-row-ops (notes row stale from-col text-x hcol width)
+  "Ghost-text ops for the notes anchored on ONE line, on screen row `row`, laid out left
+to right from the line's display column `from-col` — `hcol` columns of the line sit left
+of the row's first cell, which is screen column `text-x`, and the row is `width` cells —
+each keeping its own face, none painting over another.
+
+A line can carry several (`eolnotes/notes-on-line`), and drawing them all at one column is
+not a near-miss: `=> bar` and `=> 42` at the same cell render as unreadable mush, which is
+what this fold exists to make unrepresentable. Each note advances the column past what it
+drew; one that no longer fits is dropped, and so is everything after it."
+  (second (fold notes
+            [from-col '()]
+            (fn (acc note) (ed-eol-note-row-step acc note row stale text-x hcol width)))))
+
+;; The fold step above, as a function so its accumulator has a declared shape: `[col ops]`
+;; — the next free column and the ops so far. A lambda's accumulator no `sig` can reach.
+(sig ed-eol-note-row-step ((tuple int list) any int bool int int int -> (tuple int list)))
+
+(defn- ed-eol-note-row-step (acc note row stale text-x hcol width)
+  (let ([col ops] acc
+        body (eolnotes/note-text note)
+        at (- col hcol)
+        avail (ed-eol-note-avail note (- width at 1)))
+    (if (or (< at 0) (<= avail 3))
+      acc
+      [(+ col (string/display-width body) *eol-note-gap*)
+        (append ops
+          (list (text row
+                  (+ text-x at)
+                  (ui-clip body avail)
+                  (ed-eol-note-face (if (:warn note) :warn (:kind note)) stale))))])))
+
+(defn ed-fold-notes (geometry notes)
+  "`notes` plus a dim `…` after every line the row table jumps PAST — the next text row is
+not the line below — which is a fold's heading: its body takes no rows (`wrap/hidden?`).
+Read off the table rather than the folds, so the view needs to know nothing about them."
+  (let (text-rows (seq/filter (or (:rows geometry) []) (fn (row) (nil? (nth row 3)))))
+    (fold (range (dec (count text-rows)))
+      notes
+      (fn (acc i)
+        (let (line (first (nth text-rows i))
+              next-line (first (nth text-rows (inc i))))
+          (if (> next-line (inc line))
+            (assoc acc line (append (get acc line '()) (list {:kind :hint :text "…"})))
+            acc))))))
+
+(defn- ed-diag-note (d)
+  "A checker diagnostic in the end-of-line note's shape: a `:warn`, its message after a ⚠."
+  {:kind :warn :warn true :text (str "⚠ " (:message d))})
+
+(defn ed-diag-notes (m buf top text-h)
+  "The advisory checker's cached diagnostics as end-of-line notes on the `text-h` lines
+from `top`, keyed by 0-based line — `{line (⚠-note …)}` — for `buf` ONLY when it is the
+very rope the diagnostics were computed from (`:diag-rope`), so a warning can never sit on
+a line the text has moved out from under; `{}` otherwise. Per VISIBLE line off the model's
+index (`ed-visible-diagnostics`), like `ed-diagnostic-overrides`: this runs every frame. The
+gutter's ⚠ was easy to miss beside a live buffer's own ·/✓ marks, and the type note beside
+a form said `: bool` about `(< number)` while the checker knew the argument could not be
+ordered; the message belongs on the line, in the note's voice. Not on a form whose run
+already FAILED (`eolnotes/error-spans`): its error is on screen, and the ⚠ would repeat it."
+  (if (not (= (buffer-rope buf) (:diag-rope m)))
+    {}
+    (let (failed (eolnotes/error-spans buf))
+      (into {}
+        (seq/keep (spanpaint/ed-visible-diagnostics m top (+ top text-h))
+          (fn ([line ds])
+            (when (not (any? failed (fn ([from to]) (and (>= line from) (<= line to)))))
+              [line (map ds ed-diag-note)])))))))
+
+(defn- ed-eol-line-note-ops (buf geometry line notes stale push)
+  "Ghost-text ops for the `notes` on `line`, after the line's LAST row (`ed-line-last-row` —
+a wrapped line's last segment), its columns following that row's start like the body text
+and `push` more (the completion preview's, [[ed-preview-push]]); `()` when that row is off
+the painted rows."
+  (let (row (panegeometry/ed-line-last-row geometry line (:render-height geometry)))
+    (if (nil? row)
+      '()
+      (let ([k from _] row
+            [x width] (panegeometry/geometry-span geometry :row)
+            text (panegeometry/ed-line-text buf line)
+            ;; the columns of the line left of this row: its hscroll, or a wrapped
+            ;; row's segment start measured on the line's stops (tabs)
+            hcol (if (nil? (:rows geometry))
+                   (:hscroll geometry)
+                   (string/display-width (string/substring text
+                                           0
+                                           (math/min from (string/length text))))))
+        (ed-eol-note-row-ops notes
+          (+ (:y geometry) k)
+          stale
+          (+ (string/display-width text) push *eol-note-gap*)
+          x
+          hcol
+          width)))))
+
+(sig ed-eol-note-ops (buffer panegeometry/pane-geometry &optional map (map int int) -> any))
+
+(defn ed-eol-note-ops (buf geometry &optional (diag {}) (push {}))
+  "Ghost-text ops for the pane's visible end-of-line notes — `eolnotes/eol-notes` plus the
+`diag` notes (`ed-diag-notes`), a line's set `push` columns further out (`ed-preview-push`) —
+one annotation lookup on a buffer that has none. A note is
+owner-keyed with its anchor line inside (`:line`), so it can never be stranded at a line the
+text moved out from under. Iterated by LINE rather than by note, because a line may carry
+more than one and they have to be placed relative to each other (`ed-eol-note-row-ops`).
+Clipped to the pane's text width, and a line too full to fit at least a few cells drops its
+note rather than overpaint. Whoever annotates gets this rendering for free: the tutorial's
+verdicts today, inline eval results / inlay hints / blame next. Laid out over the
+`geometry`'s `:render-height` rows."
+  (let (top (:top geometry)
+        end (math/min (+ top (:render-height geometry)) (buffer-line-count buf))
+        ;; a diagnostic note is a `:warn`, whose face no staleness changes — so only the
+        ;; buffer's own notes ask
+        stale (eolnotes/eol-notes-stale? buf)
+        note-lines (eolnotes/note-lines buf))
+    ;; no notes and no diagnostics on screen — the usual frame — is answered here, before
+    ;; the distinct/filter/mapcat walk over nothing
+    (if (and (empty? note-lines) (empty? diag))
+      '()
+      (mapcat (seq/filter (seq/distinct (append note-lines (keys diag)))
+                (fn (line) (and (>= line top) (< line end))))
+        (fn (line)
+          (ed-eol-line-note-ops buf
+            geometry
+            line
+            (append (eolnotes/notes-on-line buf line) (get diag line '()))
+            stale
+            (get push line 0)))))))

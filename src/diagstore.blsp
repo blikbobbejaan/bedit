@@ -1,0 +1,128 @@
+(defmodule diagstore
+  "The model's diagnostics cache, whoever produced them (the Brood checker, an LSP server): a
+diagnostic's position converted in one place (0- and 1-based lines, columns, the span's end), the
+per-buffer store the view reads, and the quiet window that holds back findings on the lines being
+typed."
+  (:use editor/buffer)
+  (:use log :exclude [error]))
+
+(sig ed-diag-index ((seqable model/diagnostic) -> (map int (list model/diagnostic))))
+
+(defn ed-diag-line0 (d)
+  "A diagnostic's 0-based line, or nil when it names none (which is what makes it
+unplaceable — see [[ed-diag-index]])."
+  (let (ln (:line d)) (when (int? ln) (math/max 0 (dec ln)))))
+
+(defn ed-diag-col0 (d)
+  "A diagnostic's 0-based column, floored at 0. A missing or out-of-range column means the
+start of the line, which is where a finding about a whole line belongs anyway."
+  (let (c (:col d)) (if (int? c) (math/max 0 (dec c)) 0)))
+
+(defn ed-diag-line1 (line0)
+  "The 1-based line number a reader sees, from a 0-based one — [[ed-diag-line0]]'s inverse,
+named so the two sides of the convention are stated together rather than as two bare
+arithmetic ops in different files."
+  (inc line0))
+
+(defn- ed-word-end (text i)
+  (if (and (< i (string/length text)) (editor/highlight/symbol-char? (string/char-at text i)))
+    (ed-word-end text (inc i))
+    i))
+
+(defn ed-diag-span-end (text off)
+  "End offset (exclusive) of the run to underline at `off`: the word at `off` if it's
+on a word char, else just that one cell (so a diagnostic on a delimiter marks 1 col)."
+  (if (and (< off (string/length text)) (editor/highlight/symbol-char? (string/char-at text off)))
+    (ed-word-end text off)
+    (inc off)))
+
+(defn ed-diag-index (diags)
+  "`diags` (`{:line :col :message}`, 1-based lines) as `{0-based line -> (the diagnostics
+on it, in order)}` — the shape the view reads. Built ONCE, when a check's result lands
+(`ed-set-diagnostics`), because every reader is per frame and per VISIBLE line: the token
+underlines, the ⚠ end-of-line notes, the echo row's message. Read as a list per frame, a
+large file's checker output made the view O(all diagnostics) on every cursor blink —
+2,547 findings cost 135 ms a frame where the same frame without them cost 2.6. A
+diagnostic with no `:line` cannot be placed and is left out — of this index, and so of
+everything derived from it: the margin mark, the `*Diagnostics*` row and the mode line's
+count all read THIS, not the raw list, so that they cannot disagree with each other. An
+unplaceable finding is therefore invisible, which is the price of having one answer; every
+producer bedit has (the checker, every language server) gives a line."
+  ;; Consed onto each line's list from the LAST finding back, so every list comes out in
+  ;; order with no `append` — which rebuilt the line's list per finding, and made this fold
+  ;; most of what a language server's publish cost on the loop.
+  (fold (reverse diags)
+    {}
+    (fn (acc d)
+      (let (ln (ed-diag-line0 d))
+        (if (nil? ln)
+          acc
+          (assoc acc ln (cons d (get acc ln '()))))))))
+
+;; `(seqable diagnostic)`, not `(list …)`: the LSP path hands over a VECTOR, which the
+;; runtime contract (ADR-380) refused.
+(sig ed-set-diagnostics
+  (model/model (seqable model/diagnostic) any &optional (or nil string) -> model/model))
+
+(defn ed-set-diagnostics (m diags rope &optional (for-buffer nil))
+  "The model with `diags` as its diagnostics cache, computed for `rope` (`:diag-rope`, the
+staleness key) — and indexed by line (`:diag-by-line`, `ed-diag-index`). The ONE setter,
+so the list and its index cannot disagree: both check paths (`ed-refresh-diagnostics`,
+`ed-apply-diag`) land here.
+
+The index is also stamped on the BUFFER, as the `:diagnostic-lines` annotation. That is
+what puts findings in the margin: every other mark there (a breakpoint, a test verdict, a
+result note) is a buffer annotation, and the gutter's cell cache is keyed on the buffer, so
+model state simply cannot reach it. Going through `annotate` also buys the currency std
+already owns — a finding dims while the text differs from the text that produced it, and
+blanks once the lines have shifted under it.
+
+`for-buffer` names the buffer the findings are ABOUT — nil for the synchronous path, which
+is always the current one. The stamp is gated on THAT and not on the rope, and the
+difference is a bug that was here: a check runs in a task, so its reply lands whenever it
+lands, and the rope has usually moved on by then because you kept typing. Gating on the
+rope threw those replies away — including the one that says \"clean now\", so errors you had
+already fixed stayed in the margin and on the mode line until some later check happened to
+land on an untouched buffer. Buffer identity is the question actually being asked (\"are
+these findings about this buffer?\"); how far the text has moved since is `annotate`'s, and
+it answers it by dimming."
+  (let (buf (model/ed-current-buf m)
+        mine? (= (or for-buffer (buffer-name buf)) (buffer-name buf))
+        index (ed-without-quiet-lines (ed-diag-index diags) (when mine? (:quiet-lines buf)))
+        m1 (assoc m :diagnostics diags :diag-rope rope :diag-by-line index))
+    (if mine? (model/ed-set-buf m1 (editor/buffer/annotate buf :diagnostic-lines index)) m1)))
+
+(defn ed-without-quiet-lines (index quiet)
+  "The line index `index` without the lines of `quiet` — a buffer's `:quiet-lines`, the
+0-based `[from to]` of the form you are typing in a live buffer (`playground-core`'s quiet
+window), or nil for none.
+
+A finding about text still being typed is a finding about typing: `(dbl` checked mid-word is
+`does not compile`, and it would sit in the margin and under the word until the next check.
+Left out of the INDEX, not the list, so `:diagnostics` keeps every finding and the window
+closing re-indexes it ([[ed-set-diagnostics]] again) with nothing to re-check."
+  (if (nil? quiet)
+    index
+    (let ([from to] quiet)
+      (into {}
+        (seq/reject index (fn (kv) (let (line (first kv)) (and (>= line from) (<= line to)))))))))
+
+(sig ed-stamp-diagnostics-at (model/model int (seqable model/diagnostic) -> model/model))
+
+(defn ed-stamp-diagnostics-at (m i diags)
+  "Stamp `diags` as pool buffer `i`'s `:diagnostic-lines` annotation, whether or not that
+buffer is on screen — the margin marks and inline notes for a file you are not looking at.
+
+The model's `:diagnostics` cache is deliberately about the buffer you ARE looking at (one
+list, one view). The buffer ANNOTATION is not: it belongs to the buffer, and a server
+publishing about a background file — including publishing that it is CLEAN now — must
+reach it. Dropping those was a real bug and an unfalsifiable-looking one: a diagnostic
+from a half-typed moment would stamp itself while you were in the file, and the `[]` that
+retracted it a second later arrived after you had moved to another pane and was thrown
+away. The mark then outlived the text it described, with nothing able to clear it."
+  ;; `ed-buf-at` answers a buffer for an in-range index, and the caller found `i` with
+  ;; `ed-buffer-index-by-file`, so there is one to stamp
+  (update m
+    :buffers assoc
+    i
+    (editor/buffer/annotate (model/ed-buf-at m i) :diagnostic-lines (ed-diag-index diags))))

@@ -1,0 +1,556 @@
+(defmodule panebody
+  "One pane's body as render ops: its visible lines (folded and wrapped rows from the row table),
+each row's text with its spans and ellipsis, and the gutter beside it — numbers, the current
+line's, change bars and margin marks."
+  (:use editor/buffer)
+  (:use model)
+  (:use ui-kit)
+  (:use editor/ui)
+  (:use editor/display)
+  (:use memo)
+  (:use theme)) ; the gutter and truncation faces
+
+(sig ed-row-slice (any int int (or nil int) int &optional (or nil int) -> (tuple string int int)))
+
+(defn- ed-row-slice (rope line from to w &optional (known-col nil))
+  "`[vis from-col base]` for the chars `[from, to)` of `line` a `w`-wide row shows (`to` nil
+for the rest of the line): the text it paints, the display column that text starts at on
+its line, and the buffer offset of its first character.
+
+The line is read as rope SLICES — its bounds from the line index, then only the chars the
+row shows (and, h-scrolled, the ones left of it) — not as the whole line's text with its
+newline stripped and then substringed: two fewer copies of every visible line on every
+frame that re-renders it.
+
+`known-col` is the display column `from` sits at when the caller already knows it — the row
+after another row of the same wrapped line starts where that one ended — so a row in the
+middle of a megabyte line does not measure the line's text before it."
+  (let (bol (text/line->char rope line)
+        len (- (textpos/ed-line-end rope line) bol)
+        ;; `if`, not `math/min`: the checker reads `math/min` of two ints as a `number`, and
+        ;; these become rope offsets, which are ints
+        h (if (< from len) from len)
+        ;; `h + w` chars, not the rest of the line: `ed-fit` keeps only the first `w` of
+        ;; whatever this slices, so the cap is EXACT, not an approximation — and it is the
+        ;; difference between allocating what the pane shows and allocating the line. On a
+        ;; file of 12,000-character lines that was a 12 KB copy per row per frame.
+        end (let (cap (if (nil? to) (+ h w) to)) (if (< cap len) cap len)))
+    [(ed-fit (text/slice rope (+ bol h) (+ bol (if (< end h) h end))) w)
+      (cond
+        (= h 0) 0
+        (and (int? known-col) (= h from)) known-col
+        else (string/display-width (text/slice rope bol (+ bol h))))
+      (+ bol h)]))
+
+(defn- ed-row-start-cols (rope table)
+  "Per row of a pane's row `table`, the display column its text starts at when the row
+before it was the same line's and ended where it starts (a wrapped line's next row: that
+row's column plus its width), else nil — so only the FIRST row of a line on screen measures
+the line's text before it (`ed-row-slice`)."
+  (first
+    (fold table
+      [[] nil]
+      (fn (acc row)
+        (let ([cols previous] acc
+              line (nth row 0)
+              from (nth row 1)
+              to (nth row 2)
+              inlay (nth row 3 nil)
+              bol (text/line->char rope line)
+              start (+ bol from)
+              end (when (int? to) (+ bol to))
+              ;; the guard also tells the checker the offsets are ints: a row is untyped data
+              wrapped? (and (nil? inlay) (int? start) (int? end) (nil? (nth row 4 nil)))
+              ;; this row's start column: handed on by the row before, else — for a
+              ;; wrapped row, whose end the next row needs — measured here, once
+              col (cond
+                    (not (nil? inlay)) nil
+                    (and previous (= (first previous) line) (= (second previous) from))
+                      (nth previous 2)
+                    (not wrapped?) nil
+                    (= from 0) 0
+                    (int? start) (string/display-width (text/slice rope bol start))
+                    else nil)
+              ;; where a wrapped row ends, and the column there, for the row after it
+              next (when (and wrapped? (int? col) (int? start) (int? end))
+                     [line
+                       to
+                       (+ col
+                         (string/display-width (text/slice rope start end) col))]))
+          [(conj cols col) next])))))
+
+(sig ed-row-ops (int int int string int int any any any any -> any))
+
+(defn- ed-row-ops (row x w vis from-col base plain? spans ranges overrides)
+  "The ops painting `vis` (`ed-row-slice`) on screen row `row` from column `x`, `w` wide:
+one plain `text` op when `plain?`, else the tiled `[substring face]` chunks of the syntax
+`spans`, highlight `ranges` and `overrides` (all absolute offsets, `base` being `vis`'s)."
+  (if plain?
+    [(text row x (ed-fit-cells (string/expand-tabs vis from-col) w))]
+    (spanpaint/ed-chunks->ops row
+      x
+      (spanpaint/ed-line-chunks vis base (or spans '()) ranges overrides)
+      from-col
+      (+ x w))))
+
+(defn- ed-with-ellipsis (ops row x w ellipsis)
+  "A row's `ops` with the `ellipsis` of a truncated line (`wrap/one-row`) after them, in the
+row's LAST cells and the truncation face — so the marks of a column of truncated lines line
+up at the pane's edge, as Emacs's fringe `$` does. `ops` as they were for a row that shows
+its whole line (nil or `\"\"`: a line that scrolls is clipped by the edge, unmarked)."
+  (cond
+    (or (nil? ellipsis) (= ellipsis "")) ops
+    ;; a wrapped row's continuation mark sits OUTSIDE the text, in the scrollbar column every
+    ;; pane keeps, as Emacs's arrow sits in the fringe: the row keeps its whole width
+    (= ellipsis wrap/continuation-mark)
+      (append ops (list (text row (+ x w) ellipsis face-truncation)))
+    else
+      (append ops
+        (list (text row
+                (+ x (math/max 0 (- w (string/display-width ellipsis))))
+                ellipsis
+                face-truncation)))))
+
+(sig ed-slice-ops (buffer int int int int any any any int (or nil int) -> any))
+
+(defn ed-slice-ops (buf line row x w hl-ranges spans overrides from to)
+  "Render op(s) for the chars `[from, to)` of buffer `line` on screen row `row`, in a
+text area starting at column `x` and `w` wide — `to` nil for the rest of the line. The
+one row painter: an unwrapped pane's row is `[hscroll, len)` of its line, a wrapped
+pane's a segment of it. With neither `:fontify` `spans` nor any highlight range it's a
+single plain `text` op; otherwise coloured `[substring face]` chunks (the syntax spans +
+highlight ranges + bracket `overrides` merged), tiled from the slice's absolute `base`
+offset. Tabs are expanded to the LINE's stops (ADR-342): the slice is laid out from the
+display column its first character sits at (`from-col`), so a chunk mid-line tabs where
+the whole line would, and the frontend never sees a raw tab."
+  (let ([vis from-col base] (ed-row-slice (buffer-rope buf) line from to w))
+    (ed-row-ops row
+      x
+      w
+      vis
+      from-col
+      base
+      (and (nil? spans) (empty? hl-ranges))
+      spans
+      hl-ranges
+      overrides)))
+
+(sig ed-line-ops (buffer int int int int int any any any int -> any))
+
+(defn ed-line-ops (buf line top x y w hl-ranges spans overrides hscroll)
+  "Render op(s) for buffer `line` at its screen row `y + (line - top)` inside a pane whose
+text area starts at column `x`, width `w`, scrolled `hscroll` characters left — the
+unwrapped pane's row: `ed-slice-ops` over `[hscroll, end)` (long lines scroll, not wrap)."
+  (ed-slice-ops buf line (+ y (- line top)) x w hl-ranges spans overrides hscroll nil))
+
+(sig ed-visible-lines (buffer int int int int int any any any int -> any))
+
+(defn ed-visible-lines
+  (buf top textrows x y w hl-ranges spans overrides hscroll &optional (memo? false) (rows nil))
+  "`text` ops for the rows of a `textrows`-tall pane whose text area starts at `(x, y)`
+and is `w` wide: one buffer line per row from line `top`, scrolled `hscroll` columns
+left — or, with a row table `rows` (`panes/ed-pane-rows`, a wrapped buffer), one
+`[line from to]` segment per row. `hl-ranges` `[lo hi face]` highlight the
+region/overlays, `spans` syntax-colour, and `overrides` is the bracket/diagnostic face
+table **grouped by line** (`ed-overrides-by-line`) — each row is handed only its own.
+
+With `memo?`, each row is a memoised fragment (`editor/ui/ui-memo`, ADR-336) keyed by
+its screen cell `[:line x row]`: its ops are reused from the previous turn while what
+the row shows, the width, its spans, its highlights and **that line's** overrides are `=`
+— all of them values the model keeps between turns, so a cursor blink,
+a mouse move or a motion that touches no bracket re-renders no line at all. (The per-line
+grouping of the overrides is what makes that true — see `ed-overrides-by-line`.) Off (the
+default) outside the loop and for a scaled pane, whose ops are transformed after this.
+
+**A row's identity is its CONTENT, not its line number** — the text it shows, the column
+that text starts at, and its spans, highlights and overrides rebased to that text's first
+character — so a row whose text did not change hits even after an edit elsewhere re-lexed
+the band, and typing re-renders the edited row (and whatever the bracket pair moved
+across) rather than all of them. That was first written and MEASURED as a loss: computing
+those deps per line per frame (a rope slice and a span walk) cost more than the re-render it
+saved, on exactly the frames that change nothing. What makes it a win is that the per-row
+facts are remembered (`ed-row-facts-at`) on the rope, the band and the viewport: a frame
+where nothing moved reads them back in one comparison, and only a frame that changed the
+text or scrolled pays for them, once."
+  (let (facts (ed-row-facts-at (buffer-rope buf)
+                spans
+                top
+                textrows
+                hscroll
+                rows
+                w
+                (conventions/cell-layout-key))
+        any-ranges? (not (empty? hl-ranges))
+        paint-row (fn (row fact)
+                    (let ([line
+                            vis from-col base line-spans content bol eol plain-deps tiled-deps
+                            ellipsis] fact
+                          line-overrides (or (get overrides line) '())
+                          ;; only the highlight ranges ON this line, clipped to it: the
+                          ;; region's far end moves on every motion while it is active, and
+                          ;; with the whole range as the dep every row re-rendered — a
+                          ;; selected line in the middle paints the same either way
+                          line-ranges (if any-ranges?
+                                        (spanpaint/ed-ranges-on-line hl-ranges bol (inc eol))
+                                        '())
+                          ;; tiled or plain is the LINE's call: a line with no spans, no range
+                          ;; and no override of its own paints plain whatever the rest of the
+                          ;; pane has. As the pane's call, the first spell underline anywhere
+                          ;; (or a region) flipped every bare line to the tiler — a blank line
+                          ;; lost its `\"\"` op — so every row's memo missed once per check
+                          plain? (and (nil? line-spans)
+                                   (empty? line-ranges)
+                                   (empty? line-overrides))
+                          paint (fn ()
+                                  (ed-with-ellipsis (ed-row-ops row
+                                                      x w vis from-col base plain? line-spans
+                                                      line-ranges line-overrides)
+                                    row x w ellipsis)))
+                      ;; The deps are the row's content relative to its first character —
+                      ;; never the whole band (`=` on a rebuilt band walks it once per row:
+                      ;; on a file of 12,000-character lines that made the memo thirty times
+                      ;; slower than no memo) and never the line number, so a row whose text
+                      ;; and faces are unchanged hits wherever the edit was.
+                      (if memo?
+                        (ui-memo [:line x row]
+                          ;; `content` first: the text, its column, the width and its spans, one
+                          ;; vector built with the facts, so on a frame where nothing moved it
+                          ;; is the SAME cell as last turn's and compares at once
+                          ;; a row with no range and no override on it reads its deps back
+                          ;; from the facts (the same vector as last frame, so `=` answers at
+                          ;; once and nothing is built); the rest build theirs
+                          (if (and (empty? line-ranges) (empty? line-overrides))
+                            (if plain? plain-deps tiled-deps)
+                            [content
+                              (ed-rebase-ranges line-ranges base)
+                              (ed-rebase-overrides line-overrides base)
+                              plain?])
+                          paint)
+                        (paint)))))
+    ;; One walk that conses each row's ops onto a reversed accumulator and reverses once.
+    ;; `mapcat` over `seq/enumerate` built the index pairs, then spliced every row's
+    ;; one-marker list through `append` — about twice the cost of the memo lookups
+    ;; themselves on a frame where every row hits.
+    (ed-visible-walk facts 0 '() y x w paint-row)))
+
+(sig ed-visible-walk (any int any int int int fn -> any))
+
+(defn- ed-visible-walk (facts k acc y x w paint-row)
+  "`ed-visible-lines`' walk over its row `facts` from screen row `k`: each row's ops consed
+onto the reversed `acc` (`paint-row` for a text row; an INLAY row paints its own derived
+text, indented to the line it describes, in the hint voice — a remark about the code below
+it, not code), reversed once at the end."
+  (if (empty? facts)
+    (reverse acc)
+    (let (fact (first facts)
+          ops (if (string? fact)
+                (list (text (+ y k) x (ui-clip (str "  " fact) w) panegeometry/face-inlay-line))
+                (paint-row (+ y k) fact)))
+      (ed-visible-walk (rest facts)
+        (inc k)
+        ;; a row is almost always ONE op — its memo marker — and `fold` over a one-element
+        ;; list cost a microsecond a row, the dearest step of a row that hits
+        (if (and (list? ops) (empty? (rest ops)))
+          (ed-push-op acc (first ops))
+          (fold ops acc ed-push-op))
+        y
+        x
+        w
+        paint-row))))
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; the store only ever holds what the body below built, a list of row facts.
+(check-allow :trusted
+  (defmemo ed-row-facts-at 8 (rope spans top textrows hscroll rows w cell-layout)
+    "Per screen row of a pane, what painting it reads from the TEXT: an inlay row's string,
+or `[line vis from-col base spans content bol eol plain-deps tiled-deps ellipsis]` — the
+line, the text the row shows (`ed-row-slice`) with the display column it starts at and its
+buffer offset, the line's syntax spans (absolute), the row's CONTENT key
+`[vis from-col w spans ellipsis]` with the spans rebased to `base` and clipped to `vis` (what its memo compares), the line's
+bounds, and the row's whole memo deps for a frame with no highlight range or override on
+it, painted plain and painted tiled, and the ellipsis a truncated row ends in (nil for one
+that shows its whole line — `wrap/one-row`; a row cut short shows only the chars before
+its clip's cut).
+
+Remembered on the rope, the span band (the `:span-cache` entry's own vector), the viewport
+and the width — all of them the same cells on a frame where nothing moved, so the rows'
+deps (`ed-visible-lines`) are read back rather than rebuilt; a wrapped pane's row table
+`rows` is `wrap/rows-from`'s memoised vector."
+    (let (last-line (math/min (dec (text/line-count rope)) (dec (+ top textrows)))
+          ;; one `[line from to inlay]` per row: a wrapped pane's own table, or — unwrapped
+          ;; — one line per row from `top`, each scrolled `hscroll` and running to the edge
+          table (if (nil? rows)
+                  (map (range top (inc last-line)) (fn (line) [line hscroll nil nil]))
+                  (take rows textrows))
+          ;; the band sliced per line, ONCE — `fontify-runs` reads its whole `spans`
+          ;; argument before tiling, so handing every row the whole band is O(rows × band).
+          ;; The rows a wrapped pane draws are the same LINES, so the slice covers both.
+          by-line (if (or (nil? spans) (empty? spans))
+                    {}
+                    (spanpaint/ed-spans-by-line-at rope
+                      spans
+                      top
+                      (fold table -1 (fn (acc row) (math/max acc (first row)))))))
+      (map (seq/zip table (ed-row-start-cols rope table))
+        (fn ([row known-col])
+          (let (line (nth row 0)
+                from (nth row 1)
+                to (nth row 2)
+                inlay (nth row 3 nil)
+                clip (nth row 4 nil))
+            (if (nil? inlay)
+              (let ([vis from-col base] (ed-row-slice rope
+                                          line
+                                          from
+                                          (if clip (first clip) to)
+                                          w
+                                          known-col)
+                    ;; a wrapped row its line goes on past ends in the continuation mark,
+                    ;; painted just past the text (`ed-with-ellipsis`: the scrollbar column)
+                    ellipsis (cond
+                               clip (second clip)
+                               (and (not (nil? rows))
+                                 (not (nil? to))
+                                 (< (+ (text/line->char rope line) to)
+                                   (textpos/ed-line-end rope line)))
+                                 wrap/continuation-mark
+                               else nil)
+                    line-spans (get by-line line)
+                    ;; the spans CLIPPED to the text the row shows: a docstring's one span
+                    ;; runs over many lines and lengthens with every character typed in it,
+                    ;; and every row it covers paints the same however long it is
+                    content [vis
+                              from-col
+                              w
+                              (ed-rebase-ranges (spanpaint/ed-ranges-on-line line-spans
+                                                  base
+                                                  (+ base (string/length vis)))
+                                base)
+                              ellipsis])
+                [line
+                  vis
+                  from-col
+                  base
+                  line-spans
+                  content
+                  (text/line->char rope line)
+                  (textpos/ed-line-end rope line)
+                  ;; the row's whole memo deps for the usual frame — no highlight range
+                  ;; and no override on the line — plain, then tiled: built once with the
+                  ;; facts, so such a row hands its memo the SAME vector every frame
+                  [content '() '() true]
+                  [content '() '() false]
+                  ellipsis])
+              inlay)))))))
+
+(defn- ed-rebase-ranges (ranges base)
+  "`[start end face]` `ranges` with both ends made relative to offset `base` — `()` for
+none. What a row's memo compares, so a row whose text moved compares equal. A range whose
+ends are not numbers is kept as it is (`ed-ranges-on-line` passes those through)."
+  (if (empty? ranges)
+    '()
+    (map ranges
+      (fn (range)
+        (let ([start end face] range)
+          (if (and (int? start) (int? end)) [(- start base) (- end base) face] range))))))
+
+(defn- ed-rebase-overrides (overrides base)
+  "`[pos face]` `overrides` with the position made relative to offset `base` — `()` for
+none."
+  (if (empty? overrides) '() (map overrides (fn (o) (let ([pos face] o) [(- pos base) face])))))
+
+;; How many of the gutter's trailing columns the recessed surface leaves *unpainted*, so the
+;; cell's separator space falls on the edit background — a slight light gap between the line
+;; number and the text (not a heavy dark band). The gutter cell already reserves that space.
+(def *gutter-edit-margin* 1)
+
+(def- ed-gutter-bar-width 0.28) ; the change-bar's width in cells (a thin diff-hl rule)
+
+(defn- ed-gutter-chunk-op (row col chunk gui?)
+  "The op for one gutter chunk at column `col`. A `[:bar colour]` chunk is a git change bar:
+in the GUI a thin **full-cell-height** `frect` (a CONTINUOUS solid rule — a half-block glyph
+leaves a gap at the 1.4 line-height, reading as a dashed TUI bar), in the terminal the `▌`
+half-block. Any other chunk is `[text face]`."
+  (let ([t f] chunk)
+    (cond
+      (not (= t :bar)) (text row col t f)
+      gui? (frect (+ col 0.0) (+ row 0.0) ed-gutter-bar-width 1.0 {:bg f})
+      else (text row col "▌" {:fg f}))))
+
+(defn- ed-gutter-line-ops (row col chunks gui? acc)
+  "The render ops for one gutter cell's `chunks` (normalised via `model/gutter-cell-chunks`)
+laid left-to-right from column `col` (`ed-gutter-chunk-op`) — so a gutter can carry a change
+bar *and* the dim line number in one cell (diff-hl). A bar takes one column, a text chunk
+its length. The web mirror decodes the same chunks (`web-gutter-html`).
+
+Consed onto the reversed accumulator `acc` and left reversed — the column caller reverses
+once over every line — with the column threaded as an argument rather than a `[col ops]`
+pair allocated per chunk on every gutter rebuild."
+  (if (empty? chunks)
+    acc
+    (let (chunk (first chunks)
+          t (first chunk))
+      (ed-gutter-line-ops row
+        (+ col (if (= t :bar) 1 (string/length t)))
+        (rest chunks)
+        gui?
+        (cons (ed-gutter-chunk-op row col chunk gui?) acc)))))
+
+(defn ed-gutter-ops (cells bx by gui? &optional (memo? false))
+  "Render ops for prebuilt gutter `cells` (one `[text face]` / `[:bar colour]` chunk list
+per visible line, from `spancache/ed-pane-gutter-cells` — cached across frames, since typing
+never changes them), placed at column `bx`, rows from `by`. `gui?` picks the change bar's
+rendering (frect vs `▌`). `()` when `cells` is nil (gutter hidden / no service). With
+`memo?` the ops are a memoised fragment (ADR-336) — off for a scaled pane, whose ops
+are transformed after this."
+  (if (nil? cells)
+    '()
+    ;; A memoised fragment (ADR-336): `cells` is the model's cached vector, the same
+    ;; object turn after turn, so the ops are reused until the gutter itself changes.
+    (ui-memo (if memo? [:gutter bx by] nil)
+      [cells bx by gui?]
+      (fn ()
+        ;; one reversed accumulator across every cell's chunks, reversed once — not a list per
+        ;; line spliced by `mapcat` over `seq/enumerate`'s index pairs
+        (reverse (fold (range (count cells))
+                   '()
+                   (fn (acc i)
+                     (ed-gutter-line-ops (+ by i) bx (gutter-cell-chunks (nth cells i)) gui? acc))))))))
+
+(defn- ed-row-cells (cells rows top &optional (top-continued false))
+  "The gutter `cells` (one per buffer line from `top`) re-keyed per ROW of a wrapped
+pane's table: a line's first row gets its cell, a continuation row no number (as Emacs
+shows none on a continuation line) but the `wrap/continued-mark` (`ed-continued-cell`). `cells` itself when `rows` is nil.
+With `top-continued` the pane starts part-way through line `top`'s text, so its first rows
+continue that line and get the mark too."
+  (if (or (nil? rows) (nil? cells))
+    cells
+    ;; a line's FIRST text row is the one after a row of another line (or an inlay): not
+    ;; `from = 0`, since the line at point may be shown scrolled sideways
+    ;; (`wrap/follow-point`) and is still the line its number names
+    (let (continued (ed-continued-cell cells))
+      (letrec (walk (fn (left previous acc)
+                      (if (empty? left)
+                        (into [] (reverse acc))
+                        (let (row (first left)
+                              line (first row)
+                              inlay (nth row 3 nil)
+                              first? (and (nil? inlay) (not (= line previous))))
+                          (walk (rest left)
+                            (if (nil? inlay) line previous)
+                            (cons (cond
+                                    (not first?) (if (nil? inlay) continued '())
+                                    (< (- line top) (count cells)) (nth cells (- line top))
+                                    else '())
+                              acc))))))
+        (walk (seq rows) (if top-continued top -1) '())))))
+
+(defn- ed-continued-cell (cells)
+  "The gutter cell of a row that continues a wrapped line: no number, the
+`wrap/continued-mark` in the number's last column (Emacs's left fringe arrow) — as wide as
+the line-number cells in `cells`, so the text after it does not move. Empty when no cell
+has a width to match."
+  (let (sample (seq/find cells (fn (cell) (not (empty? cell))))
+        chunks (cond
+                 (nil? sample) '()
+                 (string? (first sample)) (list sample)
+                 else sample)
+        ;; a change bar `[:bar colour]` is one column (`ed-gutter-line-ops`), a text chunk its width
+        width (fold chunks
+                0
+                (fn (acc [text _]) (+ acc (if (string? text) (string/display-width text) 1)))))
+    (if (<= width gutter/line-number-right-margin)
+      '()
+      [(string/pad-right (string/pad-left wrap/continued-mark
+                           (- width gutter/line-number-right-margin))
+         width)
+        face-truncation])))
+
+;; `gui?` is `(:gui m)` — absent (nil) in a terminal model, never `false`.
+(sig ed-pane-gutter-ops (panegeometry/pane-geometry any (or bool nil) -> any))
+
+(defn ed-pane-gutter-ops (geometry cells gui?)
+  "The pane's gutter ops from its prebuilt/cached chunk lists `cells`, re-keyed per row of a
+wrapped pane (`ed-row-cells`)."
+  (ed-gutter-ops (ed-row-cells cells (:rows geometry) (:top geometry) (:top-continued geometry))
+    (:x geometry)
+    (:y geometry)
+    gui?
+    true))
+
+(defn- ed-number-chunk-ops (chunks row col)
+  "The current line's number repainted from its gutter `chunks` laid from column `col` on
+`row`: the chunk in the line-number face again in `face-gutter-line-current`, on the gutter's
+background so it covers the dim one. `()` when no chunk is a line number (a mark took the
+column, or relative numbering already painted the line in its current face)."
+  (if (empty? chunks)
+    '()
+    (let ([chunk-text face] (first chunks))
+      (cond
+        (= chunk-text :bar) (ed-number-chunk-ops (rest chunks) row (inc col))
+        (= face face-gutter-line)
+          (list (text row col chunk-text (assoc face-gutter-line-current :bg (:bg face-gutter-bg))))
+        else (ed-number-chunk-ops (rest chunks) row (+ col (string/length chunk-text)))))))
+
+(defn ed-current-number-ops (pane buf geometry cells)
+  "The selected pane's current line number in lavender (`face-gutter-line-current`,
+Catppuccin's \"you are here\"), painted over the cached gutter column at the line's first
+screen row — an overlay rather than a part of the cells, so a motion leaves the cached
+gutter alone (`spancache/ed-gutter-key` holds no point line under absolute numbering). `()`
+off the selected pane, with no gutter, or when the line's first row is not on screen."
+  (let (line (buffer-current-line buf)
+        top (:top geometry)
+        index (- line top))
+    (if (or (not (:selected pane))
+          (nil? cells)
+          (< index 0)
+          (>= index (count cells))
+          (and (= line top) (:top-continued geometry)))
+      '()
+      (let (row (seq/find (panegeometry/ed-line-screen-rows geometry
+                            line
+                            (math/max 1 (:text-height geometry)))
+                  (fn (row) (nil? (nth row 3 nil)))))
+        (if (nil? row)
+          '()
+          (ed-number-chunk-ops (gutter-cell-chunks (nth cells index))
+            (+ (:y geometry) (first row))
+            (:x geometry)))))))
+
+(sig ed-pane-text-ops (buffer panegeometry/pane-geometry any any any -> any))
+
+(defn ed-pane-text-ops (buf geometry hl-ranges spans overrides)
+  "The pane's visible text rows (`ed-visible-lines`, memoised per row), the whole BODY one
+memoised fragment around them (ADR-336): an unchanged pane's text is one lookup, not one
+per row.
+
+The body's deps are exactly what `ed-visible-lines` reads, and every one is a value the
+model keeps between turns, so on a frame where nothing in the body moved they are the SAME
+cells and `=` answers at once:
+- the rope — the text (identity: an edit makes a new one);
+- `spans` — the `:span-cache` band's own vector (or the buffer's `:face-spans`);
+- the viewport — `:top`, `:render-height` (the smooth-scroll extra row and a narrowing are
+  in it), `:hscroll`, the wrapped row table `:rows` (`wrap/rows-from`'s memoised vector) —
+  and the text area's `x` and width (the gutter width and the pane's rect are in those);
+- `hl-ranges` — the sources' ranges, the region, the overlays, remote selections and the link hover,
+  with their faces (a theme switch re-derives `face-region`, so it shows up here);
+- `overrides` — the bracket/diagnostic table by line (`ed-overrides-by-line-at`'s own map
+  while there is no diagnostic underline; a small `=` walk while there is).
+`y` is in the key. Those are also the union of every row's deps, so when the body misses
+the rows still answer one by one — a `C-n` that moved the bracket pair re-renders the two
+rows it touched, as before; when it hits, the stored ops carry the rows' own markers
+(`%ui-harvest` keeps an entry's ops as emitted), so the next turn's rows still find
+theirs."
+  (let ([x width] (panegeometry/geometry-span geometry :text)
+        y (:y geometry)
+        top (:top geometry)
+        height (:render-height geometry)
+        hscroll (:hscroll geometry)
+        rows (:rows geometry))
+    ;; check-allow: the thunk's only effects are the row-facts and span-slice memo stores
+    ;; (`defmemo`), which answer the same whether this turn ran them or not
+    (check-allow :pure
+      (ui-memo [:body x y]
+        [(buffer-rope buf) spans top height hscroll rows width hl-ranges overrides]
+        (fn ()
+          (ed-visible-lines buf top height x y width hl-ranges spans overrides hscroll true rows))))))

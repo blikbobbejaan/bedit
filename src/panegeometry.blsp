@@ -1,0 +1,157 @@
+(defmodule panegeometry
+  "A pane body's geometry, built once per pane per frame: the one map every layer reads, and the
+named horizontal spans (`geometry-span`, `geometry-band`) every reach across the body is measured
+as — the text, the gutter, the region's end-of-line bands, a line's screen rows."
+  (:use editor/buffer)
+  (:use model)
+  (:use panes)
+  (:use theme)
+  (:use editor/display))
+
+(deftype pane-geometry
+  (record &open
+    :top int
+    :x int
+    :y int
+    :width int
+    :gutter-width int
+    :margin-width int
+    :text-height int
+    :render-height int
+    :rows (or nil vector)
+    :top-continued (or nil bool)
+    :hscroll int))
+
+(sig geometry-span (pane-geometry keyword -> vector))
+
+(defn geometry-span (geometry span)
+  "`[x width]`: the screen column the named `span` of the pane body starts at and the cells
+it covers.
+
+- `:text`: what a line is laid out into, past the gutter and short of the right margin and
+  the scrollbar column. At least 1 wide.
+- `:row`: the text's start to the right margin, or to the body's edge when there is none
+  (the scrollbar column included). The reach of what goes after a line's text: a link zone,
+  a ghost note, a region's end-of-line fill, a remote caret. At least 1 wide.
+- `:band`: the text's start to the body's edge, through the margin and the scrollbar
+  column. A background behind a whole line (`geometry-band`). It reaches the grid's edge
+  when the pane does, so the GUI carries it on to the frame.
+- `:body`: the body's whole width, gutter included (the pulse after a jump).
+- `:gutter`: the gutter, its edit margin included.
+- `:margin`: the right margin's text, past its gap; 0 wide without one."
+  (let (x (:x geometry)
+        width (:width geometry)
+        gutter (:gutter-width geometry)
+        margin (:margin-width geometry)
+        text-x (+ x gutter)
+        text-width (math/max 1 (- width gutter margin 1)))
+    (case span
+      :text [text-x text-width]
+      :row [text-x (math/max 1 (- width gutter margin))]
+      :band [text-x (math/max 0 (- width gutter))]
+      :body [x width]
+      :gutter [x gutter]
+      ;; `:margin-width` counts the two-cell gap before the margin's text
+      :margin [(+ text-x text-width 2) (math/max 0 (- margin 2))]
+      (error (str "geometry-span: no span " span)))))
+
+(defn geometry-band (geometry row face)
+  "A background behind a whole line on body `row` (0 at the body's top): a `rect` across
+the `:band` span, so it reaches the pane's right edge and on to the frame. How every
+full-line background is painted (the current line, a diff's tinted lines), so none of them
+picks its own width."
+  (let ([x width] (geometry-span geometry :band))
+    (rect (+ (:y geometry) row) x width 1 face)))
+
+(defn ed-line-screen-rows (geometry line height)
+  "The `[k from to]` rows buffer `line`'s text occupies (`ed-rows-line-rows`) that fall
+within the first `height` rows of the body."
+  (seq/filter (ed-rows-line-rows (:rows geometry) (:top geometry) line (:hscroll geometry))
+    (fn (row) (and (>= (first row) 0) (< (first row) height)))))
+
+(defn ed-line-last-row (geometry line height)
+  "The `[k from to]` row holding the END of `line`'s text — a wrapped line's last segment —
+when it is within the first `height` rows of the body, else nil. Where anything painted
+after a line's text (a region's end-of-line fill, a ghost note) goes."
+  (let (row (last (ed-rows-line-rows (:rows geometry) (:top geometry) line (:hscroll geometry))))
+    (when (and row (< (first row) height)) row)))
+
+(defn ed-cells-between (rope bol from to)
+  "The display cells of the chars `[from, to)` on the line starting at `bol`, measured from
+the LINE's start in both halves — a tab's width is a function of its line column (ADR-342),
+so this is the width to `to` less the width to `from`, not the width of the slice alone."
+  (- (string/display-width (text/slice rope bol to))
+    (string/display-width (text/slice rope bol from))))
+
+(sig ed-hl-line-band (model map buffer pane-geometry -> any))
+
+(defn ed-hl-line-band (m pane buf geometry)
+  "The hl-line current-line highlight: a `geometry-band` behind each row the line at point
+occupies (`ed-line-screen-rows`: one for an unwrapped line, every continuation row of a
+wrapped one, as Emacs highlights the whole logical line). It starts at the text, never in
+the gutter (Emacs `hl-line-mode`, sans the fringe), and runs to the pane's edge. Painted
+only on the selected pane with `:hl-line` on and **no** active region, and only for rows on
+screen (`:text-height`). `()` otherwise. Drawn before the text so it sits behind it."
+  (if (and (:hl-line m) (:selected pane) (nil? (buffer-region-bounds buf)))
+    (map (ed-line-screen-rows geometry
+           (buffer-current-line buf)
+           (math/max 1 (:text-height geometry)))
+      (fn (row) (geometry-band geometry (first row) face-hl-line)))
+    '()))
+
+(defn- ed-region-eol-band (buf geometry lo hi line)
+  "The region band filling `line`'s end-of-text → right-edge gap, or nil: when the region
+`[lo, hi]` covers the line THROUGH its end and the line's last row is on screen. Reaching
+the end of the text is enough; the newline itself need not be inside, which is the
+difference between a selection that stops flush against the last character and one that
+reads as covering the line. The last line of a region is the case that shows it, and it is
+the one a reader looks at. It runs to the end of the `:row` span: the right margin, or the
+pane's edge."
+  (let (rope (buffer-rope buf)
+        bol (text/line->char rope line)
+        ;; the length from the line bounds, not from a copy of the line's text
+        line-len (- (textpos/ed-line-end rope line) bol)
+        eol (+ bol line-len)
+        row (when (and (<= lo eol) (<= eol hi))
+              (ed-line-last-row geometry line (math/max 1 (:text-height geometry)))))
+    (when row
+      (let ([k row-from _] row
+            [x width] (geometry-span geometry :row)
+            ;; the row's text width, measured from the LINE's column (its tabs)
+            end-column (ed-cells-between rope bol (+ bol (math/min row-from line-len)) eol)
+            band-width (- width end-column))
+        (when (> band-width 0)
+          (rect (+ (:y geometry) k) (+ x end-column) band-width 1 face-region))))))
+
+(sig ed-region-eol-bands (buffer pane-geometry -> list))
+
+(defn ed-region-eol-bands (buf geometry)
+  "Region-selection bands filling each fully-selected line's end-of-text → right-edge gap,
+so an empty or short line whose newline lies inside the region shows the selection through
+end-of-line (Emacs region highlighting). The char-range region tint (`ed-hl-ranges`) only
+paints actual text; this is its full-width counterpart — the same relationship
+`ed-hl-line-band` has to the per-line cursor. `()` when no region is active. Coords mirror
+`ed-pane-body-ops`: pane-body cells, the text `:gutter-width` in from `:x`, over the
+`:text-height` rows. The band sits on the line's LAST row (`ed-line-last-row`), after that
+row's text. Bottom line first."
+  (let (region (buffer-region-bounds buf))
+    (if (nil? region)
+      '()
+      (let (top (:top geometry)
+            last-line (math/min (dec (buffer-line-count buf))
+                        (dec (+ top (math/max 1 (:text-height geometry))))))
+        (seq/keep (reverse (range top (inc last-line)))
+          (fn (line) (ed-region-eol-band buf geometry (first region) (second region) line)))))))
+
+(sig ed-line-text (buffer int -> string))
+
+(defn ed-line-text (buf line)
+  "Line `line`'s text without its trailing newline (`buffer-line-at` keeps it)."
+  (ed-strip-newline (buffer-line-at buf line)))
+
+;; An inlay row: derived text on a row of its own, above the code it describes. The hint
+;; voice — dim and italic — because it is a remark about the line below it and must never
+;; read as a line of the buffer. Same face as the type note it replaces when the note is too
+;; long to sit at the end of its line. `defchrome`, so a theme switch re-derives it: as a
+;; plain `def` it kept the colour of the theme the editor started with.
+(defchrome face-inlay-line {:fg *overlay0* :italic true})

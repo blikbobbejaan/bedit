@@ -148,6 +148,11 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             STANDING QUESTION (a y/n read, a query-replace, a minibuffer prompt):
                             it shows beside it in brackets until the next key, as Emacs's
                             minibuffer message, and lands in *Messages* as always
+src/textpos.blsp            pure text geometry under the model: an offset's line, column, ends, and
+                            what an edit changed (the splice log)
+src/diagstore.blsp          the diagnostics cache the view reads, whoever produced it, a
+                            diagnostic's position converted in one place, the quiet window
+src/lossage.blsp            the recent keys (C-h l), a bounded ring on the model
 src/minibuffer.blsp         the minibuffer: a one-line prompt over std's lineedit with a list under
                             it, modal (`minibuffer-handle`); ranks on the key for a small source,
                             in a session off the loop for a large one; a prompt that opens once its
@@ -402,6 +407,15 @@ src/view.blsp               pure view: model -> render frame (editor/display ops
                             ADR-610): the window anchors it and the echo area to its bottom edge
                             and puts the leftover pixels above it; row 0 is a band (no top
                             margin) only under a header line
+src/panegeometry.blsp       a pane body's geometry map and the named column spans every layer
+                            measures with (the view's lowest layer)
+src/spanpaint.blsp          what colours a line: the span band sliced per line, the layers under
+                            the mode's colours, bracket overrides, the highlight ranges
+src/panebody.blsp           one pane's body: visible rows (folds, wraps), each row's text and the
+                            gutter beside it
+src/linkview.blsp           the pointer and hover band over a clickable location
+src/eolview.blsp            end-of-line notes and the inline completion preview, as painted
+                            (`view` is now the pane, its chrome and the frame over these)
 src/hittest.blsp            the mouse side of the view: every hit-test / hover fold that takes
                             a model and returns one (:hover, :diag-hover, :link-hover, a chip
                             click, the context menu's hit) — recomputed from the same widget /
