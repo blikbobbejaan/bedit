@@ -26,7 +26,7 @@ Framing is std's `jsonrpc`, which is **byte-accurate**: `Content-Length` is LSP'
 count, and bodies are cut by UTF-8 byte offset, so multi-byte content — which
 rust-analyzer's completion items routinely carry — round-trips correctly. (A multi-byte
 character split across two stdout reads is reassembled by the subprocess reader before it
-reaches us, so a large frame no longer desyncs.)
+reaches us.)
 
 Positions on the wire are LSP's: 0-based lines and UTF-16 code-unit columns, where a
 character beyond the Basic Multilingual Plane (an emoji) counts two. The buffer counts
@@ -44,12 +44,10 @@ characters, so every column crosses [[lsp-column->units]] going out and
 (def *lsp-timeout-ms* 1000) ; how long a Tab waits for the server before giving up
 ;; How long the handshake waits for the `initialize` response before giving up on it.
 ;;
-;; Three minutes, where this was ten seconds — because a real language server's
-;; `initialize` is not a handshake, it is a BUILD. Expert compiles and indexes the whole
-;; mix project before it answers; rust-analyzer does the same with cargo. At ten seconds
-;; the client gave up, sent `initialized` to a server that had not initialized, and every
-;; request after it was answered by nobody: an Elixir buffer with a correctly configured,
-;; correctly installed server that silently never completed anything.
+;; Three minutes, because a real language server's `initialize` is not a handshake, it is a
+;; BUILD: Expert compiles and indexes the whole mix project before it answers, rust-analyzer
+;; does the same with cargo. Giving up sooner sends `initialized` to a server that has not
+;; initialized, and every request after it is answered by nobody.
 ;;
 ;; A generous bound costs nothing here: this wait is inside the CONNECTION process, so a
 ;; server that never replies at all delays its own first answer and blocks neither the
@@ -161,7 +159,7 @@ A folder that cannot be listed holds nothing.
 ;; ---- the connection process (the thin IO shell) -----------------------------
 
 (defn- lsp-send-all (proc frames)
-  (doseq (f frames) (os/write proc f)))
+  (doseq (frame frames) (os/write proc frame)))
 
 (def *lsp-flush-ms*
   ;; How long what a server SAID (its log, progress, diagnostics) may wait to be sent to
@@ -179,9 +177,9 @@ that owns the buffers). Here rather than in the fold, so the fold stays pure.
 What the server SAID — its notices and diagnostics — stays on the state for [[lsp-flush]]:
 a reply is someone waiting, a log line is not, and sending each line as it arrived is what
 froze the editor while Expert indexed."
-  (doseq (r replies) (send (first r) (second r)))
+  (doseq (reply replies) (send (first reply) (second reply)))
   (lsp-send-all (:proc state) (or (:outbox state) []))
-  (doseq (e (or (:edits state) [])) (send :editor [:lsp-apply-edit e]))
+  (doseq (edit (or (:edits state) [])) (send :editor [:lsp-apply-edit edit]))
   ;; …and any document whose incremental sync it had to refuse: the editor sends the whole
   ;; text next time ([[lsp-sync-document]])
   (doseq (uri (or (:resyncs state) [])) (send :editor [:lsp-resync uri (self)]))
@@ -201,8 +199,8 @@ of a thousand log lines costs it one."
     ;; a file's diagnostics only matter at their newest: one this server published that
     ;; the editor has not folded yet is REPLACED rather than queued behind (brood ADR-490).
     ;; The log above is not state — every line of it counts — so it is a plain send.
-    (doseq (d (or (:diags state) []))
-      (let ([path items raw] d)
+    (doseq (published (or (:diags state) []))
+      (let ([path items raw] published)
         (proc/send-latest :editor
           [:lsp-diagnostics (pr-str (self)) path]
           [:lsp-diagnostics path items raw (self)])))
@@ -229,23 +227,23 @@ The bound is on the CONNECTION process, never on the editor: this runs in the pi
 late first completion rather than a frozen editor."
   (receive
     ([:proc p chunk]
-      (let (buf (str (:buf state) chunk)
-            [msgs remaining] (jsonrpc/decode buf)
-            hit (seq/find msgs (fn (msg) (and (= (:id msg) id) (nil? (:method msg)))))
+      (let (received (str (:buf state) chunk)
+            [messages remaining] (jsonrpc/decode received)
+            hit (seq/find messages (fn (msg) (and (= (:id msg) id) (nil? (:method msg)))))
             ;; everything else that arrived meanwhile is handled as the loop
             ;; would: a server that asks for its configuration or registers a
             ;; capability BEFORE answering initialize is waiting on us, and
             ;; dropping the request left it waiting for good
-            st (apply lsp-drain
-                 (fold (seq/reject msgs (fn (msg) (= msg hit)))
+            drained (apply lsp-drain
+                 (fold (seq/reject messages (fn (msg) (= msg hit)))
                    [(assoc state :buf remaining) '()]
                    lsp-dispatch)))
         (if hit
           ;; …keeping what it says it can do. A server that does not offer
           ;; signature help should not be asked for it on every keystroke,
           ;; and the only honest source for that is its own answer here.
-          (assoc st :caps (or (map/get-in hit [:result :capabilities]) {}))
-          (lsp-await-init st id))))
+          (assoc drained :caps (or (map/get-in hit [:result :capabilities]) {}))
+          (lsp-await-init drained id))))
     ([:proc-err p chunk] (lsp-await-init state id))
     ([:proc-closed p code] state)
     (after *lsp-init-timeout-ms* state)))
@@ -265,23 +263,20 @@ server; `:shutdown` or the server dying stops it."
     ([:proc-closed p code] (do (lsp-flush state) :lsp-stopped))
     ;; Every question, whatever its kind: the kind (an `LspRequest` record) says what goes
     ;; on the wire and how the answer is shaped, so a new request is an impl, not an arm.
-    ([:ask kind corr reply-to request] (let ([st2 frames] (lsp-issue state
+    ([:ask kind corr reply-to request] (let ([next-state frames] (lsp-issue state
                                                             corr reply-to kind request))
-                                         (lsp-send-all (:proc st2) frames)
-                                         (lsp-loop st2)))
-    ;; A SYNC with no question attached. Every `:ask` syncs the document as a side effect
-    ;; of asking the server something (`lsp-issue`), which is the whole reason diagnostics
-    ;; never appeared: a server PUSHES `publishDiagnostics` after a `didChange`, and nothing
-    ;; sent one while you typed. The symptom was exact — imenu worked, because asking for
-    ;; symbols synced the text on the way past, and then the findings arrived for that one
-    ;; version and never again.
+                                         (lsp-send-all (:proc next-state) frames)
+                                         (lsp-loop next-state)))
+    ;; A SYNC with no question attached: a server PUSHES `publishDiagnostics` after a
+    ;; `didChange`, so the text is sent as it is typed, not only on the way to asking
+    ;; something (`lsp-issue`).
     ;; `sync` is the `{:text|:changes …}` map [[lsp-sync-document]] takes
-    ([:sync uri lang sync] (let ([st2 frames] (lsp-sync-document state uri lang sync))
-                             (lsp-send-all (:proc st2) frames)
-                             (lsp-loop (lsp-drain st2 (list)))))
-    ([:close uri] (let ([st2 frames] (lsp-close-document state uri))
-                    (lsp-send-all (:proc st2) frames)
-                    (lsp-loop st2)))
+    ([:sync uri lang sync] (let ([next-state frames] (lsp-sync-document state uri lang sync))
+                             (lsp-send-all (:proc next-state) frames)
+                             (lsp-loop (lsp-drain next-state (list)))))
+    ([:close uri] (let ([next-state frames] (lsp-close-document state uri))
+                    (lsp-send-all (:proc next-state) frames)
+                    (lsp-loop next-state)))
     ;; a project joining or leaving a server that serves several (`lsp-add-folder`)
     ([:folders added removed] (do
                                 (lsp-send-all (:proc state)
@@ -326,33 +321,32 @@ model drops a connection whose process is gone (`ed-lsp-live`)."
   ;; Started IN the project root, not in whatever directory the editor happens to have.
   ;; A language server that builds the project reads its own working directory to find it —
   ;; Expert runs `mix`, rust-analyzer runs `cargo` — and `rootUri` in the handshake does not
-  ;; set one. Launched from elsewhere, Expert initialised, reported a full
-  ;; `completionProvider`, and then answered every request with nothing, because there was
-  ;; no project where it was standing.
-  (let (p (check-allow :discarded-catch
-            (try (os/spawn cmd cmd-args {:cwd (lsp-uri->path root-uri)}) (catch e nil))))
-    (when p (lsp-run-connected p root-uri))))
+  ;; set one: launched from elsewhere, Expert initialises and then answers every request with
+  ;; nothing.
+  (let (server (check-allow :discarded-catch
+                 (try (os/spawn cmd cmd-args {:cwd (lsp-uri->path root-uri)}) (catch e nil))))
+    (when server (lsp-run-connected server root-uri))))
 
-(defn- lsp-run-connected (p root-uri)
+(defn- lsp-run-connected (server root-uri)
   "The handshake and loop, given a live server handle."
   ;; A server can be gone before the first write: a rustup `rust-analyzer` stub for a
   ;; component that is not installed passes `os/which`, starts, and exits at once. The write
-  ;; then raises, and this process ended in a crash trace. It ends quietly instead — the
+  ;; then raises; this process ends quietly instead — the
   ;; editor sees the dead connection and says so once (`ed-lsp-autostart`).
-  (let (state {:proc p :buf "" :next-id 1 :pending {} :opened {} :version 2})
-    (if (not (lsp-write-handshake p (jsonrpc/request 0 "initialize" (lsp-init-params root-uri))))
-      :lsp-stopped (let (state2 (lsp-await-init state 0))
-        (if (not (lsp-write-handshake p (jsonrpc/notification "initialized" {})))
+  (let (state {:proc server :buf "" :next-id 1 :pending {} :opened {} :version 2})
+    (if (not (lsp-write-handshake server (jsonrpc/request 0 "initialize" (lsp-init-params root-uri))))
+      :lsp-stopped (let (initialized (lsp-await-init state 0))
+        (if (not (lsp-write-handshake server (jsonrpc/notification "initialized" {})))
           :lsp-stopped (do
             ;; tell the editor what this server can do, so a command can say "this server
             ;; does not do that" instead of showing nothing and reading as broken
-            (send :editor [:lsp-capabilities (or (:caps state2) {}) (self)])
-            (lsp-loop state2)))))))
+            (send :editor [:lsp-capabilities (or (:caps initialized) {}) (self)])
+            (lsp-loop initialized)))))))
 
-(defn- lsp-write-handshake (p frame)
+(defn- lsp-write-handshake (server frame)
   ;; write one handshake frame; false when the server is already gone (the first write can
   ;; land in the pipe's buffer before a dying server exits, so either may be the one to fail)
-  (check-allow :discarded-catch (try (do (os/write p frame) true) (catch _ false))))
+  (check-allow :discarded-catch (try (do (os/write server frame) true) (catch _ false))))
 
 (defn lsp-connect (cmd cmd-args root-uri)
   "Spawn language server `cmd` (with `cmd-args`, a list/vector of strings) for project
@@ -369,8 +363,8 @@ Asked before a request the reader did not make (the idle beat's signature help) 
 telling them a command is unavailable. Never asked to VETO a request they did make: a
 server that under-advertises and answers anyway is a thing that happens, and refusing on
 its behalf would be worse than letting it say no itself."
-  (let (v (get (or caps {}) feature))
-    (not (or (nil? v) (= v false)))))
+  (let (provider (get (or caps {}) feature))
+    (not (or (nil? provider) (= provider false)))))
 
 (defn lsp-shutdown (conn)
   "Stop a connection: kill the server and end the connection process."
@@ -386,7 +380,7 @@ incomplete, so nothing caches it."
       (receive
         ([:lsp-completion corr answer] (if (includes? corrs corr)
                                          (lsp-complete-collect (seq/reject corrs
-                                                                 (fn (c) (= c corr)))
+                                                                 (fn (asked) (= asked corr)))
                                            deadline
                                            {:entries (seq/distinct (append (:entries acc)
                                                                      (:entries answer)))
@@ -435,10 +429,8 @@ the editor sends the edits since its last sync when the server accepts them
 (`lsp-servers/ed-lsp-push-text`).
 
 This is what makes DIAGNOSTICS work. A server does not answer a question with them; it
-pushes `publishDiagnostics` when it learns the text changed. Requests used to sync the
-document only on their way to asking something, so before this existed the findings arrived
-only for whatever version you happened to invoke a lookup on — and never while typing,
-which is the only time they are worth having."
+pushes `publishDiagnostics` when it learns the text changed, so the text has to reach it
+while you type, not only with a lookup."
   (send conn [:sync uri lang sync]))
 
 (defn lsp-ask-async (conn kind corr reply-to request)
@@ -450,20 +442,19 @@ plus `:diags` (code actions) or `:new-name` (rename); `{:command :arguments}` fo
 `[:lsp-definition corr locs]`, `[:lsp-workspace-edit corr wsedit]`, … (see its
 `lsp-request-shape`) — lands on `reply-to`.
 
-ONE sender rather than one per kind: each used to be a function, a `lsp-loop` arm and a
-request builder, three copies of the same plumbing that differed only in the method name
-and the params, which are now the kind's own `lsp-request-method` / `lsp-request-params`."
+ONE sender for every kind: what differs between kinds is the method name and the params,
+which are the kind's own `lsp-request-method` / `lsp-request-params`."
   (send conn [:ask kind corr reply-to request]))
 
 ;; ---- the completion source --------------------------------------------------
 
-(defn- lsp-symbol-at-point (buf)
+(defn- lsp-symbol-at-point (buffer)
   "`[start prefix line]` — the symbol before point, the completion region, by the same
 boundary rule the other sources use (`symbol-prefix-at`), so the merge keeps this source;
 and the current line up to point, which a server's edit columns are read against. Read
 from that line alone: a symbol never crosses a line, and flattening the buffer to find it
-was a measurable part of every Tab on a big file."
-  (let ([line-start line] (complete-words/complete-line-to-point buf)
+costs every Tab on a big file."
+  (let ([line-start line] (complete-words/complete-line-to-point buffer)
         [start prefix] (symbol-prefix-at line (string/length line)))
     [(+ line-start start) prefix line]))
 
@@ -515,8 +506,8 @@ was a measurable part of every Tab on a big file."
 extension when unmapped, or \"\" when there's none."
   (if (nil? path)
     ""
-    (let (ext (lsp-extension path))
-      (get *lsp-language-ids* ext ext))))
+    (let (extension (lsp-extension path))
+      (get *lsp-language-ids* extension extension))))
 
 (defn lsp-specs-for (path)
   "The server specs (`*lsp-server-specs*`) that serve `path`'s extension, main servers
@@ -524,8 +515,8 @@ first and add-ons after, each group in table order; `[]` for a file no server se
 no file: a `.py` file has `python` and the `ruff` add-on."
   (if (not (string? path))
     []
-    (let (ext (lsp-extension path)
-          serving (seq/filter *lsp-server-specs* (fn (spec) (includes? (:extensions spec) ext))))
+    (let (extension (lsp-extension path)
+          serving (seq/filter *lsp-server-specs* (fn (spec) (includes? (:extensions spec) extension))))
       (into []
         (append (seq/reject serving (fn (spec) (:add-on spec)))
           (seq/filter serving (fn (spec) (:add-on spec))))))))
@@ -540,11 +531,6 @@ no file: a `.py` file has `python` and the `ruff` add-on."
 ;; connection: one process, one entry, whatever projects it comes to serve. A server that
 ;; serves several projects (`:shared`) has several roots. A file belongs to every entry whose spec serves its extension and one of
 ;; whose roots holds it.
-;;
-;; There used to be ONE connection, `:lsp`, and every buffer with a file was pushed to it:
-;; open a `.blsp` file and brood-lsp started, then open wos kernel source and brood-lsp
-;; checked THAT as Brood (`unbound symbol: var` on every line), while a Rust file beside
-;; them never got rust-analyzer at all.
 
 (defn lsp-under? (file root)
   "True when `file` is `root` or inside it — a directory, not a prefix: `/p/crate` does not
@@ -614,18 +600,18 @@ serving several from one process."
       (let (notify (:changeNotifications folders))
         (or (= notify true) (string? notify))))))
 
-(defn- lsp-complete-request (m entry file buf)
+(defn- lsp-complete-request (m entry file buffer)
   "The completion request for `entry`'s server: with the text only when that server's copy
 is not this buffer's (completion's prepare step normally synced it just before)."
   (let (uri (lsp-path->uri file)
         synced (map/get-in m [:lsp-synced [(:key entry) uri] :buf])
         request {:uri uri
                  :lang (lsp-language-id file)
-                 :line (buffer-current-line buf)
-                 :char (lsp-buffer-units buf)})
-    (if (and synced (= (buffer-rope synced) (buffer-rope buf)))
+                 :line (buffer-current-line buffer)
+                 :char (lsp-buffer-units buffer)})
+    (if (and synced (= (buffer-rope synced) (buffer-rope buffer)))
       request
-      (assoc request :text (buffer-text buf)))))
+      (assoc request :text (buffer-text buffer)))))
 
 (defn lsp-complete-source (m)
   "The LSP completion source (a `complete-at-point/*completion-sources*` entry): `[start prefix
@@ -642,17 +628,17 @@ or every narrowing key would ask again.
 A connection whose process has died counts as off: this source runs on every Tab, and a
 pid nothing answers would spend `*lsp-timeout-ms*` per press waiting for a reply that
 cannot come."
-  (let (buf (ed-current-buf m)
-        file (buffer-file buf)
+  (let (buffer (ed-current-buf m)
+        file (buffer-file buffer)
         live (lsp-live-entries m file)
         offering (seq/filter live (fn (entry) (lsp-capable? (:caps entry) :completionProvider)))
         asked (cond (not (empty? offering)) offering (empty? live) [] else [(first live)]))
     (if (or (empty? asked) (nil? file))
       nil
-      (let ([start prefix line] (lsp-symbol-at-point buf)
+      (let ([start prefix line] (lsp-symbol-at-point buffer)
             answer (lsp-complete-all (map asked
                                        (fn (entry)
-                                         [(:conn entry) (lsp-complete-request m entry file buf)]))
+                                         [(:conn entry) (lsp-complete-request m entry file buffer)]))
                      *lsp-timeout-ms*)
             separators (complete-at-point/completion-separators m)
             word-start (- (string/length line) (string/length prefix))
