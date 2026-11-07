@@ -33,12 +33,12 @@ dispatcher names it, and the session router has no row seeded on its behalf."
 refreshed iff the current buffer has a `:diagnostics` service and its rope changed since
 the last check; otherwise `m` unchanged. Synchronous — the core the async path and the
 tests share."
-  (let (buf (ed-current-buf m)
-        svc (ed-mode-service buf :diagnostics)
-        rope (buffer-rope buf))
-    (if (or (nil? svc) (= rope (:diag-rope m)))
+  (let (buffer (ed-current-buf m)
+        check (ed-mode-service buffer :diagnostics)
+        rope (buffer-rope buffer))
+    (if (or (nil? check) (= rope (:diag-rope m)))
       m
-      (diagstore/ed-set-diagnostics m (svc (buffer-text buf)) rope))))
+      (diagstore/ed-set-diagnostics m (check (buffer-text buffer)) rope))))
 
 ;; How long a sandboxed check may run before the child answers `:timeout` (and the
 ;; next idle beat re-sends). A large file's check is hundreds of ms; a project's first
@@ -75,10 +75,10 @@ in its own image; the reply folds back through `sandbox-events` as this module's
 `:reply` client. Nothing of the project is ever loaded into the editor. When the
 sandbox cannot take the request (no runtime to spawn), the check falls back to the
 in-image task, which sees only the editor's own image."
-  (let (buf (ed-current-buf m)
-        svc (ed-mode-service buf :diagnostics))
+  (let (buffer (ed-current-buf m)
+        check (ed-mode-service buffer :diagnostics))
     (cond
-      (or (nil? svc) (not (ed-diag-stale? m))) m
+      (or (nil? check) (not (ed-diag-stale? m))) m
       (:diag-proc m) m
       ;; a sandbox check in flight — unless it is overdue (a worker that was shutting
       ;; down took the request and never answered): forget it and send again
@@ -87,30 +87,37 @@ in-image task, which sees only the editor's own image."
       else
       ;; Neither path flattens the buffer ON the loop: a task captures the rope (a rope
       ;; cannot ride a message, but a closure keeps it) and builds the text there.
-        (let (rope (buffer-rope buf)
+        (let (rope (buffer-rope buffer)
               ;; the sandbox is off for this model once its worker gave up (`:diag-sandbox-off`,
               ;; set by the down hook): from then on the in-image task checks, so a project
               ;; whose child cannot boot is not respawned on every idle beat
-              remote? (and (ed-mode-service buf :check-remote) (not (:diag-sandbox-off m)))
+              remote? (and (ed-mode-service buffer :check-remote) (not (:diag-sandbox-off m)))
               id (session/next-id m)
               sent? (and remote?
                       (do
-                        ;; the CURRENT buffer's project, resolved live from its directory —
-                        ;; `:project-root` is the last visit's, which another project's
-                        ;; buffer switched to by C-x b must not inherit. Memoised per
-                        ;; directory: this runs on every pause after an edit
-                        (sandbox/sandbox-check-start (or (projects/project-root-cached (ed-buffer-dir buf))
-                                                       (:project-root m)
-                                                       (sandbox/sandbox-projectless-root)))
+                        (sandbox/sandbox-check-start (check-root m buffer))
                         (ed-send-check id rope))))
           (if sent?
             (assoc (session/ids-used m (inc id))
               :diag-req id
               :diag-sent (os/now)
               :diag-checking rope
-              :diag-checking-buf (buffer-name buf))
-            (let (job (task (fn () (svc (text/->string rope)))))
-              (assoc m :diag-proc job :diag-checking rope :diag-checking-buf (buffer-name buf))))))))
+              :diag-checking-buf (buffer-name buffer))
+            (let (job (task (fn () (check (text/->string rope)))))
+              (assoc m :diag-proc job :diag-checking rope :diag-checking-buf (buffer-name buffer))))))))
+
+(defn- check-root (m buffer)
+  "The project root a remote check of `buffer` runs in: the CURRENT buffer's project, resolved
+live from its directory — `:project-root` is the last visit's, which another project's buffer
+switched to by C-x b must not inherit. Memoised per directory, since this runs on every pause
+after an edit."
+  (or (projects/project-root-cached (ed-buffer-dir buffer))
+    (:project-root m)
+    (sandbox/sandbox-projectless-root)))
+
+(defn- forget-check-in-flight (m)
+  ;; the sandbox request and what it was checking, gone
+  (dissoc m :diag-req :diag-checking :diag-checking-buf))
 
 ;; ---- the sandbox's diagnostics client (registered with `sandbox-events` below) ----
 
@@ -134,7 +141,7 @@ is another client's, untouched."
       ;; loaded a large project overran) or a checker error: keep the old cache and
       ;; leave `:diag-rope` as it was, so the buffer stays stale and the next idle beat
       ;; sends again — `ed-apply-diag` would record the rope as checked
-      (dissoc (dissoc m :diag-req :diag-checking) :diag-checking-buf))
+      (forget-check-in-flight m))
     m))
 
 (defn ed-diag-sandbox-down (m code)
@@ -143,8 +150,10 @@ or never will), so the next idle beat re-sends. A worker that GAVE UP (`:gave-up
 the child died three times in a row, e.g. a project whose manifest it cannot load —
 or `:spawn-failed`) turns the sandbox off for this model's checks (`:diag-sandbox-off`):
 they run in-image from then on rather than respawning a doomed child on every idle beat."
-  (let (m1 (dissoc (dissoc m :diag-req :diag-checking) :diag-checking-buf))
-    (if (or (= code :gave-up) (= code :spawn-failed)) (assoc m1 :diag-sandbox-off true) m1)))
+  (let (forgotten (forget-check-in-flight m))
+    (if (or (= code :gave-up) (= code :spawn-failed))
+      (assoc forgotten :diag-sandbox-off true)
+      forgotten)))
 
 (sig ed-apply-diag (model any -> model))
 (defn ed-apply-diag (m result)
@@ -162,15 +171,9 @@ re-fires iff the buffer moved on while the check ran, so the next idle tick rela
 `:diag-rope` (the rope the cached `:diagnostics` were computed from) — i.e. a recheck is
 due. An O(1) rope-handle compare, not a whole-buffer text compare, so movement (which
 keeps the rope) costs nothing. Buffers whose mode offers no service are never stale."
-  (let (buf (ed-current-buf m))
-    (and (ed-mode-service buf :diagnostics)
-      (not (= (buffer-rope buf) (:diag-rope m))))))
-
-(defn ed-run-diag (m)
-  "Launch the deferred diagnostics check (async via `ed-launch-diag` when an `:editor`
-process is live, synchronous otherwise) — a no-op when not stale or one is in flight.
-What the `:idle-recompute` timer (ADR-102) runs once the debounce window has elapsed."
-  (ed-launch-diag m))
+  (let (buffer (ed-current-buf m))
+    (and (ed-mode-service buffer :diagnostics)
+      (not (= (buffer-rope buffer) (:diag-rope m))))))
 
 (defn ed-quit-diag (m)
   "C-g killed a diagnostics check (`:on-quit`): forget the rope it was checking. The cache
@@ -186,7 +189,7 @@ stays stale, so the check runs again once typing settles."
   {:cancel-on-quit? true :on-quit 'diagcheck/ed-quit-diag})
 
 (register-idle-job :diagnostics
-  {:order 60 :run 'diagcheck/ed-run-diag :stale? 'diagcheck/ed-diag-stale?})
+  {:order 60 :run 'diagcheck/ed-launch-diag :stale? 'diagcheck/ed-diag-stale?})
 
 ;; a brood buffer's checks are `:check` requests to a child rooted in the buffer's project —
 ;; its OWN session, so checking a project file never re-roots the playground's child.
