@@ -1,0 +1,81 @@
+(defmodule offloop
+  "Run a slow call OFF the loop, then fold its answer into the model (`ed-open-when-ready`):
+a prompt that opens once its candidates are ready, a project search that shows its rows
+when the searcher answers. Moved out of `minibuffer`: most of its callers open no prompt."
+  (:use model)) ; register-task-reply / ed-task-reply-table / ed-headless?
+
+;; A command whose answer comes from a SLOW call that does not depend on the typed text —
+;; a build tool asked for its tasks (`mix help` takes seconds), `rg` over a large tree — used
+;; to make that call inside the keypress, and the editor froze until it answered. It hands
+;; the call to [[ed-open-when-ready]] instead: the call runs in a task, the activity chip
+;; names the wait, keys keep working, and the answer is folded when it lands.
+
+;; Each CALLER waits in its own slot (`key`): a project search and a project-task listing
+;; are different questions, and with one shared slot starting either cancelled the other.
+;; A second call from the SAME caller overtakes its first, which is the point of a slot.
+
+(defn ed-ready-slot (key)
+  "The model field caller `key`'s [[ed-open-when-ready]] call waits in — `:ready-wait` for
+`:default`, else `:ready-wait-<key>` — with its open and label beside it, and its row in the
+task-reply table (registered here, so a caller needs no setup).
+
+    (offloop/ed-ready-slot :search)   ;=> :ready-wait-search"
+  (let (slot (if (= key :default) :ready-wait (keyword (str "ready-wait-" (->string key))))
+        label-field (second (ed-ready-fields slot)))
+    (do
+      ;; the activity chip reads the label from the label field (a keyword label is a field)
+      (register-task-reply slot
+        'offloop/ed-apply-ready-event
+        :ready/failed label-field
+        {:cancel-on-quit? true :folds-event? true})
+      slot)))
+
+(defn- ed-ready-fields (slot)
+  "The fields beside `slot`: `[open-field label-field]` — `:ready-open` / `:ready-label` for
+the default slot, `<slot>-open` / `<slot>-label` for a caller's own."
+  (if (= slot :ready-wait)
+    [:ready-open :ready-label]
+    [(keyword (str (->string slot) "-open")) (keyword (str (->string slot) "-label"))]))
+
+;; check-allow: `open` is an opaque caller-supplied `(model candidates) -> model`; the
+;; declaration is the contract (ADR-341's `:trusted`)
+(check-allow :trusted
+  (sig ed-open-when-ready (model string fn fn &optional any -> model))
+  (defn ed-open-when-ready (m label produce open &optional (key :default))
+    "Run `produce` (a `() -> candidates` thunk that closes over what it needs, never the
+model) off the loop, then fold `(open m candidates)`: the prompt opens when the slow call
+answers. `label` names the wait in the activity chip; `key` names the CALLER, whose calls
+share one slot — a second overtakes its first, another caller's runs beside it. C-g
+cancels, a failed call says so; a headless model (a test) runs it inline."
+    (if (ed-headless?)
+      (open m (produce))
+      (let (slot (ed-ready-slot key)
+            [open-field label-field] (ed-ready-fields slot))
+        (do
+          (when (get m slot) (task/cancel (get m slot)))
+          (assoc m slot (task/task produce) open-field open label-field label))))))
+
+(defn ed-apply-ready (m answer &optional (slot :ready-wait))
+  "Fold an [[ed-open-when-ready]] call's `answer` (waiting in `slot`) through the `open` it
+was given; a call that failed (`:ready/failed`) is reported under its label instead."
+  (let ([open-field label-field] (ed-ready-fields slot)
+        open (get m open-field)
+        label (get m label-field)
+        cleared (dissoc m slot open-field label-field))
+    (cond
+      (nil? open) cleared
+      (= answer :ready/failed) (assoc cleared :echo (str label ": failed"))
+      else (open cleared answer))))
+
+(defn ed-apply-ready-event (m event)
+  "Route a finished [[ed-open-when-ready]] task's reply `event` to the slot whose handle it
+answers ([[ed-apply-ready]]); a task that did not finish folds as `:ready/failed`."
+  (let (handle (nth event 1)
+        slot (seq/find (keys (ed-task-reply-table))
+               (fn (field)
+                 (and (string/starts-with? (->string field) "ready-wait") (= (get m field) handle)))))
+    (if (nil? slot)
+      m
+      (ed-apply-ready m (if (= (first event) :task-done) (nth event 2) :ready/failed) slot))))
+
+(ed-ready-slot :default)

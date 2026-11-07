@@ -155,9 +155,12 @@ src/diagstore.blsp          the diagnostics cache the view reads, whoever produc
 src/lossage.blsp            the recent keys (C-h l), a bounded ring on the model
 src/minibuffer.blsp         the minibuffer: a one-line prompt over std's lineedit with a list under
                             it, modal (`minibuffer-handle`); ranks on the key for a small source,
-                            in a session off the loop for a large one; a prompt that opens once its
-                            candidates are ready. The accessors (`mb-text`, `mb-candidates`) and
-                            the echo area's height (`ed-echo-rows`) the layout reads
+                            in a session off the loop for a large one. The accessors (`mb-text`,
+                            `mb-candidates`) and the echo area's height (`ed-echo-rows`) the layout
+                            reads
+src/offloop.blsp            a slow call run OFF the loop, its answer folded when it lands
+                            (`ed-open-when-ready`): a prompt that opens once its candidates are
+                            ready (M-x project-task), C-x p g's search; one slot per caller
 src/clipboard.blsp          the kill ring and what it shares text with: kills mirror to the OS
                             CLIPBOARD; a mouse drag sets only PRIMARY (`ed-drag-select`, brood
                             ADR-553 — the clipboard and kill ring stay put unless
