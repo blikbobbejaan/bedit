@@ -1,151 +1,34 @@
 (defmodule view
-  "The editor's view: a pure `(model cols rows) -> render frame`, built from
-`std/display.blsp` ops. The bottom row is the **echo area / minibuffer**; the rows
-above it are the **pane layout** (`std/pane.blsp`): the model's `:layout` tree
-is laid out into that body rect, giving one or more panes (each a buffer in its own
-sub-rect) separated by dividers. Each pane reserves its bottom row for a reverse-video
-**mode line** (buffer name · mode · line:col; the selected pane also shows the status).
-Within a pane the buffer is offset to the pane's origin, clipped to its
-width, scrolled by the pane's `:top`, and the region (point↔mark) is reverse-video.
-No pane IO, no state: testable as plain data.
-
-A single pane fills the whole body, so the lone-pane layout is identical to the
-old full-screen one (mode line at `rows-2`, echo at `rows-1`)."
+  "The editor's view: a pure `(model cols rows) -> render frame` of `editor/display` ops. The
+rows at the bottom are the **echo area / minibuffer** (`echoarea`); the rows above are the
+**pane layout** (`editor/pane`): the model's `:layout` tree laid into that body rect, one or
+more panes (each a buffer in its own sub-rect) with dividers between them. Each pane keeps its
+bottom row for its **mode line** (`modeline`). This module composes a pane from its layers —
+the body (`panebody`, coloured by `spanpaint`), the end-of-line notes (`eolview`), the link
+zones (`linkview`), the caret — inside its scroll and zoom regions, then the frame from the
+panes, the echo area and the overlays. No IO, no state: testable as plain data."
   (:use editor/buffer) ; line text / point + column / region bounds, read to lay out the frame
-  (:use keyhelp) ; key / command labels, where-is, docstrings
-  (:use scroll) ; ed-scroll / ed-max-top / ed-long-lines — keeping point on screen
-  (:use minibuffer)
-  (:use scrollbar)
-  (:use model) ; current-buffer accessors, pane buffer + mode name
-  (:use spancache)
-  (:use panes) ; ed-body-layout — the :layout tree -> pane rects + divider rects
-  (:use complete-at-point) ; the completion popup
-  (:use complete-card :only [complete-popup-ops]) ; …its overlay
-  (:use complete-words :only [complete-word-char?])
-  (:use completion) ; the shared vertical-menu renderer + faces
-  (:use plume) ; the minibuffer completion UI — marginalia annotations + the N/M counter
-  (:use projects) ; project-name — the bracketed project label on the mode line ; fontify-runs — the shared span+overlay -> [substring face] tiler
-  (:use theme) ; the curated palette + semantic chrome faces (src/theme.blsp)
-  (:use statusbar) ; the status-bar segment model + layout + zones + hover tooltip
+  (:use scroll) ; ed-max-top — a smooth scroll's fraction is clamped by it
+  (:use minibuffer) ; ed-echo-rows, the echo area's height
+  (:use scrollbar) ; the selected pane's scrollbar
+  (:use model) ; the highlight sources, pane layers and frame overlays registered on the model
+  (:use spancache) ; the span band and the gutter cells a pane keeps across frames
+  (:use panes) ; a pane's buffer, top, rows, gutter and text widths
+  (:use complete-card :only []) ; loaded with the view: the completion popup's frame-overlay row
+  (:use overlayview :only []) ; …and the transient's and the context menu's
+  (:use theme) ; the palette and the chrome faces
   (:use echoarea) ; the echo area: message, prompt, candidates, which-key
   (:use modeline) ; a pane's mode line + the hover tooltips
-  (:use overlayview) ; the context menu + the transient menu
-  (:use ui-kit) ; the widget kit (ui-panel / ui-list) — the context menu is one list
-  (:use editor/ui) ; ui-memo — memoised view fragments, one per visible line (ADR-336)
+  (:use ui-kit) ; ed-flatten-ops, ed-fit, ui-space
+  (:use editor/ui) ; ui-memo — memoised view fragments (ADR-336)
   (:use editor/display) ; clear / text / cursor / frame / zone-at render ops
-  (:use memo)) ; defmemo — the bracket match, asked every frame while nothing changes
+  (:use memo)) ; defmemo — point's cell and column, asked every frame while nothing moves
 
 (defn- frame-of (groups)
   "The frame (`editor/display/frame`'s vector of non-nil ops) of the op lists in `groups`.
 Not `(apply frame …)` over the flattened list: the flatten already dropped the nils, and
 `frame`'s own filter would walk every op of the frame again to find none."
   (into [] (ed-flatten-ops groups)))
-
-;; ---- syntax highlighting: tile precomputed spans onto a visible line --------
-;; A language mode may supply a `:fontify` service (`text -> [start end face]`
-;; spans, the `highlight-spans` shape). When it does, each visible line is painted
-;; as coloured `[substring face]` chunks — with the active region's `:reverse` and
-;; any bracket-match `overrides` merged into the per-char face — instead of plain
-;; text. Spans are lexed ONCE per frame (in `ed-pane-ops`) and tiled here, so the
-;; buffer isn't re-lexed per visible line. The view never names a language: it asks
-;; the buffer's mode for these services (`ed-mode-service`, src/model.blsp).
-
-;; ---- the span band, sliced per line ----------------------------------------
-;; `fontify-runs` (native `%span-runs`) reads its whole `spans` argument into a vector
-;; before it tiles anything — so handing every row the whole pane's band makes painting a
-;; pane O(rows × band) rather than O(band). Nobody noticed on ordinary source, where the
-;; band is a couple of thousand spans; on a file of 12,000-character lines the visible
-;; text is half a megabyte, the band is enormous, and one frame measured **199 ms**.
-;;
-;; Slicing it once per pane and giving each row only its own spans makes that O(band + rows)
-;; — a win at every file size, not a special case for long lines. The band stays in ABSOLUTE
-;; offsets (what `ed-slice-ops` and `fontify-runs` already speak), so nothing downstream
-;; changes; a span straddling lines appears on each line it covers.
-
-;; ---- highlight ranges: the region + transient overlays ----------------------
-
-;; ---- a pane body's GEOMETRY: one map, built once per pane ---------------------
-;; Every layer of a pane's body (the bands, the gutter and text, the link zones, the notes,
-;; the remote carets) is laid out in the same frame, so `ed-pane-ops` builds it ONCE and
-;; hands each the map rather than ten positional ints in a different order apiece (`rows
-;; hscroll` here, `hscroll rows` there — the kind of swap that type-checks):
-;;
-;;   :top            the first buffer line the pane shows
-;;   :x :y           the body's origin — the pane's rect, or a zoomed pane's region (0 0)
-;;   :width          the body's width in cells, the scrollbar column included
-;;   :gutter-width   the gutter's columns, edit margin included — the text starts past it
-;;   :text-height    the rows of text the pane shows
-;;   :render-height  the rows actually painted: one more while a smooth scroll is part-way,
-;;                   capped at a narrowing's last line
-;;   :rows           the wrapped row table (`panes/ed-pane-rows`), nil unwrapped
-;;   :top-continued  the pane starts part-way through its top line's text (no number on
-;;                   that first row)
-;;   :hscroll        the columns scrolled off the left of an unwrapped pane
-
-;; `ed-pane-ops` also carries `:scroll-frac` (the smooth-scroll fraction, clamped) in the
-;; open record: the pane itself reads it to wrap the body, no layer does.
-
-;; ---- the body's COLUMNS: every horizontal reach is a named span ---------------
-;; A pane body, left to right:
-;;
-;;   | gutter (edit margin incl.) | text … | gap + right margin | scrollbar column |
-;;   x                            text-x                                  x + :width
-;;
-;; A layer asks `geometry-span` for the span it covers and never subtracts widths itself.
-;; Each hand-written `(- width gutter margin 1)` chose its own subset, and the `1` (the
-;; scrollbar column) got into some and not others: the current-line highlight, a diff's
-;; tinted lines and a region's end-of-line fill all stopped one column short of the pane's
-;; edge. Short of the edge, a band is not carried on to the frame either (brood ADR-508's
-;; edge bleed), so the gap showed twice. A guard in tests/view_test.blsp holds that only
-;; `geometry-span` reads the raw widths.
-
-;; ---- one pane's body (a buffer clipped into a sub-rect at origin x,y) -------
-;; Render ops carry absolute screen coordinates, so a pane simply offsets every
-;; op by its rect's origin `(x, y)` and clips text to its width `w`.
-
-;; *rendering* (`ed-gutter-ops`, below) stays here.
-
-;; `gui?` is `(:gui m)` — absent (nil) in a terminal model, never `false` — so the
-;; declaration admits nil: as a plain `bool` the runtime contract (ADR-380, on by default
-;; under `nest test`) refused every terminal render.
-;; The pane's BODY is two layers — its optional gutter, then its visible buffer lines (or,
-;; with a row table `:rows`, its wrapped rows) — rendered into the `geometry`'s rect at
-;; `[:x :y]`, `:width` wide less the gutter and the scrollbar column, and `:render-height`
-;; rows tall. For a zoomed buffer the rect is the REGION's (origin 0,0, its own cells —
-;; `ed-pane-ops` wraps the result in a `cell-region`), so neither knows about zoom at all.
-;; Two functions rather than one appending the halves, so the pane flattens them with every
-;; other layer in a single copy (`ed-flatten-ops`).
-
-;; ---- link affordance: pointer cursor + subtle hover over clickable rows ------
-;; A results buffer (one whose mode provides a `:line-loc` service — *Tests* / *Run*
-;; / *compilation* / *Occur* / *git-status*) makes its actionable rows FEEL like
-;; links, universally and with no visible link text: every line that resolves to a
-;; source location gets a `:pointer` cursor-zone (the hand), and the one under the
-;; pointer (`:link-hover`) a subtle surface highlight. The location itself is off in
-;; `:line-loc` (text-parsed or stored), never shown. Click-to-visit is the mode's
-;; `:on-click` (`cmd-visit-location`); this is purely the affordance.
-
-;; ---- end-of-line notes: derived text shown AT a line -------------------------
-;; A buffer may carry `:eol-notes` (see `eolnotes/eol-notes`) — derived text anchored
-;; to lines, e.g. the tutorial's per-box verdicts. THREE renderers share that one
-;; annotation: the margin glyph (gutter/gutter-mark-for), the echo row when point is
-;; on the line (ed-eol-note-on-line), and here — eros-style ghost text two cells
-;; past the line's end: `=> 42` muted, `✓ 42` green, `✗ …` red, `⋯` pending, all
-;; dimmed once the text moves and blanked once lines shift (std `annotate` owns that
-;; currency). Pure ops over existing `text` — no new display primitive (the
-;; keep-the-surface-small rule).
-
-;; Cells between the code and the first ghost note, and between two notes on one line. A
-;; note is somebody else's voice arriving at the end of your line, and at two cells it read
-;; as a continuation of the code — `|> DateTime.` followed by `error: cannot pipe` looked
-;; like one expression. Three is the smallest gap that reads as a gap.
-
-;; A ghost note is a GLANCE, not the report. A checker message can run to a couple of
-;; hundred columns (`+: expected number, got failure (#failure{:message "…"})`), and drawn
-;; from the end of an already-indented line it walked off to the right edge, where the only
-;; readable part was the half nobody needed. Capped here, ellipsised by `ui-clip`, and the
-;; whole thing is still one keystroke away: the echo row (`eolnotes/eol-note-at`) prints the
-;; full text whenever point is on the line.
 
 ;; ---- one pane: its geometry, its layers, its regions, its chrome ---------------
 
