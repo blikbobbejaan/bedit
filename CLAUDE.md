@@ -485,6 +485,10 @@ src/passwd.blsp             a password a program asks for (Emacs read-passwd + c
                             stays as the next input, as comint leaves it) and
                             `secret-key?`, the typing key that opens a read asked for while
                             you were elsewhere (`secret-overlay`, here, over each mode's `:secret-pending?` / `:secret-key` facets)
+src/lastsession.blsp        the last session in a project reopened (Emacs desktop-save-mode, `:restore-session`):
+                            quitting keeps the files and the pane layout (each pane's file, scroll,
+                            point) under the project the editor STARTED in (`:session-root`); a start
+                            there with no file named opens them again; a file gone since is skipped
 src/saveplace.blsp          a file reopens where it was left (Emacs save-place, `:save-place`): its
                             point kept when its buffer is killed or the editor quits
 src/solong.blsp             so-long (Emacs so-long-mode, `:so-long-threshold`): a file opened with a line
