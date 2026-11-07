@@ -28,13 +28,13 @@ module is content only."
   (:use editor/buffer-client) ; link-init / link-propagate-buffers / link-fold / view-parts
   (:use model) ; ed-buf-at / ed-stamp
   (:use editor/buffer-registry)) ; registry-share / -remove / -rekey — one process per document across frames
-(defn- hosted-proj (b)
+(defn- hosted-projection (buffer)
   "The subscription projection: std's `content-view` — `[text markers participants
 properties]`: the document, every marker (pid → offset; presence cursors ride these), the
 pid → name registry and the text properties (a program's colours, brood ADR-579), so a
 frame that joins late gets the colours too. Sent on the seed and on closure edits;
 structured ops push O(change) deltas instead, each splice with its properties."
-  (content-view b))
+  (content-view buffer))
 
 (defn ed-hosted? (m &optional i)
   "Whether pool slot `i` (default the current buffer's) is backed by a buffer process."
@@ -50,14 +50,14 @@ structured ops push O(change) deltas instead, each splice with its properties."
   "Back pool slot `i` with a buffer process: the given `proc` (a shared / registry
 buffer that already exists), or one spawned from the slot's current cache when nil (a
 locally-hosted buffer — the common case). Subscribes this model's process for pushes
-(`hosted-proj`) and records the link at version -1, so the seed push always applies
+(`hosted-projection`) and records the link at version -1, so the seed push always applies
 and syncs the slot to the process's current text. Returns the model."
-  (let (bp (or proc (spawn-buffer (ed-buf-at m i))))
+  (let (process (or proc (spawn-buffer (ed-buf-at m i))))
     ;; monitored: its death lands as [:down …] → hosted-rehost / collab-reshare (the
     ;; ref rides the link so unhosting can demonitor — no ghost corpse messages)
-    (let (mref (monitor bp))
-      (subscribe-buffer bp hosted-proj)
-      (map/assoc-in m [:hosted i] (assoc (link-init bp (self)) :mref mref)))))
+    (let (monitor-ref (monitor process))
+      (subscribe-buffer process hosted-projection)
+      (map/assoc-in m [:hosted i] (assoc (link-init process (self)) :mref monitor-ref)))))
 
 (defn ed-unhost-slot (m i &optional stop?)
   "Drop pool slot `i`'s hosted link: unsubscribe this model's process (the slot's
@@ -66,11 +66,11 @@ content stops tracking; the local copy stays as an ordinary pool buffer), and wi
 wrong for a shared/registry process that outlives its subscribers. A no-op when the
 slot isn't hosted."
   (let (proc (map/get-in m [:hosted i :proc])
-        mref (map/get-in m [:hosted i :mref]))
+        monitor-ref (map/get-in m [:hosted i :mref]))
     (if (nil? proc)
       m
       (do
-        (when mref (demonitor mref))
+        (when monitor-ref (demonitor monitor-ref))
         (unsubscribe-buffer proc)
         (when stop? (stop-buffer proc))
         (assoc m :hosted (dissoc (:hosted m) i))))))
@@ -83,38 +83,38 @@ slot isn't hosted."
 ;; is `:registry?` — the registry owns the process; a kill removes it there (global, as in
 ;; Emacs) and the other frames learn of it as `[:registry-removed …]`.
 
-(defn hosted-meta (b)
-  "What another frame needs to build its own copy of `b` before the seed push fills the
+(defn hosted-meta (buffer)
+  "What another frame needs to build its own copy of `buffer` before the seed push fills the
 text: `{:file :type :dir :eol :bom :so-long}` — the registry entry's `:meta` (`:eol` and `:bom` so a
 file read with CRLF or a byte-order mark, saved from another frame or a restarted loop, is
 written back as it was read)."
-  {:file (buffer-file b)
-   :type (editor/layers/buffer-type-for b)
-   :dir (:dir b)
-   :eol (:eol b)
-   :bom (:bom b)
-   :coding (:coding b)
+  {:file (buffer-file buffer)
+   :type (editor/layers/buffer-type-for buffer)
+   :dir (:dir buffer)
+   :eol (:eol buffer)
+   :bom (:bom buffer)
+   :coding (:coding buffer)
    ;; so-long's state (`solong`): the other frame's copy is empty until the seed push, too
    ;; late to find the long line in, so it is carried over
-   :so-long (:so-long b)
+   :so-long (:so-long buffer)
    ;; a file edited as root (sudoedit): another frame, a restarted loop and an emergency
    ;; auto-save must write it through sudo and keep its sidecar private too
-   :sudo (:sudo b)
-   :sudo-user (:sudo-user b)
+   :sudo (:sudo buffer)
+   :sudo-user (:sudo-user buffer)
    ;; …and is its own document per user it is edited as, apart from the plain file's
-   :key (when (= true (:sudo b)) (str (buffer-file b) "#sudo:" (or (:sudo-user b) "root")))})
+   :key (when-let (user (sidecar/buffer-sudo-user buffer)) (str (buffer-file buffer) "#sudo:" user))})
 
-(defn hosted-key (b)
-  "The registry identity of pool buffer `b` (std `registry-key`): its file when it has one,
+(defn hosted-key (buffer)
+  "The registry identity of pool buffer `buffer` (std `registry-key`): its file when it has one,
 else its name. Never the name alone — two `README.md`s from two projects are two documents,
 and sharing by name spliced one's edits into the other. A file edited through sudo is a
 document per user it is edited as (`/sudo::/x` and `/sudo:www@:/x` — sudoedit): its meta
 names a `:key` with the user ([[hosted-meta]])."
-  (registry-key (buffer-name b) (hosted-meta b)))
+  (registry-key (buffer-name buffer) (hosted-meta buffer)))
 
 (defn hosted-index-by-key (m key)
   "The pool index of the buffer whose `hosted-key` is `key`, or nil."
-  (let (i (seq/index-where (:buffers m) (fn (b) (= (hosted-key b) key))))
+  (let (i (seq/index-where (:buffers m) (fn (buffer) (= (hosted-key buffer) key))))
     (if (< i 0) nil i)))
 
 (defn hosted-rekey-slot (m i old-key)
@@ -122,14 +122,16 @@ names a `:key` with the user ([[hosted-meta]])."
 buffer names (a `C-x C-w` wrote it to another file): the entry follows it, keeping the
 process, and every other frame renames its copy. `m` unchanged when the slot is not
 registry-hosted or its identity did not change."
-  (let (reg (:buffer-reg m)
-        b (ed-buf-at m i))
-    (if (or (nil? reg) (not (map/get-in m [:hosted i :registry?])) (= old-key (hosted-key b)))
+  (let (registry (:buffer-reg m)
+        buffer (ed-buf-at m i))
+    (if (or (nil? registry)
+          (not (map/get-in m [:hosted i :registry?]))
+          (= old-key (hosted-key buffer)))
       m
-      (let (answer (registry-rekey reg old-key (buffer-name b) (hosted-meta b)))
+      (let (answer (registry-rekey registry old-key (buffer-name buffer) (hosted-meta buffer)))
         (if (= answer :taken)
           (message m
-            (str "another frame has " (buffer-file b) " open — this copy is no longer shared"))
+            (str "another frame has " (buffer-file buffer) " open — this copy is no longer shared"))
           m)))))
 
 (defn hosted-share-slot (m i)
@@ -138,23 +140,23 @@ process for the buffer's document — `hosted-key` — shared with every other f
 (`ed-host-slot`). A registry that does not answer falls back to a local host, so the
 editor never wedges on it. The registry starts the process from the buffer's text AND its text
 properties, so a log coloured before it was shared stays coloured in every frame."
-  (let (reg (:buffer-reg m)
-        b (ed-buf-at m i))
-    (if (nil? reg)
+  (let (registry (:buffer-reg m)
+        buffer (ed-buf-at m i))
+    (if (nil? registry)
       (ed-host-slot m i)
-      (let (bp (registry-share reg
-                 (buffer-name b)
-                 {:text (buffer-text b) :properties (buffer-property-map b)}
-                 (hosted-meta b)))
-        (if (pid? bp)
-          (map/update-in (ed-host-slot m i bp)
+      (let (process (registry-share registry
+                      (buffer-name buffer)
+                      {:text (buffer-text buffer) :properties (buffer-property-map buffer)}
+                      (hosted-meta buffer)))
+        (if (pid? process)
+          (map/update-in (ed-host-slot m i process)
             [:hosted i]
-            (fn (l) (assoc l :registry? true)))
+            (fn (link) (assoc link :registry? true)))
           (ed-host-slot m i))))))
 
-(defn- hosted-coding (b)
-  "How `b`'s file is written: `[eol bom coding]` — what every frame's copy must agree on."
-  [(buffer-eol b) (buffer-bom? b) (:coding b)])
+(defn- hosted-coding (buffer)
+  "How `buffer`'s file is written: `[eol bom coding]` — what every frame's copy must agree on."
+  [(buffer-eol buffer) (buffer-bom? buffer) (:coding buffer)])
 
 (defn hosted-sync-coding (m i before-buf after-buf)
   "Tell the registry when registry-hosted slot `i`'s file CODING changed this event — a
@@ -163,12 +165,15 @@ that converted them: the entry's meta is updated in place (`registry-rekey` unde
 key), and every other frame takes the new `:eol` / `:bom` from the `[:registry-renamed …]`
 that follows (`frames/ed-ev-registry-renamed`) — so a frame that never saw the revert does
 not write the old mark back. `m` itself, either way."
-  (let (reg (:buffer-reg m))
-    (when (and reg
+  (let (registry (:buffer-reg m))
+    (when (and registry
             (map/get-in m [:hosted i :registry?])
             (not (= (hosted-coding before-buf) (hosted-coding after-buf)))
             (= (hosted-key before-buf) (hosted-key after-buf)))
-      (registry-rekey reg (hosted-key after-buf) (buffer-name after-buf) (hosted-meta after-buf)))
+      (registry-rekey registry
+        (hosted-key after-buf)
+        (buffer-name after-buf)
+        (hosted-meta after-buf)))
     m))
 
 (defn hosted-propagate (before after &optional skip-i)
@@ -202,15 +207,17 @@ changed one reads no text at all."
           ;; own edits, sent ahead of its saved mark — `file-save/ed-save-buf-at`): diff from it
           (let (link (map/get-in acc [:hosted i])
                 synced (:synced link)
-                ob (or synced (ed-buf-at before i))
-                nb (ed-buf-at acc i)
-                _ (hosted-sync-coding acc i ob nb))
+                before-buffer (or synced (ed-buf-at before i))
+                after-buffer (ed-buf-at acc i)
+                _ (hosted-sync-coding acc i before-buffer after-buffer))
             (cond
-              (not (buffer-content-changed? ob nb))
+              (not (buffer-content-changed? before-buffer after-buffer))
               ;; O(1): the same rope and property map — no edit here, don't even read the text
                 (if (nil? synced) acc (map/assoc-in acc [:hosted i] (dissoc link :synced)))
               else
-                (map/assoc-in acc [:hosted i] (link-propagate-buffers (dissoc link :synced) ob nb)))))))))
+                (map/assoc-in acc
+                  [:hosted i]
+                  (link-propagate-buffers (dissoc link :synced) before-buffer after-buffer)))))))))
 
 (defn hosted-reconcile (m)
   "Host every pool slot that isn't yet — THE FLIP (`docs/actor-architecture.md`):
@@ -230,10 +237,10 @@ actually grew the pool."
         (if (map/get-in acc [:hosted i])
           acc
           ;; the process starts from the buffer AS IT IS NOW, this event's edits included:
-          ;; `:synced` says so, so `hosted-propagate` does not send them a second time. A
-          ;; slot hosted on the event that first edited it — the launch file, when the first
-          ;; thing the loop sees is a key (a terminal sends no focus event first) — had every
-          ;; character of that edit doubled
+          ;; `:synced` says so, so `hosted-propagate` does not send them a second time — a
+          ;; slot hosted on the event that first edited it (the launch file, when the first
+          ;; thing the loop sees is a key: a terminal sends no focus event first) would
+          ;; otherwise have every character of that edit doubled
           (let (hosted (hosted-share-slot acc i))
             (if (map/get-in hosted [:hosted i])
               (map/assoc-in hosted [:hosted i :synced] (ed-buf-at hosted i))
@@ -252,12 +259,12 @@ Also stamps `:pool-shifted` — pool indices no longer name the same documents
 across this event, so `hosted-step` must NOT diff before/after by index (it would
 ship splice(other-document → this-one) to every surviving process above the kill).
 Returns the model; safe on an unhosted slot (still stamps)."
-  (let (sh (map/get-in m [:hosted killed])
-        reg (:buffer-reg m)
+  (let (link (map/get-in m [:hosted killed])
+        registry (:buffer-reg m)
         key (if (< killed (count (:buffers m))) (hosted-key (ed-buf-at m killed)) nil)
-        m1 (if (nil? sh) m (ed-unhost-slot m killed (not (or (:registry? sh) (:collab? sh)))))
-        _ (when (and sh reg key (:registry? sh) (not (:drop-local-only m)))
-            (registry-remove reg key)))
+        m1 (if (nil? link) m (ed-unhost-slot m killed (not (or (:registry? link) (:collab? link)))))
+        _ (when (and link registry key (:registry? link) (not (:drop-local-only m)))
+            (registry-remove registry key)))
     (assoc (dissoc m1 :drop-local-only) :pool-shifted true)))
 
 ;; after collab, which needs the slot's link to withdraw its presence, and before the caches
@@ -284,18 +291,18 @@ their edits made, with the text properties they carried (`link-propagate-buffers
     after
     (fn (acc kv)
       (let (i (first kv)
-            nb (if (< i (count (:buffers acc))) (ed-buf-at acc i) nil))
-        (if (nil? nb)
+            after-buffer (if (< i (count (:buffers acc))) (ed-buf-at acc i) nil))
+        (if (nil? after-buffer)
           acc
-          (let (j (ed-buffer-index-by-name before (buffer-name nb)))
+          (let (j (ed-buffer-index-by-name before (buffer-name after-buffer)))
             (if (nil? j)
               acc
-              (let (ob (ed-buf-at before j))
-                (if (not (buffer-content-changed? ob nb))
+              (let (before-buffer (ed-buf-at before j))
+                (if (not (buffer-content-changed? before-buffer after-buffer))
                   acc
                   (map/assoc-in acc
                     [:hosted i]
-                    (link-propagate-buffers (map/get-in acc [:hosted i]) ob nb)))))))))))
+                    (link-propagate-buffers (map/get-in acc [:hosted i]) before-buffer after-buffer)))))))))))
 
 (defn hosted-step (before after input)
   "The loop-tail content hook: host any new pool slot (`hosted-reconcile` — the
@@ -328,13 +335,11 @@ nothing."
 
 (defn hosted-rebuilt (old text properties)
   "`old` with its text replaced by `text` and its text properties by `properties` (the
-process's, `{key spans}` — a program's colours), KEEPING every non-content field. A hosted
-resync used to `make-buffer` from scratch, which silently dropped the buffer's
-`:type`/`:layers` (so its whole mode — keymap, fontify, indent — vanished) along with
-every mode-local field: `:git-status`/`:line-links` on a report buffer,
-`:input-start` on a shell, and `:read-only-spans` on the tutorial, whose loss
-would unfreeze the read-only prose (the spans are the buffer's own protection now —
-ADR-219). The rope and what belongs to its text are the only things that should change.
+process's, `{key spans}` — a program's colours), KEEPING every non-content field: the
+buffer's `:type`/`:layers` (its whole mode — keymap, fontify, indent) and every mode-local
+field — `:git-status`/`:line-links` on a report buffer, `:input-start` on a shell, and
+`:read-only-spans` on the tutorial, which freeze its prose (ADR-219). The rope and what
+belongs to its text are the only things that change.
 
 The history goes with the old text, and with it the SPLICE LOG: both hold texts the process
 no longer has — after another frame's redaction, the secret (brood ADR-581) — and neither can
@@ -361,10 +366,10 @@ touched on both sides inside one round-trip) — always correct. `buffer-sync` p
 and our snapshot are inside the returned text, and advancing the link to the snapshot
 version makes their queued pushes drop as stale instead of replaying onto the rebuilt copy
 (doubling)."
-  (let (snap (buffer-sync (:proc link) content-view))
-    (if (= snap :no-reply)
+  (let (snapshot (buffer-sync (:proc link) content-view))
+    (if (= snapshot :no-reply)
       m ; process died mid-resync — the [:down] rehost will recover
-      (let ([version view] snap
+      (let ([version view] snapshot
             [text _ _ properties] view)
         (hosted-carried (assoc m :hosted (assoc (:hosted m) i (assoc link :version version)))
           i
@@ -393,8 +398,8 @@ is."
 
 ;; ---- our own echo, absorbed late --------------------------------------------
 ;; Every splice we send comes back to us as a push tagged with our own `:me`. Folding it
-;; changed nothing but the link's bookkeeping (the version, one `:pending` popped), and that
-;; was enough for the loop to see a new model: a second full update and a second frame for
+;; changes nothing but the link's bookkeeping (the version, one `:pending` popped), and that
+;; is enough for the loop to see a new model: a second full update and a second frame for
 ;; every keystroke on a hosted buffer — which, under the flip, is every buffer.
 ;;
 ;; So an own SPLICE echo on a slot nobody shares is not folded at all (`hosted-own-echo?`,
