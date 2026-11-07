@@ -934,6 +934,16 @@ src/folds.blsp              outline FOLDING in an editable buffer (org's TAB): a
                             covers, and the row table gives the hidden lines no rows — so the
                             view, cursor, scroll and mouse never see them; point landing
                             inside one opens it
+src/codefold.blsp           code folding, Emacs's hideshow (C-c @): every `deflanguage` gets a `:fold-extent`
+                            from its indent spec (a `:blocks` node folds from its parent's line, a
+                            `:brackets` node from its own; the closing line stays), a Lisp folds the
+                            form opening on a line; over `folds`, Org's mechanism
+src/foldview.blsp           a folded line ends in ` …` (a `:with-text` pane layer)
+src/searchedit.blsp         editable search results (wgrep): C-c C-p in *Project Search* opens each
+                            row's text (the `file:line:` stays read-only — `narrow-to`), C-c C-c
+                            writes the changed rows to their files' buffers (a line changed since
+                            is skipped), C-c C-k puts them back; C-x p % is a project replace over
+                            them (query-replace passes over what it may not edit)
 src/isearch.blsp            incremental search (C-s / C-r), a modal mini-loop: regexp
                             (C-M-s / C-M-r, M-r) and word (M-s w) search, M-c case toggle; the `3/17`
                             match count (a timer of its own, a slice of the rope per turn, never on
