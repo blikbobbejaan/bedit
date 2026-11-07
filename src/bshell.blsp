@@ -15,7 +15,7 @@ printed `=> …`, defs persisting across the session); anything else runs via `p
 `sh -c` **in the project root** (`:cwd`, ADR-104). Output streams back, then a fresh prompt
 (non-zero exit → `[exit N]`; success silent, bash-style). ↑/↓ recall history, Tab completes
 (filenames / Brood globals), and `:fontify`/`:bracket-match`/`:eldoc` colour + light up the
-input form. The `proc` mechanism is pipe-based (no PTY) — no raw mode; ANSI escapes stripped.
+input form. Commands run on pipes (no PTY, so no raw mode); their ANSI colours become faces.
 
 Structure mirrors `lsp.blsp`: a dedicated **shell process** (`bshell-loop`, per buffer)
 owns the child `proc` (and runs Brood eval in its own image, off the editor loop). It
@@ -35,8 +35,8 @@ receives `[:bshell-run line]`, runs it, and forwards each chunk as a `bshell-out
   (:use ansicolor :only [insert-output]) ; a command's output: its ANSI colours as text properties, its returns done
   (:use editor/buffer) ; make-buffer / insert / end-of-buffer / buffer-length / goto-char
   (:use passwd)) ; ed-read-passwd / password-prompt? — a password a command asks for, read masked
-;; formbuf (guard-clamp / tail-region), ansicolor/decode, ansi/decoder and modes (fontify + gutter
-;; faces) are referenced qualified below — each `mod/name` auto-loads its module.
+;; ansicolor/decode and brood-mode are referenced qualified below — each `mod/name` auto-loads
+;; its module.
 ;; ---- prompt + per-project buffer name ---------------------------------------
 
 (defn- bshell-prompt (dir)
@@ -58,29 +58,29 @@ each project gets its own (Emacs `project-eshell` names per project the same way
 ;;   :input-history / :input-history-index / :input-draft  ↑/↓ recall state
 ;; The project root is the generic `:dir` (so project commands from a bshell buffer just work).
 
-(defn bshell-buffer? (b)
-  "Whether buffer `b` is a bshell buffer — its mode/`:type` is `:bshell` (the generic buffer
+(defn bshell-buffer? (buffer)
+  "Whether `buffer` is a bshell buffer — its mode/`:type` is `:bshell` (the generic buffer
 mechanism, not a bespoke field). Its project root is just the buffer's `:dir`."
-  (= (:type b) :bshell))
+  (= (:type buffer) :bshell))
 
 (defn bshell-live (m)
   "Every shell whose command C-x C-c would kill (`model/register-exit-query`): a bshell
 buffer with a command in flight. An idle shell loses nothing — its prompt is bedit's."
   (vec (seq/keep (:buffers m)
-         (fn (b)
-           (when (and (bshell-buffer? b) (:input-running b))
-             (str (buffer-name b) ": " (or (:bshell-command b) "a command")))))))
+         (fn (buffer)
+           (when (and (bshell-buffer? buffer) (:input-running buffer))
+             (str (buffer-name buffer) ": " (or (:bshell-command buffer) "a command")))))))
 
 (register-exit-query :bshell 'bshell/bshell-live)
 
-(defn- bshell-bufget (m nm k)
-  "Field `k` of the pool buffer named `nm`, or nil if there's no such buffer."
-  (let (i (ed-buffer-index-by-name m nm))
-    (when i (get (nth (:buffers m) i) k))))
+(defn- bshell-buffer-field (m name field)
+  "Field `field` of the pool buffer named `name`, or nil if there's no such buffer."
+  (let (index (ed-buffer-index-by-name m name))
+    (when index (get (nth (:buffers m) index) field))))
 
-(defn- bshell-bufset (m nm k v)
-  "The model with field `k`=`v` set on the pool buffer named `nm` (a no-op if absent)."
-  (ed-update-named m nm (fn (b) (assoc b k v))))
+(defn- bshell-set-buffer-field (m name field value)
+  "The model with `field` = `value` on the pool buffer named `name` (a no-op if absent)."
+  (ed-update-named m name (fn (buffer) (assoc buffer field value))))
 
 ;; ---- persistent command history (across sessions, like the REPL) ------------
 
@@ -102,8 +102,6 @@ under the editor's shared state dir — a re-readable vector, persisted through 
   "Keep the most recent `*bshell-history-max*` entries (oldest first). Pure — the testable
 core of save."
   (into [] (drop history (math/max 0 (- (count history) *bshell-history-max*)))))
-;; Declared: inferring the domain from the body reached for `math/max`'s numeric
-;; argument and typed `history` as a datetime, which no caller passes.
 
 (defn- bshell-load-history ()
   "The saved history as a vector (oldest first), or `[]` if none / unreadable — a missing or
@@ -139,10 +137,10 @@ advanced."
 command — true when its first non-blank char is `(`."
   (string/starts-with? (string/triml line) "("))
 
-(defn- bshell-incomplete? (e)
-  "Whether caught value `e` is the reader's *incomplete input* error (an unclosed form or
+(defn- bshell-incomplete? (caught)
+  "Whether caught value `caught` is the reader's *incomplete input* error (an unclosed form or
 string — code E0002, ADR-049): the signal that RET should add a line, not submit."
-  (and (map? e) (= (:code e) "E0002")))
+  (and (map? caught) (= (:code caught) "E0002")))
 
 (defn- bshell-complete-input? (line)
   "Whether `line` is ready to run on RET. A shell command always is. A Brood form is ready
@@ -150,25 +148,22 @@ once it parses; an *incomplete* form (unclosed paren/string) is not — RET adds
 you keep typing it, like the REPL. A complete-but-malformed form still submits (reflect/eval reports
 the error)."
   (if (bshell-brood-form? line)
-    (try (do (reflect/read-all line) true) (catch e (not (bshell-incomplete? e))))
+    (try (do (reflect/read-all line) true) (catch caught (not (bshell-incomplete? caught))))
     true))
 
 (defn- bshell-eval-and-reply (state line)
   "Evaluate `line` as Brood **in this process** (so defs persist across the session, like
 a REPL — and off the editor loop), then push the formatted result + a success exit back."
-  (let (buf (:buffer state)
+  ;; `eval-source` never throws: captured output then `=> value`, or `error: …`
+  (let (buffer (:buffer state)
         out (eval-source line))
-    ; never throws: captured output then `=> value`, or `error: …`
-    (do
-      (send (:reply state) (bshell/bshell-output-event buf (str out "\n") []))
-      (send (:reply state) (bshell/bshell-done-event buf 0))
-      (bshell-loop state))))
+    (send (:reply state) (bshell/bshell-output-event buffer (str out "\n") []))
+    (send (:reply state) (bshell/bshell-done-event buffer 0))
+    (bshell-loop state)))
 
-;; The record constructors below are named QUALIFIED, and have to be. These sends run
-;; inside a `spawn`ed process: the closure ships, and its free globals re-resolve on
-;; the receiver — where the BARE name is not bound (only `bshell/bshell-output-event`
-;; is), so the worker died with "unbound symbol: bshell-output-event" the moment it
-;; had anything to say.
+;; The record constructors the shell process sends are named QUALIFIED: it runs in a
+;; `spawn`ed process, where a free global re-resolves on the receiver and only the
+;; qualified name (`bshell/bshell-output-event`) is bound.
 
 (defn- bshell-loop (state)
   "The shell process's receive loop: `[:bshell-run line]` evaluates `line` as Brood when it
@@ -182,9 +177,9 @@ a pty and a real emulator."
   (receive
     ([:bshell-run line] (if (bshell-brood-form? line)
                           (bshell-eval-and-reply state line)
-                          (let (p (os/shell-spawn line {:cwd (:root state)}))
+                          (let (child (os/shell-spawn line {:cwd (:root state)}))
                             (bshell-loop (assoc state
-                                           :proc p
+                                           :proc child
                                            :out (ansicolor/decoder)
                                            :err (ansicolor/decoder))))))
     ([:proc p data] (bshell-loop (bshell-forward state :out data)))
@@ -234,57 +229,52 @@ a no-op when it is idle."
   "Stop a shell process: kill any running child and end the process."
   (send pid [:shutdown]))
 
-(defn bshell-on-close (buf)
+(defn bshell-on-close (buffer)
   "The bshell layer's `:on-close` hook (fired by `pool/cmd-kill-buffer` via
 `close-context`): the shell buffer is going away, so stop the worker it owns and
-whatever child it was running. Without this, `C-x k` on a `*shell: …*` buffer left
-both alive until the editor exited — the layers `:on-close` seam exists precisely
-for a mode that spawned something."
-  (do (when (:bshell-proc buf) (bshell-shutdown (:bshell-proc buf))) buf))
+whatever child it was running."
+  (do (when (:bshell-proc buffer) (bshell-shutdown (:bshell-proc buffer))) buffer))
 
 ;; ---- buffer plumbing --------------------------------------------------------
 ;; Every write to a shell buffer goes through `bshell-write`, because of where the cursor
 ;; lives. Point is PER PANE (window-point, model.blsp): the pooled buffer's own point is
-;; only a saved default, so a write that leaves the pooled point at the new end moves no
-;; cursor anyone can see. That was the bug — type a command, RET, and the cursor stayed on
-;; the line you typed while the output and the next prompt appeared below it. The rule is
-;; comint's: a pane whose point was at or past the PROCESS MARK (where the output goes)
+;; only a saved default, so a write must carry the panes' points itself. comint's rule: a pane whose point was at or past the PROCESS MARK (where the output goes)
 ;; moves with the text after it; a pane up in the scrollback, reading — even the running
 ;; command's own output — stays put.
 
-(defn- bshell-write (m nm f)
-  "Buffer `nm` (which must exist) replaced by `(f buffer)` — a write of output at the
+(defn- bshell-write (m name rewrite)
+  "Buffer `name` (which must exist) replaced by `(rewrite buffer)` — a write of output at the
 process mark (`bshell-output-point`) — with every pane on it that was AT or past the mark
 carried along with the text after it, as comint's windows at the process mark follow: a
 pane at the end stays at the end, one in the input typed ahead keeps its place in it. A
 pane up in the scrollback — the running command's own output included — stays put."
-  (let (idx (ed-buffer-index-by-name! m nm)
-        before (ed-buf-at m idx)
+  (let (index (ed-buffer-index-by-name! m name)
+        before (ed-buf-at m index)
         at (bshell-output-point before)
-        after (f before)
+        after (rewrite before)
         grown (- (buffer-length after) (buffer-length before)))
-    (ed-map-panes (ed-set-buf-at m idx after)
-      (fn (w)
-        (if (and (= (:buffer w) idx) (int? (:point w)) (>= (:point w) at))
-          (assoc w :point (math/max 0 (math/min (buffer-length after) (+ (:point w) grown))))
-          w)))))
+    (ed-map-panes (ed-set-buf-at m index after)
+      (fn (pane)
+        (if (and (= (:buffer pane) index) (int? (:point pane)) (>= (:point pane) at))
+          (assoc pane :point (math/max 0 (math/min (buffer-length after) (+ (:point pane) grown))))
+          pane)))))
 
-(defn- bshell-append (m nm s)
-  "Append raw text `s` at the end of buffer `nm` (creating it if absent), point following
+(defn- bshell-append (m name text)
+  "Append raw text `text` at the end of buffer `name` (creating it if absent), point following
 the inserted text. Unlike `model/ed-append-named` it forces **no** trailing newline — a
 stream chunk isn't line-aligned, so a forced newline would split mid-line output. `insert`
 preserves the buffer's other fields (`:bshell-*`), so its per-buffer state survives."
-  (bshell-append-output m nm s nil))
+  (bshell-append-output m name text nil))
 
 ;; The process mark itself is comint's (`process-mark-at`).
-(defn- bshell-output-point (b)
-  "Where output lands in shell buffer `b`: while a command runs, its process mark — before
+(defn- bshell-output-point (buffer)
+  "Where output lands in shell `buffer`: while a command runs, its process mark — before
 anything typed ahead — else the buffer's end."
-  (let (end (buffer-length b)
-        at (process-mark-at b))
-    (if (and (:input-running b) (int? at)) (math/min at end) end)))
+  (let (end (buffer-length buffer)
+        at (process-mark-at buffer))
+    (if (and (:input-running buffer) (int? at)) (math/min at end) end)))
 
-(defn- bshell-append-output (m nm s spans)
+(defn- bshell-append-output (m name text spans)
   "`bshell-append` of a chunk of command output at the process mark (`bshell-output-point`),
 its ANSI colours (`spans` from the chunk's start, `ansicolor/decode`'s) coming with it as its
 `:ansi` text property and its carriage returns done — a progress counter rewrites its line,
@@ -292,15 +282,15 @@ Emacs's `comint-carriage-motion` (`ansicolor/insert-output`) — the mark advanc
 point at the buffer's end. The buffer then keeps only its newest lines (`ed-cap-output`,
 Emacs's `comint-buffer-maximum-size`): its `:input-start`, process mark and every pane's
 cursor move with the text, and the colours belong to it."
-  (ed-cap-output (if (nil? (ed-buffer-index-by-name m nm))
-                   (ed-write-output m nm (fn (fresh) (first (insert-output fresh 0 s spans))))
+  (ed-cap-output (if (nil? (ed-buffer-index-by-name m name))
+                   (ed-write-output m name (fn (fresh) (first (insert-output fresh 0 text spans))))
                    (bshell-write m
-                     nm
-                     (fn (b)
-                       (let ([written end] (insert-output b (bshell-output-point b) s spans)
+                     name
+                     (fn (buffer)
+                       (let ([written end] (insert-output buffer (bshell-output-point buffer) text spans)
                              [broken mark] (bshell-break-long-line written end))
                          (end-of-buffer (with-process-mark broken mark))))))
-    nm))
+    name))
 
 (defdyn *bshell-line-max* 65536)
 ;; The longest output line a shell lets a command grow before it ends it, as procstream hands
@@ -308,39 +298,39 @@ cursor move with the text, and the colours belong to it."
 ;; bar, a minified dump) would otherwise grow one line without end, and every chunk would pay
 ;; for the line so far (the password watch, the carriage return, the view).
 
-(defn- bshell-break-long-line (b end)
-  "`[b' end']`: shell buffer `b`, output just written up to `end`, with a newline added there
+(defn- bshell-break-long-line (buffer end)
+  "`[buffer' end']`: shell `buffer`, output just written up to `end`, with a newline added there
 when the line `end` is on has grown past [[*bshell-line-max*]] chars — the next chunk then
 starts a fresh line."
-  (let (rope (buffer-rope b)
+  (let (rope (buffer-rope buffer)
         line-start (text/line->char rope (text/char->line rope end)))
     (if (> (- end line-start) *bshell-line-max*)
-      [(first (insert-output b end "\n" [])) (inc end)]
-      [b end])))
+      [(first (insert-output buffer end "\n" [])) (inc end)]
+      [buffer end])))
 
-(defn- bshell-buffer-end (m nm)
-  "The char length of buffer `nm` — where freshly-emitted input begins."
-  (buffer-length (nth (:buffers m) (ed-buffer-index-by-name! m nm))))
+(defn- bshell-buffer-end (m name)
+  "The char length of buffer `name` — where freshly-emitted input begins."
+  (buffer-length (nth (:buffers m) (ed-buffer-index-by-name! m name))))
 
-(defn- bshell-ensure-bol (m nm)
-  "Append a newline to buffer `nm` only if its output doesn't already end at a line start —
+(defn- bshell-ensure-bol (m name)
+  "Append a newline to buffer `name` only if its output doesn't already end at a line start —
 so a fresh prompt sits at column 0 without a spurious blank line after newline-terminated
 output. Asked at the process mark (`bshell-output-point`), not the end, which may hold
 input typed ahead."
-  (let (b (nth (:buffers m) (ed-buffer-index-by-name! m nm))
-        at (bshell-output-point b)
-        before (if (= at 0) nil (buffer-char-before (goto-char b at))))
-    (if (or (nil? before) (= before "\n")) m (bshell-append m nm "\n"))))
+  (let (buffer (nth (:buffers m) (ed-buffer-index-by-name! m name))
+        at (bshell-output-point buffer)
+        before (if (= at 0) nil (buffer-char-before (goto-char buffer at))))
+    (if (or (nil? before) (= before "\n")) m (bshell-append m name "\n"))))
 
-(defn- bshell-emit-prompt (m nm prompt)
-  "Append `prompt` (preceded by a newline) to buffer `nm` and mark its input region as
+(defn- bshell-emit-prompt (m name prompt)
+  "Append `prompt` (preceded by a newline) to buffer `name` and mark its input region as
 starting at the new end (`:input-start`, on the buffer)."
-  (let (m1 (bshell-append m nm (str "\n" prompt)))
-    (bshell-bufset m1 nm :input-start (bshell-buffer-end m1 nm))))
+  (let (appended (bshell-append m name (str "\n" prompt)))
+    (bshell-set-buffer-field appended name :input-start (bshell-buffer-end appended name))))
 
-(defn- bshell-prompt-for (m nm)
-  "The prompt string for the shell buffer `nm` (from its `:dir` — its project root)."
-  (bshell-prompt (or (bshell-bufget m nm :dir) ".")))
+(defn- bshell-prompt-for (m name)
+  "The prompt string for the shell buffer `name` (from its `:dir` — its project root)."
+  (bshell-prompt (or (bshell-buffer-field m name :dir) ".")))
 
 ;; ---- the inbound async events (UiEvent records — see model.blsp) ------------
 ;; Each folds through its named `ed-ev-*` fn (`model/defuievent`), so redefining one
@@ -353,13 +343,13 @@ starting at the new end (`:input-start`, on the buffer)."
   "A `bshell-output-event` from the shell process → append the (ANSI-decoded) chunk to
 that buffer, its colours as faces, and keep the viewport following the output; a chunk that
 leaves the running command at a password prompt reads the password (`bshell-watch-password`)."
-  (let (nm (bshell-output-event-buffer event))
+  (let (name (bshell-output-event-buffer event))
     (bshell-watch-password (ed-scroll (bshell-append-output m
-                                        nm
+                                        name
                                         (bshell-output-event-text event)
                                         (bshell-output-event-spans event))
                              textrows)
-      nm)))
+      name)))
 
 ;; ---- a password the running command asks for ------------------------------------------------
 ;; A command runs on PIPES (no terminal), so nothing can say it turned echo off; what it
@@ -369,60 +359,60 @@ leaves the running command at a password prompt reads the password (`bshell-watc
 ;; history. `:bshell-secret` marks a command waiting for one; it is re-decided per chunk of
 ;; output, so the prompt it answered cannot ask again until the command prints anew.
 
-(defn- last-line (b)
+(defn- last-line (buffer)
   "The text of the line a command's output ends on, up to where its next output would land
 (`bshell-output-point`) — its prompt, without anything typed ahead after it. A line longer
 than [[*bshell-prompt-max*]] is no prompt and reads as \"\": the password watch runs on
 every chunk, and must not pay for a long line of output again on each one."
-  (let (rope (buffer-rope b)
-        at (bshell-output-point b)
+  (let (rope (buffer-rope buffer)
+        at (bshell-output-point buffer)
         line-start (text/line->char rope (text/char->line rope at)))
     (if (> (- at line-start) *bshell-prompt-max*) "" (text/slice rope line-start at))))
 
 (defdyn *bshell-prompt-max* 256) ; the longest line the password watch reads as a prompt
 
-(defn bshell-read-secret (m nm &optional (seed nil))
-  "Read a line masked and send it to the command shell `nm` is running — the answer to a
+(defn bshell-read-secret (m name &optional (seed nil))
+  "Read a line masked and send it to the command shell `name` is running — the answer to a
 password prompt, kept out of the buffer and the history. Says so when nothing is running.
 With `seed` (the key that opened the read, or \"\"), what was typed after the process mark
 since the prompt APPEARED is MOVED into the read — out of the buffer and its undo history
 (`passwd/take-since-prompt`) — and `seed` follows it. Text typed ahead of the prompt stays
 as the next input."
-  (let (idx (ed-buffer-index-by-name m nm)
-        b (if (nil? idx) nil (ed-buf-at m idx)))
-    (if (not (and b (:input-running b) (:bshell-proc b)))
+  (let (index (ed-buffer-index-by-name m name)
+        shell (if (nil? index) nil (ed-buf-at m index)))
+    (if (not (and shell (:input-running shell) (:bshell-proc shell)))
       (message m "no command running to send to")
-      (let (line (string/trim (last-line b))
+      (let (line (string/trim (last-line shell))
             [taken typed] (if (nil? seed)
-                            [b ""]
-                            (passwd/take-since-prompt b
-                              (bshell-output-point b)
-                              (buffer-length b))))
-        (passwd/ed-read-passwd (ed-update-named m nm (fn (_) taken))
+                            [shell ""]
+                            (passwd/take-since-prompt shell
+                              (bshell-output-point shell)
+                              (buffer-length shell))))
+        (passwd/ed-read-passwd (ed-update-named m name (fn (_) taken))
           (if (= line "") "Password: " (str line " "))
-          (fn (m1 password)
-            (let (now (ed-buffer-index-by-name m1 nm)
+          (fn (answered password)
+            (let (now (ed-buffer-index-by-name answered name)
                   finished "the command has finished; nothing sent")
               (if (nil? now)
-                (message m1 finished)
-                (let (current (ed-buf-at m1 now))
+                (message answered finished)
+                (let (current (ed-buf-at answered now))
                   (if (not (and (:input-running current) (:bshell-proc current)))
-                    (message m1 finished)
+                    (message answered finished)
                     (do
                       (send (:bshell-proc current) [:bshell-input password])
-                      (ed-set-buf-at m1 now (assoc current :bshell-secret false))))))))
-          nm
+                      (ed-set-buf-at answered now (assoc current :bshell-secret false))))))))
+          name
           (str typed (or seed "")))))))
 
 (defn bshell-secret-pending? (m)
   "Whether the selected buffer is a shell whose running command waits at a password prompt
 no read has been opened for yet — where a typed key belongs to a masked read
 (`passwd/secret-overlay`)."
-  (let (b (ed-current-buf m))
-    (and (bshell-buffer? b)
-      (= true (:bshell-secret b))
-      (:input-running b)
-      (not (nil? (:bshell-proc b)))
+  (let (buffer (ed-current-buf m))
+    (and (bshell-buffer? buffer)
+      (= true (:bshell-secret buffer))
+      (:input-running buffer)
+      (not (nil? (:bshell-proc buffer)))
       (nil? (:minibuffer m)))))
 
 (defn bshell-secret-key (m input)
@@ -435,24 +425,24 @@ appeared; type-ahead from before it stays in the input region."
   "A shell's `:send-invisible` service: read a line masked for the command it is running."
   (bshell-read-secret m (buffer-name (ed-current-buf m))))
 
-(defn- bshell-watch-password (m nm)
-  "After output reached shell `nm`: note whether its running command now waits at a password
+(defn- bshell-watch-password (m name)
+  "After output reached shell `name`: note whether its running command now waits at a password
 prompt, and when it has just started to — and you are looking at it, with no other prompt
 open — read the password (`bshell-read-secret`). Elsewhere the first key typed there, or
 RET, asks (`passwd/secret-overlay`). Where the input ended when the prompt appeared is
 marked (`passwd/mark-prompt`): what was typed before it stays as the next input."
-  (let (idx (ed-buffer-index-by-name m nm))
-    (if (nil? idx)
+  (let (index (ed-buffer-index-by-name m name))
+    (if (nil? index)
       m
-      (let (b (ed-buf-at m idx))
-        (if (not (:input-running b))
+      (let (shell (ed-buf-at m index))
+        (if (not (:input-running shell))
           m
-          (let (secret? (passwd/password-prompt? (last-line b))
-                asked? (and secret? (not (:bshell-secret b)))
-                flagged (assoc b :bshell-secret secret?)
-                noted (ed-set-buf-at m idx (if asked? (passwd/mark-prompt flagged) flagged)))
-            (if (and asked? (= idx (ed-current-index noted)) (ed-prompt-free? noted))
-              (bshell-read-secret noted nm "")
+          (let (secret? (passwd/password-prompt? (last-line shell))
+                asked? (and secret? (not (:bshell-secret shell)))
+                flagged (assoc shell :bshell-secret secret?)
+                noted (ed-set-buf-at m index (if asked? (passwd/mark-prompt flagged) flagged)))
+            (if (and asked? (= index (ed-current-index noted)) (ed-prompt-free? noted))
+              (bshell-read-secret noted name "")
               noted)))))))
 
 (defn ed-ev-bshell-done (m event textrows cols rows)
@@ -460,21 +450,23 @@ marked (`passwd/mark-prompt`): what was typed before it stays as the next input.
 0 is silent; a signal is `[exit killed]`), then a fresh prompt for that buffer — all at the
 process mark, so input typed ahead ends up after the prompt, waiting to be sent; mark *that*
 shell idle and start *its* input region where the prompt ends (all per-buffer)."
-  (let (nm (bshell-done-event-buffer event)
+  (let (name (bshell-done-event-buffer event)
         code (bshell-done-event-code event)
-        ;; a password prompt the command left open has nobody to answer now
-        m0 (bshell-ensure-bol (passwd/ed-withdraw-read m nm) nm) ; the prompt starts at column 0, no blank line
-        m1 (cond
-             (= code 0) m0
-             (nil? code) (bshell-append m0 nm "[exit killed]\n")
-             else (bshell-append m0 nm (str "[exit " code "]\n")))
-        m2 (bshell-append m1 nm (bshell-prompt-for m1 nm))
-        prompt-end (bshell-output-point (nth (:buffers m2) (ed-buffer-index-by-name! m2 nm)))
-        m3 (ed-update-named m2
-             nm
-             (fn (b)
-               (without-process-mark (assoc b :input-running false :bshell-secret false)))))
-    (ed-scroll (bshell-bufset m3 nm :input-start prompt-end) textrows)))
+        ;; a password prompt the command left open has nobody to answer now; the prompt
+        ;; starts at column 0, with no blank line
+        at-line-start (bshell-ensure-bol (passwd/ed-withdraw-read m name) name)
+        reported (cond
+                   (= code 0) at-line-start
+                   (nil? code) (bshell-append at-line-start name "[exit killed]\n")
+                   else (bshell-append at-line-start name (str "[exit " code "]\n")))
+        prompted (bshell-append reported name (bshell-prompt-for reported name))
+        prompt-end (bshell-output-point (nth (:buffers prompted)
+                                          (ed-buffer-index-by-name! prompted name)))
+        idle (ed-update-named prompted
+               name
+               (fn (buffer)
+                 (without-process-mark (assoc buffer :input-running false :bshell-secret false)))))
+    (ed-scroll (bshell-set-buffer-field idle name :input-start prompt-end) textrows)))
 
 ;; ---- syntax highlighting (the :fontify mode service) ------------------------
 ;; bash colours its prompt; we colour the prompt prefix (green/bold) of each prompt line,
@@ -491,27 +483,27 @@ shell idle and start *its* input region where the prompt ends (all per-buffer)."
   "The shell's prompt, detected from `text`: the buffer's first prompt is `<dir> $ `, so it's
 the text up to and including the first `\" $ \"`. `\"\"` when there's none. Per-buffer (each
 project's prompt is its own first line), so no global state is needed."
-  (let (i (index-of text " $ "))
-    (if (< i 0) "" (string/substring text 0 (+ i 3)))))
+  (let (at (index-of text " $ "))
+    (if (< at 0) "" (string/substring text 0 (+ at 3)))))
 
-(defn- bshell-span-for (line linestart prompt)
-  "A fontify span for the buffer `line` starting at offset `linestart`, given the session
+(defn- bshell-span-for (line line-start prompt)
+  "A fontify span for the buffer `line` starting at offset `line-start`, given the session
 `prompt`, or nil."
   (cond
     (and (> (string/length prompt) 0) (string/starts-with? line prompt))
-      [linestart (+ linestart (string/length prompt)) bshell-face-prompt]
+      [line-start (+ line-start (string/length prompt)) bshell-face-prompt]
     (or (string/starts-with? line "[exit ") (string/starts-with? line "error:"))
-      [linestart (+ linestart (string/length line)) bshell-face-error]
+      [line-start (+ line-start (string/length line)) bshell-face-error]
     else nil))
 
 (defn- bshell-line-spans (text pos prompt acc)
   "Tail-recursive line scan from offset `pos`, collecting the non-nil per-line spans."
   (if (>= pos (string/length text))
     (reverse acc)
-    (let (nl (index-of text "\n" pos)
-          end (if (< nl 0) (string/length text) nl)
-          sp (bshell-span-for (string/substring text pos end) pos prompt))
-      (bshell-line-spans text (+ end 1) prompt (if (nil? sp) acc (cons sp acc))))))
+    (let (newline (index-of text "\n" pos)
+          end (if (< newline 0) (string/length text) newline)
+          span (bshell-span-for (string/substring text pos end) pos prompt))
+      (bshell-line-spans text (+ end 1) prompt (if (nil? span) acc (cons span acc))))))
 
 (sig bshell-input-span (string -> (or nil (tuple int string))))
 (defn- bshell-input-span (text)
@@ -521,24 +513,24 @@ eldoc) act on just the form you're typing, not the plain-text output."
   (let (prompt (bshell-detect-prompt text))
     (if (= prompt "")
       nil
-      (let (pi (string/last-index-of text prompt))
-        (if (< pi 0)
+      (let (at (string/last-index-of text prompt))
+        (if (< at 0)
           nil
-          (let (start (+ pi (string/length prompt)))
+          (let (start (+ at (string/length prompt)))
             [start (string/substring text start (string/length text))]))))))
 
 (sig bshell-input-form? ((or nil (tuple int string)) -> bool))
-(defn- bshell-input-form? (isp)
+(defn- bshell-input-form? (input)
   "Whether the `[start substring]` input is a Brood form (worth lexing/eldoc/bracket-match)."
-  (if isp (string/starts-with? (string/triml (second isp)) "(") false))
+  (if input (string/starts-with? (string/triml (second input)) "(") false))
 
 (defn- bshell-input-spans (text)
   "Brood syntax spans for the input region, in buffer coordinates, when the input is a
 `(`-form; else `()`. Sits after every prompt/error line span, so the combined list stays
 ascending + non-overlapping."
-  (let (isp (bshell-input-span text))
-    (if (and isp (bshell-input-form? isp))
-      (shift-spans (highlight-spans (second isp)) (first isp))
+  (let (input (bshell-input-span text))
+    (if (and input (bshell-input-form? input))
+      (shift-spans (highlight-spans (second input)) (first input))
       ())))
 
 (defn bshell-fontify (text)
@@ -551,23 +543,23 @@ are ascending + non-overlapping (the highlight-spans shape)."
 (defn bshell-bracket-match (full pos)
   "The bshell `:bracket-match` service: match the bracket adjacent to `pos`, scoped to the
 input form (buffer coordinates), so output brackets never match. Nil outside the input."
-  (let (isp (bshell-input-span full))
-    (if (and isp (>= pos (first isp)) (bshell-input-form? isp))
-      (let (start (first isp)
-            r (bracket-match (second isp) (- pos start)))
+  (let (input (bshell-input-span full))
+    (if (and input (>= pos (first input)) (bshell-input-form? input))
+      (let (start (first input)
+            matched (bracket-match (second input) (- pos start)))
         (cond
-          (nil? r) nil
-          (= (second r) :unmatched) [(+ (first r) start) :unmatched]
-          else [(+ (first r) start) (+ (second r) start)]))
+          (nil? matched) nil
+          (= (second matched) :unmatched) [(+ (first matched) start) :unmatched]
+          else [(+ (first matched) start) (+ (second matched) start)]))
       nil)))
 
 (sig bshell-eldoc (string int -> any))
 (defn bshell-eldoc (text pos)
   "The bshell `:eldoc` service: the signature of the call enclosing `pos` within the input
 form (reusing brood-mode's eldoc), or nil when point isn't in a form's input."
-  (let (isp (bshell-input-span text))
-    (if (and isp (>= pos (first isp)) (bshell-input-form? isp))
-      (brood-mode/brood-eldoc (second isp) (- pos (first isp)))
+  (let (input (bshell-input-span text))
+    (if (and input (>= pos (first input)) (bshell-input-form? input))
+      (brood-mode/brood-eldoc (second input) (- pos (first input)))
       nil)))
 
 (defn bshell-remember (m line)
@@ -580,45 +572,45 @@ persist that history to the shell's history file."
 ;; ---- completion: filenames for a shell command, Brood globals for a form ----
 
 (sig bshell-token-start (string int -> int))
-(defn- bshell-token-start (text p)
-  "The start of the whitespace-delimited token ending at offset `p`."
-  (if (or (<= p 0) (includes? " \t" (string/char-at text (dec p))))
-    p
-    (bshell-token-start text (dec p))))
+(defn- bshell-token-start (text position)
+  "The start of the whitespace-delimited token ending at offset `position`."
+  (if (or (<= position 0) (includes? " \t" (string/char-at text (dec position))))
+    position
+    (bshell-token-start text (dec position))))
 
-(defn- bshell-path-candidates (tok cwd)
-  "Filename completions for shell token `tok` resolved against `cwd`: the entries of the
+(defn- bshell-path-candidates (token cwd)
+  "Filename completions for shell token `token` resolved against `cwd`: the entries of the
 directory it references whose name starts with the token's last segment, directories
 suffixed `/`. `()` on any error. Dir-ness is the cheap `dir?` stat, not a full `list-dir`."
-  (let (slash (string/last-index-of tok "/")
-        sub (if (< slash 0) "" (string/substring tok 0 (+ slash 1))) ; the dir part, incl trailing /
-        partial (if (< slash 0) tok (string/substring tok (+ slash 1) (string/length tok)))
+  (let (slash (string/last-index-of token "/")
+        sub (if (< slash 0) "" (string/substring token 0 (+ slash 1))) ; the dir part, incl trailing /
+        partial (if (< slash 0) token (string/substring token (+ slash 1) (string/length token)))
         dir (if (= sub "") cwd (path/absolute sub cwd)))
     ;; `dir` is the half-typed prefix of a path — an unlistable one simply has no candidates
     (check-allow :discarded-catch
       (try
-        (map (seq/filter (file/ls dir) (fn (e) (string/starts-with? e partial)))
-          (fn (e) (str sub e (if (file/dir? (path/join dir e)) "/" ""))))
-        (catch e ())))))
+        (map (seq/filter (file/ls dir) (fn (entry) (string/starts-with? entry partial)))
+          (fn (entry) (str sub entry (if (file/dir? (path/join dir entry)) "/" ""))))
+        (catch _ ())))))
 
 (defn bshell-complete-source (m)
   "The bshell completion source (a `complete-at-point/*completion-sources*` entry): inside a bshell
 buffer's input region, complete the token before point — **Brood globals** for a `(`-form
 line (the REPL), else **filenames** under that shell's directory. `nil` in any other buffer
 (and above the input line), so it's inert everywhere else."
-  (let (buf (ed-current-buf m))
-    (if (not (bshell-buffer? buf))
+  (let (buffer (ed-current-buf m))
+    (if (not (bshell-buffer? buffer))
       nil
-      (let (text (buffer-text buf)
-            p (buffer-point buf)
-            istart (first (input-region buf)))
-        (if (< p istart)
+      (let (text (buffer-text buffer)
+            point (buffer-point buffer)
+            input-start (first (input-region buffer)))
+        (if (< point input-start)
           nil
-          (if (string/starts-with? (string/triml (string/substring text istart p)) "(")
-            (brood-mode/brood-complete-at text p) ; REPL: live Brood globals
-            (let (start (math/max istart (bshell-token-start text p))
-                  tok (string/substring text start p))
-              [start tok (bshell-path-candidates tok (or (:dir buf) "."))])))))))
+          (if (string/starts-with? (string/triml (string/substring text input-start point)) "(")
+            (brood-mode/brood-complete-at text point) ; REPL: live Brood globals
+            (let (start (math/max input-start (bshell-token-start text point))
+                  token (string/substring text start point))
+              [start token (bshell-path-candidates token (or (:dir buffer) "."))])))))))
 
 ;; ---- the commands -----------------------------------------------------------
 
@@ -626,12 +618,12 @@ line (the REPL), else **filenames** under that shell's directory. `nil` in any o
   "Open this project's shell: a fresh `*bshell: <root>*` buffer (mode `:bshell`, so RET runs
 the command) with its prompt, its shell process rooted at `root`, and all its state recorded
 **on the buffer** — so each project's shell is independent."
-  (let (nm (bshell-buffer-name root)
+  (let (name (bshell-buffer-name root)
         prompt (bshell-prompt root)
-        raw (end-of-buffer (insert (make-buffer "" nm) prompt))
+        raw (end-of-buffer (insert (make-buffer "" name) prompt))
         typed (editor/layers/set-buffer-type raw :bshell)
-        pid (bshell-connect nm root)
-        buf (assoc typed
+        pid (bshell-connect name root)
+        buffer (assoc typed
               :dir root ; the generic per-buffer default-directory = this shell's project root
               :bshell-proc pid
               :input-running false
@@ -639,7 +631,7 @@ the command) with its prompt, its shell process rooted at `root`, and all its st
               :input-history (bshell-load-history)
               :input-history-index nil
               :input-draft nil))
-    (ed-open-buffer m buf)))
+    (ed-open-buffer m buffer)))
 
 (defcommand cmd-project-bshell
   (m key)
@@ -649,11 +641,11 @@ shell (each project has its own — like Emacs `project-eshell`). Reports when n
   (let (root (ed-project-root m))
     (if (nil? root)
       (message m "not in a project (no project.blsp found)")
-      (let (nm (bshell-buffer-name root)
-            idx (ed-buffer-index-by-name m nm))
-        (if (nil? idx)
+      (let (name (bshell-buffer-name root)
+            index (ed-buffer-index-by-name m name))
+        (if (nil? index)
           (bshell-start m root)
-          (ed-select m idx))))))
+          (ed-select m index))))))
 
 (defcommand cmd-bshell-send
   (m key)
@@ -663,28 +655,28 @@ form** inserts a newline so you keep typing it (REPL-style multi-line); otherwis
 is sent to this shell's process. Ignored in a non-bshell buffer or while a command is running
 — unless that command waits at a password prompt, which RET then reads, masked —
 holding what was typed since the prompt appeared, moved out of the buffer."
-  (let (b (ed-current-buf m))
+  (let (shell (ed-current-buf m))
     (cond
-      (not (bshell-buffer? b)) m
-      (and (:input-running b) (:bshell-secret b)) (bshell-read-secret m (buffer-name b) "")
-      (:input-running b) m
+      (not (bshell-buffer? shell)) m
+      (and (:input-running shell) (:bshell-secret shell)) (bshell-read-secret m (buffer-name shell) "")
+      (:input-running shell) m
       else
-        (let (nm (buffer-name b)
-              line (string/trimr (input-text b)))
+        (let (name (buffer-name shell)
+              line (string/trimr (input-text shell)))
           (cond
-            (string/blank? line) (bshell-emit-prompt m nm (bshell-prompt-for m nm))
+            (string/blank? line) (bshell-emit-prompt m name (bshell-prompt-for m name))
             ;; an unclosed Brood form → newline at point, keep editing (don't submit)
-            (not (bshell-complete-input? line)) (ed-set-buf m (insert b "\n"))
+            (not (bshell-complete-input? line)) (ed-set-buf m (insert shell "\n"))
             else
-              (let (m1 (bshell-remember m line))
-                ; ↑/↓ recall it later (this buffer)
-                (send (:bshell-proc b) [:bshell-run line])
-                (ed-update-named (bshell-append m1 nm "\n")
-                  nm
+              ;; remembered for ↑/↓ in this buffer
+              (let (remembered (bshell-remember m line))
+                (send (:bshell-proc shell) [:bshell-run line])
+                (ed-update-named (bshell-append remembered name "\n")
+                  name
                   ;; the process mark starts after the command line: its output goes there
-                  (fn (buf)
-                    (with-process-mark (assoc buf :input-running true :bshell-command line)
-                      (buffer-length buf))))))))))
+                  (fn (buffer)
+                    (with-process-mark (assoc buffer :input-running true :bshell-command line)
+                      (buffer-length buffer))))))))))
 
 ;; Turn the completion source on: highest precedence, but inert outside a bshell buffer.
 (complete-add-source! 'bshell/bshell-complete-source)
@@ -694,11 +686,11 @@ holding what was typed since the prompt appeared, moved out of the buffer."
   "C-c C-c in a bshell buffer: interrupt the running command, as Ctrl-C does in a terminal —
 the signal reaches the command and everything it started (`sleep`, `make` and its
 compilers), and its exit is reported as usual. Says so when nothing is running."
-  (let (b (ed-current-buf m))
+  (let (shell (ed-current-buf m))
     (cond
-      (not (bshell-buffer? b)) m
-      (not (and (:input-running b) (:bshell-proc b))) (message m "no command running")
-      else (do (bshell-interrupt (:bshell-proc b)) (message m "interrupted")))))
+      (not (bshell-buffer? shell)) m
+      (not (and (:input-running shell) (:bshell-proc shell))) (message m "no command running")
+      else (do (bshell-interrupt (:bshell-proc shell)) (message m "interrupted")))))
 
 ;; bshell-mode: the project shell + Brood REPL (`C-x p e`, see src/bshell.blsp), stacked
 ;; on text-mode. RET runs the current input line; Tab completes (filenames for a command,
