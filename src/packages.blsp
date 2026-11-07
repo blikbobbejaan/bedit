@@ -33,12 +33,9 @@ applied, and the install says why — one bad package never blocks the editor."
   (:use pool) ; ed-show-named / ed-name-prompt / ed-goto-line / ed-upsert-named
   (:use editor/buffer) ; buffer-current-line — the *Packages* row at point
   (:use task :only [task])) ; task — the network work runs off the loop
-;; A plugin needing a newer bedit than we are is not applied. What its `:enhances {bedit …}`
-;; constraint is checked against comes from `about/bedit-version` — the manifest, read at
-;; the moment it is asked — rather than a constant here "kept in lockstep with project.blsp".
-;; It was not kept in lockstep: this said 0.2.0 against a manifest two releases further on
-;; (0.4.1), so every plugin declaring `:enhances {bedit ">= 0.3"}` was silently refused. A
-;; version a human has to remember to copy is a version that is wrong.
+;; The name a plugin's `:enhances {bedit …}` constraint names. A plugin needing a newer bedit
+;; than this one is not applied; the version it is checked against is `about/bedit-version`,
+;; read from the manifest when asked, never a constant copied here.
 (def *bedit-name* "bedit")
 
 (def *package-job-timeout-ms* 300000)
@@ -58,7 +55,7 @@ applied, and the install says why — one bad package never blocks the editor."
 
 (defn- add-to-load-path! (name)
   "Put package `name`'s src/ on `*load-path*` so `(require-one 'name)` finds it (idempotent)."
-  (reflect/add-load-path (path/join (pkg-dir name) "src")))
+  (reflect/add-load-path (path/join (package-dir name) "src")))
 
 (defn- reload-sources (name)
   "Load every source file of package `name` again — what an UPDATE of a plugin this image has
@@ -66,9 +63,7 @@ already loaded needs, since `require-one` of a loaded module is a no-op and woul
 the old code until a restart. In load order (`reflect/source-load-order`): a module after the
 ones it uses, so a macro the update changed is defined again before the file that expands
 it, and one reload is enough."
-  (doseq (file (reflect/source-load-order (seq/filter (file/walk-files (path/join (pkg-dir name)
-                                                                         "src"))
-                                            (fn (path) (string/ends-with? path ".blsp")))))
+  (doseq (file (reflect/source-load-order (source-files name)))
     (reflect/load file)))
 
 (defn- entry-symbol (name) (symbol (str name "/bedit-plugin")))
@@ -293,10 +288,6 @@ asked for it. It is not dropped in silence either: each installed package's fate
 ;; Each answers an OUTCOME map — never raises, so a reason never turns into a bare \"the task
 ;; errored\": `{:kind :name …}` plus `:error` (the reason, a string) when it failed.
 
-(defn- reason-of (value)
-  "The reason a registry call gave: a failure's message, or a raised error's."
-  (error-message value))
-
 (defn- clear-stale-staging (packages-dir)
   "Remove the staging directories a cancelled or crashed install left behind. Called by the
 install holding the runtime's one job slot ([[job-slot]]), so no other window's install is
@@ -309,12 +300,13 @@ never taken for a package."
         (check-allow :discarded-catch
           (try (file/rmdir (path/join packages-dir entry)) (catch _ nil)))))))
 
-(defn- staged-modules (staging name)
-  ;; the modules the package `name` just extracted into `staging` declares
-  (let (src (path/join staging name "src"))
-    (modules-in (if (file/exists? src)
-                  (seq/filter (file/walk-files src) (fn (path) (string/ends-with? path ".blsp")))
-                  ()))))
+(defn- staged-refusal (staging name)
+  ;; why the package `name` just extracted into `staging` is not moved into place, or nil
+  (if (not (includes? (compatible-in staging) name))
+    (str name " does not enhance bedit " (about/bedit-version))
+    (when-let (clash (collision-reason (modules-in (source-files-under (path/join staging
+                                                                         name "src")))))
+      (str name ": " clash))))
 
 (defn- staged-install (registry name id)
   "Install `name` through `registry`'s `:install` into a fresh staging directory, and move it
@@ -330,29 +322,23 @@ back, so trust on first use still sees the key it pinned."
     (file/mkdir staging)
     (when (file/exists? pins) (file/cp pins staged-pins))
     (let (result (try ((:install registry) name staging) (catch e (failure (error-message e)))))
-      (cond
-        (failure? result) (do (file/rmdir staging) result)
-        (not (includes? (compatible-in staging) name))
-          (do
-            (file/rmdir staging)
-            (failure name " does not enhance bedit " (about/bedit-version) " — not installed"))
-        (collision-reason (staged-modules staging name))
-          (let (reason (collision-reason (staged-modules staging name)))
-            (file/rmdir staging)
-            (failure name ": " reason " — not installed"))
-        else
-          (do
-            (when (file/exists? staged-pins) (file/cp staged-pins pins))
-            (file/rmdir (pkg-dir name))
-            (file/rename (path/join staging name) (pkg-dir name))
-            (file/rmdir staging)
-            (assoc result :path (pkg-dir name)))))))
+      (if (failure? result)
+        (do (file/rmdir staging) result)
+        (let (refusal (staged-refusal staging name))
+          (if refusal
+            (do (file/rmdir staging) (failure refusal " — not installed"))
+            (do
+              (when (file/exists? staged-pins) (file/cp staged-pins pins))
+              (file/rmdir (package-dir name))
+              (file/rename (path/join staging name) (package-dir name))
+              (file/rmdir staging)
+              (assoc result :path (package-dir name)))))))))
 
 (defn- fetch-list (registry)
   ;; the hive's bedit packages, or the reason it could not say
   (let (listed (try ((:enhancers registry) *bedit-name*) (catch e (failure (error-message e)))))
     (cond
-      (failure? listed) {:kind :list :error (reason-of listed)}
+      (failure? listed) {:kind :list :error (error-message listed)}
       (or (list? listed) (vector? listed)) {:kind :list :available (vec listed)}
       ;; nil: a registry answer with no `:packages` — nothing published yet
       else {:kind :list :available []})))
@@ -360,7 +346,7 @@ back, so trust on first use still sees the key it pinned."
 (defn- install-job (registry name id)
   (let (result (staged-install registry name id))
     (if (failure? result)
-      {:kind :install :name name :error (reason-of result)}
+      {:kind :install :name name :error (error-message result)}
       {:kind :install :name name :result result})))
 
 (defn- update-job (registry name id)
@@ -368,14 +354,14 @@ back, so trust on first use still sees the key it pinned."
   (let (installed (installed-version name)
         latest (try ((:latest-version registry) name) (catch e (failure (error-message e)))))
     (cond
-      (failure? latest) {:kind :update :name name :error (reason-of latest)}
+      (failure? latest) {:kind :update :name name :error (error-message latest)}
       (nil? latest) {:kind :update :name name :error (str name " is not published on the registry")}
       (and installed (not (version/newer? latest installed)))
         {:kind :update :name name :current true}
       else
         (let (result (staged-install registry name id))
           (if (failure? result)
-            {:kind :update :name name :error (reason-of result)}
+            {:kind :update :name name :error (error-message result)}
             {:kind :update :name name :result result})))))
 
 (defn run-package-job (registry job)
@@ -424,6 +410,7 @@ reason it failed. Never raises. What a package task runs; inline when headless."
 (defn- claim-job-slot! (job)
   ;; the slot for `job`, from this window: the claim, or nil when a job runs somewhere
   (let (slot {:pid (self) :id (rand/token 4) :label (job-label job)})
+    ;; asked for its effect: a slot whose window died is freed, so this claim can take it
     (job-slot)
     (when (registry/put-new! :packages/job :slot slot) slot)))
 
@@ -505,12 +492,12 @@ applied live and redraws them — and a failure says its reason in the echo area
 *Packages* status line, rather than a bare `install failed`. A nil `outcome` is the task having
 died or timed out, said as such."
     (let (job (or (:package-job-info m) {})
-          m1 (release-job-slot! (dissoc m :package-job :package-job-info)))
+          released (release-job-slot! (dissoc m :package-job :package-job-info)))
       (cond
         (nil? outcome)
           (let (note (str (job-label job)
                        " failed or timed out after " *package-job-timeout-ms* "ms")
-                shown (refresh-packages (message (assoc m1 :package-status note) note)))
+                shown (refresh-packages (message (assoc released :package-status note) note)))
             (if (= (:kind job) :list)
               (refill-package-prompt shown note)
               (settle-package-prompt shown)))
@@ -518,14 +505,15 @@ died or timed out, said as such."
         ;; an open package prompt takes the list too, or says why there is none
           (if (:error outcome)
             (let (note (str "could not fetch the package list: " (:error outcome)))
-              (refill-package-prompt (refresh-packages (message (assoc m1 :package-status note)
+              (refill-package-prompt (refresh-packages (message (assoc released
+                                                                  :package-status note)
                                                          note))
                 note))
-            (refill-package-prompt (refresh-packages (assoc m1
+            (refill-package-prompt (refresh-packages (assoc released
                                                        :package-list (:available outcome)
                                                        :package-status nil))))
         else
-          (let ([applied note] (apply-outcome m1 outcome))
+          (let ([applied note] (apply-outcome released outcome))
             (settle-package-prompt (refresh-packages (message (assoc applied :package-status note)
                                                        note))))))))
 
@@ -784,15 +772,15 @@ package job runs — what a package prompt does before it opens."
   "`m` with an open package prompt ([[package-prompt]]) given the packages just fetched —
 the typed text kept, the candidates re-ranked from them — and `note` (a failure's reason, or
 nil) as what it says. Any other prompt, or none, is left alone."
-  (let (mb (:minibuffer m)
-        kind (when mb (:package-prompt mb)))
+  (let (prompt (:minibuffer m)
+        kind (when prompt (:package-prompt prompt)))
     (if (nil? kind)
       m
       (let (names (prompt-names m kind)
-            fresh (ed-name-prompt "" names (:on-complete mb)))
+            fresh (ed-name-prompt "" names (:on-complete prompt)))
         (assoc (ed-mb-stop-ranker m)
           :minibuffer
-            (assoc (merge (dissoc mb :ranker :cand-cache :sel :asked)
+            (assoc (merge (dissoc prompt :ranker :cand-cache :sel :asked)
                      {:complete-fn (:complete-fn fresh) :rank-source (:rank-source fresh)})
               :status note))))))
 
