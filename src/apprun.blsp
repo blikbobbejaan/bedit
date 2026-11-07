@@ -60,17 +60,12 @@ traced call then streams into *Run* via the spy tap."
         '(let (root (project/find-root (file/cwd)))
            (when root
              (project/setup root)
-             ;; Load all sources / build the startup image NOW, before the traces
-             ;; below. `project-run/run` (the last form) force-reloads sources on a COLD
-             ;; run to build the image (ADR-218), and that reload rebinds the
-             ;; project's fns to their clean source — wiping any trace installed
-             ;; first. (This is why run-breakpoints silently did nothing on the
-             ;; FIRST run of a project, but worked on later runs where the image
-             ;; already existed.) Building the image here means it exists when
-             ;; `project-run/run` runs, so its cold check skips the reload and `require`
-             ;; is genuinely idempotent — the traces survive. The trace is a
-             ;; runtime-only rebinding installed AFTER this load, so it is never
-             ;; snapshotted into the image.
+             ;; Load the sources / build the startup image NOW, before the traces below:
+             ;; `project-run/run` (the last form) reloads sources on a COLD run to build
+             ;; the image (ADR-218), rebinding the project's fns to their clean source and
+             ;; wiping a trace installed first. With the image built here, its cold check
+             ;; skips that reload and the traces survive. A trace is a runtime-only
+             ;; rebinding installed after this load, so it is never snapshotted.
              (when (nil? (project-image/setup-lazy-image root))
                (project-image/load-sources-cached root)))))
       (map run-breaks
@@ -91,7 +86,7 @@ traced call then streams into *Run* via the spy tap."
       ;; the stats heartbeat: a tiny sibling process, hibernating between beats
       (list 'def 'apprun-stats-ms *apprun-stats-ms*)
       '(defn- apprun-emit-stats (started)
-         (let (infos (keep proc/info (proc/list)))
+         (let (infos (seq/keep (proc/list) proc/info))
            (io/puts
              (json/encode
                {:event "stats"
@@ -104,9 +99,11 @@ traced call then streams into *Run* via the spy tap."
                 :uptime-ms (- (os/now) started)}))))
       '(defn- apprun-beat (started)
          (do
-           (apprun-emit-stats started) ; emit at once, then every interval —
-           (receive (after apprun-stats-ms nil)) ; so telemetry shows immediately, even
-           (apprun-beat started))) ; for an app that exits before 5s
+           ;; emit at once, then every interval: telemetry shows even for an app that
+           ;; exits before the first interval
+           (apprun-emit-stats started)
+           (receive (after apprun-stats-ms nil))
+           (apprun-beat started)))
       '(spawn (apprun-beat (os/now))))
     (apprun-run-forms run-breaks)))
 
@@ -117,8 +114,8 @@ traced call then streams into *Run* via the spy tap."
 
 (defn- apprun-decode-line (line)
   "Classify one stdout line — `[:spy m]` / `[:stats m]` / `[:output s]` / `[:drop]` —
-salvaging a JSON line another process's unflushed `print` may have prefixed (the
-testrun-decode-line shape; the shared decoder is a fold-up candidate)."
+salvaging a JSON line another process's unflushed `print` may have prefixed
+(`model/ed-json-event-line`, as `testadapter/brood-decode-line` does)."
   (let (parsed (ed-json-event-line line)
         event (when parsed (get parsed :event)))
     (cond
@@ -127,12 +124,13 @@ testrun-decode-line shape; the shared decoder is a fold-up candidate)."
       (= (string/trim line) "") [:drop]
       else [:output line])))
 
-(defn- apprun-dispatch-line (line spans gen)
-  (let (kv (apprun-decode-line line))
-    (case (first kv)
-      :spy (apprun-spy-event (second kv) gen)
-      :stats (apprun-stats-event (second kv) gen)
-      :output (apprun-output-event (second kv) spans gen)
+(defn- apprun-dispatch-line (line spans generation)
+  ;; the event a decoded stdout line becomes, or nil for one to drop
+  (let ([kind value] (apprun-decode-line line))
+    (case kind
+      :spy (apprun-spy-event value generation)
+      :stats (apprun-stats-event value generation)
+      :output (apprun-output-event value spans generation)
       nil)))
 
 (defn- apprun-handlers ()
@@ -146,47 +144,38 @@ arrives ANSI-decoded (procstream), its colours beside it as `spans`, which *Run*
 
 ;; ---- rendering + folds -------------------------------------------------------------
 
-(defn apprun-stats-line (s)
-  "The one-line stats rendering (the chip tooltip's first line)."
-  (str (get s :procs)
-    " procs · "
-    (humanize/byte-size (or (get s :memory) 0))
-    " · up "
-    (math/quot (or (get s :uptime-ms) 0) 1000)
-    "s"))
-
-(defn- apprun-current? (m gen)
-  "Whether `gen` is the running app's generation — a superseded run's straggler is
+(defn- apprun-current? (m generation)
+  "Whether `generation` is the running app's generation — a superseded run's straggler is
 dropped."
-  (= gen (map/get-in m [:apprun :gen])))
+  (= generation (map/get-in m [:apprun :gen])))
 
 (impl UiEvent
   apprun-output-event
-  (ui-event-fold (e m textrows cols rows)
-    (if (apprun-current? m (apprun-output-event-gen e))
+  (ui-event-fold (event m textrows columns rows)
+    (if (apprun-current? m (apprun-output-event-gen event))
       (ed-append-follow m
         *run-buffer*
-        (str (apprun-output-event-text e) "\n")
-        cols
+        (str (apprun-output-event-text event) "\n")
+        columns
         rows
-        (apprun-output-event-spans e))
+        (apprun-output-event-spans event))
       m)))
 
 (impl UiEvent
   apprun-spy-event
-  (ui-event-fold (e m textrows cols rows)
-    (if (apprun-current? m (apprun-spy-event-gen e))
+  (ui-event-fold (event m textrows columns rows)
+    (if (apprun-current? m (apprun-spy-event-gen event))
       (ed-append-follow m
         *run-buffer*
         (str "~ "
-          (let (sp (apprun-spy-event-entry e))
-            (debugger/debugger-spy-body (get sp :kind)
-              (get sp :form)
-              (get sp :value)
-              (get sp :fn)
-              (get sp :args)))
+          (let (entry (apprun-spy-event-entry event))
+            (debugger/debugger-spy-body (get entry :kind)
+              (get entry :form)
+              (get entry :value)
+              (get entry :fn)
+              (get entry :args)))
           "\n")
-        cols
+        columns
         rows)
       m)))
 
@@ -195,30 +184,29 @@ dropped."
   ;; model-only: the statusbar chip renders the stats live and its hover carries the
   ;; detail (current + peak) — *Run* stays the app's OWN output, never the taps'.
   ;; Peaks make a leak/spawn-storm visible even if you look after it settled.
-  (ui-event-fold (e m textrows cols rows)
-    (if (not (apprun-current? m (apprun-stats-event-gen e)))
+  (ui-event-fold (event m textrows columns rows)
+    (if (not (apprun-current? m (apprun-stats-event-gen event)))
       m
-      (let (s (apprun-stats-event-stats e)
-            peak (map/get-in m [:apprun :peak] {}))
+      (let (stats (apprun-stats-event-stats event)
+            peak (map/get-in m [:apprun :peak] {})
+            higher (fn (key) (math/max (or (get stats key) 0) (or (get peak key) 0))))
         (update m
           :apprun assoc
-          :stats s
-          :peak {:procs (math/max (or (get s :procs) 0) (or (get peak :procs) 0))
-           :memory (math/max (or (get s :memory) 0) (or (get peak :memory) 0))
-           :reductions (math/max (or (get s :reductions) 0) (or (get peak :reductions) 0))})))))
+          :stats stats
+          :peak {:procs (higher :procs) :memory (higher :memory) :reductions (higher :reductions)})))))
 
 (impl UiEvent
   apprun-done-event
   ;; drop :apprun so the statusbar chip disappears with the app. A stale-gen done
   ;; (an old run exiting just as a new one starts) must NOT clear the new run's chip.
-  (ui-event-fold (e m textrows cols rows)
-    (if (not (apprun-current? m (apprun-done-event-gen e)))
+  (ui-event-fold (event m textrows columns rows)
+    (if (not (apprun-current? m (apprun-done-event-gen event)))
       m
-      (let (code (apprun-done-event-code e))
+      (let (code (apprun-done-event-code event))
         (message (ed-append-follow (dissoc m :apprun)
                    *run-buffer*
                    (str "\n[app exited " (if (nil? code) "killed" code) "]\n")
-                   cols
+                   columns
                    rows)
           (str "app exited " (if (nil? code) "(killed)" code)))))))
 
@@ -243,13 +231,14 @@ Phoenix app wanting `mix phx.server` — is one edit there rather than a branch 
     (apprun-start-native m)))
 
 (defn- apprun-start-native (m)
+  ;; C-c r in a Brood project: the generated script under `nest run`, streamed into *Run*
   (let (run-breaks (or (:run-breaks m) '()))
     (file/spit *apprun-script-path* (apprun-script-source run-breaks))
     (let (root (or (:project-root m) (file/cwd))
           proc (spawn :apprun (procstream/procstream-loop (apprun-handlers)))
-          gen (inc (or (map/get-in m [:apprun :gen]) 0)))
-      (send proc [:run "nest" ["run" *apprun-script-path*] {:cwd root} gen (ed-loop-address)])
-      (ed-show-named-aside (message (assoc m :apprun {:root root :gen gen})
+          generation (inc (or (map/get-in m [:apprun :gen]) 0)))
+      (send proc [:run "nest" ["run" *apprun-script-path*] {:cwd root} generation (ed-loop-address)])
+      (ed-show-named-aside (message (assoc m :apprun {:root root :gen generation})
                              (str "running project in "
                                root
                                "…"
@@ -318,25 +307,25 @@ line). Clickability is the pointer/hover the view draws from `:line-loc`."
 ;; ---- the mode-line chip ------------------------------------------------------
 
 (defn- apprun-label (m)
-  "The app-run telemetry chip: `▶ 18p · 1.0 MB · 12s` while a C-c r app runs (procs ·
-memory · uptime, live per heartbeat), `▶ running` before the first reading, `\"\"`
+  "The app-run telemetry chip: `▶ 18p · 2.1M reds · 12s` while a C-c r app runs (procs ·
+reductions · uptime, live per heartbeat), `▶ running` before the first reading, `\"\"`
 when no app is running (`:apprun` is dropped on exit). Click opens *Run*."
   (if (nil? (:apprun m))
     ""
-    (let (s (map/get-in m [:apprun :stats]))
-      (if (nil? s)
+    (let (stats (map/get-in m [:apprun :stats]))
+      (if (nil? stats)
         "▶ running"
         (str "▶ "
-          (:procs s)
+          (:procs stats)
           "p · "
-          (ed-reds-human (or (:reductions s) 0))
+          (ed-reds-human (or (:reductions stats) 0))
           " reds"
           " · "
-          (math/quot (or (:uptime-ms s) 0) 1000)
+          (math/quot (or (:uptime-ms stats) 0) 1000)
           "s")))))
 
-(defn apprun-segment (m pane buf)
-  "The live app-run chip (C-c r): procs + memory, refreshed by the heartbeat; click opens
+(defn apprun-segment (m pane buffer)
+  "The live app-run chip (C-c r): procs + reductions, refreshed by the heartbeat; click opens
 *Run*. Present only while an app runs (`:apprun` is dropped on exit)."
   (statusbar/seg :apprun
     (apprun-label m)
@@ -344,20 +333,20 @@ when no app is running (`:apprun` is dropped on exit). Click opens *Run*."
      :face {:fg *teal*}
      :on-click 'apprun/cmd-run-show
      :tooltip (fn (mm)
-                (let (s (map/get-in mm [:apprun :stats])
-                      p (map/get-in mm [:apprun :peak]))
+                (let (stats (map/get-in mm [:apprun :stats])
+                      peak (map/get-in mm [:apprun :peak]))
                   [(str "app running · "
-                     (:procs s)
+                     (:procs stats)
                      " procs · "
-                     (ed-reds-human (or (:reductions s) 0))
+                     (ed-reds-human (or (:reductions stats) 0))
                      " reductions · up "
-                     (math/quot (or (:uptime-ms s) 0) 1000)
+                     (math/quot (or (:uptime-ms stats) 0) 1000)
                      "s")
-                    (str "memory " (humanize/byte-size (or (:memory s) 0)) " (at last receive)")
+                    (str "memory " (humanize/byte-size (or (:memory stats) 0)) " (at last receive)")
                     (str "peak "
-                      (or (:procs p) 0)
+                      (or (:procs peak) 0)
                       " procs · "
-                      (ed-reds-human (or (:reductions p) 0))
+                      (ed-reds-human (or (:reductions peak) 0))
                       " reds")
                     "click for *Run*"]))}))
 
