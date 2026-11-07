@@ -12,18 +12,16 @@ The subprocess runs a generated Brood script (`testrun-script-source`, written t
 in the worker as it finishes — that prints one JSON object per line, then the
 `run-tests-structured` summary map. (A defdyn seam, added for exactly this: the
 runner fns ship in the binary, so ADR-166 reserves their names against advice.)
-The editor side is compile.blsp's proven shape: the shared
-`procstream` worker owns the proc handle and line-buffers stdout; testrun supplies
-the handlers that JSON-decode each line and forward `UiEvent` records the loop folds
-into `*Tests*` — pass/fail rows stream in live, failures carry `file:line:col`, and
-RET/click jumps to them (the shared location-jump layer).
+The editor side: the shared `procstream` worker owns the proc handle and line-buffers
+stdout, each line goes to the loop RAW (`test-line-event`), and the fold decodes it with the
+run's `testadapter` — pass/fail rows stream into `*Tests*` live, failures carry
+`file:line:col`, and RET/click jumps to them (the shared location-jump layer).
 
 Test prints from the suite itself interleave with the JSON on stdout; anything that
 doesn't parse as a tagged object is forwarded verbatim (`test-output-event`), so a
 suite's own output is visible rather than lost."
   (:use editor/buffer) ; buffer-file / buffer-rope / buffer-line-count — the marks + jump
   (:use model) ; UiEvent + message / ed-append-named / ed-buf-at
-  (:use interactive) ; defcommand
   (:use pool) ; ed-show-named / ed-find-file / ed-goto-line
   (:use results)) ; ed-append-follow / loc-at-line / default-line-loc — the results-buffer abstraction
 (def *tests-buffer* "*Tests*")
@@ -105,17 +103,10 @@ suite's own output is visible rather than lost."
 worker delivers it to the loop that started the run): every stdout line is
 forwarded RAW, stderr as plain output, the exit as the done event.
 
-Decoding used to happen here, in the worker, because Brood's runner emits one
-self-contained JSON object per line and a stateless fn could classify it. ExUnit
-cannot be read that way — a test's verdict arrives after its line — so the decoder
-needs state, and these handlers are plain fns captured at spawn with nowhere to keep
-any. The state lives in the model instead, which is where a TEA program keeps state,
-and both runners now take the same route: raw line in, `testadapter` events out.
-
-The line comes from procstream already ANSI-decoded — ExUnit colours its verdicts, and
-an escape split across two reads used to land in *Tests* as `1mERROR` — and *Tests*
-keeps the text alone: its own `:fontify` colours a row by what it says, so the
-program's colour spans are dropped here."
+Decoding is not done here: an adapter may need state (ExUnit's verdict arrives after its
+line), and these handlers are plain fns captured at spawn with nowhere to keep any — the
+decoder state rides on the model instead. The line arrives already ANSI-decoded, and its
+colour spans are dropped: *Tests*' own `:fontify` colours a row by what it says."
   {:on-line testrun-line-handler :on-err-line testrun-output-handler :on-done test-done-event})
 
 (defn- testrun-line-handler (line spans generation)
@@ -132,7 +123,7 @@ run's verdicts replace the last run's."
   (assoc m
     :buffers
       (into []
-        (map (:buffers m) (fn (buf) (dissoc buf :test-marks :describe-marks :line-links))))))
+        (map (:buffers m) (fn (buffer) (dissoc buffer :test-marks :describe-marks :line-links))))))
 
 (defn- testrun-brood-invocation (script)
   "`[prog argv adapter-id env]` that runs the generated Brood runner `script`: `nest run`,
@@ -195,13 +186,9 @@ first decoded line does not."
       :test-menu)))
 
 (defn tests-header (label mode)
-  "The `*Tests*` banner: what was run, and by WHICH runner.
-
-Saying which is not decoration. The two runners differ in ways a reader has to be able to
-account for — one starts a runtime and one reuses a session — and when the warm one was
-silently testing the code it booted with, the only symptom was a verdict that disagreed
-with the file on screen, with nothing anywhere to suggest where to look. A word in the
-banner is the cheapest possible answer to \"which of these am I reading?\"."
+  "The `*Tests*` banner: what was run, and by WHICH runner (`mode`) — a cold run starts a
+runtime and a warm one reuses a session, and a reader accounting for a surprising verdict
+needs to know which."
   (str "-*- tests: " label (if mode (str "  ·  " mode) "") " -*-\n\n"))
 
 ;; ---- rendering + folds ----------------------------------------------------------
@@ -261,14 +248,14 @@ moves every offset before the end."
     (if (nil? loc)
       appended
       (let (index (ed-buffer-index-by-name! appended *tests-buffer*) ; `ed-append-follow` just made it
-            tests-buf (ed-buf-at appended index)
-            landed (text/char->line (buffer-rope tests-buf)
-                     (math/max 0 (- (buffer-length tests-buf) (string/length row)))))
+            tests-buffer (ed-buf-at appended index)
+            landed (text/char->line (buffer-rope tests-buffer)
+                     (math/max 0 (- (buffer-length tests-buffer) (string/length row)))))
         (update appended
           :buffers assoc
           index
-          (assoc tests-buf
-            :line-links (assoc (or (:line-links tests-buf) {}) (math/max 0 landed) loc)))))))
+          (assoc tests-buffer
+            :line-links (assoc (or (:line-links tests-buffer) {}) (math/max 0 landed) loc)))))))
 
 (defn testrun-result-lines (result)
   "The *Tests* lines for one finished test: an indented ✓/✗ row under its describe
@@ -297,7 +284,7 @@ file), or nil — matched at a path-component boundary."
                (when (and file (testrun-path-suffix? file relpath)) index))))))
 
 (sig testrun-test-head-line (buffer int -> int))
-(defn- testrun-test-head-line (buf line0)
+(defn- testrun-test-head-line (buffer line0)
   "The 0-based `(test …)` head line at or above `line0` — the framework's `:where`
 points at the test's FIRST BODY FORM (its position varies with formatting: the line
 below the head, or the same line for a one-liner), so the ✓/✗ mark resolves upward
@@ -305,30 +292,30 @@ to the `(test`/`(describe` head it belongs to."
   (cond
     (< line0 0) line0
     else
-      (let (trimmed (string/triml (buffer-line-at buf line0)))
+      (let (trimmed (string/triml (buffer-line-at buffer line0)))
         (if (or (string/starts-with? trimmed "(test ")
               (string/starts-with? trimmed "(test\"")
               (string/starts-with? trimmed "(describe"))
           line0
-          (testrun-test-head-line buf (dec line0))))))
+          (testrun-test-head-line buffer (dec line0))))))
 
 (sig testrun-describe-head-line (buffer int -> (or nil int)))
-(defn- testrun-describe-head-line (buf line0)
+(defn- testrun-describe-head-line (buffer line0)
   "The 0-based `(describe …)` head at or above `line0`, or nil — the enclosing block
 of the test at `line0`."
   (cond
     (< line0 0) nil
-    (string/starts-with? (string/triml (buffer-line-at buf line0)) "(describe") line0
-    else (testrun-describe-head-line buf (dec line0))))
+    (string/starts-with? (string/triml (buffer-line-at buffer line0)) "(describe") line0
+    else (testrun-describe-head-line buffer (dec line0))))
 
-(defn- testrun-describe-test-total (buf describe-line)
+(defn- testrun-describe-test-total (buffer describe-line)
   "How many `(test …)` forms sit syntactically under the describe at `describe-line`
 — counted from its body to the next top-level form (a `(` at column 0). Lets the
 rollup tell 'all ran' from 'some ran' (a line-filtered single-test run)."
   (letrec (go (fn (line found)
-                (if (>= line (buffer-line-count buf))
+                (if (>= line (buffer-line-count buffer))
                   found
-                  (let (raw (buffer-line-at buf line)
+                  (let (raw (buffer-line-at buffer line)
                         trimmed (string/triml raw))
                     (cond
                       (string/starts-with? raw "(") found ; the next top-level form ends the block
@@ -338,14 +325,14 @@ rollup tell 'all ran' from 'some ran' (a line-filtered single-test run)."
                       else (go (inc line) found))))))
     (go (inc describe-line) 0)))
 
-(defn- testrun-bump-describe (buf describe-line verdict)
+(defn- testrun-bump-describe (buffer describe-line verdict)
   "Accumulate one child verdict into the describe's rollup tally (`:describe-marks
 {line {:pass :fail :skip :total}}`) — `:total` computed once from the buffer."
-  (let (marks (or (editor/buffer/annotation-value buf :describe-marks) {})
+  (let (marks (or (editor/buffer/annotation-value buffer :describe-marks) {})
         tally (or (get marks describe-line)
-                {:pass 0 :fail 0 :skip 0 :total (testrun-describe-test-total buf describe-line)})
+                {:pass 0 :fail 0 :skip 0 :total (testrun-describe-test-total buffer describe-line)})
         slot (cond (= verdict :skipped) :skip verdict :pass else :fail))
-    (editor/buffer/annotate buf :describe-marks (assoc marks describe-line (update tally slot inc)))))
+    (editor/buffer/annotate buffer :describe-marks (assoc marks describe-line (update tally slot inc)))))
 
 (defn- testrun-annotate (m result)
   "Stamp a finished test's verdict into its buffer's margin (`:test-marks
@@ -355,17 +342,13 @@ points at the first body form) AND rolled up onto the enclosing `(describe …)`
 (`:describe-marks` — ✓ all-pass, a mixed icon on any failure, a partial icon when
 only some of the describe's tests ran). Dimmed by the gutter once the buffer is
 edited. A test with no recorded position, or whose file isn't open, marks nothing."
-  (let (where (or (get result :where) ""))
-    (if (= where "")
-      m
-      (let (parts (string/split where ":")
-            line (string/->number (last parts))
-            relpath (string/join (take parts (dec (count parts))) ":")
-            index (when (int? line) (testrun-buffer-for m relpath)))
-        ;; `index` is only set when `line` parsed, but that implication crosses two
-        ;; bindings — test both, so the `(dec line)` below reads as guarded where it is.
-        (if (and (int? line) index)
-          (let (buf (ed-buf-at m index)
+  (let (loc (testrun-where->loc (get result :where))
+        line (:line loc)
+        index (when loc (testrun-buffer-for m (:file loc))))
+    ;; `index` is only set when `line` parsed, but that implication crosses two bindings —
+    ;; test both, so the `(dec line)` below reads as guarded where it is
+    (if (and (int? line) index)
+          (let (buffer (ed-buf-at m index)
                 ;; Where the mark goes depends on what the runner's line MEANS. Brood
                 ;; reports the first body form, so resolve upward to the `(test …)`
                 ;; head; ExUnit reports the declaration line itself, and resolving
@@ -376,19 +359,19 @@ edited. A test with no recorded position, or whose file isn't open, marks nothin
                                                                                      [:testrun
                                                                                        :adapter-id]))))
                        (math/max 0 (dec line))
-                       (math/max 0 (testrun-test-head-line buf (dec line))))
+                       (math/max 0 (testrun-test-head-line buffer (dec line))))
                 verdict (cond (get result :skipped) :skipped (get result :passed) true else false)
-                describe-line (testrun-describe-head-line buf head)
+                describe-line (testrun-describe-head-line buffer head)
                 ;; one annotation, stamped with the text it describes (std's
                 ;; `annotate` owns the currency/staleness pairing)
-                marked (editor/buffer/annotate buf
-                         :test-marks (assoc (or (editor/buffer/annotation-value buf :test-marks) {})
+                marked (editor/buffer/annotate buffer
+                         :test-marks (assoc (or (editor/buffer/annotation-value buffer :test-marks) {})
                            head verdict))
                 rolled-up (if (nil? describe-line)
                             marked
                             (testrun-bump-describe marked describe-line verdict)))
             (update m :buffers assoc index rolled-up))
-          m)))))
+          m)))
 
 (defn- testrun-current? (m generation)
   "Whether `generation` is the run the model is currently showing — a straggler from a
@@ -431,6 +414,8 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
       (testrun-apply-result m (test-result-event-result event) columns rows))))
 
 (defn testrun-apply-summary (m summary columns rows)
+  "Append a run's `summary` (`{:total :passed :failed :ms}`) to *Tests* and say it in the echo
+area."
   (let (line (str "\n"
                (get summary :total)
                " tests, "
@@ -473,6 +458,8 @@ superseded run (rapid re-runs) is dropped so it can't corrupt the fresh report."
 ;; whether it passed.
 
 (defn testrun-apply-event (m event columns rows)
+  "Apply one decoded `event` (`[:test result]`, `[:summary map]`, `[:spy entry]`, `[:output
+text]`) to the run — what a `testadapter` yields and a warm session's replies carry."
   (case (first event)
     :test (testrun-apply-result m (second event) columns rows)
     :summary (testrun-apply-summary m (second event) columns rows)
@@ -535,6 +522,6 @@ finishes however it does (`testrun-finished`)."
 (register-exit-query :testrun 'testrun-cold/testrun-live)
 
 (defn testrun-root (m)
-  ;; The project (`projects/root-of`), else the cwd itself: a run outside any project
-  ;; still runs somewhere rather than nowhere.
+  "Where a test run runs: the project (`projects/root-of`), else the cwd itself — a run
+outside any project still runs somewhere rather than nowhere."
   (or (projects/root-of m) (file/cwd)))
