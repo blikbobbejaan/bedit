@@ -939,6 +939,9 @@ src/codefold.blsp           code folding, Emacs's hideshow (C-c @): every `defla
                             `:brackets` node from its own; the closing line stays), a Lisp folds the
                             form opening on a line; over `folds`, Org's mechanism
 src/foldview.blsp           a folded line ends in ` …` (a `:with-text` pane layer)
+src/projectdiag.blsp        C-x p !: every warning and error in the project — open buffers' findings and
+                            what the language servers published for files not open — errors first;
+                            RET visits, `a` asks the server for the fixes there (code actions)
 src/searchedit.blsp         editable search results (wgrep): C-c C-p in *Project Search* opens each
                             row's text (the `file:line:` stays read-only — `narrow-to`), C-c C-c
                             writes the changed rows to their files' buffers (a line changed since

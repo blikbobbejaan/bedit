@@ -1,0 +1,136 @@
+(defmodule projectdiag
+  "Every warning and error in the PROJECT (Emacs's `flymake-show-project-diagnostics`): C-x p !
+lists them in `*Project Diagnostics*`, file by file, errors first. RET visits a finding; `a`
+(or C-c C-a) visits it and asks its language server for the fixes there (the code actions,
+C-c C-a's list); `g` lists them again.
+
+The findings are the ones bedit already holds — no checker runs for this: each open buffer's
+(the Brood checker's and its servers', `results/diagnostic-lines`, the margin's reader) and
+whatever a language server published for a file that is not open (`lsp-servers`'
+`:lsp-diags`; rust-analyzer, gopls and pyright report the whole workspace)."
+  (:use modes :only []) ; register-special-type runs at load, after modes declares its kinds
+  (:use editor/buffer) ; buffer-file / buffer-name
+  (:use editor/keymap :only [keymap-bind]) ; the list's keys
+  (:use interactive) ; defcommand
+  (:use model) ; ed-current-buf / message / ed-buf-at
+  (:use pool :only [ed-project-root ed-show-named])) ; the project, the list buffer
+
+(def *buffer-name* "*Project Diagnostics*")
+
+;; ---- what is known, file by file ---------------------------------------------------
+
+(defn- buffer-findings (buffer)
+  ;; `[line0 diagnostic]`s an open buffer carries, in reading order
+  (diagnostics/findings buffer))
+
+(defn- published-findings (m path)
+  ;; `[line0 diagnostic]`s the servers published for `path` (a file that is not open)
+  (seq/sort-by (seq/keep (lsp-servers/ed-lsp-merged-diags m path)
+                 (fn (diagnostic)
+                   (let (line (diagstore/ed-diag-line0 diagnostic)) (when line [line diagnostic]))))
+    (fn ([line diagnostic]) [line (or (:col diagnostic) 0)])))
+
+(defn project-findings (m root)
+  "`{path [[line0 diagnostic] …]}` for every file under `root` with a finding: open files from
+their buffers, the rest from what the language servers published."
+  (let (open (fold (range 0 (count (:buffers m)))
+               {}
+               (fn (acc index)
+                 (let (buffer (ed-buf-at m index)
+                       path (buffer-file buffer)
+                       found (when (and path (projects/path-within? path root))
+                               (buffer-findings buffer)))
+                   (if (empty? found) acc (assoc acc path found)))))
+        published (fold (keys (or (:lsp-diags m) {}))
+                    {}
+                    (fn (acc path)
+                      (if (or (contains? open path) (not (projects/path-within? path root)))
+                        acc
+                        (let (found (published-findings m path))
+                          (if (empty? found) acc (assoc acc path found)))))))
+    (merge published open)))
+
+(defn- error-count (found)
+  (count (seq/filter found (fn ([_ diagnostic]) (results/diagnostic-error? diagnostic)))))
+
+(defn- ordered-paths (findings)
+  ;; files with errors first, then by path
+  (seq/sort-by (keys findings)
+    (fn (path) [(if (> (error-count (get findings path)) 0) 0 1) path])))
+
+;; ---- the list -------------------------------------------------------------------
+
+(defn report (m root)
+  "`[text links]`: the list's text — a header, then each file's path over its findings' rows
+(`diagnostics/rows-for`) — and the row→location map (`:line-links`, `{:file :line :col}`) every
+row of a finding links through, continuation rows included."
+  (let (findings (project-findings m root)
+        total (fold (vals findings) 0 (fn (sum found) (+ sum (count found))))
+        header (if (= total 0)
+                 (str "no diagnostics in " root)
+                 (str (ed-count-noun total "diagnostic")
+                   " in "
+                   (ed-count-noun (count findings) "file")
+                   " under "
+                   root))
+        [lines links] (fold (ordered-paths findings)
+                        [[header ""] {}]
+                        (fn ([lines links] path)
+                          (fold (get findings path)
+                            [(conj lines (projects/project-relative root path)) links]
+                            (fn ([lines links] [line diagnostic])
+                              (let (rows (diagnostics/rows-for line diagnostic)
+                                    location {:file path
+                                              :line (diagstore/ed-diag-line1 line)
+                                              :col (or (:col diagnostic) 0)})
+                                [(into lines rows)
+                                  (fold (range (count rows))
+                                    links
+                                    (fn (acc offset) (assoc acc (+ (count lines) offset) location)))]))))))
+    [(string/join lines "\n") links]))
+
+(defn- show (m root)
+  ;; `*Project Diagnostics*` for `root`, filled in from what is known now
+  (let ([text links] (report m root)
+        shown (ed-show-named m *buffer-name* text :project-diagnostics))
+    (ed-set-buf shown (assoc (ed-current-buf shown) :line-links links :dir root :project-root root))))
+
+(defcommand cmd-project-diagnostics
+  (m key)
+  "List every warning and error in the project (C-x p !): open files' findings and what the
+language servers published for the rest, errors first. RET visits one, `a` asks for its fixes,
+`g` lists them again."
+  (let (root (ed-project-root m))
+    (if (nil? root)
+      (message m "not in a project")
+      (let (shown (show m root)
+            total (count (:line-links (ed-current-buf shown))))
+        (if (= total 0) (message shown "no diagnostics in the project") shown)))))
+
+(defcommand cmd-project-diagnostics-refresh
+  (m key)
+  "List the project's diagnostics again (`g` in *Project Diagnostics*)."
+  (let (root (:project-root (ed-current-buf m)))
+    (if (nil? root) (cmd-project-diagnostics m key) (show m root))))
+
+(defcommand cmd-project-diagnostics-fix
+  (m key)
+  "Visit the finding on this row and ask its language server for the fixes there (`a` or C-c
+C-a in *Project Diagnostics*) — the code actions C-c C-a offers in the file itself."
+  (let (location (results/line-links-loc (ed-current-buf m)
+                   (buffer-current-line (ed-current-buf m))))
+    (if (nil? location)
+      (ed-ding (message m "not on a finding"))
+      (lsp-commands/cmd-lsp-code-action (commands/cmd-visit-location m :enter) nil))))
+
+(def project-diagnostics-layer
+  {:name 'project-diagnostics
+   :doc "Every warning and error in the project — RET visits one, a asks for its fixes, g lists them again."
+   :line-loc 'results/line-links-loc
+   :keymap (-> {}
+             (keymap-bind ["a"] 'projectdiag/cmd-project-diagnostics-fix)
+             (keymap-bind [:ctrl-c :ctrl-a] 'projectdiag/cmd-project-diagnostics-fix)
+             (keymap-bind ["g"] 'projectdiag/cmd-project-diagnostics-refresh))})
+
+(modes/register-special-type :project-diagnostics
+  'projectdiag/project-diagnostics-layer 'results/location-jump-layer)
