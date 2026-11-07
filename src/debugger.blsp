@@ -70,6 +70,12 @@ keys snapshots by pid and the *Debug* rows carry stable indices per render."
 (defn- debugger-entry (pid entry)
   {:pid pid :entry entry})
 
+(defn- debugger-span-enter (pid label)
+  (debugger-entry pid {:spy :span-enter :label label}))
+
+(defn- debugger-span-exit (pid value)
+  (debugger-entry pid {:spy :span-exit :value value}))
+
 (defn- debugger-flush (editor pending)
   "Send the gathered trace batch (stored newest-first) to the editor, oldest first."
   (when (not (empty? pending))
@@ -86,15 +92,12 @@ keys snapshots by pid and the *Debug* rows carry stable indices per render."
         ([:trace entry from] (debugger-gather editor
                                (cons (debugger-entry from entry) pending)
                                deadline))
-        ([:span-enter span parent pid label] (debugger-gather editor
-                                               (cons (debugger-entry pid
-                                                       {:spy :span-enter :label label})
-                                                 pending)
-                                               deadline))
-        ([:span-exit span pid value] (debugger-gather editor
-                                       (cons (debugger-entry pid {:spy :span-exit :value value})
-                                         pending)
+        ([:span-enter _ _ pid label] (debugger-gather editor
+                                       (cons (debugger-span-enter pid label) pending)
                                        deadline))
+        ([:span-exit _ pid value] (debugger-gather editor
+                                    (cons (debugger-span-exit pid value) pending)
+                                    deadline))
         ([:break pid snap] (do
                              (debugger-flush editor pending)
                              (send editor (debug-break-event pid snap))
@@ -105,19 +108,16 @@ keys snapshots by pid and the *Debug* rows carry stable indices per render."
             (debugger-flush editor pending)
             (debugger-loop editor)))))))
 
+(defn- debugger-start-batch (editor item)
+  ;; The first trace item after a quiet spell opens a batch, flushed `*spy-flush-ms*` on.
+  (debugger-gather editor (list item) (+ (os/now) *spy-flush-ms*)))
+
 (defn- debugger-loop (editor)
   "The quiet state: park (cheaply, forever) until debug traffic arrives."
   (receive
-    ([:trace entry from] (debugger-gather editor
-                           (list (debugger-entry from entry))
-                           (+ (os/now) *spy-flush-ms*)))
-    ([:span-enter span parent pid label] (debugger-gather editor
-                                           (list (debugger-entry pid
-                                                   {:spy :span-enter :label label}))
-                                           (+ (os/now) *spy-flush-ms*)))
-    ([:span-exit span pid value] (debugger-gather editor
-                                   (list (debugger-entry pid {:spy :span-exit :value value}))
-                                   (+ (os/now) *spy-flush-ms*)))
+    ([:trace entry from] (debugger-start-batch editor (debugger-entry from entry)))
+    ([:span-enter _ _ pid label] (debugger-start-batch editor (debugger-span-enter pid label)))
+    ([:span-exit _ pid value] (debugger-start-batch editor (debugger-span-exit pid value)))
     ([:break pid snap] (do (send editor (debug-break-event pid snap)) (debugger-loop editor)))
     ([:stop] :debugger-stopped)))
 
@@ -333,9 +333,9 @@ reserved std/prelude names are refused by ADR-166 and reported in the echo area.
     :minibuffer
       (ed-name-prompt prompt
         (sort (map (reflect/global-names) str))
-        (fn (mm nm)
+        (fn (mm typed)
           (try
-            (apply-fn mm (reflect/read-string nm))
+            (apply-fn mm (reflect/read-string typed))
             (catch e (message mm (str "debug: " (error-message e)))))))))
 
 (defcommand cmd-debug-trace-fn
@@ -367,14 +367,14 @@ Completes over BOTH registries (std's traces + our breakpoints)."
         :minibuffer
           (ed-name-prompt "Remove instrumentation: "
             (sort names)
-            (fn (mm nm)
-              (let (sym (reflect/read-string nm))
+            (fn (mm typed)
+              (let (sym (reflect/read-string typed))
                 (if (includes? (debugger-breakpoints) sym)
                   (debugger-clear-breakpoint (debugger-rerender mm) sym)
                   (do
                     (debug/untrace-fn sym)
                     (message (debugger-remark (debugger-rerender mm))
-                      (str "untraced " nm)))))))))))
+                      (str "untraced " typed)))))))))))
 
 (defcommand cmd-debug-untrace-all
   (m key)
@@ -465,22 +465,22 @@ the result; errors echo instead of throwing."
 (defn debugger-defn-name (line-text)
   "The name a top-level definition line defines — `(defn NAME`, `(defcommand NAME` —
 or nil for any other line."
-  (let (t (string/trimr line-text)
+  (let (trimmed (string/trimr line-text)
         head (cond
-               (string/starts-with? t "(defn ") 6
-               (string/starts-with? t "(defcommand ") 12
+               (string/starts-with? trimmed "(defn ") 6
+               (string/starts-with? trimmed "(defcommand ") 12
                else nil))
     (when head
-      (let (rest-text (string/triml (string/substring t head (string/length t)))
-            nm (first (string/split rest-text " ")))
-        (when (and nm (> (string/length nm) 0)) (string/trimr (first (string/split nm ")"))))))))
+      (let (rest-text (string/triml (string/substring trimmed head (string/length trimmed)))
+            word (first (string/split rest-text " ")))
+        (when (and word (> (string/length word) 0)) (string/trimr (first (string/split word ")"))))))))
 
 (defn debugger-buffer-module (text)
   "The `(defmodule NAME …)` name in `text` (a buffer's source), as a string, or nil."
   (let (hits (seq/keep (string/split text "\n")
-               (fn (l)
-                 (when (string/starts-with? l "(defmodule ")
-                   (first (string/split (string/substring l 11 (string/length l)) " "))))))
+               (fn (line)
+                 (when (string/starts-with? line "(defmodule ")
+                   (first (string/split (string/substring line 11 (string/length line)) " "))))))
     (when (not (empty? hits)) (string/trimr (first (string/split (or (first hits) "") ")"))))))
 
 (sig debugger-head-at
@@ -489,10 +489,8 @@ or nil for any other line."
   "The nearest TOP-LEVEL `(def…)` head at or above `line`: `{:kind :fn :line N}` for a
 defn/defcommand (breakpointable), `{:kind :other :line N :word head-word}` for any other definition
 form (defmacro/defrecord/defability/… — no fn boundary to break on; walking PAST it
-would silently retarget the previous defn), nil above everything. NAMED fields, not a
-positional tuple: a caller reading `(:line head)` gets an int, where `(second head)` on a
-heterogeneous tuple reads as `some element of it` — keyword, int or string — and any
-arithmetic on the result was then a checker finding. Test scaffolding
+would silently retarget the previous defn), nil above everything. Named fields rather
+than a tuple, so `(:line head)` reads as an int to the checker. Test scaffolding
 (describe/test) is body content and is skipped."
   (cond
     (< line 0) nil
@@ -522,9 +520,9 @@ qualify to root and could shadow-instrument a prelude/root binding of the same n
 (a different function than the one clicked), so we refuse it rather than guess."
   (let (head (debugger-defn-line-at buf line))
     (when head
-      (let (nm (debugger-defn-name (buffer-line-at buf head))
+      (let (defined (debugger-defn-name (buffer-line-at buf head))
             module (debugger-buffer-module (buffer-text buf)))
-        (when module (reflect/read-string (str module "/" nm)))))))
+        (when module (reflect/read-string (str module "/" defined)))))))
 
 (def *breakpoint-originals* {})
 ;; sym -> {:orig the original fn value, :wrapper the parking fn we bound in its place}. The editor's OWN breakpoint registry (std's
@@ -587,9 +585,10 @@ undid that edit; a redefined function simply keeps its new definition."
     (fold (range (count lines))
       {}
       (fn (acc i)
-        (let (nm (debugger-defn-name (nth lines i "")))
-          (if (and nm
-                (includes? break-syms (reflect/read-string (if module (str module "/" nm) nm))))
+        (let (defined (debugger-defn-name (nth lines i "")))
+          (if (and defined
+                (includes? break-syms
+                  (reflect/read-string (if module (str module "/" defined) defined))))
             (assoc acc i true)
             acc))))))
 
@@ -636,11 +635,11 @@ on each so their calls stream into *Run*."
 (defn- debugger-toggle-run-break (m sym)
   "Toggle `sym` as a run breakpoint (the project's own code, debugged when run). No
 in-image instrumentation — it's applied by the next `C-c r` (apprun traces it)."
-  (let (cur (debugger-run-breaks m))
-    (if (includes? cur sym)
-      (message (debugger-remark (assoc m :run-breaks (seq/reject cur (fn (x) (= x sym)))))
+  (let (marked (debugger-run-breaks m))
+    (if (includes? marked sym)
+      (message (debugger-remark (assoc m :run-breaks (seq/reject marked (fn (other) (= other sym)))))
         (str "run breakpoint removed: " sym))
-      (message (debugger-remark (assoc m :run-breaks (cons sym cur)))
+      (message (debugger-remark (assoc m :run-breaks (cons sym marked)))
         (str "breakpoint on " sym " — its calls stream to *Run* when you run the project (C-c r)")))))
 
 (defn- debugger-set-breakpoint (m sym file)
