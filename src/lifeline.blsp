@@ -18,7 +18,7 @@ is `main`'s, handed in as functions."
   (:use editor/buffer-file) ; file-text-decode
   (:use editor/buffer-server) ; buffer-sync
   (:use editor/buffer-registry) ; registry-entries
-  (:use sidecar)) ; ed-auto-save-path
+  (:use sidecar)) ; write-sidecar
 
 (def *restart-max* 3)
 (def *restart-window-ms* 60000)
@@ -45,16 +45,16 @@ without Unix signals has nothing to route, and answers an empty map."
   (case sig :hup 129 :int 130 143))
 
 (defn- unsaved-text (entry)
-  "`[path text user]` (`user` nil unless it is edited through sudo) for registry `entry` when it is a file buffer MODIFIED since it was read
+  "`[path text user]` for registry `entry` when it is a file buffer MODIFIED since it was read
 or saved (the buffer's own mark, which a save sets on the process too) whose text its file
 does not hold, else nil. An unmodified buffer never counts: a file it cannot read — a root
 file looked at through sudo, /etc/shadow — is not taken as missing and its text copied to a
 sidecar. Read from the buffer process with a timeout, so a process that died too is skipped,
-not waited on."
+not waited on. `user` is who the file is edited as through sudo, nil for yourself."
   (let (path (:file (or (:meta entry) {})))
     (when path
       (let (snapshot (buffer-sync (:proc entry)
-                       (fn (buf) [(buffer-modified? buf) (buffer-text buf)])
+                       (fn (buffer) [(buffer-modified? buffer) (buffer-text buffer)])
                        1000))
         (when (and (vector? snapshot) (vector? (second snapshot)))
           (let ([modified? text] (second snapshot)
@@ -83,20 +83,25 @@ written is logged and the rest still are."
                 (let ([path text user] unsaved)
                   (check-allow :discarded-catch
                     (try
-                      (do
-                        ;; a file edited as another user keeps its sidecar private (autosave)
-                        (file/spit-private (if user
-                                             (ensure-private-sidecar path user)
-                                             (ed-auto-save-path path))
-                          text)
-                        path)
-                      (catch e
+                      ;; a file edited as another user keeps its sidecar private
+                      (do (write-sidecar path user text) path)
+                      (catch failure
                         (do
                           (log/warn (str "emergency auto-save of "
                                       path
                                       " failed: "
-                                      (error-message e)))
+                                      (error-message failure)))
                           nil)))))))))))))
+
+(defn saved-note (saved)
+  "What a death or a signal says of the sidecars [[emergency-save!]] wrote, `saved` its paths.
+
+    (lifeline/saved-note [])   ;=> \"auto-saved 0 unsaved file(s)\"
+    (lifeline/saved-note [\"/a\" \"/b\"])   ;=> \"auto-saved 2 unsaved file(s): /a, /b\""
+  (str "auto-saved "
+    (count saved)
+    " unsaved file(s)"
+    (if (empty? saved) "" (str ": " (string/join saved ", ")))))
 
 (defn restart-allowed? (deaths now)
   "Whether a loop that died at `now` may be started again, given the times of the earlier
@@ -126,21 +131,28 @@ its last frame, and its input would go to a mailbox nobody reads."
   (when (and window (gui/available?))
     (check-allow :discarded-catch (try (gui/close window) (catch e nil)))))
 
+(defn- save-announced (state)
+  "The sidecars of the registry a loop announced (`state`, [[announce!]]) written
+([[emergency-save!]]): their paths — none when it announced no registry."
+  (let (registry (:registry state)) (if (nil? registry) [] (emergency-save! registry))))
+
+(defn- on-fatal-signal (child on-death state sig)
+  "The runtime was told to end by `sig` (a logout, a `kill`): this process holds the signal so
+a loop stuck in a turn cannot lose the text. The sidecars are written, the loop ended — not
+waited for — and its window closed. `[:signal sig]`."
+  (let (saved (save-announced state))
+    (do
+      (exit child :kill)
+      (close-window! (:window state))
+      (when on-death (on-death {:signal sig :saved saved :restarting? false}))
+      [:signal sig])))
+
 (defn- watch (supervisor restart on-death child state deaths)
   "The supervisor's loop over one child: take its announcement, and on its death save,
 close, and restart it or stop (see [[supervise]])."
   (receive
     ([:lifeline/loop ^child announced] (watch supervisor restart on-death child announced deaths))
-    ;; the runtime was told to end (a logout, a `kill`): this process holds the signal so a
-    ;; loop stuck in a turn cannot lose the text; the loop is ended, not waited for
-    ([:signal sig] (let (registry (:registry state)
-                         saved (if (nil? registry) [] (emergency-save! registry)))
-                     (do
-                       (exit child :kill)
-                       (close-window! (:window state))
-                       (when on-death
-                         (on-death {:signal sig :saved saved :restarting? false}))
-                       [:signal sig])))
+    ([:signal sig] (on-fatal-signal child on-death state sig))
     ;; the loop is ending for good (its terminal hung up): whatever ends it, no restart
     ([:lifeline/no-restart ^child] (watch supervisor
                                      restart
@@ -149,29 +161,26 @@ close, and restart it or stop (see [[supervise]])."
                                      (assoc state :no-restart true)
                                      deaths))
     ([:down _ ^child reason] (if (= reason :normal)
-                               :quit (let (now (os/now)
-                                     registry (:registry state)
-                                     saved (if (nil? registry) [] (emergency-save! registry))
-                                     restarting? (and (not (nil? registry))
-                                                   (not (:no-restart state))
-                                                   (restart-allowed? deaths now)))
-                                 (do
-                                   (close-window! (:window state))
-                                   (when on-death
-                                     (on-death {:reason reason
-                                                :saved saved
-                                                :restarting? restarting?}))
-                                   (if restarting?
-                                     (let (next (spawn (fn () (restart supervisor state))))
-                                       (do
-                                         (monitor next)
-                                         (watch supervisor
-                                           restart
-                                           on-death
-                                           next
-                                           state
-                                           (conj deaths now))))
-                                     :died)))))))
+                               :quit (on-loop-death supervisor restart on-death state deaths reason)))))
+
+(defn- on-loop-death (supervisor restart on-death state deaths reason)
+  "The loop died of `reason`: its sidecars written, its window closed, `on-death` told, and a
+fresh loop started over the announced registry when [[restart-allowed?]] — the supervisor
+watching on — else `:died`."
+  (let (now (os/now)
+        saved (save-announced state)
+        restarting? (and (not (nil? (:registry state)))
+                      (not (:no-restart state))
+                      (restart-allowed? deaths now)))
+    (do
+      (close-window! (:window state))
+      (when on-death (on-death {:reason reason :saved saved :restarting? restarting?}))
+      (if restarting?
+        (let (next (spawn (fn () (restart supervisor state))))
+          (do
+            (monitor next)
+            (watch supervisor restart on-death next state (conj deaths now))))
+        :died))))
 
 (defn supervise (start restart &optional (on-death nil))
   "Run the editor loop `(start supervisor)` in a child process and keep it running: when the
