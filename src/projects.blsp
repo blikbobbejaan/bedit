@@ -1,11 +1,11 @@
 (defmodule projects
   "Project awareness for the editor: find the **project root** (the nearest ancestor
-directory holding `project.blsp`) and list **every file under it** (recursively,
-skipping VCS/build dirs). Pure editor *policy* over the filesystem primitives
-(`cwd` / `dir?` / `list-dir` / `file-exists?` + `path-join` / `parent-directory`) — this is
-the editor's view of a project (find-file-in-project), distinct from the build tool's
-`std/project` (which loads/checks sources). Deliberately a different module name from
-std `project` to avoid the clash."
+directory holding a `*project-markers*` entry or a VCS checkout's top) and list **every file
+under it** (the VCS's list, else a bounded walk skipping VCS/build dirs) — the editor's view
+of a project (find-file-in-project), distinct from the build tool's `std/project` (which
+loads/checks sources), and named apart from it. Also the editor's persisted state under
+`editor-state-dir`: known projects, recent files and commands, per-project recency and
+frequency, bookmarks."
   (:use config-paths)) ; config-dir — the one config folder the editor's state/ lives under
 (defdyn *project-markers*
   ;; A directory is a project root if it holds any of these: a VCS checkout's top — so
@@ -22,8 +22,8 @@ std `project` to avoid the clash."
   ;; excluded: a `Makefile` describes what a directory can do, not that it is the top of
   ;; anything. Edit this list (or the toolchain table) to taste.
   (into [".git"]
-    (mapcat (seq/filter toolchain/*toolchains* (fn (tc) (not (= false (get tc :root?)))))
-      (fn (tc) (get tc :markers)))))
+    (mapcat (seq/filter toolchain/*toolchains* (fn (row) (not (= false (get row :root?)))))
+      (fn (row) (get row :markers)))))
 
 (def *project-search-depth* 64)
 ;; How many ancestor levels `project-root` climbs before giving up (the file's own
@@ -46,7 +46,7 @@ std `project` to avoid the clash."
 
 (defn project-path (dir)
   "`dir` in the one spelling a project is known by: absolute, with no `.`, `..` or trailing
-`/`. `~/src/x`, `~/src/x/` and `~/src/x/.` are one project, and were three in C-x p p.
+`/`, so `~/src/x`, `~/src/x/` and `~/src/x/.` are one project.
 
     (projects/project-path \"/a/b/./\")   ;=> \"/a/b\""
   (path/normalize (path/absolute dir)))
@@ -61,7 +61,7 @@ std `project` to avoid the clash."
 
 (defn project-root (dir &optional (limit *project-search-depth*))
   "The project root for `dir`: the nearest ancestor (including `dir` itself) that holds a
-`*project-markers*` entry (`project.blsp` or `.git`), found by walking **backwards** up the
+`*project-markers*` entry or is a VCS checkout's top ([[project-marked?]]), found by walking **backwards** up the
 tree, in `project-path` form whatever spelling `dir` came in. `nil` if there's none within
 `limit` ancestor levels, or up to the filesystem top."
   (root-above (project-path dir) limit))
@@ -104,10 +104,8 @@ too — that is the walk that climbs all the way up."
 
 (defn root-of (m)
   "The project a command acting on model `m` is about: the model's `:project-root`, else
-the project the editor was started in (`project-root` of the cwd), else nil.
-
-One spelling, because the session-starting commands each wrote it out and a fallback that
-drifts between them roots two sessions of the same project in two different places."
+the project the editor was started in (`project-root` of the cwd), else nil — one spelling,
+so two sessions of one project are rooted in one place."
   (or (:project-root m) (project-root (file/cwd))))
 
 (defn file-display-name (path &optional root)
@@ -155,18 +153,18 @@ command argument that may name a file outside the project."
   "Append entry `name` to the root-relative dir path `rel` (\"\" = the root itself)."
   (if (= rel "") name (str rel "/" name)))
 
-(defn- project-classify (abs rel st name)
-  "Fold step: sort entry `name` (under absolute dir `abs`, relative dir `rel`) into
-`st` = `[subdirs files]` of root-relative paths; ignored dir names are dropped."
-  (let (subdirs (first st)
-        files (second st)
-        childrel (project-rel rel name))
+(defn- project-classify (absolute rel sorted name)
+  "Fold step: sort entry `name` (under absolute dir `absolute`, relative dir `rel`) into
+`sorted` = `[subdirs files]` of root-relative paths; ignored dir names are dropped."
+  (let (subdirs (first sorted)
+        files (second sorted)
+        child (project-rel rel name))
     (cond
-      (project-ignored? name) st
-      (file/dir? (path/join abs name)) [(cons childrel subdirs) files]
-      else [subdirs (cons childrel files)])))
+      (project-ignored? name) sorted
+      (file/dir? (path/join absolute name)) [(cons child subdirs) files]
+      else [subdirs (cons child files)])))
 
-(defn- project-walk (root pending acc seen math/max)
+(defn- project-walk (root pending acc seen entry-limit)
   "Tail-recursive worklist walk: `pending` is a list of root-relative dir paths still
 to visit (\"\" = the root); collect root-relative file paths into `acc`. O(1) stack
 regardless of tree depth. A directory that can't be listed is treated as empty. Each
@@ -174,27 +172,26 @@ step prepends this dir's subdirs/files (the *small* lists) onto `pending`/`acc` 
 than appending the growing accumulator — O(1) per item, so the whole walk is O(files)
 not O(files²). Traversal becomes depth-first and `acc` ends unordered; the final `sort`
 fixes the order, so neither matters. `seen` counts directory entries processed so far;
-once it reaches `max` the walk stops between directories — a hard bound against a symlink
+once it reaches `entry-limit` the walk stops between directories — a hard bound against a symlink
 cycle (which would loop forever) or an accidentally enormous root (which would OOM)."
-  (if (or (empty? pending) (>= seen math/max))
+  (if (or (empty? pending) (>= seen entry-limit))
     (sort acc)
     (let (rel (first pending)
-          abs (if (= rel "") root (path/join root rel))
+          absolute (if (= rel "") root (path/join root rel))
           entries (try
-                    (file/ls abs)
+                    (file/ls absolute)
                     (catch e
                       (do
-                        (log/warn (str "project walk: cannot list " abs ": " (error-message e)))
+                        (log/warn (str "project walk: cannot list " absolute ": " (error-message e)))
                         ())))
-          step (fold entries [() ()] (fn (st name) (project-classify abs rel st name))))
+          step (fold entries [() ()] (fn (sorted name) (project-classify absolute rel sorted name))))
       ;; `append` shares its LAST list and copies only the small head, so each step is
-      ;; O(head), not O(files) — the `C-x p p` freeze on a ~12k-file project was this
-      ;; walk going quadratic. Order is irrelevant: the final `sort` fixes it.
+      ;; O(head), not O(files). Order is irrelevant: the final `sort` fixes it.
       (project-walk root
         (append (first step) (rest pending))
         (append (second step) acc)
         (+ seen (count entries))
-        math/max))))
+        entry-limit))))
 
 (defn- project-vcs-files (root)
   "Project files as the version control lists them — git's tracked and untracked-but-not-
@@ -215,29 +212,31 @@ caller falls back to the manual walk. (Emacs `project.el` lists a VC project the
     (try
       ;; `symbolic-ref`, not `rev-parse --abbrev-ref HEAD`: it names the branch even before
       ;; the first commit, where there is no HEAD commit to resolve and rev-parse fails
-      (let (r (os/cmd "git" ["-C" root "symbolic-ref" "--short" "-q" "HEAD"])
-            b (string/trim (:stdout r "")))
-        (if (and (= (:exit r) 0) (not (= b "")))
-          b
+      (let (symbolic (os/cmd "git" ["-C" root "symbolic-ref" "--short" "-q" "HEAD"])
+            branch (string/trim (:stdout symbolic "")))
+        (if (and (= (:exit symbolic) 0) (not (= branch "")))
+          branch
           ;; detached HEAD → a short SHA instead of a name
-          (let (s (os/cmd "git" ["-C" root "rev-parse" "--short" "HEAD"]))
-            (if (= (:exit s) 0) (let (h (string/trim (:stdout s ""))) (if (= h "") nil h)) nil))))
+          (let (parsed (os/cmd "git" ["-C" root "rev-parse" "--short" "HEAD"]))
+            (if (= (:exit parsed) 0)
+              (let (sha (string/trim (:stdout parsed ""))) (if (= sha "") nil sha))
+              nil))))
       (catch e (do (log/warn (str "git branch lookup failed: " (error-message e))) nil)))))
 
-(defn project-files (root &optional (math/max *project-files-max*))
+(defn project-files (root &optional (entry-limit *project-files-max*))
   "Every project file as sorted root-relative paths; `()` when `root` is nil. A **checkout** (git, mur)
 is listed by its version control (honouring `.gitignore` — `project-vcs-files`); otherwise a
-manual recursive walk skipping VCS/build dirs, bounded by `max` entries (default
+manual recursive walk skipping VCS/build dirs, bounded by `entry-limit` entries (default
 `*project-files-max*`) so a symlink cycle or huge root can't hang the editor."
   (if (nil? root)
     '()
     (or (project-vcs-files root)
-      (project-walk root (list "") '() 0 math/max))))
+      (project-walk root (list "") '() 0 entry-limit))))
 
 (defn project-matches (prefix files)
   "The `files` whose root-relative path starts with `prefix` — the live find-file
 candidate set."
-  (seq/filter files (fn (f) (string/starts-with? f prefix))))
+  (seq/filter files (fn (file) (string/starts-with? file prefix))))
 
 (defn project-name (root)
   "The project's display name: the last path segment of `root` (its directory name),
@@ -249,9 +248,8 @@ or `\"\"` when `root` is nil."
 ;; bookmarks — lives under one dedicated folder, `~/.config/bedit/state/` (honouring
 ;; $XDG_CONFIG_HOME), kept separate from the user's hand-edited `init.blsp` and never under
 ;; the Brood language's own `brood` dirs. Regenerable, most-recently-used first. The
-;; read/write helpers are path-parameterised (`projects-read` / `projects-remember`) so the
-;; policy is testable without touching the real state; the
-;; public `known-projects` / `remember-project!` close over the default path.
+;; read/write helpers are path-parameterised, so the policy is testable without touching the
+;; real state; the public `known-projects` / `remember-project!` close over the default path.
 
 (defn editor-state-dir ()
   "The editor's auto-generated state folder — `$XDG_CONFIG_HOME/bedit/state` (else
@@ -261,13 +259,9 @@ A `state` subdirectory of `config-paths/config-dir` — the app's folder is name
 place (`config-paths/*app-id*`), the same string its desktop entry is named after."
   (path/join (config-paths/config-dir) "state"))
 
-(defn- projects-cache-dir ()
-  "Alias for `editor-state-dir` — the dir the project/recentf/bookmark caches live in."
-  (editor-state-dir))
-
 (defn projects-file ()
   "Path of the known-projects cache file."
-  (path/join (projects-cache-dir) "projects.blsp"))
+  (path/join (editor-state-dir) "projects.blsp"))
 
 ;; ---- the shared persistence layer (one read / write / MRU for ALL generated state) ----
 ;; Every persisted file in the editor — known projects, recent files, per-project recency,
@@ -290,8 +284,8 @@ humans to read (and delete) round-trips fine."
   "The value stored in `file` (a vector), or `[]` when it's missing / unreadable / not a
 vector — never throws. A corrupt or half-written file reads as `[]` instead of crashing.
 The vector-shaped reader the MRU caches use; `persist-read-value` is the general one."
-  (let (v (persist-read-value file []))
-    (if (vector? v) v [])))
+  (let (value (persist-read-value file []))
+    (if (vector? value) value [])))
 
 (defn persist-write! (file value &optional (header nil))
   "Write `value` to `file` as a re-readable literal, **atomically**: write a sibling `.tmp`
@@ -319,14 +313,10 @@ The most-recently-used write behind known projects, recentf, bookmarks, and bshe
   (let (kept (into [entry] (seq/reject (persist-read file) same?)))
     (persist-write! file (if (nil? cap) kept (into [] (take kept cap))))))
 
-;; Historic names for the shared layer — kept so existing call sites and tests still bind.
-(def- projects-read persist-read)
-(def- projects-mru persist-mru)
-
 (defn- projects-remember (file root)
   "Move `root` to the front of `file`'s project list (dedup), write it back, and return
 the updated vector — most-recently-used first."
-  (projects-mru file root (fn (p) (= p root))))
+  (persist-mru file root (fn (known) (= known root))))
 
 (def *known-projects-max* 50)
 
@@ -367,18 +357,18 @@ so it can't accumulate dead paths forever. Best-effort; a nil/blank root is igno
 
 (defn recent-files-file ()
   "Path of the recent-files cache file."
-  (path/join (projects-cache-dir) "recent-files.blsp"))
+  (path/join (editor-state-dir) "recent-files.blsp"))
 
 (defn- recent-remember (file path)
   "Move `path` to the front of `file`'s recent-files list (dedup), capped at
 `*recent-files-max*`; write it back; return the updated vector — most-recent first."
-  (projects-mru file path (fn (p) (= p path)) *recent-files-max*))
+  (persist-mru file path (fn (known) (= known path)) *recent-files-max*))
 
 (defn recent-files ()
   "The remembered recently-opened file paths that still exist (most-recent first), or `[]`
 — deleted files are filtered out, so they never resurface in find-file (mirrors how
 `known-projects` drops vanished roots)."
-  (seq/filter (persist-read (recent-files-file)) (fn (p) (file/exists? p))))
+  (seq/filter (persist-read (recent-files-file)) file/exists?))
 
 (defn remember-file! (path)
   "Record `path` as recently opened (most-recent first), persisting it. Best-effort; a
@@ -396,7 +386,7 @@ nil/blank path is ignored. Returns `path`."
 
 (defn recent-commands-file ()
   "Path of the recent-commands (M-x history) cache file."
-  (path/join (projects-cache-dir) "recent-commands.blsp"))
+  (path/join (editor-state-dir) "recent-commands.blsp"))
 
 (defn recent-commands ()
   "The remembered recently-run M-x command names (most-recent first), or `[]`."
@@ -406,7 +396,7 @@ nil/blank path is ignored. Returns `path`."
   "Record M-x command `name` as recently run (most-recent first, deduped, capped, persisted).
 Best-effort; a nil/blank name is ignored. Returns `name`."
   (when (and (string? name) (not (= name "")))
-    (projects-mru (recent-commands-file) name (fn (c) (= c name)) *recent-commands-max*))
+    (persist-mru (recent-commands-file) name (fn (known) (= known name)) *recent-commands-max*))
   name)
 
 ;; ---- per-project recency + the default project-file sort --------------------
@@ -430,14 +420,14 @@ named by the root with slashes encoded (`/` → `%`) so each project keeps its o
 
 (defn project-recent (root)
   "The project's recently-visited files (root-relative paths, most-recent first), or `[]`."
-  (if (nil? root) [] (projects-read (project-recent-file root))))
+  (if (nil? root) [] (persist-read (project-recent-file root))))
 
 (defn remember-project-file! (root rel)
   "Record root-relative file `rel` as visited in project `root`: the most-recently-visited
 (dedup, capped) AND one more visit in its count (`project-frequency`), both persisted.
 Best-effort; a nil/blank root or file is ignored. Returns `rel`."
   (when (and (string? root) (string? rel) (not (= rel "")))
-    (projects-mru (project-recent-file root) rel (fn (p) (= p rel)) *project-recent-max*)
+    (persist-mru (project-recent-file root) rel (fn (known) (= known rel)) *project-recent-max*)
     (persist-count (project-frequency-file root) rel *project-frequency-max*))
   rel)
 
@@ -464,7 +454,7 @@ The counting twin of `persist-mru`, path-parameterised the same way."
         bumped (assoc counts entry (inc (get counts entry 0)))
         kept (if (or (nil? cap) (<= (count bumped) cap))
                bumped
-               (into {} (take (seq/sort-by bumped (fn ([_ n]) (- 0 n))) cap))))
+               (into {} (take (seq/sort-by bumped (fn ([_ visits]) (- 0 visits))) cap))))
     (persist-write! file kept)))
 
 (defn project-frequency (root)
@@ -506,34 +496,33 @@ not enough to lift a scattered match over the file you named.
   (history-boost (project-recent root) (project-frequency root)))
 
 (sig recent-partition (seqable seqable -> (tuple any any)))
-(defn recent-partition (cands recent)
-  "`[present rest]`: the entries of `recent` (most-recent first) that are still in `cands`,
-and the `cands` that are not among them, each in its given order. The split both recency
+(defn recent-partition (candidates recent)
+  "`[present rest]`: the entries of `recent` (most-recent first) that are still in `candidates`,
+and the `candidates` that are not among them, each in its given order. The split both recency
 orders are built from — `float-recent` appends the two, `project-files-order` re-sorts the
 second half by mtime.
 
-Both membership tests go through SETS, and neither set is built unless it is needed. They
-were `includes?` over the candidate list, which is O(n) each — so this was O(|recent| ×
-|cands|) plus O(|cands| × |present|), and on a 27,310-file project with a hundred remembered
-files that is ~3M comparisons, paid on the loop every time `C-x p f` opened. The guards are
-not decoration: a project with NOTHING remembered yet floats nothing, and building a 27k-
-element set to discover that costs more than the scan it replaces."
+Both membership tests go through sets, and neither set is built unless it is needed: a
+project with nothing remembered floats nothing without hashing every candidate."
   (let (present (if (empty? recent)
                   '()
-                  (let (cand-set (into #{} cands))
-                    (seq/filter recent (fn (r) (contains? cand-set r)))))
+                  (let (candidate-set (into #{} candidates))
+                    (seq/filter recent (fn (entry) (contains? candidate-set entry)))))
         present-set (if (empty? present) nil (into #{} present)))
-    [present (if (nil? present-set) cands (seq/reject cands (fn (c) (contains? present-set c))))]))
+    [present
+      (if (nil? present-set)
+        candidates
+        (seq/reject candidates (fn (candidate) (contains? present-set candidate))))]))
 
-(defn float-recent (cands recent)
-  "The shared recency-ordering core: `cands` with the entries present in `recent` (a
-most-recent-first list) floated to the front **in recency order**, then the remaining `cands`
+(defn float-recent (candidates recent)
+  "The shared recency-ordering core: `candidates` with the entries present in `recent` (a
+most-recent-first list) floated to the front **in recency order**, then the remaining `candidates`
 in their given order. The single seam every completion floats its recents through — find-file
 (`mincomplete/ed-sort-candidates`), project find-file (`sort-project-files`), and `M-x`
 (`commands/cmd-execute-extended-command`) all order through this, so \"recent-first\" behaves
 identically everywhere (the recentf model, generalised). Pure — recent lists come from the
 persisted `recent-*` caches (`recent-files` / `recent-commands` / `project-recent`)."
-  (let ([present rest] (recent-partition cands recent))
+  (let ([present rest] (recent-partition candidates recent))
     (append present rest)))
 
 (defn- project-files-order (recent files mtime-of)
@@ -541,16 +530,15 @@ persisted `recent-*` caches (`recent-files` / `recent-commands` / `project-recen
 rest by `mtime-of` (a `rel -> epoch-ms` fn) descending. The orderable core of
 `sort-project-files`, so it's unit-testable without the filesystem."
   (let ([present rest] (recent-partition files recent)
-        decorated (map rest (fn (f) [f (mtime-of f)])))
-    (append present (map (sort decorated (fn (a b) (> (second a) (second b)))) first))))
+        decorated (map rest (fn (file) [file (mtime-of file)])))
+    (append present (map (sort decorated (fn (left right) (> (second left) (second right)))) first))))
 
 (defn sort-project-files (root files)
   "Project `files` (root-relative) in find-file order: the editor's recorded **recency** per
 project first (`project-recent` — the files you've actually visited), then the rest in path
-order (already sorted by `project-files`). No per-file mtime stat — that was one `file-stat`
-syscall *per file* (≈90ms on a 700-file project, ~1.8s on 12k) paid on every find-file open,
-just to order the list before you type. Recency is the signal that matters; you narrow by
-typing anyway. (`project-files-order` keeps the mtime-orderable core for callers that want it.)"
+order (already sorted by `project-files`). No per-file mtime stat: that is a syscall per file
+on every open, and recency is the signal that matters. (`project-files-order` keeps the
+mtime-orderable core for callers that want it.)"
   (float-recent files (project-recent root)))
 
 ;; ---- bookmarks (named file positions, persisted — like recentf) -------------
@@ -559,16 +547,14 @@ typing anyway. (`project-files-order` keeps the mtime-orderable core for callers
 
 (defn bookmarks-file ()
   "Path of the bookmarks cache file."
-  (path/join (projects-cache-dir) "bookmarks.blsp"))
+  (path/join (editor-state-dir) "bookmarks.blsp"))
 
-(defn- bookmarks-read (file) (projects-read file))
-
-(defn- bookmarks-set (file name f pos)
+(defn- bookmarks-set (file name target pos)
   "Add/replace bookmark `name` → `{:file :pos}` at the front of `file`'s list (dedup by
 name); write it back; return the updated vector."
-  (projects-mru file {:name name :file f :pos pos} (fn (b) (= (:name b) name))))
+  (persist-mru file {:name name :file target :pos pos} (fn (bookmark) (= (:name bookmark) name))))
 
-(defn bookmarks () (bookmarks-read (bookmarks-file)))
+(defn bookmarks () (persist-read (bookmarks-file)))
 (defn bookmark-names () (map (bookmarks) :name))
-(defn bookmark-get (name) (seq/find (bookmarks) (fn (b) (= (:name b) name))))
-(defn bookmark-set! (name f pos) (bookmarks-set (bookmarks-file) name f pos))
+(defn bookmark-get (name) (seq/find (bookmarks) (fn (bookmark) (= (:name bookmark) name))))
+(defn bookmark-set! (name target pos) (bookmarks-set (bookmarks-file) name target pos))
