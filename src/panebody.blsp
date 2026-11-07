@@ -233,6 +233,12 @@ text or scrolled pays for them, once."
     ;; themselves on a frame where every row hits.
     (ed-visible-walk facts 0 '() y x w paint-row)))
 
+;; An inlay row: derived text on a row of its own, above the code it describes. The hint
+;; voice — dim and italic — because it is a remark about the line below it and must never
+;; read as a line of the buffer. Same face as the type note it replaces when the note is too
+;; long to sit at the end of its line. `defchrome`, so a theme switch re-derives it.
+(defchrome face-inlay-line {:fg *overlay0* :italic true})
+
 (sig ed-visible-walk (any int any int int int fn -> any))
 
 (defn- ed-visible-walk (facts k acc y x w paint-row)
@@ -244,7 +250,7 @@ it, not code), reversed once at the end."
     (reverse acc)
     (let (fact (first facts)
           ops (if (string? fact)
-                (list (text (+ y k) x (ui-clip (str "  " fact) w) panegeometry/face-inlay-line))
+                (list (text (+ y k) x (ui-clip (str "  " fact) w) face-inlay-line))
                 (paint-row (+ y k) fact)))
       (ed-visible-walk (rest facts)
         (inc k)
@@ -554,3 +560,125 @@ theirs."
         [(buffer-rope buf) spans top height hscroll rows width hl-ranges overrides]
         (fn ()
           (ed-visible-lines buf top height x y width hl-ranges spans overrides hscroll true rows))))))
+
+;; ---- the layers behind and beside the text: bands, the gutter surface, the margin ----
+;; Full-row backgrounds, and the columns the text was narrowed for, laid out over the same
+;; `panegeometry` map as the text and drawn before it.
+
+(sig ed-hl-line-band (model map buffer panegeometry/pane-geometry -> any))
+
+(defn ed-hl-line-band (m pane buf geometry)
+  "The hl-line current-line highlight: a `geometry-band` behind each row the line at point
+occupies (`ed-line-screen-rows`: one for an unwrapped line, every continuation row of a
+wrapped one, as Emacs highlights the whole logical line). It starts at the text, never in
+the gutter (Emacs `hl-line-mode`, sans the fringe), and runs to the pane's edge. Painted
+only on the selected pane with `:hl-line` on and **no** active region, and only for rows on
+screen (`:text-height`). `()` otherwise. Drawn before the text so it sits behind it."
+  (if (and (:hl-line m) (:selected pane) (nil? (buffer-region-bounds buf)))
+    (map (panegeometry/ed-line-screen-rows geometry
+           (buffer-current-line buf)
+           (math/max 1 (:text-height geometry)))
+      (fn (row) (panegeometry/geometry-band geometry (first row) face-hl-line)))
+    '()))
+
+(defn- ed-region-eol-band (buf geometry lo hi line)
+  "The region band filling `line`'s end-of-text → right-edge gap, or nil: when the region
+`[lo, hi]` covers the line THROUGH its end and the line's last row is on screen. Reaching
+the end of the text is enough; the newline itself need not be inside, which is the
+difference between a selection that stops flush against the last character and one that
+reads as covering the line. The last line of a region is the case that shows it, and it is
+the one a reader looks at. It runs to the end of the `:row` span: the right margin, or the
+pane's edge."
+  (let (rope (buffer-rope buf)
+        bol (text/line->char rope line)
+        ;; the length from the line bounds, not from a copy of the line's text
+        line-len (- (textpos/ed-line-end rope line) bol)
+        eol (+ bol line-len)
+        row (when (and (<= lo eol) (<= eol hi))
+              (panegeometry/ed-line-last-row geometry line (math/max 1 (:text-height geometry)))))
+    (when row
+      (let ([k row-from _] row
+            [x width] (panegeometry/geometry-span geometry :row)
+            ;; the row's text width, measured from the LINE's column (its tabs)
+            end-column (panegeometry/ed-cells-between rope
+                         bol
+                         (+ bol (math/min row-from line-len))
+                         eol)
+            band-width (- width end-column))
+        (when (> band-width 0)
+          (rect (+ (:y geometry) k) (+ x end-column) band-width 1 face-region))))))
+
+(sig ed-region-eol-bands (buffer panegeometry/pane-geometry -> list))
+
+(defn ed-region-eol-bands (buf geometry)
+  "Region-selection bands filling each fully-selected line's end-of-text → right-edge gap,
+so an empty or short line whose newline lies inside the region shows the selection through
+end-of-line (Emacs region highlighting). The char-range region tint (`ed-hl-ranges`) only
+paints actual text; this is its full-width counterpart — the same relationship
+`ed-hl-line-band` has to the per-line cursor. `()` when no region is active. Laid out over
+the `:text-height` rows. The band sits on the line's LAST row (`ed-line-last-row`), after that
+row's text. Bottom line first."
+  (let (region (buffer-region-bounds buf))
+    (if (nil? region)
+      '()
+      (let (top (:top geometry)
+            last-line (math/min (dec (buffer-line-count buf))
+                        (dec (+ top (math/max 1 (:text-height geometry))))))
+        (seq/keep (reverse (range top (inc last-line)))
+          (fn (line) (ed-region-eol-band buf geometry (first region) (second region) line)))))))
+
+(defn ed-gutter-bg-ops (geometry)
+  "The line-number gutter's own recessed surface, short of the edit margin; `[]` with no
+gutter."
+  (let ([x gutter-width] (panegeometry/geometry-span geometry :gutter))
+    (if (> gutter-width 0)
+      [(rect (:y geometry)
+         x
+         (math/max 0 (- gutter-width *gutter-edit-margin*))
+         (:text-height geometry)
+         face-gutter-bg)]
+      [])))
+
+(defn ed-right-margin-ops (buf geometry)
+  "The buffer's right margin (`:right-margin`, `{:width :lines {line [[text face] …]}}`):
+each shown line's segments painted in the margin's column at the pane's right edge, on the
+line's first screen row — Emacs's right margin, where Magit's log keeps who and when. The
+text area was narrowed for it (`:margin-width`), so a long line is cut before it rather
+than painted under it. `()` for a buffer without one."
+  (let (margin (:right-margin buf))
+    (if (nil? margin)
+      '()
+      (let (top (:top geometry)
+            height (:render-height geometry)
+            end (math/min (+ top height) (buffer-line-count buf))
+            x (first (panegeometry/geometry-span geometry :margin))
+            lines (:lines margin))
+        (mapcat (range top end)
+          (fn (line)
+            (let (segments (get lines line)
+                  row (when segments
+                        (first (first (panegeometry/ed-line-screen-rows geometry line height)))))
+              (if (nil? row)
+                '()
+                (second (fold segments
+                          [x '()]
+                          (fn ([col ops] segment)
+                            (let ([s face] segment)
+                              [(+ col (string/display-width s))
+                                (conj ops (text (+ (:y geometry) row) col s face))]))))))))))))
+
+(defn ed-line-band-ops (buf geometry)
+  "The buffer's line backgrounds (`:line-bands`, `{line face}`): a band across the text area
+behind each shown line, every screen row of a wrapped one — a diff's added and removed lines
+tinted whole, Magit's `magit-diff-added`, rather than only as far as their text reaches.
+Drawn first, so the hl-line band and the region sit over it. `()` for a buffer without any."
+  (let (bands (:line-bands buf))
+    (if (empty? bands)
+      '()
+      (let (top (:top geometry)
+            height (math/max 1 (:text-height geometry))
+            end (math/min (+ top height) (buffer-line-count buf)))
+        (mapcat (seq/filter (range top end) (fn (line) (contains? bands line)))
+          (fn (line)
+            (map (panegeometry/ed-line-screen-rows geometry line height)
+              (fn (row) (panegeometry/geometry-band geometry (first row) (get bands line))))))))))
