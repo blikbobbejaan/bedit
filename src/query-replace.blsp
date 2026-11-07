@@ -8,6 +8,7 @@ is the search's (`isearch/search-fold?`) and the window's other matches are lit 
   (:use isearch :only [search-fold? regexp-fold?]) ; a replace folds case as a search does
   (:use editor/ui :only [Overlay overlay-active? overlay-owns? overlay-handle overlay-exit]) ; its key overlay
   (:use theme) ; face-isearch — the match at point
+  (:use minibuffer :only [ed-mb-edit]) ; E edits the replacement
   (:use model)) ; ed-current-buf / ed-set-buf
 
 ;; `:query-replace` carries `{:from :to :regexp? :match :found :count}`; each match is highlighted with a transient
@@ -278,7 +279,99 @@ after the last replacement, as Emacs's does. No match, or an empty `from`, is `[
       [buf 0]
       [(undo-group buf (fn (group) (qr-replace-at group replacements))) (count replacements)])))
 
-(def *qr-keys* ["y" "n" " " "!" "." "q"])
+;; ---- going back: ^ , u U, and E -------------------------------------------------
+;; Emacs's query-replace remembers each answer (`stack` in `perform-replace`): `^` goes back to
+;; the previous match, `u` undoes the last replacement and asks about it again, `U` undoes them
+;; all, `,` replaces and stays to show the result. A remembered answer is `{:state :replaced?
+;; :next}`: the replace as it stood at that match, whether it was replaced, and where the search
+;; went on from.
+
+(defn- qr-remembered (m before replaced? next)
+  "`m` with the answer just given at the match `before` (the replace's state there) pushed on its
+history, when the replace is still going."
+  (let (qr (:query-replace m))
+    (if (nil? qr)
+      m
+      (assoc m
+        :query-replace
+          (assoc qr
+            :history
+              (cons {:state (dissoc before :history :shown) :replaced? replaced? :next next}
+                (or (:history before) '())))))))
+
+(defn- qr-show-replaced (m current entry history)
+  "Point at a match already replaced (`entry`'s), its replacement lit and the question standing:
+y, n or SPC go on from where the search went on before, `!` replaces the rest from there."
+  (let (state (:state entry)
+        start (:match state)
+        to (qr-replacement state (:found state))
+        shown (assoc current :history history :shown entry :match nil))
+    (assoc (ed-set-buf m (goto-char (ed-current-buf m) start))
+      :overlays [{:start start :end (+ start (string/length to)) :face face-isearch}]
+      :echo (str (qr-prompt state) " (replaced)")
+      :query-replace (assoc shown :prompt (qr-prompt current)))))
+
+(defn- qr-back (m)
+  "`^`: back to the previous match — asked again when it was skipped, shown when it was
+replaced. Dings at the first."
+  (let (qr (qr-state m)
+        history (or (:history qr) '()))
+    (if (empty? history)
+      (ed-ding (message m "No previous match"))
+      (let (entry (first history))
+        (if (:replaced? entry)
+          (qr-show-replaced m qr entry (rest history))
+          (qr-goto (assoc m :query-replace (assoc (:state entry) :history (rest history)))
+            (:match (:state entry))))))))
+
+(defn- qr-undo-one (m)
+  "`[m' undone?]`: the last replacement undone (one buffer undo — each was one edit) and the
+replace back at its match, the answers since it forgotten."
+  (let (qr (qr-state m)
+        ;; the match shown after `^` or `,` is the latest answer
+        answers (if (:shown qr) (cons (:shown qr) (or (:history qr) '())) (or (:history qr) '()))
+        history (seq/drop-while answers (fn (entry) (not (:replaced? entry)))))
+    (if (empty? history)
+      [m false]
+      (let (entry (first history)
+            buf (ed-current-buf m)
+            ;; one run of undo: a fresh `undo` after another would redo it
+            undone (ed-set-buf m (if (:undoing qr) (undo-next buf) (undo buf))))
+        [(qr-goto (assoc undone
+                    :query-replace (assoc (:state entry) :history (rest history) :undoing true))
+           (:match (:state entry)))
+          true]))))
+
+(defn- qr-undo (m)
+  "`u`: undo the last replacement and ask about its match again."
+  (let ([undone done?] (qr-undo-one m))
+    (if done? undone (ed-ding (message m "Nothing to undo")))))
+
+(defn- qr-undo-all (m)
+  "`U`: undo every replacement made so far, back at the first one's match."
+  (let ([undone done?] (qr-undo-one m))
+    (cond
+      (not done?) (ed-ding (message m "Nothing to undo"))
+      (any? (or (map/get-in undone [:query-replace :history]) []) (fn (entry) (:replaced? entry)))
+        (qr-undo-all undone)
+      else undone)))
+
+(defn- qr-edit-replacement (m)
+  "`E`: the replacement edited in the minibuffer, then asked again at this match with it. The
+replace is set aside while the minibuffer reads, since it would take the keys; C-g goes back
+to it unchanged."
+  (let (qr (qr-state m))
+    (assoc m
+      :query-replace nil
+      :minibuffer
+        {:edit (ed-mb-edit (str "Edit replacement string: ") (:to qr))
+         :on-complete (fn (mm to) (qr-goto (assoc mm :query-replace (assoc qr :to to)) (:match qr)))
+         :on-abort (fn (mm) (qr-goto (assoc mm :query-replace qr) (:match qr)))})))
+
+(def- *qr-help*
+  "y/SPC replace · n/DEL skip · , replace and stay · ! all · . replace and quit · ^ back · u undo · U undo all · E edit · q quit")
+
+(def *qr-keys* ["y" "n" " " "!" "." "q" "," "^" "u" "U" "E" "?"])
 
 (defn qr-control-key? (input)
   "Whether an active query-replace consumes `input`: an answer key (y/n/space/!/./q)
@@ -308,19 +401,52 @@ match may end past `high` — which moves as replacements change the text's leng
             low)))))
 
 (defn qr-handle (m input)
-  "Fold one query-replace answer key: y/space replace+advance, n/Delete skip, ! all,
-. replace-one-and-stop, q/Enter/Esc/C-g stop."
-  (let (qr (qr-state m))
+  "Fold one query-replace answer key: y/space replace+advance, n/Delete skip, `,` replace and
+stay, ! all, . replace-one-and-stop, ^ back, u / U undo one / all, E edit the replacement,
+? the keys, q/Enter/Esc/C-g stop. At a match already replaced (after `^` or `,`), y / n / SPC
+go on and ! replaces the rest from there."
+  (let (qr0 (qr-state m)
+        ;; an undo run goes on only while u / U are pressed
+        qr (if (includes? ["u" "U"] input) qr0 (dissoc qr0 :undoing))
+        m (assoc m :query-replace qr)
+        shown (:shown qr))
     (cond
+      (= input "^") (qr-back m)
+      (= input "u") (qr-undo m)
+      (= input "U") (qr-undo-all m)
+      (= input "?") (message m *qr-help*)
+      shown
+        (let (going (dissoc qr :shown))
+          (cond
+            (includes? ["y" " " "n" :delete] input)
+              (qr-remembered (qr-goto (assoc m :query-replace going) (:next shown))
+                (assoc (:state shown) :history (:history qr))
+                true
+                (:next shown))
+            (= input "!") (qr-all (assoc m :query-replace (assoc going :match (:next shown))))
+            (= input "E") (ed-ding m)
+            else (qr-finish m)))
       (or (= input "y") (= input " "))
-        (let ([replaced position] (qr-replace m)) (qr-goto replaced position))
+        (let ([replaced position] (qr-replace m))
+          (qr-remembered (qr-goto replaced position) qr true position))
+      (= input ",")
+        (let ([replaced position] (qr-replace m))
+          (if (:query-replace replaced)
+            (qr-show-replaced replaced
+              (:query-replace replaced)
+              {:state (dissoc qr :history :shown) :replaced? true :next position}
+              (or (:history qr) '()))
+            replaced))
       (or (= input "n") (= input :delete))
         (let (buf (ed-current-buf m)
-              found (:found qr))
-          (qr-goto m (qr-next qr buf (qr-adjacent? qr buf found) (:end found))))
+              found (:found qr)
+              next (qr-next qr buf (qr-adjacent? qr buf found) (:end found)))
+          (qr-remembered (qr-goto m next) qr false next))
       (= input "!") (qr-all m)
       (= input ".") (let ([replaced _] (qr-replace m)) (qr-finish replaced))
+      (= input "E") (qr-edit-replacement m)
       else (qr-finish m)))) ; q / Enter / Esc / C-g
+
 ;; ---- the non-interactive replace family (M-x) --------------------------------
 ;; `query-replace` (M-%) asks at every match; these do not ask at all, which is the whole
 ;; point of them — `replace-string` over a region you have just selected, `flush-lines` to

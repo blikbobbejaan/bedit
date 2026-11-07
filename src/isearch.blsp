@@ -21,6 +21,8 @@ reading the buffer."
   (:use theme) ; face-isearch / face-isearch-lazy — the match highlights (src/theme.blsp)
   (:use memo) ; defmemo — the window's lazy highlight, asked every frame
   (:use clipboard)
+  (:use minibuffer :only [ed-mb-edit]) ; M-e edits the search string
+  (:use interactive :only [run-command]) ; M-% hands the search to query-replace by name
   (:use model)) ; ed-current-buf / ed-set-buf / register-timer-client
 ;; The match highlight is the theme's `face-isearch`, read when the overlay is made (not
 ;; copied at load, which kept the old palette's yellow after a theme switch) — distinct
@@ -88,6 +90,7 @@ what a regexp or word search searches for. Nil when there is nothing to search f
       (= string "") nil
       (= (isearch-mode is) :regexp) string
       (= (isearch-mode is) :word) (word-search-regexp string)
+      (= (isearch-mode is) :symbol) (str "\\b" (regex/escape string) "\\b")
       else (regex/escape string))))
 
 (defn- isearch-incomplete? (is)
@@ -118,6 +121,7 @@ regexp is unfinished, or a toggle's momentary note (` [case sensitive]`)."
                 (case (isearch-mode is)
                   :regexp "regexp "
                   :word "word "
+                  :symbol "symbol "
                   "")
                 "I-search"
                 (if backward? " backward" "")))
@@ -492,6 +496,15 @@ once (the next turn) while it is going; nil otherwise."
   (when (isearch-count-due? m)
     {:after (if (nil? (isearch-count-current m)) *isearch-count-delay-ms* 1) :idle? true}))
 
+(defn- crossing-end (pattern rope from hi fold?)
+  "1 when the last match starting in `[from hi)` runs past `hi` (a narrowing's end, which a
+search cannot cross), else 0. Looked for among the matches in the last few thousand characters
+before `hi`: a match longer than that is not looked for."
+  (if (>= hi (text/length rope))
+    0
+    (let (spans (regex/rope-spans pattern rope (math/max from (- hi 4096)) hi {:fold? fold?}))
+      (if (and (not (empty? spans)) (> (second (last spans)) hi)) 1 0))))
+
 (defn isearch-count-step (m)
   "One turn of the count: slices of `*isearch-count-slice*` characters counted until
 `*isearch-count-budget-ms*` has gone (at least one), kept on `:isearch-count`
@@ -511,10 +524,15 @@ once (the next turn) while it is going; nil otherwise."
                                              {:fold? fold?})
                                ;; a narrowed search ends at its restriction, not the buffer's end
                                resume (when (and reached (< reached hi)) reached)
+                               ;; and C-s cannot reach a match running past that end, so it is
+                               ;; not counted either
+                               counted (if (nil? resume)
+                                         (- n (crossing-end pattern rope from hi fold?))
+                                         n)
                                next {:key key
-                                     :slices (conj (:slices count) [from n])
+                                     :slices (conj (:slices count) [from counted])
                                      :resume resume
-                                     :total (+ (:total count) n)})
+                                     :total (+ (:total count) counted)})
                            (if (or (nil? resume) (>= (os/now) deadline)) next (slice next)))))
           (isearch-refresh (assoc m :isearch-count (if (nil? (:resume start)) start (slice start)))))))))
 
@@ -589,6 +607,7 @@ the search state. A no-op if no search is active."
           :isearch-count nil
           :overlays nil
           last-key (if (= (:string is) "") (get m last-key) (:string is))
+          (isearch-ring-key is) (ring-with (get m (isearch-ring-key is)) (:string is))
           :echo "")))))
 
 (defn- isearch-trim-failing (m is)
@@ -628,8 +647,15 @@ state cleared."
 
 (def *isearch-keys*
   [:backspace
-    :ctrl-s :ctrl-r :ctrl-meta-s :ctrl-meta-r :enter :escape :ctrl-g :ctrl-y :ctrl-w :alt-r
-    :alt-c :alt-s])
+    :ctrl-s :ctrl-r
+    :ctrl-meta-s :ctrl-meta-r
+    :enter :escape
+    :ctrl-g :ctrl-y
+    :ctrl-w :alt-r
+    :alt-c :alt-s
+    :alt-p :alt-n
+    :alt-e (keyword "alt-%")
+    (keyword "ctrl-meta-%")])
 
 (defn isearch-control-key? (input)
   "Whether an active isearch consumes `input`: a printable char (extends the search)
@@ -663,7 +689,108 @@ case folding (Emacs's `M-s` search map); any other key is handled as itself."
       "w" (isearch-toggle m1 is1 :word)
       "r" (isearch-toggle m1 is1 :regexp)
       "c" (isearch-toggle m1 is1 :case)
+      "." (isearch-start-symbol (assoc m1 :isearch nil))
       (isearch-dispatch m1 is1 input))))
+
+;; ---- the search ring (M-p / M-n), M-e, and M-% from a search -------------------
+;; Emacs keeps the searches you finished (`search-ring`, a regexp's apart in
+;; `regexp-search-ring`); M-p / M-n inside a search step through them, M-e edits the string in
+;; the minibuffer, and M-% / C-M-% turn the search into a query-replace of what it found.
+
+(def *isearch-ring-max* 16)
+
+(defn- isearch-ring-key (is)
+  ;; where this kind of search's ring lives on the model
+  (if (= (isearch-mode is) :regexp) :isearch-ring-regexp :isearch-ring))
+
+(defn- ring-with (ring string)
+  ;; `ring` (newest first) with `string` at its head, once, at most `*isearch-ring-max*` long
+  (if (= string "")
+    ring
+    (take (into [string] (seq/reject (or ring []) (fn (old) (= old string)))) *isearch-ring-max*)))
+
+(defn- isearch-ring-step (m is step)
+  "M-p (`step` 1, older) / M-n (`step` -1, newer): the search string becomes that entry of the
+ring and is searched again from where the search began. Past either end it dings."
+  (let (ring (or (get m (isearch-ring-key is)) [])
+        index (+ (if (nil? (:ring-index is)) -1 (:ring-index is)) step))
+    (if (or (< index 0) (>= index (count ring)))
+      (ed-ding (assoc m :isearch is))
+      (isearch-land m
+        (assoc (isearch-remember m is) :ring-index index)
+        (nth ring index)
+        (:dir is)
+        (:origin is)
+        false))))
+
+(defn- isearch-edit-string (m is)
+  "M-e: the search string edited in the minibuffer; RET searches again with the edited string
+from where the search began, C-g goes back to the search as it was. The search is set aside
+while the minibuffer reads (`:isearch-edited`), since it would take the keys."
+  (assoc m
+    :isearch nil
+    :isearch-edited is
+    :minibuffer
+      {:edit (ed-mb-edit (str (isearch-prompt (assoc is :string "" :match nil :wrapped false)))
+               (:string is))
+       :on-complete (fn (mm string)
+                      (isearch-refresh (isearch-land (assoc mm :isearch is :isearch-edited nil)
+                                         (isearch-remember mm is)
+                                         string
+                                         (:dir is)
+                                         (:origin is)
+                                         false)))
+       :on-abort (fn (mm) (isearch-refresh (assoc mm :isearch is :isearch-edited nil)))}))
+
+(defn- isearch-query-replace (m is regexp?)
+  "M-% / C-M-% in a search: the search ends at its match and a query-replace of its string
+starts there, asking only for the replacement — Emacs's `isearch-query-replace`. A word search
+replaces its words as the regexp it ran; C-M-% replaces a literal search's text as a regexp."
+  (let (pattern (isearch-pattern is)
+        from (if (or regexp? (= (isearch-mode is) :literal)) (:string is) pattern)
+        at (or (:match is) (:origin is))
+        exited (isearch-exit (assoc m :isearch is)))
+    (if (= (:string is) "")
+      exited
+      (run-command (ed-set-buf (assoc exited
+                                 :query-replace-seed
+                                   {:from from
+                                    :regexp? (or regexp? (= (isearch-mode is) :word))})
+                     (goto-char (ed-current-buf exited) at))
+        (if (or regexp? (= (isearch-mode is) :word)) "query-replace-regexp" "query-replace")
+        (fn (mm name) (message mm (str name " is not loaded")))))))
+
+(defn isearch-symbol-at-point (m)
+  "The symbol at point in the current buffer, or nil — what M-s . searches for."
+  (let (buf (ed-current-buf m)
+        rope (buffer-rope buf)
+        point (buffer-point buf)
+        line-start (buffer-point (beginning-of-line buf))
+        line-end (buffer-point (end-of-line buf))
+        found (editor/highlight/symbol-at (text/slice rope line-start line-end)
+                (- point line-start)))
+    (when found (second found))))
+
+(defn- symbol-start (buf symbol)
+  ;; where the symbol around point starts: the last start of `symbol` at or before point
+  ;; whose span covers point
+  (let (point (buffer-point buf)
+        from (math/max 0 (- point (string/length symbol))))
+    (or (buffer-search-forward buf symbol from false) point)))
+
+(defn isearch-start-symbol (m)
+  "M-s . (Emacs's isearch-forward-symbol-at-point): a search for the symbol at point, whole
+symbols only, starting at it — the next C-s goes to its next use."
+  (let (symbol (isearch-symbol-at-point m))
+    (if (nil? symbol)
+      (ed-ding (message m "No symbol at point"))
+      (let (started (isearch-start m :forward :symbol)
+            buf (ed-current-buf started))
+        (isearch-refresh (isearch-land started
+                           (:isearch started)
+                           symbol
+                           :forward (symbol-start buf symbol)
+                           false))))))
 
 (defn- isearch-dispatch (m is input)
   "One isearch control key, folded into the search."
@@ -680,6 +807,11 @@ case folding (Emacs's `M-s` search map); any other key is handled as itself."
     (= input :alt-r) (isearch-toggle m is :regexp)
     (= input :alt-c) (isearch-toggle m is :case)
     (= input :alt-s) (assoc m :isearch (assoc is :meta-s true))
+    (= input :alt-p) (isearch-ring-step m is 1)
+    (= input :alt-n) (isearch-ring-step m is -1)
+    (= input :alt-e) (isearch-edit-string m is)
+    (= input (keyword "alt-%")) (isearch-query-replace m is false)
+    (= input (keyword "ctrl-meta-%")) (isearch-query-replace m is true)
     (or (= input :enter) (= input :escape)) (isearch-exit m)
     (= input :ctrl-g) (isearch-abort m)
     else m))
