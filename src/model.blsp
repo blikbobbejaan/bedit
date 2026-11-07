@@ -516,37 +516,7 @@ opened a file buffer. This is the single decoder both the native view (`panebody
 and the web mirror (`web/web-gutter-html`) share, so the two can never drift apart again."
   (if (string? (first cell)) (list cell) cell))
 
-;; ---- pure text geometry (offset → line/column) ------------------------------
-;; Shared by the indenters (brood-mode, lisp-modes) and the indent command (src/commands.blsp):
-;; a char offset's line start, line end and column, from the text alone so they're testable
-;; without a buffer. The text is a string or a rope (brood ADR-488): a Lisp indenter is handed
-;; the buffer's rope and reads only the lines it measures. A line ends at `\n` alone — not at
-;; the form feed or lone CR the rope's line index also breaks at, which an elisp file's `^L`
-;; page breaks would otherwise turn into line ends.
-
-;; ---- what an edit changed, from the buffer's splice log -------------------------
-;; A cache kept against an older rope of a buffer (a line band, the completion word index,
-;; the fold set) wants to know what changed since. Comparing the two ropes answers, at a
-;; cost of the whole text; the buffer's splice log (`buffer-splices-since`, brood ADR-466)
-;; answers at the cost of the edit. These fold the log into the one changed stretch.
-
-;; ---- the diagnostics cache: what the view reads, whoever produced it ----------
-;; Two producers fill it — the advisory checker (`diagcheck`, off the loop on the idle beat)
-;; and a language server (`lsp-commands`, on `publishDiagnostics`) — and both land in
-;; [[ed-set-diagnostics]], so the list, its line index and the buffer's margin stamp agree.
-
-;; ---- a diagnostic's position, converted in ONE place ----------------------------
-;; A diagnostic carries 1-BASED `:line` and `:col` — the Brood checker emits them that way
-;; and `lsp-protocol/lsp-diagnostic` shifts a server's 0-based range to match. Everything that
-;; PLACES one works in 0-based buffer coordinates, so the conversion happens at every
-;; crossing: the line index, the token underline, the `*Diagnostics*` row, the row's jump
-;; target. Four `dec`/`inc`s written out four times, and the one that was written without a
-;; floor turned a `:col 0` into column -1 and took the whole frame down with a
-;; `string/substring: range [-1, 0)` — a render error, every frame, for one odd number from
-;; a language server.
-;;
-;; Data from a server is data: it is clamped here rather than trusted, and it is clamped
-;; once.
+;; ---- calling a hook in a module that may not have loaded ------------------------
 
 (defn ed-call-deferred (m sym fallback)
   "Call `sym` — a `(model) -> model` hook in a DEFERRED module — if that module has been
@@ -561,23 +531,6 @@ as it runs goes back with the package."
 row's symbol, called under its package's claimant if its module has loaded, else `fallback`."
   (ownership/with-symbol-claimant sym
     (fn () (apply reflect/call-if-bound sym fallback arguments))))
-
-(defn ed-buffer-dir (buf)
-  "The directory `buf` lives in — its `:dir`, else its file's folder, else the working
-dir — what `pool/ed-default-dir` answers for the current buffer (Emacs `default-directory`)."
-  (or (:dir buf)
-    (let (f (buffer-file buf)) (if (nil? f) (file/cwd) (path/dirname f)))))
-
-(defn ed-layer-modeline-segments (m buf)
-  "The status-bar segments `buf`'s active layers contribute via a `:modeline` service — each a
-`(model buf) -> string|nil` (resolved late, like every mode service). The seam a mode / layer
-uses to put its own info on the status bar (the git layer, a REPL connection, …); blanks and
-nils are dropped. The view appends these (and the global git branch) on the selected pane."
-  (seq/keep (layer-collect buf :modeline)
-    (fn (svc)
-      (let (f (if (symbol? svc) (reflect/eval svc) svc)
-            s (f m buf))
-        (if (or (nil? s) (= "" s)) nil s)))))
 
 ;; ---- the off-loop job table: what is in flight, and what to call it ----------
 ;; It lives in `model` rather than in the dispatcher because it is MODEL vocabulary —
@@ -1053,6 +1006,21 @@ delay, the undo-pause boundary — are present only while their work is pending
     ;; timer fired
     (assoc m :timers (merge kept managed) :timers-synced? true)))
 
+(sig ed-break-undo-run (model -> model))
+(defn ed-break-undo-run (m)
+  "Insert an undo boundary at a typing pause: arm the one-shot `:undo-break` so the next
+self-insert / deletion starts a FRESH undo group instead of amalgamating into the run
+typed before the pause (Emacs `undo-boundary` on idle). `input/ed-dispatch-key` consumes
+the flag. Leaves `:last-command` untouched, so kill coalescing / yank-pop are unaffected."
+  (assoc m :undo-break true))
+
+(sig ed-which-key-reveal (model -> model))
+(defn ed-which-key-reveal (m)
+  "When the `:which-key` timer fires with a prefix still pending, reveal the panel
+(`ed-sync-timers` then drops the now-satisfied timer); if the chord ended first, clear it.
+Public (called cross-module from `input/ed-timer-fire`)."
+  (if (:pending m) (assoc m :which-key true) (dissoc m :which-key)))
+
 ;; ---- overlay scrollbar: what wakes it (the rest is `scrollbar`) ---------------
 ;; The scrollbar thumb is hidden at rest. Any scroll wakes it to full opacity
 ;; (`ed-scrollbar-wake`, called from every `:top` change) and arms ONE quiet one-shot,
@@ -1075,42 +1043,6 @@ scroll path (`ed-set-top`, `mouse/ed-scroll-pane`) so the thumb appears whenever
 moves, then auto-hides. A fade already running stops: the thumb is back to full."
   (ed-set-timer (ed-drop-timer (assoc m :sb-fade *scrollbar-fade-ticks*) :scrollbar-fade)
     :scrollbar-hold {:after *scrollbar-hold-ms* :idle? true}))
-
-(sig ed-read-char (model any any -> model))
-(defn ed-read-char (m prompt then)
-  "Show `prompt` in the echo area and route the *next* key to `then` (a `(model key) ->
-model` continuation), via the read-char transient (`input`). Esc/C-g aborts. The shared
-one-key reader behind zap-to-char, the register / bookmark commands and every y/n question.
-The prompt stands until the key comes: a [[message]] meanwhile shows beside it, not over it."
-  (assoc (message (dissoc m :read-char) prompt) :read-char {:then then :prompt prompt}))
-
-(defn ed-yes-key? (key)
-  "Whether `key` — what an `ed-read-char` continuation was handed for a `(y or n)`
-question — answers yes: `y` or `Y`. Anything else declines, as in Emacs `y-or-n-p`."
-  (or (= key "y") (= key "Y")))
-
-(defn ed-confirm (m prompt on-yes &optional (declined "canceled"))
-  "Ask the one-key y/n question `prompt` ([[ed-read-char]]) and fold `(on-yes model)` on a
-yes ([[ed-yes-key?]]); any other key says `declined` instead. `prompt` names what is about
-to happen and carries its own `(y or n)`."
-  (ed-read-char m
-    prompt
-    (fn (answered key) (if (ed-yes-key? key) (on-yes answered) (message answered declined)))))
-
-(sig ed-break-undo-run (model -> model))
-(defn ed-break-undo-run (m)
-  "Insert an undo boundary at a typing pause: arm the one-shot `:undo-break` so the next
-self-insert / deletion starts a FRESH undo group instead of amalgamating into the run
-typed before the pause (Emacs `undo-boundary` on idle). `input/ed-dispatch-key` consumes
-the flag. Leaves `:last-command` untouched, so kill coalescing / yank-pop are unaffected."
-  (assoc m :undo-break true))
-
-(sig ed-which-key-reveal (model -> model))
-(defn ed-which-key-reveal (m)
-  "When the `:which-key` timer fires with a prefix still pending, reveal the panel
-(`ed-sync-timers` then drops the now-satisfied timer); if the chord ended first, clear it.
-Public (called cross-module from `input/ed-timer-fire`)."
-  (if (:pending m) (assoc m :which-key true) (dissoc m :which-key)))
 
 ;; ---- buffer recency (Emacs `buffer-list` order) ------------------------------
 ;; `:buffer-mru` is the names of the buffers in most-recently-selected-first order —
@@ -1496,6 +1428,17 @@ keyed on. Layers with no `:deps` add nothing."
   (map (registry/ranked :model/frame-overlays)
     (fn ([_ overlay]) (ed-call-hook (:run overlay) '() m cols rows))))
 
+(defn ed-layer-modeline-segments (m buf)
+  "The status-bar segments `buf`'s active layers contribute via a `:modeline` service — each a
+`(model buf) -> string|nil` (resolved late, like every mode service). The seam a mode / layer
+uses to put its own info on the status bar (the git layer, a REPL connection, …); blanks and
+nils are dropped. The view appends these (and the global git branch) on the selected pane."
+  (seq/keep (layer-collect buf :modeline)
+    (fn (svc)
+      (let (f (if (symbol? svc) (reflect/eval svc) svc)
+            s (f m buf))
+        (if (or (nil? s) (= "" s)) nil s)))))
+
 ;; ---- the steps around an event: input, post and tail ----------------------------
 ;; The per-event follow-ups that keep a derived view in step with the model the event left:
 ;; buffer recency, a *Diagnostics* pane following the findings, a stale completion popup
@@ -1811,6 +1754,12 @@ heard back — the same mistake `ed-headless?` and `session/request` were cured 
 path or a basename, so it can't be matched against the on-disk path)."
   (let (i (seq/index-where (:buffers m) (fn (b) (= (buffer-file b) path))))
     (if (< i 0) nil i)))
+
+(defn ed-buffer-dir (buf)
+  "The directory `buf` lives in — its `:dir`, else its file's folder, else the working
+dir — what `pool/ed-default-dir` answers for the current buffer (Emacs `default-directory`)."
+  (or (:dir buf)
+    (let (f (buffer-file buf)) (if (nil? f) (file/cwd) (path/dirname f)))))
 
 ;; ---- the `*Messages*` log + echo area ---------------------------------------
 
@@ -2207,6 +2156,27 @@ reports reads as. \"1 lines\" in a report whose claim is precision reads as care
     (model/ed-count-noun 3 \"file\")   ;=> \"3 files\""
   (str amount " " noun (if (= amount 1) "" "s")))
 
+(sig ed-read-char (model any any -> model))
+(defn ed-read-char (m prompt then)
+  "Show `prompt` in the echo area and route the *next* key to `then` (a `(model key) ->
+model` continuation), via the read-char transient (`input`). Esc/C-g aborts. The shared
+one-key reader behind zap-to-char, the register / bookmark commands and every y/n question.
+The prompt stands until the key comes: a [[message]] meanwhile shows beside it, not over it."
+  (assoc (message (dissoc m :read-char) prompt) :read-char {:then then :prompt prompt}))
+
+(defn ed-yes-key? (key)
+  "Whether `key` — what an `ed-read-char` continuation was handed for a `(y or n)`
+question — answers yes: `y` or `Y`. Anything else declines, as in Emacs `y-or-n-p`."
+  (or (= key "y") (= key "Y")))
+
+(defn ed-confirm (m prompt on-yes &optional (declined "canceled"))
+  "Ask the one-key y/n question `prompt` ([[ed-read-char]]) and fold `(on-yes model)` on a
+yes ([[ed-yes-key?]]); any other key says `declined` instead. `prompt` names what is about
+to happen and carries its own `(y or n)`."
+  (ed-read-char m
+    prompt
+    (fn (answered key) (if (ed-yes-key? key) (on-yes answered) (message answered declined)))))
+
 ;; ---- applying buffer ops to the current buffer ------------------------------
 ;; The editing core: every command that changes the text goes through `ed-try-edit`
 ;; (or `ed-edit`), so a read-only refusal is handled in ONE place and a command
@@ -2402,20 +2372,3 @@ metric."
         branch (:label (:vcs-summary m))
         branch-seg (if (nil? branch) "" (str " — " branch)))
     (str name modified branch-seg " — " *app-name*)))
-
-;; ---- lossage: the keys that reached the dispatcher (Emacs recent-keys) ------
-;; The command loop keeps it, as Emacs keeps recent-keys in its C core: every key the
-;; dispatcher sees goes in, and C-h l (`help`) reads it.
-
-;; How many recent keys `C-h l` remembers (Emacs keeps 300 in a C ring). The model carries
-;; them as a plain vector, so the cap is what stops a long session growing a field without
-;; bound — and it is read at trim time, not baked in, so raising it takes effect live.
-
-;; How far the ring is allowed to run past `*lossage-max*` before it is cut back. The trim
-;; is the expensive half (a `take-last` plus a rebuild), and trimming on every keystroke
-;; past the cap paid it on every keystroke FOREVER. Cutting back in blocks amortises it
-;; over `*lossage-slack*` keys — this is the dispatcher's path, and it is the one place in
-;; the editor where a tenth of a millisecond is worth an integer of slack.
-;;
-;; `C-h l` reads the last `*lossage-max*` of whatever is here, so the overshoot never
-;; shows: the ring holds between max and max+slack, and the report takes the tail.
