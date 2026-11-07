@@ -1,0 +1,183 @@
+(defmodule codefold
+  "Code folding (Emacs's hideshow): what a block of code covers, as a mode's `:fold-extent`
+for the `folds` mechanism Org's TAB already stands on — read from the parse. A tree-sitter
+mode folds the outermost node that starts on a line and ends on a later one (a definition, a
+block, a multi-line call or literal), its closing line (`end`, `}`) left showing, as hideshow
+leaves it; a Lisp folds the form that starts on the line. And the hideshow keys, C-c @:
+toggle, hide and show the block at point, hide and show every top-level block."
+  (:use editor/buffer) ; the rope, point, the current line
+  (:use interactive) ; defcommand
+  (:use model) ; ed-current-buf / ed-apply / ed-mode-service / message
+  (:use memo)) ; defmemo — a rope's fold table
+
+;; ---- a line's ink ---------------------------------------------------------------
+
+(sig line-span (any int -> any))
+(defn- line-span (rope line)
+  ;; `[start end]` of `line`'s text, its newline left out
+  (let (start (text/line->char rope line)
+        next (if (< (inc line) (text/line-count rope))
+               (text/line->char rope (inc line))
+               (text/length rope))
+        end (if (and (> next start) (= (text/slice rope (dec next) next) "\n")) (dec next) next))
+    [start end]))
+
+(defn- ink-span (rope line)
+  ;; `[first last]` offsets of the first and last non-blank characters on `line`, or nil
+  (let ([start end] (line-span rope line)
+        first (text/skip-forward rope start " \t" true)
+        after-last (text/skip-backward rope end " \t" true))
+    (when (< first end) [first (dec after-last)])))
+
+(defn- closer-line? (rope line)
+  ;; whether `line` holds only a block's closing (`}`, `end`, `});`) — the line a fold leaves
+  ;; showing, as hideshow does
+  (let (span (ink-span rope line))
+    (and span
+      (let ([first last] span
+            ink (text/slice rope first (inc last)))
+        (regex/match? "^(end|[\\])}][\\])};,.]*)$" ink)))))
+
+(defn- folded-through (rope start-line end-line)
+  ;; the last line a block from `start-line` to `end-line` hides: its closing line stays
+  (let (last (if (closer-line? rope end-line) (dec end-line) end-line))
+    (when (> last start-line) last)))
+
+;; ---- a tree-sitter language's blocks ------------------------------------------------
+;; A block is what the language's indent spec says opens a level (`editor/treesit/indent-column`'s
+;; spec): a `:blocks` node is a body, folded from the line its PARENT starts on (Ruby's method
+;; body from its `def`, Elixir's do-block from its call); a `:brackets` node folds from its own
+;; first line (`{`, `[`, an argument list — so `} else {` folds its own block). Either reaches
+;; to the farther end of the node and its parent; the closing line stays showing.
+
+(defn- line-of (rope offset) (text/char->line rope offset))
+(defn- end-line-of (rope node) (line-of rope (math/max (:start node) (dec (:end node)))))
+
+(defn- chain-blocks (rope chain kinds)
+  "`[header end-line]` for every block in `chain` (outermost first) by `kinds`
+(`{:blocks :brackets}`)."
+  (seq/keep (range 1 (count chain))
+    (fn (index)
+      (let (node (nth chain index)
+            parent (nth chain (dec index))
+            kind (:kind node))
+        (cond
+          (contains? (:blocks kinds) kind)
+            [(line-of rope (:start parent))
+              (math/max (end-line-of rope node) (end-line-of rope parent))]
+          (contains? (:brackets kinds) kind) [(line-of rope (:start node)) (end-line-of rope node)]
+          else nil)))))
+
+;; check-allow: the table only ever holds what `fold-table`'s body built, a map of line to
+;; line, so a hit has the declared shape — but it comes back out of the memo's store
+(check-allow :trusted
+  (defmemo fold-table 3 (rope lang kinds)
+    "Every line of `rope` that opens a block in `lang` (by the indent spec's `kinds`), to the last
+line its fold hides. Each line's node chain names every block around it, so one chain a line
+finds them all. Parsed once per text, the tree read in place and freed before this returns: a
+fold extent is asked with the text alone, and a tree kept per text would outlive it."
+    (let (tree (editor/treesit/open-tree rope lang)
+          ends (fold (range 0 (text/line-count rope))
+                 {}
+                 (fn (acc line)
+                   (let (span (ink-span rope line))
+                     (if (nil? span)
+                       acc
+                       (fold (chain-blocks rope
+                               (editor/treesit/node-chain rope lang (first span) tree)
+                               kinds)
+                         acc
+                         (fn (found [header end-line])
+                           (if (> end-line header)
+                             (assoc found header (math/max end-line (get found header 0)))
+                             found)))))))
+          table (fold (%map-pairs ends)
+                  {}
+                  (fn (acc [header end-line])
+                    (let (last (folded-through rope header end-line))
+                      (if last (assoc acc header last) acc)))))
+      (editor/treesit/free-tree tree)
+      table)))
+
+(defn tree-fold-extent (lang kinds rope line)
+  "A tree-sitter mode's `:fold-extent` in `lang` (each `deflanguage` names one that calls this,
+with its indent spec's `{:blocks :brackets}` as `kinds`): the last line the block opening on
+`line` of `rope` hides, or nil."
+  (when kinds (get (fold-table rope lang kinds) line)))
+
+;; ---- a Lisp's forms -----------------------------------------------------------
+
+(defn form-fold-extent (rope line)
+  "A Lisp mode's `:fold-extent`: the form that opens on `line` (its first ink a `(`, `[` or
+`{`) hides through the line it closes on — a Lisp's closers trail the last line, so none is left
+showing."
+  (let (span (ink-span rope line))
+    (when (and span (includes? ["(" "[" "{"] (text/slice rope (first span) (inc (first span)))))
+      (let (end (reflect/scan-form-end rope (first span) 1)
+            end-line (text/char->line rope (math/max (first span) (dec end))))
+        (when (> end-line line) end-line)))))
+
+;; ---- the hideshow commands (C-c @) ------------------------------------------------
+
+(defn- block-line (buf)
+  ;; the line whose block holds point: point's own line when it opens one, else the nearest
+  ;; line above whose block reaches point's line
+  (let (line (buffer-current-line buf)
+        opens? (fn (at) (let (last (folds/extent buf at)) (and last (>= last line)))))
+    (seq/find (range line -1 -1) (fn (at) (if (= at line) (folds/extent buf at) (opens? at))))))
+
+(defn- with-block (m f)
+  ;; `(f buf line)` on the block holding point, or a failure saying there is none
+  (let (buf (ed-current-buf m)
+        line (block-line buf))
+    (cond
+      (nil? (ed-mode-service buf :fold-extent)) (ed-ding (message m "This mode does not fold"))
+      (nil? line) (ed-ding (message m "No block here"))
+      else (ed-apply m (fn (b) (f b line))))))
+
+(defcommand cmd-hs-toggle-hiding
+  (m key)
+  "Fold or unfold the block at point (C-c @ C-c) — the block whose first line point is on, else
+the one around it. Point moves to the block's first line when it folds, as hideshow's does."
+  (with-block m
+    (fn (buf line)
+      (if (folds/folded? buf line)
+        (folds/unfold-heading buf line)
+        (goto-char (folds/fold-heading buf line) (text/line->char (buffer-rope buf) line))))))
+
+(defcommand cmd-hs-hide-block
+  (m key)
+  "Fold the block at point (C-c @ C-h)."
+  (with-block m
+    (fn (buf line)
+      (goto-char (folds/fold-heading buf line) (text/line->char (buffer-rope buf) line)))))
+
+(defcommand cmd-hs-show-block
+  (m key)
+  "Unfold the block at point (C-c @ C-s)."
+  (with-block m (fn (buf line) (folds/unfold-heading buf line))))
+
+(defn- top-level-blocks (buf)
+  ;; the lines that open a block no other block holds
+  (let (count (buffer-line-count buf)
+        step (fn (line acc)
+               (if (>= line count)
+                 (reverse acc)
+                 (let (last (folds/extent buf line))
+                   (if last (step (inc last) (cons line acc)) (step (inc line) acc))))))
+    (step 0 '())))
+
+(defcommand cmd-hs-hide-all
+  (m key)
+  "Fold every top-level block (C-c @ C-M-h) — the file as an outline of its definitions."
+  (let (buf (ed-current-buf m))
+    (if (nil? (ed-mode-service buf :fold-extent))
+      (ed-ding (message m "This mode does not fold"))
+      (ed-apply m
+        (fn (b)
+          (folds/reveal (fold (top-level-blocks b) b (fn (acc line) (folds/fold-heading acc line)))))))))
+
+(defcommand cmd-hs-show-all
+  (m key)
+  "Unfold everything (C-c @ C-M-s)."
+  (ed-apply m folds/unfold-all))
