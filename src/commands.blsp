@@ -668,6 +668,14 @@ auto-indented blank line left that indentation behind as trailing whitespace."
         from (text/skip-backward (buffer-rope buffer) point " \t" true))
     (if (< from point) (goto-char (replace-region buffer from point "") from) buffer)))
 
+(defn- ed-between-pair? (m b)
+  ;; point between an empty bracket pair of the buffer's (`{|}`), with electric pairs on —
+  ;; where Emacs's electric-pair-open-newline-between-pairs makes RET open a line
+  (let (pair (electric/empty-pair-at m b))
+    (and pair
+      (not (= (first pair) (second pair)))
+      (electric/electric-pair-in? m b))))
+
 (defcommand cmd-newline-and-indent
   (m key)
   "Enter in a structured mode: insert a newline, then indent the new line to its
@@ -679,12 +687,24 @@ tutorial), which outrank the vim profile, so the check has to live here."
     (cmd-next-line m key)
     ;; the indent is asked of the text the newline made: the held tree is followed to it
     ;; (an incremental update of one splice) rather than the indenter parsing the document
-    (let ([m fill] (ed-auto-fill m))
+    (let ([m fill] (ed-auto-fill m)
+          between? (ed-between-pair? m (ed-current-buf m)))
       (ed-edit-following-tree m
         (fn (b held follow)
           (let (nb (undo-group b (fn (bb) (insert (ed-trim-before-point (fill bb)) "\n")))
                 current (follow held nb))
-            [(ed-reindent-line nb (ed-indent-target nb current)) current]))))))
+            (if (not between?)
+              [(ed-reindent-line nb (ed-indent-target nb current)) current]
+              ;; `{|}`: the closer gets a line of its own at the block's column, and point
+              ;; the empty line between, indented one level in
+              (let (closer (insert (amalgamate-undo nb) "\n")
+                    closer-tree (follow current closer)
+                    placed (ed-reindent-line (amalgamate-undo closer)
+                             (ed-indent-target closer closer-tree))
+                    middle (goto-char placed (dec (buffer-point (beginning-of-line placed))))
+                    middle-tree (follow closer-tree middle))
+                [(ed-reindent-line (amalgamate-undo middle) (ed-indent-target middle middle-tree))
+                  middle-tree]))))))))
 
 (defcommand cmd-indent-or-complete
   (m key)
@@ -858,6 +878,56 @@ one undo step."
       (ed-edit m (fn (b) (undo-group b (fn (bb) (insert-replacing m (fill bb) key))))))
     (ed-edit m (fn (b) (insert-replacing m b key)))))
 
+;; ---- electric indent -------------------------------------------------------------
+;; Emacs's electric-indent-mode: a key that ENDS a block reindents its line as it is typed,
+;; so `}` or `end` on a line of its own lands at the block's column without a TAB.
+
+(def- *electric-closers* #{")" "]" "}"})
+
+(defn- line-head (b)
+  ;; the text of point's line before point, its indentation dropped
+  (let (rope (buffer-rope b)
+        point (buffer-point b)
+        bol (buffer-point (beginning-of-line b))
+        from (math/min point (+ bol (rope-leading-whitespace rope bol))))
+    (text/slice rope from point)))
+
+(defn- ends-block? (b head)
+  ;; whether `head` (what precedes point on its line) ends a block: a closing bracket alone,
+  ;; or a word the mode names (its `:electric-indent` regexp) — now, or one character ago, so
+  ;; `end` + `_` reindents `end_time` back where it was
+  (let (pattern (ed-mode-service b :electric-indent)
+        length (string/length head))
+    (or (and (= 1 length) (contains? *electric-closers* head))
+      (and pattern
+        (> length 0)
+        (or (regex/match? pattern head)
+          (regex/match? pattern (string/substring head 0 (dec length))))))))
+
+(sig ed-electric-reindent (model -> model))
+(defn ed-electric-reindent (m)
+  "After a typed character: point's line reindented when what now precedes point on it ends a
+block — a closing bracket first on its line, or a word its mode names in `:electric-indent`
+(Ruby's `end`, Python's `else:`) — Emacs's electric-indent-mode. Only in a mode with an indenter,
+never in a string or a comment, and in the same undo step as the character."
+  (let (b (ed-current-buf m))
+    (if (not (and (ed-mode-service b :indent) (ends-block? b (line-head b))))
+      m
+      (let ([m2 info] (stringstate/ed-point-state m))
+        (if (or (:inside info) (electric/in-comment? info))
+          m2
+          (ed-edit-following-tree m2
+            (fn (b held follow)
+              (let (current (follow held b)
+                    rope (buffer-rope b)
+                    bol (buffer-point (beginning-of-line b))
+                    indentation (text/slice rope bol (+ bol (rope-leading-whitespace rope bol)))
+                    wanted (ed-indentation b (ed-indent-target b current)))
+                (if (= wanted indentation)
+                  [b current]
+                  [(ed-reindent-line (amalgamate-undo b) (ed-indent-target b current))
+                    current])))))))))
+
 (defcommand cmd-self-insert
   (m key)
   "Insert the typed character `key` (a 1-char string) at point — over the region when
@@ -868,11 +938,11 @@ the fill column breaks the line when the buffer auto-fills (`fill/ed-auto-fill`)
   (let (b (ed-current-buf m)
         pairs (when (string? key) (electric/pairs-for m b)))
     (cond
-      (nil? pairs) (ed-type m key)
+      (nil? pairs) (ed-electric-reindent (ed-type m key))
       (or (electric/opener-pair pairs key) (electric/triple-pair pairs b key))
         (cmd-open-delimiter m key)
       (electric/closer-pair pairs key) (cmd-electric-close m key)
-      else (ed-type m key))))
+      else (ed-electric-reindent (ed-type m key)))))
 
 ;; ---- electric brackets -----------------------------------------------------------
 ;; The policy — which pairs a buffer has, when an opener pairs, the switches — is `electric`'s;
@@ -930,7 +1000,7 @@ region, point after the closer. Bound on brood-keymap (every other mode has
                 (> ahead (inc (buffer-point b)))
                 (editor/highlight/closer-redundant? (buffer-rope b) (dec ahead) key))
             (step-to m ahead)
-            (ed-type m key))))))
+            (ed-electric-reindent (ed-type m key)))))))
 
 (defcommand cmd-electric-close
   (m key)
@@ -947,8 +1017,8 @@ which reads the form you are in."
       (and pair (electric/electric-pair-in? m b) (not (selection-to-replace? m b)))
         (let ([m2 info] (stringstate/ed-point-state m)
               target (electric/skip-target m2 b pair key info))
-          (if target (step-to m2 target) (ed-type m2 key)))
-      else (ed-type m key))))
+          (if target (step-to m2 target) (ed-electric-reindent (ed-type m2 key))))
+      else (ed-electric-reindent (ed-type m key)))))
 
 (defcommand cmd-open-delimiter
   (m key)
