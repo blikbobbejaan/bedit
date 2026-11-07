@@ -1,0 +1,193 @@
+(defmodule search-commands
+  "The search commands that open a search, a list or a replace: isearch's entry points (C-s C-r
+C-M-s M-s w M-s .), occur (M-s o), the fuzzy line search, and the query-replace prompts (M-%
+C-M-%). The loops themselves are `isearch`'s and `query-replace`'s."
+  (:use editor/buffer)
+  (:use interactive)
+  (:use isearch)
+  (:use query-replace)
+  (:use task)
+  (:use pool)
+  (:use scroll)
+  (:use minibuffer)
+  (:use model))
+
+;; ---- occur (M-s o) ----------------------------------------------------------
+;; List the current buffer's lines matching a string in a read-only *Occur* buffer;
+;; RET or a click on a result visits that line of the source, in another pane. A results
+;; buffer like *Diagnostics*: each row's location rides OFF-text in `:line-links`
+;; (`{:buffer :line}`, resolved by `results/line-links-only-loc`), and the jump is the
+;; shared `cmd-visit-location` (`results/location-jump-layer`) — so a second *Occur* over
+;; another buffer can never send the first one's rows to the wrong source.
+;; ---- incremental search (C-s / C-r) -----------------------------------------
+;; Open the modal isearch loop; `input/ed-update` then routes keys to it (see
+;; `isearch`). The work — searching, highlighting, wrap — lives in `src/isearch.blsp`.
+;; ---- fuzzy in-buffer line search (M-s) --------------------------------------
+;; The same Vertico minibuffer the other completers use, ranking the buffer's own lines
+;; (consult-line / swiper style): you fuzzy-type, the list narrows, Enter jumps to the
+;; selected line. Each candidate is "<n>: <text>" so accept can recover the line number
+;; (and typing a bare number jumps straight to that line, like goto-line).
+
+(defn- ed-occur-matches (buf needle)
+  "`[line0 text]` for each 0-based line of `buf` whose text contains `needle`."
+  (seq/keep (range (buffer-line-count buf))
+    (fn (ln)
+      (let (txt (ed-strip-newline (buffer-line-at buf ln)))
+        (if (>= (index-of txt needle 0) 0) [ln txt] nil)))))
+
+(defn ed-occur-text (matches needle)
+  "The *Occur* buffer text for `matches` of `needle`: a header line then `N: <line>`
+rows (1-based source line numbers)."
+  (str (count matches)
+    " matches for \""
+    needle
+    "\":\n"
+    (string/join (map matches (fn (e) (str (inc (first e)) ": " (second e)))) "\n")
+    "\n"))
+
+(defn- ed-occur-links (matches source)
+  "The *Occur* rows' `:line-links`: each row (0-based, after the header line) → the
+`{:buffer :line}` of the match it shows in buffer `source`."
+  (into {}
+    (map (seq/enumerate matches) (fn ([i e]) [(inc i) {:buffer source :line (inc (first e))}]))))
+
+(defcommand cmd-occur
+  (m key)
+  "List the current buffer's lines matching a string in a read-only *Occur* buffer
+(M-s o); RET on a result visits that line of the source buffer, in another pane."
+  (let (src (buffer-name (ed-current-buf m)))
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "Occur: " "")
+         :on-complete (fn (mm t)
+                        (if (= t "")
+                          (message mm "empty pattern")
+                          (let (matches (ed-occur-matches (ed-current-buf mm) t))
+                            (if (empty? matches)
+                              (message mm (str "no matches for \"" t "\""))
+                              (let (shown (ed-show-named mm
+                                            "*Occur*"
+                                            (ed-occur-text matches t)
+                                            :occur))
+                                (ed-set-buf shown
+                                  (assoc (ed-current-buf shown)
+                                    :line-links (ed-occur-links matches src))))))))})))
+
+(defcommand cmd-isearch-forward
+  (m key)
+  "Begin an incremental search forward (C-s)."
+  (isearch-start m :forward))
+
+(defcommand cmd-isearch-backward
+  (m key)
+  "Begin an incremental search backward (C-r)."
+  (isearch-start m :backward))
+
+(defcommand cmd-isearch-forward-regexp
+  (m key)
+  "Begin an incremental REGEXP search forward (C-M-s) — Brood's pattern dialect, `^`/`$` at a
+line's ends and `.` short of a newline. M-r inside any search toggles between the two."
+  (isearch-start m :forward :regexp))
+
+(defcommand cmd-isearch-backward-regexp
+  (m key)
+  "Begin an incremental regexp search backward (C-M-r)."
+  (isearch-start m :backward :regexp))
+
+(defcommand cmd-isearch-forward-symbol-at-point
+  (m key)
+  "Search forward for the symbol at point, whole symbols only (M-s .) — the next C-s is its next
+use (Emacs's isearch-forward-symbol-at-point)."
+  (isearch-start-symbol m))
+
+(defcommand cmd-isearch-forward-word
+  (m key)
+  "Begin an incremental WORD search forward (M-s w): the words typed, whatever punctuation,
+spaces or line breaks lie between them in the buffer."
+  (isearch-start m :forward :word))
+
+(defn- ed-query-replace-prompts (m regexp?)
+  "Ask what to replace and with what, then start the y/n/!/./q loop (`query-replace/qr-start`).
+The region is read NOW, before either prompt, as Emacs's interactive spec reads it: with one
+active the replace is confined to it, and both prompts say so — `Query replace in region:`."
+  (let (region (region/ed-active-region m)
+        kind (str "Query replace" (if regexp? " regexp" "") (if region " in region" ""))
+        ;; a narrowed pane confines it too: from point (or the region) to the restriction's end
+        scope (when (or region (ed-selected-restrict m)) (ed-replace-scope m region))
+        options (merge {:regexp? regexp?} (if scope {:region scope} {}))
+        ;; the last pair of THIS kind, which an empty answer reuses (Emacs's
+        ;; `query-replace-defaults`): the prompt names it
+        last (get (or (:query-replace-last m) {}) regexp?)
+        default (if last (str " (default " (first last) " -> " (second last) ")") "")
+        ;; M-% from a search hands over what it searched for: only the replacement is asked
+        seed (:query-replace-seed m)
+        ask-to (fn (mm from)
+                 (assoc mm
+                   :minibuffer
+                     {:edit (ed-mb-edit (str kind " " from " with: ") "")
+                      :on-complete (fn (m2 to)
+                                     (qr-start (map/assoc-in m2
+                                                 [:query-replace-last regexp?]
+                                                 [from to])
+                                       from to options))})))
+    (if seed
+      (ask-to (dissoc m :query-replace-seed) (:from seed))
+      (assoc m
+        :minibuffer
+          {:edit (ed-mb-edit (str kind default ": ") "")
+           :on-complete (fn (mm from)
+                          (cond
+                            (and (= from "") last) (qr-start mm (first last) (second last) options)
+                            (= from "") (message mm "(nothing to replace)")
+                            else (ask-to mm from)))}))))
+
+(defcommand cmd-query-replace
+  (m key)
+  "Replace occurrences of one string with another from point — or within the region when one
+is active — asking at each (M-%). Prompts for the search string, then the replacement, then
+enters the y/n/!/./q loop (see `query-replace`)."
+  (ed-query-replace-prompts m false))
+
+(defcommand cmd-query-replace-regexp
+  (m key)
+  "Replace matches of a regexp from point — or within the region when one is active — asking
+at each (C-M-%). The replacement may refer to what matched: `\\&` the whole match, `\\1`…`\\9`
+its groups, `\\\\` a backslash."
+  (ed-query-replace-prompts m true))
+
+(defn ed-buffer-line-cands (buf)
+  "Every non-blank line of `buf` as `\"<1-based n>: <text>\"` — the fuzzy line-search
+candidates; the leading number lets accept jump back to the line."
+  (let (n (buffer-line-count buf))
+    (seq/keep (range n)
+      (fn (i)
+        (let (txt (ed-strip-newline (buffer-line-at buf i)))
+          (if (= "" (string/trim txt)) nil (str (inc i) ": " txt)))))))
+
+(defn ed-goto-line-cand (m cand)
+  "Move point to the start of the line a fuzzy line-search candidate names; a candidate
+with no leading number leaves point unmoved (`ed-scroll` after dispatch reveals it). The
+candidate's leading number is parsed by the shared `ed-leading-int` (a `\"<n>: text\"`
+row, like an *Occur* line)."
+  (let (n (ed-leading-int cand))
+    (if (nil? n)
+      m
+      (let (buf (ed-current-buf m)
+            line (math/max 0 (math/min (dec (buffer-line-count buf)) (dec n)))
+            bol (text/line->char (buffer-rope buf) line))
+        (ed-set-buf m (goto-char buf bol))))))
+
+(defcommand cmd-fuzzy-find-line
+  (m key)
+  "Fuzzy-search the current buffer's lines (M-s s, or M-s l as consult-line): a minibuffer listing every non-blank
+line as `\"<n>: <text>\"`, fuzzy-ranked as you type — the same list + ↑/↓ navigation as
+M-x and find-file. Enter jumps point to the selected line; a bare number jumps to it."
+  (let (cands (ed-buffer-line-cands (ed-current-buf m)))
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "Find line: " "")
+         :on-complete (fn (mm t) (ed-goto-line-cand mm t))
+         :complete-fn (fn (t) t)
+         :rank-source cands ; every buffer line, narrowed incrementally as you type
+         :rank-cap 40
+         :accept-selection true})))

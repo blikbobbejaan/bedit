@@ -1,0 +1,326 @@
+(defmodule motion
+  "Moving point: by character, word, line and screen row (C-f C-b M-f M-b C-n C-p, with a goal
+column kept across presses), to the line's and the buffer's ends, by paragraph and sentence, a
+screenful at a time (C-v M-v), recentring (C-l, M-r), shift-selection, and to a line or a
+character offset (M-g g, M-g c). A motion that cannot move fails (`model/ed-ding`), which is what
+stops a keyboard macro."
+  (:use editor/buffer)
+  (:use bufferops)
+  (:use interactive)
+  (:use panes)
+  (:use task)
+  (:use pool)
+  (:use scroll)
+  (:use minibuffer)
+  (:use model))
+
+;; ---- movement (Emacs C-f/C-b/C-n/C-p/C-a/C-e/M-f/M-b + the arrow keys) -------
+
+;; A motion that cannot move says so, as Emacs's signals `end-of-buffer` /
+;; `beginning-of-buffer`: the echo, and `ed-ding`'s failure, which is what ends a keyboard
+;; macro run with `C-u 0 C-x e` ("until it fails") at the last line.
+
+;; C-n / C-p move by SCREEN row in a wrapped buffer (Emacs `line-move-visual`) and by line
+;; elsewhere, and both aim at a GOAL column in display cells: the column the first press
+;; started from, kept while presses follow one another, so passing a short line or row
+;; does not drag point to the left for good (Emacs `temporary-goal-column`). The goal is
+;; live while point is still where the last line motion left it in the same buffer — no
+;; command bookkeeping, so a `C-u 5 C-n` (five runs of one command) keeps it too.
+;; ---- screenful scrolling (C-v / M-v, PageDown / PageUp) ---------------------
+;; A "page" is the viewport height less one line of overlap. `ed-update` stashes
+;; the live viewport height on the model as `:view-rows`, so these stay correct
+;; across a pane resize (10 is a fallback for a model built outside the loop).
+;; ---- recenter & window-line motion (C-l, M-r) -------------------------------
+;; Both cycle on consecutive presses via `:last-command` (the Emacs mechanism). Their
+;; targets respect the scroll margin so the post-command `ed-scroll` clamp leaves them
+;; put (a "top" that sat at row 0 would otherwise be pulled back down by the margin).
+;; ---- paragraph / sentence / indentation motion (M-{ M-} · M-a M-e · M-m) -----
+;; All three are `std/editor/buffer` primitives — the text-level motions live next to
+;; `forward-word` in the toolkit, so these commands are one `ed-apply` each.
+
+(defn- ed-edge-motion (m moved forward?)
+  "The model with the current buffer as `moved`, a motion's result — or, when the motion
+left point where it was, the model unmoved and failed ([[model/ed-ding]]) with `End of
+buffer` / `Beginning of buffer`."
+  (if (= (buffer-point moved) (buffer-point (ed-current-buf m)))
+    (ed-ding m (if forward? "End of buffer" "Beginning of buffer"))
+    (ed-set-buf m moved)))
+
+(defcommand cmd-forward-char
+  (m key)
+  "Move point one character forward (C-f); at the end of the buffer, say so and fail."
+  (ed-edge-motion m (forward-char (ed-current-buf m)) true))
+
+(defcommand cmd-backward-char
+  (m key)
+  "Move point one character back (C-b); at the start of the buffer, say so and fail."
+  (ed-edge-motion m (backward-char (ed-current-buf m)) false))
+
+(sig ed-visible-line (set int int int -> (or nil int)))
+
+(defn- ed-visible-line (hidden line step bound)
+  "The nearest line from `line` in direction `step` (1 or -1) that no fold hides, not
+past `bound` — nil when there is none."
+  (let (next (+ line step))
+    (cond
+      (if (> step 0) (> next bound) (< next bound)) nil
+      (contains? hidden next) (ed-visible-line hidden next step bound)
+      else next)))
+
+(sig ed-row-motion (buffer int int int map -> buffer))
+
+(defn- ed-row-motion (buf rows goal w extras)
+  "`buf` with point `rows` screen rows on (negative = up) at display column `goal`, the
+rows broken at width `w` (`wrap/line-segments`, by the row `extras` — a truncated line is one
+row) — or, when `w` is 0, whole lines. Stops at the buffer's first and last row, and steps over
+the lines a fold hides (`:hidden` in `extras`)."
+  (let (hidden (get extras :hidden #{})
+        line (buffer-current-line buf)
+        col (buffer-column buf)
+        segs (if (> w 0)
+               (wrap/line-segments buf line w extras)
+               (list [0 (string/length (wrap/line-text buf line))]))
+        row (wrap/row-of segs col)
+        target (+ row rows))
+    (cond
+      (and (>= target 0) (< target (count segs)))
+        (let (text (wrap/line-text buf line)
+              segment (nth segs target)
+              from (first segment)
+              to (second segment)
+              start (string/display-width (string/substring text 0 from))
+              ;; a row that is not the line's last ends where the next begins: stop short of
+              ;; that column, or point would be shown at the start of the row below
+              last (if (< target (dec (count segs))) (if (> (dec to) from) (dec to) from) to)
+              index (+ from (string/width->index (string/substring text from to) goal start)))
+          ;; a segment is untyped data (`wrap/line-segments`: its ints and, cut short, a clip),
+          ;; so the offset is an int by this guard rather than by declaration
+          (let (offset (+ (text/line->char (buffer-rope buf) line) (if (< index last) index last)))
+            (if (int? offset) (goto-char buf offset) buf)))
+      (< target 0)
+        (let (above (ed-visible-line hidden line -1 0))
+          (if (not (int? above))
+            buf
+            ;; onto the line above's LAST row, then the rest of the way
+            (ed-row-motion (goto-char buf
+                             (+ (text/line->char (buffer-rope buf) above)
+                               (string/length (wrap/line-text buf above))))
+              (+ target 1)
+              goal
+              w
+              extras)))
+      else
+        (let (below (ed-visible-line hidden line 1 (dec (buffer-line-count buf))))
+          (if (not (int? below))
+            buf
+            (ed-row-motion (goto-char buf (text/line->char (buffer-rope buf) below))
+              (- target (count segs))
+              goal
+              w
+              extras))))))
+
+(sig ed-line-move (model int -> model))
+
+(defn- ed-line-move (m rows)
+  "Point `rows` screen rows on (lines, when the buffer does not wrap), at the goal column."
+  (let (buf (ed-current-buf m)
+        extras (ed-row-extras buf)
+        w (if (ed-row-wise? buf extras) (or (:view-cols m) 0) 0)
+        col (buffer-column buf)
+        text (wrap/line-text buf (buffer-current-line buf))
+        segs (if (> w 0)
+               (wrap/line-segments buf (buffer-current-line buf) w extras)
+               (list [0 (string/length text)]))
+        from (first (nth segs (wrap/row-of segs col)))
+        here (string/display-width (string/substring text from col)
+               (string/display-width (string/substring text 0 from)))
+        held (:line-goal m)
+        goal (if (and (map? held) (= (:point held) (:point buf)) (= (:buffer held) (:name buf)))
+               (:column held)
+               here)
+        moved (ed-row-motion buf rows goal w extras))
+    (if (= (:point moved) (:point buf))
+      ;; no row to move to (Emacs's `next-line` signalling `end-of-buffer`)
+      (ed-ding m (if (> rows 0) "End of buffer" "Beginning of buffer"))
+      (assoc (ed-set-buf m moved)
+        :line-goal {:column goal :point (:point moved) :buffer (:name moved)}))))
+
+(defcommand cmd-next-line (m key) (ed-line-move m 1))
+
+(defcommand cmd-previous-line (m key) (ed-line-move m -1))
+
+(defcommand cmd-beginning-of-line (m key) (ed-apply m beginning-of-line))
+
+(defcommand cmd-end-of-line (m key) (ed-apply m end-of-line))
+
+(defcommand cmd-forward-word (m key) (ed-apply m forward-word))
+
+(defcommand cmd-backward-word (m key) (ed-apply m backward-word))
+
+(defcommand cmd-beginning-of-buffer (m key) (ed-apply m beginning-of-buffer)) ; M-<
+
+(defcommand cmd-end-of-buffer (m key) (ed-apply m end-of-buffer)) ; M->
+
+(sig ed-page-step (model -> int))
+
+(defn ed-page-step (m)
+  "Lines a screenful scroll moves: the viewport height (`:view-rows`) less one
+line of overlap; at least 1."
+  (math/max 1 (dec (or (:view-rows m) 10))))
+
+(sig ed-scroll-page (model int -> model))
+
+(defn ed-scroll-page (m n)
+  "Scroll the selected pane by `n` lines (negative = up), moving point with it so its
+**screen row is preserved** (Emacs `scroll-preserve-screen-position`): point and `:top`
+shift by the same amount (clamped at the buffer's last line), so the text under point
+stays put on screen rather than the cursor jumping to an edge. A buffer that scrolls by
+rows (wrapped) moves `n` ROWS (`scroll/ed-scroll-by-rows`), as Emacs's C-v counts screen
+lines."
+  (let (row-width (ed-row-scroll-width m))
+    (if row-width
+      (ed-scroll-by-rows m n row-width)
+      (let (b (ed-current-buf m)
+            l0 (buffer-current-line b)
+            b2 (forward-line b n)
+            dl (- (buffer-current-line b2) l0) ; actual lines moved (clamps near edges)
+            top (ed-current-top m))
+        (ed-set-top (ed-set-buf m b2) (math/max 0 (+ top dl)))))))
+
+(defcommand cmd-scroll-up
+  (m key)
+  "Scroll forward a screenful (C-v / PageDown): point and view move down together,
+keeping a line of overlap and point's screen position. (Emacs `scroll-up-command`.)"
+  (ed-scroll-page m (ed-page-step m)))
+
+(defcommand cmd-scroll-down
+  (m key)
+  "Scroll back a screenful (M-v / PageUp): point and view move up together, keeping a
+line of overlap and point's screen position. (Emacs `scroll-down-command`.)"
+  (ed-scroll-page m (- (ed-page-step m))))
+
+(defn- ed-cycle-pos (m self field)
+  "The next position 0/1/2 in a 3-way cycle for a repeated command: advance the stored
+`field` when the previous command was `self` (a quoted command symbol), else restart 0."
+  (let (pos (get m field 0))
+    (if (and (= (:last-command m) self) (int? pos)) (math/mod (inc pos) 3) 0)))
+
+(defcommand cmd-recenter
+  (m key)
+  "Scroll so point sits at the middle of the window, then the top, then the bottom on
+successive presses (Emacs `recenter-top-bottom`, C-l). Targets honour the scroll
+margin; the view moves, point does not. In a terminal (`bedit -nw`) it also repaints the
+whole screen, as Emacs's does — what clears whatever another program wrote over it."
+  (when (:terminal m) (term/invalidate))
+  (let (rows (or (:view-rows m) 10)
+        mgn (ed-margin rows)
+        pos (ed-cycle-pos m 'motion/cmd-recenter :recenter-cycle)
+        row (cond (= pos 0) (math/quot rows 2) (= pos 1) mgn else (- rows 1 mgn))
+        line (buffer-current-line (ed-current-buf m))
+        ;; a wrapped buffer counts the rows above point, not the lines
+        row-width (ed-row-scroll-width m))
+    (assoc (if row-width
+             (ed-recenter-rows m row row-width)
+             (ed-set-top m (math/max 0 (- line row))))
+      :recenter-cycle pos)))
+
+(defcommand cmd-move-to-window-line
+  (m key)
+  "Move point to the top visible line, then the middle, then the bottom on successive
+presses (Emacs `move-to-window-line-top-bottom`, M-r). Targets honour the scroll
+margin; point moves, the view does not."
+  (let (rows (or (:view-rows m) 10)
+        mgn (ed-margin rows)
+        buf (ed-current-buf m)
+        ;; the line the window's first row SHOWS (`panes/ed-pane-view-top`: the scroll
+        ;; top plus one while a glide rests past half a cell) — the row→line geometry is
+        ;; the pane's to answer, never re-derived from `:top` here
+        vtop (ed-payload-view-top (ed-current-pane m) buf)
+        last (math/max 0 (dec (buffer-line-count buf)))
+        pos (ed-cycle-pos m 'motion/cmd-move-to-window-line :mwl-cycle)
+        target (cond
+                 (= pos 0) (+ vtop mgn)
+                 (= pos 1) (+ vtop (math/quot rows 2))
+                 else (- (+ vtop rows) 1 mgn))
+        line (math/min last (math/max vtop target)))
+    (assoc (ed-set-buf m (forward-line buf (- line (buffer-current-line buf)))) :mwl-cycle pos)))
+
+(defcommand cmd-forward-paragraph (m key) (ed-apply m forward-paragraph))
+
+(defcommand cmd-backward-paragraph (m key) (ed-apply m backward-paragraph))
+
+(defcommand cmd-forward-sentence
+  (m key)
+  "To the end of the sentence (M-e); the paragraph's end when none follows."
+  (ed-apply m forward-sentence))
+
+(defcommand cmd-backward-sentence
+  (m key)
+  "To the start of the sentence (M-a); the paragraph's start when none precedes."
+  (ed-apply m backward-sentence))
+
+(defcommand cmd-back-to-indentation
+  (m key)
+  "To the first non-whitespace character of the line, skipping its indent (M-m)."
+  (ed-apply m back-to-indentation))
+
+(defn- ed-parse-int (s)
+  "Parse `s` as an integer, or nil if it isn't one."
+  ;; `s` is what the user typed at the prompt — not reading as an integer is the answer
+  (check-allow :discarded-catch
+    (try (let (v (reflect/read-string s)) (if (int? v) v nil)) (catch e nil))))
+
+(defcommand cmd-goto-line
+  (m key)
+  "Prompt for a line number and jump to it (M-g g). With a prefix argument (C-u 42 M-g g, M-4 M-2
+M-g g) go to that line without asking, as Emacs does."
+  (if-let (line (current-prefix-arg m))
+    (ed-apply m (fn (b) (ed-goto-line b line)))
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "Goto line: " "")
+         :on-complete (fn (mm t)
+                        (let (n (ed-parse-int t))
+                          (if (nil? n)
+                            (message mm (str "not a line number: " t))
+                            (ed-apply mm (fn (b) (ed-goto-line b n))))))})))
+
+(defcommand cmd-goto-char
+  (m key)
+  "Prompt for a character offset and jump to it (M-g c). Clamped to the buffer."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "Goto char: " "")
+       :on-complete (fn (mm t)
+                      (let (n (ed-parse-int t))
+                        (if (nil? n)
+                          (message mm (str "not a character offset: " t))
+                          (ed-apply mm
+                            (fn (b) (goto-char b (math/max 0 (math/min n (buffer-length b)))))))))}))
+
+;; ---- shift-select (Shift+arrows / Home / End extend the region) -------------
+(def ed-shift-motion-for
+  {:shift-up cmd-previous-line
+   :shift-down cmd-next-line
+   :shift-left cmd-backward-char
+   :shift-right cmd-forward-char
+   :shift-home cmd-beginning-of-line
+   :shift-end cmd-end-of-line})
+
+(defn ed-shift-move (m move-cmd key)
+  "Start (or extend) a shift-selection: set the mark at point when no region is active
+and flag `:shift-select`, then run the base motion `move-cmd`. point↔mark is the region;
+a plain motion afterwards collapses it (`input/ed-shift-deactivate`)."
+  (let (b (ed-current-buf m)
+        m1 (if (or (:shift-select m) (buffer-mark b))
+             (assoc m :shift-select true)
+             (ed-set-buf (assoc m :shift-select true) (set-mark b))))
+    (move-cmd m1 key)))
+
+(register-prefix-consuming 'motion/cmd-goto-line)
+(register-inverse 'motion/cmd-forward-char 'motion/cmd-backward-char)
+(register-inverse 'motion/cmd-forward-word 'motion/cmd-backward-word)
+(register-inverse 'motion/cmd-next-line 'motion/cmd-previous-line)
+(register-inverse 'motion/cmd-forward-paragraph 'motion/cmd-backward-paragraph)
+(register-inverse 'motion/cmd-forward-sentence 'motion/cmd-backward-sentence)
+(register-inverse 'motion/cmd-scroll-up 'motion/cmd-scroll-down)

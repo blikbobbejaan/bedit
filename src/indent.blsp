@@ -1,0 +1,414 @@
+(defmodule indent
+  "Indentation: TAB (indent or complete), RET (`newline-and-indent`, opening a line between a
+bracket pair), a region's indent and dedent, C-M-q, and electric indent — a closing bracket or a
+block word (`end`, `else:`) reindents its line as it is typed. The column comes from the mode's
+`:indent` service, else the previous line."
+  (:use editor/buffer)
+  (:use bufferops)
+  (:use sexp)
+  (:use interactive)
+  (:use syntaxtree)
+  (:use complete-at-point)
+  (:use complete-words :only [complete-word-char?])
+  (:use task)
+  (:use keymaps)
+  (:use fill :only [ed-auto-fill])
+  (:use conventions :only [with-indent-width indent-width tab-width indentation])
+  (:use model))
+
+;; ---- indentation (TAB / RET; sexp-aware via the mode's :indent service) -----
+;; The mechanism is language-neutral: `ed-indent-target` asks the buffer's mode for
+;; an `:indent` service (brood-mode supplies a sexp-aware one — see `modes`), and
+;; falls back to matching the previous line. `ed-reindent-line` rewrites the line's
+;; leading whitespace, preserving point. Emacs feel: TAB indents-or-completes, and
+;; (in brood-mode) RET indents the new line.
+;; ---- electric indent -------------------------------------------------------------
+;; Emacs's electric-indent-mode: a key that ENDS a block reindents its line as it is typed,
+;; so `}` or `end` on a line of its own lands at the block's column without a TAB.
+
+(sig ed-fallback-indent (any int -> int))
+
+(defn- ed-fallback-indent (rope bol)
+  "The simple, mode-less indent for the line at `bol`: the COLUMN the previous non-blank
+line's text starts at — its leading whitespace's display width, a tab reaching the next stop
+of `*tab-width*` (bound by [[ed-indent-target]]) — or 0 at the top. Tail-recursive over
+blank lines. A count of characters was read as a column: after `\\tgcc x.c` in a Makefile,
+TAB wrote one space where make needs the tab."
+  ;; Over the rope for the reason `rope-leading-whitespace` is: this walks a line or two, and
+  ;; the string form paid O(buffer) to do it. The previous line's start is the rope's own
+  ;; line index (`text/line->char` of the line holding `bol - 1`) — the offset just past
+  ;; the previous newline that the backward char-at scan found.
+  (if (<= bol 0)
+    0
+    (let (prev-bol (text/line->char rope (text/char->line rope (dec bol)))
+          content-len (- (dec bol) prev-bol)
+          ws (rope-leading-whitespace rope prev-bol))
+      (if (>= ws content-len)
+        ; previous line is empty / all whitespace — skip it
+        (ed-fallback-indent rope prev-bol)
+        (string/display-width (text/slice rope prev-bol (+ prev-bol ws)))))))
+
+(defn ed-indent-target (buf &optional (held nil))
+  "The column the current line should indent to: the buffer mode's `:indent` service
+applied to the line start, else the previous-line fallback. `held` is the buffer's held tree
+entry ([[ed-held-tree]]): while `buf` is still the text it was parsed from, a tree-sitter
+mode's indenter is handed its tree (`editor/treesit/indent-column`'s last argument) and
+walks it instead of parsing the text."
+  ;; Every indenter is handed the ROPE, never a whole-buffer string: the `:indent` service
+  ;; contract is `(text bol)` with `text` a string or a rope. A tree-sitter mode's indenter
+  ;; reads only the lines it inspects (brood ADR-483); a Lisp mode's (`brood-indent`,
+  ;; `lisp-modes/lisp-indent-with`) finds its top-level form with the rope-native form scan
+  ;; and copies that form out (brood ADR-488). RET in a large file flattens nothing.
+  ;; A tree-sitter indenter counts a level as the buffer's indent width
+  ;; (`conventions/indent-width` — its .editorconfig, the user's setting for the mode, the
+  ;; language's own), handed over as `conventions/*indent-width*`.
+  (let (bol (buffer-point (beginning-of-line buf))
+        svc (ed-mode-service buf :indent)
+        lang (ed-mode-service buf :ts-lang)
+        tree (when lang (held-tree-for held buf lang)))
+    ;; the answer is a COLUMN, and an indenter that reads a line's existing indentation
+    ;; (the fallback, a verbatim heredoc line, YAML's content) measures it at the buffer's
+    ;; tab width — bound here, so a caller outside the editor loop gets the same answer
+    (conventions/with-cell-layout buf
+      (fn ()
+        (with-indent-width (indent-width buf)
+          (fn ()
+            (cond
+              (nil? svc) (ed-fallback-indent (buffer-rope buf) bol)
+              ;; only a tree-sitter mode has a tree, and its `deflanguage` indenter takes one
+              tree (svc (buffer-rope buf) bol tree)
+              else (svc (buffer-rope buf) bol))))))))
+
+(sig ed-reindent-line (buffer int -> buffer))
+
+(sig ed-indentation (buffer int -> string))
+
+(defn ed-indentation (buf target)
+  "The leading whitespace that reaches column `target` in `buf`: spaces, or — when it indents
+with tabs (Emacs `indent-tabs-mode`: Go and Makefiles by default, or as its .editorconfig or
+the user's `:indent-tabs` says) — tabs of its tab width, then spaces for the rest
+(`conventions/indentation`)."
+  (indentation buf target))
+
+(defn ed-reindent-line (buf target)
+  "Reindent the current line of `buf` to `target` columns (`ed-indentation` — spaces, or
+tabs in a mode that indents with them), preserving point: from inside the old
+indentation point moves to the first non-blank char; from the body it shifts by the
+indent delta."
+  (let (p (buffer-point buf)
+        bol (buffer-point (beginning-of-line buf))
+        ;; from the rope, not `(buffer-text buf)` — see `rope-leading-whitespace`: RET and TAB
+        ;; both land here, and the string copy was a third of RET's cost on a large file
+        cur (rope-leading-whitespace (buffer-rope buf) bol)
+        within (<= (- p bol) cur)
+        indentation (ed-indentation buf target)
+        length (string/length indentation)
+        b1 (replace-region buf bol (+ bol cur) indentation)
+        newp (if within (+ bol length) (+ p (- length cur))))
+    (goto-char b1 newp)))
+
+(defcommand cmd-indent-line
+  (m key)
+  "Reindent the current line to the column its mode dictates — sexp-aware in
+brood-mode, the previous line elsewhere (`M-x indent-line`)."
+  (structural/ed-with-held-tree m
+    (fn (m held) (ed-edit m (fn (b) (ed-reindent-line b (ed-indent-target b held)))))))
+
+(defn- ed-region-lines (buf)
+  "`[first last]` (0-based, inclusive) — the lines the active region spans, or nil. The
+last line holds the last *selected* char, so a region ending at a line start doesn't pull
+in that next (empty) line."
+  (let (bnds (buffer-region-bounds buf))
+    (if (nil? bnds)
+      nil
+      (let (rope (buffer-rope buf) [lo hi] bnds)
+        [(text/char->line rope lo) (text/char->line rope (math/max lo (dec hi)))]))))
+
+(sig ed-reselect-lines (buffer int int -> buffer))
+
+(defn ed-reselect-lines (buf first last)
+  "Re-activate the region to fully cover lines `[first, last]` (mark at the first line's
+start, point at the start of the line after the last), so repeated TAB / Shift-TAB keep
+acting on the same block."
+  (let (rope (buffer-rope buf)
+        n (buffer-line-count buf)
+        start (text/line->char rope first)
+        end (if (< (inc last) n) (text/line->char rope (inc last)) (buffer-length buf)))
+    (assoc buf :point end :mark start)))
+
+(defn- ed-fold-region-lines (buf first last f)
+  "Apply `(f buf ln)` down lines `first..last`, coalescing every line's edit into ONE
+undo step (amalgamate after the first). Leaves point/mark wherever `f` left them — the
+caller decides (TAB re-selects the block; `indent-sexp` restores point)."
+  (fold (range first (inc last)) buf (fn (b ln) (f (if (= ln first) b (amalgamate-undo b)) ln))))
+
+(defn- ed-map-region-lines (buf first last f)
+  "`ed-fold-region-lines`, then re-select lines `first..last` so repeated TAB / Shift-TAB
+keep acting on the same block."
+  (ed-reselect-lines (ed-fold-region-lines buf first last f) first last))
+
+(sig ed-reindent-line-at (buffer int &optional any -> buffer))
+
+(defn ed-reindent-line-at (buf ln &optional (held nil))
+  "Reindent line `ln` to its mode column (positions point at the line first so the shared
+`ed-reindent-line` acts on it).
+
+A BLANK line is emptied rather than indented. `newline-and-indent` wants the opposite —
+pressing RET puts you at the right column on a line that is empty precisely because you
+are about to type there — but reindenting an existing blank line to its block level only
+writes trailing whitespace onto it. Invisible on screen, and every one of them is a line
+in the diff: reindenting a `mix.exs` rewrote all three of its blank lines and nothing
+else. So the rule is per CALLER, not per line: the indenter answers what the column is,
+and a bulk reindent declines to put anything on a line with nothing on it. `held` is passed
+to [[ed-indent-target]]."
+  (let (b (goto-char buf (text/line->char (buffer-rope buf) ln))
+        rope (buffer-rope b)
+        from (text/line->char rope ln)
+        to (math/min (text/length rope) (text/line->char rope (inc ln)))
+        line (text/slice rope from to))
+    (if (= (string/trim line) "")
+      (ed-reindent-line b 0)
+      (ed-reindent-line b (ed-indent-target b held)))))
+
+(defn- ed-edit-following-tree (m f)
+  "`ed-edit` for an edit that asks the held tree about text it has itself just changed —
+RET's indent, every line of a region reindent after the first. `f` is `(buffer held follow)
+-> [buffer entry]`: `held` is the buffer's held tree entry ([[ed-held-tree]]) and `(follow
+entry buffer)` brings an entry up to a buffer the edit made (`syntaxtree/follow-held-tree`,
+an incremental update of the splices between them), so each query after an edit reads a
+current tree instead of parsing the whole document. The entry `f` ends with is brought up
+to the edited buffer and becomes the model's (`ed-adopt-syntax-tree`), so the loop's next
+refresh finds it current rather than applying the same edit again."
+  (let (buf (ed-current-buf m)
+        held (structural/ed-held-tree m)
+        lang (ed-mode-service buf :ts-lang)
+        origin (:tree held)
+        follow (fn (entry b) (when lang (follow-held-tree entry b lang origin)))
+        [edited ran entry] (ed-try-edit-with m
+                             (fn (b)
+                               (let ([nb entry] (f b (when lang held) follow))
+                                 [nb (follow entry nb)]))))
+    (if ran (ed-adopt-syntax-tree edited (ed-current-index edited) entry) edited)))
+
+(defn- ed-reindent-region-lines (buf first last held follow)
+  "`[buffer entry]`: lines `first..last` of `buf` reindented ([[ed-reindent-line-at]]) as
+ONE undo step, the held tree entry `held` followed down them so each line's indenter reads
+a tree of the text the lines above it left — the shape [[ed-edit-following-tree]] takes."
+  (fold (range first (inc last))
+    [buf held]
+    (fn ([b entry] ln)
+      (let (current (follow entry b))
+        [(ed-reindent-line-at (if (= ln first) b (amalgamate-undo b)) ln current) current]))))
+
+(defn- ed-reindent-region (m first last)
+  "Reindent lines `first..last` of the current buffer as one undo step and re-select them,
+so a repeated TAB keeps acting on the same block (TAB on a region, `indent-region`)."
+  (ed-edit-following-tree m
+    (fn (b held follow)
+      (let ([nb entry] (ed-reindent-region-lines b first last held follow))
+        [(ed-reselect-lines nb first last) entry]))))
+
+(sig ed-dedent-line-at (buffer int int -> buffer))
+
+(defn ed-dedent-line-at (buf ln width)
+  "Move line `ln`'s text up to `width` COLUMNS left — its indentation rewritten at the
+column that leaves (`ed-indentation`: tabs where the buffer indents with them), so a tab
+counts as the columns it spans rather than one; a no-op on a line with none."
+  (let (rope (buffer-rope buf)
+        bol (text/line->char rope ln)
+        length (rope-leading-whitespace rope bol)
+        leading (text/slice rope bol (+ bol length))
+        column (string/display-width leading 0 (tab-width buf))
+        indentation (ed-indentation buf (math/max 0 (- column width))))
+    (if (or (= length 0) (= indentation leading))
+      buf
+      (replace-region buf bol (+ bol length) indentation))))
+
+(defcommand cmd-dedent
+  (m key)
+  "Shift-TAB: dedent — remove up to one indent level (the buffer's indent width:
+`conventions/indent-width`, 4 in Python, 2 in Brood) of leading whitespace from the current
+line, or from every line of the active region (one undo step, keeping the region)."
+  (let (buf (ed-current-buf m)
+        rl (ed-region-lines buf)
+        width (indent-width buf))
+    (if (nil? rl)
+      (ed-edit m (fn (b) (ed-dedent-line-at b (buffer-current-line b) width)))
+      (let ([first last] rl)
+        (ed-edit m
+          (fn (b)
+            (ed-map-region-lines b first last (fn (bb ln) (ed-dedent-line-at bb ln width)))))))))
+
+(defcommand cmd-describe-indentation
+  (m key)
+  "Say the current buffer's indent width, tabs or spaces, tab width and fill column, and
+where each comes from — its .editorconfig, init.blsp, its mode (M-x describe-indentation)."
+  (message m (conventions/summary (ed-current-buf m))))
+
+(defcommand cmd-set-fill-column
+  (m key)
+  "Set the current buffer's fill column (M-q's width) to the prefix argument, or without one
+to point's column (Emacs `set-fill-column`, M-x set-fill-column) — this buffer only, over
+its .editorconfig and init.blsp."
+  (let (buf (ed-current-buf m)
+        column (or (current-prefix-arg m) (buffer-column buf)))
+    (if (< column 1)
+      (message m "fill column must be at least 1")
+      (message (ed-set-buf m (conventions/with-buffer-setting buf :fill-column column))
+        (str "fill column set to " column)))))
+
+(defcommand cmd-indent-sexp
+  (m key)
+  "Reindent every line of the s-expression after point (C-M-q) as one undo step — the
+whole-form counterpart of TAB's single line. Point returns to the indentation of the
+form's first line (Emacs holds point with a marker; landing on the reindented text is the
+useful equivalent). A no-op when no form follows point."
+  (structural/ed-with-held-tree m
+    (fn (m held)
+      (let (buf (ed-current-buf m)
+            rope (buffer-rope buf)
+            point (buffer-point buf)
+            end (buffer-point ((structural/ed-structural-move held
+                                 key editor/treesit/point-forward sexp/forward) buf))
+            first (text/char->line rope point))
+        (if (<= end point)
+          m
+          (let (last (text/char->line rope (dec end)))
+            (ed-edit-following-tree m
+              (fn (b held follow)
+                (let ([nb entry] (ed-reindent-region-lines b first last held follow))
+                  [(back-to-indentation (goto-char nb (text/line->char (buffer-rope nb) first)))
+                    entry])))))))))
+
+(defn- ed-trim-before-point (buffer)
+  "`buffer` without the spaces and tabs just before point — what Emacs's `newline-and-indent`
+deletes before it breaks the line (`delete-horizontal-space t`). Without it every RET on an
+auto-indented blank line left that indentation behind as trailing whitespace."
+  (let (point (buffer-point buffer)
+        from (text/skip-backward (buffer-rope buffer) point " \t" true))
+    (if (< from point) (goto-char (replace-region buffer from point "") from) buffer)))
+
+(defn- ed-between-pair? (m b)
+  ;; point between an empty bracket pair of the buffer's (`{|}`), with electric pairs on —
+  ;; where Emacs's electric-pair-open-newline-between-pairs makes RET open a line
+  (let (pair (electric/empty-pair-at m b))
+    (and pair
+      (not (= (first pair) (second pair)))
+      (electric/electric-pair-in? m b))))
+
+(defcommand cmd-newline-and-indent
+  (m key)
+  "Enter in a structured mode: insert a newline, then indent the new line to its
+mode's column (Emacs `newline-and-indent`). Under a modal profile's command state
+RET is a **motion** (down a line, as in vim) rather than an edit — see
+`ed-vim-command-mode?`: this command is bound by MODE layers (brood-mode, the
+tutorial), which outrank the vim profile, so the check has to live here."
+  (if (ed-vim-command-mode? m)
+    (motion/cmd-next-line m key)
+    ;; the indent is asked of the text the newline made: the held tree is followed to it
+    ;; (an incremental update of one splice) rather than the indenter parsing the document
+    (let ([m fill] (ed-auto-fill m)
+          between? (ed-between-pair? m (ed-current-buf m)))
+      (ed-edit-following-tree m
+        (fn (b held follow)
+          (let (nb (undo-group b (fn (bb) (insert (ed-trim-before-point (fill bb)) "\n")))
+                current (follow held nb))
+            (if (not between?)
+              [(ed-reindent-line nb (ed-indent-target nb current)) current]
+              ;; `{|}`: the closer gets a line of its own at the block's column, and point
+              ;; the empty line between, indented one level in
+              (let (closer (insert (amalgamate-undo nb) "\n")
+                    closer-tree (follow current closer)
+                    placed (ed-reindent-line (amalgamate-undo closer)
+                             (ed-indent-target closer closer-tree))
+                    middle (goto-char placed (dec (buffer-point (beginning-of-line placed))))
+                    middle-tree (follow closer-tree middle))
+                [(ed-reindent-line (amalgamate-undo middle) (ed-indent-target middle middle-tree))
+                  middle-tree]))))))))
+
+(defcommand cmd-indent-or-complete
+  (m key)
+  "TAB: with an active region, reindent every line in it to its mode column (one undo,
+keeping the region selected). Otherwise reindent the current line; if it's already at the
+right indent and point sits on a symbol, complete instead (Emacs `tab-always-indent` =
+`'complete`)."
+  ;; `ed-with-held-tree` inline: the completion branch answers a map, not a model
+  (let ([m held] (ed-catch-up-syntax-tree m (ed-current-index m)))
+    (let (buf (ed-current-buf m)
+          rl (ed-region-lines buf))
+      (if rl
+        (let ([first last] rl)
+          (ed-reindent-region m first last))
+        ;; the indent and the char before point are read off the rope — a `buffer-text` copy
+        ;; here was a second whole-buffer string per TAB beside `ed-indent-target`'s; `p > 0`
+        ;; there (it exceeds `bol + cur`), so the one-char slice before it is that same char
+        (let (bol (buffer-point (beginning-of-line buf))
+              cur (rope-leading-whitespace (buffer-rope buf) bol)
+              p (buffer-point buf)
+              target (ed-indent-target buf held))
+          (if (and (= cur target)
+                (> p (+ bol cur))
+                (complete-word-char? (text/slice (buffer-rope buf) (dec p) p)))
+            (cmd-complete m key)
+            (ed-edit m (fn (b) (ed-reindent-line b target)))))))))
+
+(def- *electric-closers* #{")" "]" "}"})
+
+(defn- line-head (b)
+  ;; the text of point's line before point, its indentation dropped
+  (let (rope (buffer-rope b)
+        point (buffer-point b)
+        bol (buffer-point (beginning-of-line b))
+        from (math/min point (+ bol (rope-leading-whitespace rope bol))))
+    (text/slice rope from point)))
+
+(defn- ends-block? (b head)
+  ;; whether `head` (what precedes point on its line) ends a block: a closing bracket alone,
+  ;; or a word the mode names (its `:electric-indent` regexp) — now, or one character ago, so
+  ;; `end` + `_` reindents `end_time` back where it was
+  (let (pattern (ed-mode-service b :electric-indent)
+        length (string/length head))
+    (or (and (= 1 length) (contains? *electric-closers* head))
+      (and pattern
+        (> length 0)
+        (or (regex/match? pattern head)
+          (regex/match? pattern (string/substring head 0 (dec length))))))))
+
+(sig ed-electric-reindent (model -> model))
+
+(defn ed-electric-reindent (m)
+  "After a typed character: point's line reindented when what now precedes point on it ends a
+block — a closing bracket first on its line, or a word its mode names in `:electric-indent`
+(Ruby's `end`, Python's `else:`) — Emacs's electric-indent-mode. Only in a mode with an indenter,
+never in a string or a comment, and in the same undo step as the character."
+  (let (b (ed-current-buf m))
+    (if (not (and (ed-mode-service b :indent) (ends-block? b (line-head b))))
+      m
+      (let ([m2 info] (stringstate/ed-point-state m))
+        (if (or (:inside info) (electric/in-comment? info))
+          m2
+          (ed-edit-following-tree m2
+            (fn (b held follow)
+              (let (current (follow held b)
+                    rope (buffer-rope b)
+                    bol (buffer-point (beginning-of-line b))
+                    indentation (text/slice rope bol (+ bol (rope-leading-whitespace rope bol)))
+                    wanted (ed-indentation b (ed-indent-target b current)))
+                (if (= wanted indentation)
+                  [b current]
+                  [(ed-reindent-line (amalgamate-undo b) (ed-indent-target b current))
+                    current])))))))))
+
+(defcommand cmd-indent-region
+  (m key)
+  "Reindent every line of the region to its mode's column (C-M-\\). With no region, the
+current line — the same rule `indent-line` follows, so the key does something sensible
+either way rather than complaining about the selection you forgot to make."
+  (structural/ed-with-held-tree m
+    (fn (m held)
+      (let (rl (ed-region-lines (ed-current-buf m)))
+        (if (nil? rl)
+          (ed-edit m (fn (b) (ed-reindent-line-at b (buffer-current-line b) held)))
+          (let ([first last] rl) (ed-reindent-region m first last)))))))
+
+(register-prefix-consuming 'indent/cmd-set-fill-column)

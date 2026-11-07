@@ -1,0 +1,194 @@
+(defmodule typing
+  "The keys that type: self-insert, newline, the delete keys, delete-selection (what is typed over
+an active region replaces it), and the electric bracket keys — pairs, a closer stepped over, a
+backspace between an empty pair, a region wrapped. Which pairs a buffer has is `electric`'s
+policy."
+  (:use editor/buffer)
+  (:use sexp)
+  (:use interactive)
+  (:use task)
+  (:use fill :only [ed-auto-fill])
+  (:use model))
+
+;; ---- delete-selection-mode ----------------------------------------------------------
+;; Emacs's `delete-selection-mode`: with a region active, what you type, yank or newline
+;; REPLACES it, and a delete takes the region rather than one character. On with the init
+;; file's `:delete-selection` (the model's `:delete-selection`). One undo step each: the region
+;; and what replaced it come back together. A bracket typed over a region still WRAPS it
+;; (`cmd-open-delimiter`), as electric-pair does in Emacs with the mode on.
+;; ---- electric brackets -----------------------------------------------------------
+;; The policy — which pairs a buffer has, when an opener pairs, the switches — is `electric`'s;
+;; these are the keys. Two behaviours, split the way Emacs splits them:
+;;  - an opener or closer typed over an ACTIVE REGION wraps the region — always, since a
+;;    selection plus a bracket has exactly one meaning;
+;;  - otherwise, with electric-pair-mode on in the buffer, an opener types its pair and lands
+;;    inside (`insert-pair`), a closer at point is stepped over, and a backspace between an
+;;    empty pair takes both (`delete-empty-pair`) — so what one key put there, one key takes
+;;    away. The mechanism is std's (`sexp/wrap-region`, `editor/buffer`'s `insert-pair` /
+;;    `delete-empty-pair`).
+
+(defn selection-to-replace? (m b)
+  "True when `b` has a non-empty active region that typing should replace — delete-selection
+is on in `m`."
+  (and (= true (:delete-selection m))
+    (let (bounds (buffer-region-bounds b)) (and bounds (< (first bounds) (second bounds))))))
+
+(defn insert-replacing (m b text)
+  "`text` inserted at point of `b`, replacing its region first when `selection-to-replace?` —
+one undo step."
+  (if (selection-to-replace? m b)
+    (undo-group b (fn (bb) (insert (delete-region bb) text)))
+    (insert b text)))
+
+(defn- deleting-selection (m edit)
+  ;; a delete command's edit: the region when there is one to replace, else `edit`
+  (fn (b) (if (selection-to-replace? m b) (delete-region b) (edit b))))
+
+(defn- ed-type (m key)
+  ;; the plain insert every typing command falls back to — over the region when
+  ;; delete-selection is on — with auto-fill's break first when a space runs past the column,
+  ;; in the same undo step as the space
+  (if (= key " ")
+    (let ([m fill] (ed-auto-fill m))
+      (ed-edit m (fn (b) (undo-group b (fn (bb) (insert-replacing m (fill bb) key))))))
+    (ed-edit m (fn (b) (insert-replacing m b key)))))
+
+(defcommand cmd-self-insert
+  (m key)
+  "Insert the typed character `key` (a 1-char string) at point — over the region when
+delete-selection is on (`insert-replacing`). A character the buffer's electric pairs name
+(`electric/pairs-for` — `'` in Python, a backtick in Markdown, a user's `<`) is electric here
+whatever key typed it: it goes to [[cmd-open-delimiter]] or [[cmd-electric-close]]. A space past
+the fill column breaks the line when the buffer auto-fills (`fill/ed-auto-fill`)."
+  (let (b (ed-current-buf m)
+        pairs (when (string? key) (electric/pairs-for m b)))
+    (cond
+      (nil? pairs) (indent/ed-electric-reindent (ed-type m key))
+      (or (electric/opener-pair pairs key) (electric/triple-pair pairs b key))
+        (cmd-open-delimiter m key)
+      (electric/closer-pair pairs key) (cmd-electric-close m key)
+      else (indent/ed-electric-reindent (ed-type m key)))))
+
+(defn- step-to (m offset)
+  ;; point moved to `offset`: stepping over a closer
+  (ed-apply m (fn (bb) (goto-char bb offset))))
+
+(defn- wrap-region-in (m pair after-close?)
+  ;; the active region wrapped in `pair`, point inside the opener — or after the closer when
+  ;; a closer was typed (Emacs's electric-pair does the same)
+  (ed-edit m
+    (fn (bb)
+      (let ([lo hi] (buffer-region-bounds bb)
+            [open close] pair
+            wrapped (sexp/wrap-region bb open close))
+        (if after-close?
+          (goto-char wrapped (+ hi (string/length open) (string/length close)))
+          wrapped)))))
+
+(defcommand cmd-close-delimiter
+  (m key)
+  "Type the closing delimiter `key` — or, when the one already at point closes the form you
+are in, move over it instead of typing a second (`editor/highlight/closer-redundant?`).
+
+Emacs's `electric-pair-mode` skip, and paredit's `close-round`: with point at `(+ 1 2|)`,
+typing `)` gives you `(+ 1 2)|` rather than `(+ 1 2))`, and a closer past whitespace is stepped to
+as well, newlines included (`electric-pair-skip-whitespace`). The condition is about the enclosing
+FORM, not the next character, which is what keeps it from eating a delimiter you meant — at top
+level a stray `)` closes nothing and is typed, `[1 2|)` is a mismatch and is typed, and inside a
+string or a comment a bracket is a character and is typed. Over an active region it wraps the
+region, point after the closer. Bound on brood-keymap (every other mode has
+[[cmd-electric-close]], which counts the balance): the scan reads Brood syntax (`;` comments,
+`\"` strings), which is not Ruby's."
+  (let (b (ed-current-buf m)
+        pair (electric/closer-pair (electric/pairs-for m b) key))
+    ;; Over the rope (brood ADR-488): the test reads the char at point first, and only when it
+    ;; is this closer the top-level form up to point — never the whole buffer, which a
+    ;; `buffer-text` copy and its char-index build cost (~4 ms per keystroke on a 2 MB file).
+    (cond
+      (and pair (buffer-region-bounds b)) (wrap-region-in m pair true)
+      (editor/highlight/closer-redundant? (buffer-rope b) (buffer-point b) key)
+        (step-to m (inc (buffer-point b)))
+      else
+        (let (ahead (when (electric/electric-pair-in? m b) (electric/closer-ahead b key)))
+          (if (and ahead
+                (> ahead (inc (buffer-point b)))
+                (editor/highlight/closer-redundant? (buffer-rope b) (dec ahead) key))
+            (step-to m ahead)
+            (indent/ed-electric-reindent (ed-type m key)))))))
+
+(defcommand cmd-electric-close
+  (m key)
+  "Type the closing bracket `key` — or, with electric-pair-mode on in the buffer and that closer
+at point or past only whitespace (newlines included), step over it while that keeps the brackets
+balanced (`electric/skip-target`, Emacs's `electric-pair-preserve-balance`): `(a|)` + `)` steps,
+`((a|)` + `)` types the second closer the first opener needs. Over an active region it wraps the
+region in the pair, point after the closer. A brood buffer binds `cmd-close-delimiter` instead,
+which reads the form you are in."
+  (let (b (ed-current-buf m)
+        pair (electric/closer-pair (electric/pairs-for m b) key))
+    (cond
+      (and pair (buffer-region-bounds b)) (wrap-region-in m pair true)
+      (and pair (electric/electric-pair-in? m b) (not (selection-to-replace? m b)))
+        (let ([m2 info] (stringstate/ed-point-state m)
+              target (electric/skip-target m2 b pair key info))
+          (if target (step-to m2 target) (indent/ed-electric-reindent (ed-type m2 key))))
+      else (indent/ed-electric-reindent (ed-type m key)))))
+
+(defcommand cmd-open-delimiter
+  (m key)
+  "Type the opening delimiter `key`. Over an active region, wrap the region in the pair (point
+lands inside the opener). With electric-pair-mode on in the buffer, where point stands decides
+(`stringstate/ed-point-state`, Emacs's `syntax-ppss` — the held parse, else the mode's string
+syntax over the cached state of point's line): the last character of a triple quote in code
+(`\"\"` + `\"`) opens the triple and its closer (`electric/triple-pair`); a quote opens a pair in
+code, closes the string it is in, steps over that string's closer (`electric/quote-action`); a
+bracket types its pair and lands between unless Emacs's inhibit and balance rules say not
+(`electric/should-pair?`). The pairs are the buffer's mode's (`electric/pairs-for`); a key it
+does not pair is just typed. Bound to `(` `[` `{` `\"` in every buffer, and reached from
+[[cmd-self-insert]] for any other opener a mode pairs."
+  (let (b (ed-current-buf m)
+        pairs (electric/pairs-for m b)
+        pair (electric/opener-pair pairs key)
+        triple (electric/triple-pair pairs b key))
+    (cond
+      (and pair (buffer-region-bounds b)) (wrap-region-in m pair false)
+      (or (and (nil? pair) (nil? triple)) (not (electric/electric-pair-in? m b))) (ed-type m key)
+      else
+        (let ([m2 info] (stringstate/ed-point-state m))
+          (cond
+            (and triple (nil? (:inside info)) (not (electric/in-comment? info)))
+              (ed-edit m2 (fn (bb) (insert-pair bb key (second triple))))
+            (nil? pair) (ed-type m2 key)
+            (= (first pair) (second pair))
+              (case (electric/quote-action m2 b key info)
+                :skip (step-to m2 (inc (buffer-point b)))
+                :pair (ed-edit m2 (fn (bb) (insert-pair bb key (second pair))))
+                (ed-type m2 key))
+            (electric/should-pair? m2 b pair key info)
+              (ed-edit m2 (fn (bb) (insert-pair bb key (second pair))))
+            else (ed-type m2 key))))))
+
+(defcommand cmd-electric-backspace
+  (m key)
+  "Backspace — and, with electric-pair-mode on in the buffer and point between an empty pair of
+its mode (`(|)`), delete both delimiters; with a region delete-selection replaces, the region.
+Bound to Backspace in every buffer (the global keymap)."
+  (let (b (ed-current-buf m)
+        pair (when (and (electric/electric-pair-in? m b) (not (selection-to-replace? m b)))
+               (electric/empty-pair-at m b)))
+    (if pair
+      (ed-edit m (fn (bb) (delete-empty-pair bb (first pair) (second pair))))
+      (cmd-delete-backward m key))))
+
+(defcommand cmd-newline
+  (m key)
+  "Insert a newline at point (RET) — over the region when delete-selection is on; a line past
+the fill column is broken first when the buffer auto-fills (`fill/ed-auto-fill`), one undo step."
+  (let ([m fill] (ed-auto-fill m))
+    (ed-edit m (fn (b) (undo-group b (fn (bb) (insert-replacing m (fill bb) "\n")))))))
+
+(defcommand cmd-delete-char (m key) (ed-edit m (deleting-selection m delete-char)))
+
+(defcommand cmd-delete-backward (m key) (ed-edit m (deleting-selection m delete-backward-char)))
+
+(register-inverse 'typing/cmd-delete-char 'typing/cmd-delete-backward)

@@ -1,0 +1,349 @@
+(defmodule editing
+  "Edits on lines and words: open-line, transposes (C-t M-t C-x C-t C-M-t, a negative argument
+dragging backward), duplicate and join lines, case (M-u M-l M-c), the read-only toggle, and undo /
+redo with Emacs's undo runs."
+  (:use editor/buffer)
+  (:use bufferops)
+  (:use sexp)
+  (:use interactive)
+  (:use task)
+  (:use pool)
+  (:use conventions :only [with-indent-width indent-width tab-width indentation])
+  (:use model))
+
+(defcommand cmd-transpose-sexps
+  (m key)
+  "Interchange the s-expressions either side of point, point landing past both (C-M-t).
+Point inside a form counts as being before it, so the chord mid-symbol swaps that symbol
+with its predecessor — as it does in Emacs."
+  (ed-apply m (fn (b) (sexp/transpose b key))))
+
+(defcommand cmd-transpose-sexps-backward
+  (m key)
+  "Drag the s-expression before point one back, point after it (C-M-t's negative direction)."
+  (structural/ed-with-held-tree m
+    (fn (m held)
+      (ed-transpose m
+        (fn (b)
+          (ed-transpose-back b
+            (structural/ed-structural-move held key editor/treesit/point-backward sexp/backward)
+            (structural/ed-structural-move held key editor/treesit/point-forward sexp/forward)))))))
+
+(defn ed-capitalize (s)
+  "`s` with its first LETTER or digit upper-cased and the rest lower-cased; what comes before
+it (the space M-c starts on when point is between words) is kept. Upper-casing the first
+character left \" two\" unchanged, so M-c before a space did nothing."
+  (let (found (regex/find "[[:alnum:]]" s)
+        at (when found (:start found)))
+    (if (not (int? at))
+      s
+      (str (string/substring s 0 at)
+        (string/upper (string/substring s at (inc at)))
+        (string/lower (string/substring s (inc at) (string/length s)))))))
+
+(defn ed-xform-word (m f)
+  "Apply the string transform `f` to the word from point forward, leaving point
+after it (M-u / M-l / M-c)."
+  (let (b (ed-current-buf m)
+        p (buffer-point b)
+        e (buffer-point (forward-word b))
+        word (buffer-region (assoc b :mark p :point e)))
+    (if (or (nil? word) (= word ""))
+      m
+      (ed-edit m (fn (bb) (replace-region bb p e (f word)))))))
+
+;; open lines — C-o keeps point, M-o opens below, M-O opens above
+(defcommand cmd-open-line
+  (m key)
+  "Insert a newline after point, leaving point (C-o)."
+  (ed-edit m (fn (b) (backward-char (insert b "\n")))))
+
+(defcommand cmd-open-line-below
+  (m key)
+  "Open a new line below and move there (M-o)."
+  (ed-edit m (fn (b) (insert (end-of-line b) "\n"))))
+
+(defcommand cmd-open-line-above
+  (m key)
+  "Open a new line above and move there (M-O)."
+  (ed-edit m (fn (b) (backward-line (insert (beginning-of-line b) "\n")))))
+
+;; transpose / duplicate / join
+(defn- ed-transpose (m f)
+  "Run the transpose `f` (`buffer -> buffer`, or nil when there are not two things to swap) on
+the current buffer — or fail, as Emacs's \"Don't have two things to transpose\" does, which is
+what stops a keyboard macro."
+  (let (result (f (ed-current-buf m)))
+    (if (nil? result)
+      (ed-ding (message m "Don't have two things to transpose"))
+      (ed-edit m (fn (_) result)))))
+
+(sig ed-transpose-back (buffer any any -> (or nil buffer)))
+
+(defn ed-transpose-back (b back forward)
+  "`b` with the thing before point swapped with the thing before THAT, point after the first in
+its new place — a negative argument's transpose (Emacs's `transpose-subr` with -1), which drags
+the thing before point backward. `back` and `forward` are the thing's motions (a char, a word,
+a line, a sexp). Nil when there is no thing before it."
+  (let (s1 (buffer-point (back b))
+        e1 (buffer-point (forward (goto-char b s1)))
+        s2 (buffer-point (back (goto-char b s1)))
+        e2 (buffer-point (forward (goto-char b s2))))
+    (when (and (< s2 e2) (<= e2 s1) (< s1 e1))
+      (let (rope (buffer-rope b))
+        (goto-char (replace-region b
+                     s2
+                     e1
+                     (str (text/slice rope s1 e1) (text/slice rope e2 s1) (text/slice rope s2 e2)))
+          (+ s2 (- e1 s1)))))))
+
+(defn- ed-transpose-chars (b)
+  ;; C-t: the chars around point, point after them; at a line's or the buffer's end the two
+  ;; before point. Nil with nothing to swap — at the start of the buffer, or `a|` alone on
+  ;; the first line, where only the newline is left to swap with
+  (let (p (buffer-point b)
+        after (buffer-char-after b))
+    (cond
+      (and (or (nil? after) (= after "\n")) (>= p 2))
+        (replace-region b
+          (- p 2)
+          p
+          (str (buffer-char-before b) (text/slice (buffer-rope b) (- p 2) (dec p))))
+      (and (>= p 1) (not (nil? after)) (not (= after "\n")))
+        (replace-region b (dec p) (inc p) (str after (buffer-char-before b)))
+      else nil)))
+
+(defcommand cmd-transpose-chars
+  (m key)
+  "Swap the two characters around point and move forward (C-t). At the end of a line —
+or of the buffer — there is no character after point worth swapping with, so it swaps the
+two BEFORE point instead, as Emacs does: `ab|` becomes `ba|`, where swapping around point
+dragged the newline into the line. With a negative argument (M-- C-t) the character before
+point is dragged backward. Fails with nothing to swap."
+  (ed-transpose m ed-transpose-chars))
+
+(defcommand cmd-transpose-chars-backward
+  (m key)
+  "Drag the character before point one back, point after it (C-t's negative direction)."
+  (ed-transpose m (fn (b) (ed-transpose-back b backward-char forward-char))))
+
+(defn- ed-in-word? (b)
+  "Whether point is inside a word: a word character on each side of it."
+  (let (before (buffer-char-before b)
+        after (buffer-char-after b))
+    (and (string? before)
+      (string? after)
+      (regex/matches? "[[:alnum:]]" before)
+      (regex/matches? "[[:alnum:]]" after))))
+
+(defn ed-transpose-words (b)
+  "Swap the word before point with the word after it, leaving point after the second
+(M-t). With point INSIDE a word, that word and the next, as in Emacs (it is the first of the
+pair; this swapped it with the word before). A no-op when there are not two words."
+  (let (b (if (ed-in-word? b) (forward-word b) b)
+        e2 (buffer-point (forward-word b))
+        s2 (buffer-point (backward-word (goto-char b e2)))
+        s1 (buffer-point (backward-word (goto-char b s2)))
+        e1 (buffer-point (forward-word (goto-char b s1))))
+    (if (and (>= s1 0) (< s1 e1) (<= e1 s2) (< s2 e2))
+      ;; the three pieces are sliced off the rope: each is a word or the gap between two, and
+      ;; a `buffer-text` copy of the whole buffer to cut them from cost O(buffer) per M-t
+      (let (rope (buffer-rope b))
+        (goto-char (replace-region b
+                     s1
+                     e2
+                     (str (text/slice rope s2 e2)
+                       (text/slice rope e1 s2)
+                       (text/slice rope s1 e1)))
+          e2))
+      b)))
+
+(defn ed-transpose-lines (b)
+  "Swap the current line with the previous one (C-x C-t), leaving point at the start of
+the line AFTER the pair — so pressing it again drags the same line further down, as in
+Emacs (leaving point on the pair made a second press swap them straight back). A no-op on
+the first line. On a last line with no newline (an empty one included) the line gets one first,
+as Emacs's does: the line moved down keeps its newline rather than the file losing its last."
+  (let (cur (buffer-current-line b))
+    (if (< cur 1)
+      b
+      (let (pv (ed-strip-newline (buffer-line-at b (dec cur)))
+            current-line (buffer-line-at b cur)
+            cv (ed-strip-newline current-line)
+            ending (if (string/ends-with? current-line "\n") "" "\n")
+            s0 (buffer-point (beginning-of-line (backward-line b))) ; start of the previous line
+            span-end (+ s0 (string/length pv) 1 (string/length cv)))
+        (forward-line (forward-line (goto-char (replace-region b
+                                                 s0
+                                                 span-end
+                                                 (str cv "\n" pv ending))
+                                      s0)))))))
+
+(defcommand cmd-transpose-words
+  (m key)
+  "Transpose the word before point with the one after it (M-t); with a negative argument drag
+the word before point backward. Fails when there are not two words."
+  (ed-transpose m
+    (fn (b)
+      (let (swapped (ed-transpose-words b))
+        (when (not (= (buffer-rope swapped) (buffer-rope b))) swapped)))))
+
+(defcommand cmd-transpose-words-backward
+  (m key)
+  "Drag the word before point one word back, point after it (M-t's negative direction)."
+  (ed-transpose m (fn (b) (ed-transpose-back b backward-word forward-word))))
+
+(defcommand cmd-transpose-lines
+  (m key)
+  "Transpose the current line with the previous one (C-x C-t); with a negative argument drag the
+line above point up. Fails on the first line."
+  (ed-transpose m (fn (b) (when (>= (buffer-current-line b) 1) (ed-transpose-lines b)))))
+
+(defcommand cmd-transpose-lines-backward
+  (m key)
+  "Drag the line above point one line up, point at the start of the line after it (C-x C-t's
+negative direction)."
+  (ed-transpose m
+    (fn (b)
+      (ed-transpose-back b
+        (fn (bb) (beginning-of-line (backward-line bb)))
+        (fn (bb) (beginning-of-line (forward-line bb)))))))
+
+(defcommand cmd-duplicate-line
+  (m key)
+  "Duplicate the current line below it (M-x duplicate-line — C-x d is dired, as in Emacs)."
+  (ed-edit m
+    (fn (b)
+      (let (lt (buffer-line-at b (buffer-current-line b)))
+        (insert (beginning-of-line b) (if (string/ends-with? lt "\n") lt (str lt "\n")))))))
+
+(defcommand cmd-join-line
+  (m key)
+  "Join this line to the one ABOVE, collapsing its indentation to a single space —
+Emacs `delete-indentation` (M-^). With a region active, join every line in it, which
+is how you pull a wrapped paragraph back onto one line in one stroke (Emacs 29).
+
+This used to delete the newline at END of line, joining the NEXT line up into this one
+— Vim's `J`, the opposite direction — so the line under point never moved. The seam
+rule (one space, but none next to a delimiter) lives in `bufferops/join-line`."
+  (let (b (ed-current-buf m) region-bounds (buffer-region-bounds b))
+    (if (nil? region-bounds)
+      (ed-edit m join-line)
+      ;; bottom-up: joining shifts everything below the seam, so walking downward would
+      ;; invalidate the line numbers we still have to visit
+      (let ([first-line last-line] (region-line-range b))
+        (ed-edit m
+          (fn (bb)
+            ;; `ed-goto-line-col` is 0-based, matching `region-line-range`; the 1-based
+            ;; `ed-goto-line` would silently join one line short of the region's end
+            (fold (reverse (range (inc first-line) (inc last-line)))
+              bb
+              (fn (acc line) (join-line (ed-goto-line-col acc line 0))))))))))
+
+;; case
+(defn ed-xform-words (m f)
+  "[[ed-xform-word]] under the prefix argument N, Emacs's: N words from point, point after
+them; a negative N the |N| words BEFORE point, point left where it is (`M-- M-u` upcases the
+word just typed). Repeating the command changed the NEXT word for `M--`."
+  (let (arg (current-prefix-arg m)
+        count (if (int? arg) arg 1))
+    (if (>= count 0)
+      (fold (range count) m (fn (acc _) (ed-xform-word acc f)))
+      (let (b (ed-current-buf m)
+            point (buffer-point b)
+            start (fold (range (- 0 count)) b (fn (acc _) (backward-word acc)))
+            from-start (ed-set-buf m (goto-char b (buffer-point start)))
+            changed (fold (range (- 0 count)) from-start (fn (acc _) (ed-xform-word acc f))))
+        (ed-set-buf changed (goto-char (ed-current-buf changed) point))))))
+
+(defcommand cmd-upcase-word (m key) (ed-xform-words m string/upper))
+
+(defcommand cmd-downcase-word (m key) (ed-xform-words m string/lower))
+
+(defcommand cmd-capitalize-word (m key) (ed-xform-words m ed-capitalize))
+
+(defcommand cmd-toggle-read-only
+  (m key)
+  "Toggle the current buffer's read-only flag (C-x C-q)."
+  (let (b (ed-current-buf m))
+    (assoc (ed-set-buf m (set-read-only b (not (read-only? b))))
+      :echo (if (read-only? b) "writable" "read-only")))) ; report the NEW state
+
+(defn- ed-undo-step (m kind exhausted-msg status)
+  "One step of the Emacs undo *tree* on the current buffer (`kind` = 'editing/cmd-undo
+or 'editing/cmd-redo): continue the run while the previous command was the same `kind`,
+else start a fresh run (`undo-start`) — which, after some undos, reverses direction (so
+undo-after-a-break, or redo, walks the recorded undos forward). Reports `exhausted-msg`
+when the run has nothing left."
+  (let (b (ed-current-buf m)
+        b1 (if (= (:last-command m) kind) b (undo-start b))
+        depth (ed-redo-depth b))
+    (cond
+      (and (= kind 'editing/cmd-redo) (<= depth 0)) (ed-ding (message m "No undo to redo"))
+      (empty? (:pending-undo b1)) (ed-ding (message m exhausted-msg))
+      else
+        (let (stepped (undo-next b1))
+          (assoc (ed-set-buf m
+                   (assoc stepped
+                     :redo-mark
+                       [(if (= kind 'editing/cmd-redo) (dec depth) (inc depth))
+                         (count (or (:undo stepped) ()))]))
+            :status status)))))
+
+(defn- ed-redo-depth (b)
+  "How many undos a redo may still reverse in buffer `b`: the count the last undo or redo
+left in its `:redo-mark`, while nothing has been recorded on the buffer's history since —
+an edit conses onto `:undo`, so a count that moved means the text changed after the undos
+and there is nothing left to redo (Emacs's `undo-redo`, which only undoes undos)."
+  (let ([depth recorded-at] (or (:redo-mark b) [0 -1]))
+    (if (= recorded-at (count (or (:undo b) ()))) depth 0)))
+
+(defcommand cmd-undo
+  (m key)
+  "Undo one change (C-/ , C-x u). Emacs-style tree: after undoing, run any other command
+to break the chain and undo again — that undoes your undos (redo). No state is ever lost.
+
+**With a region active this undoes only the selected lines** (Emacs
+`undo-in-region`, `editor/buffer/undo-in-region`): the most recent change that touched
+them is reverted and everything outside is left exactly as it is, with the region kept
+so a repeat peels the next change off the same lines. Cheap here because undo is
+snapshot-based — the change set is a line diff of the previous text, so the hunks
+outside your selection are simply not applied."
+  (let (b (ed-current-buf m))
+    (if (nil? (buffer-region-bounds b))
+      (ed-undo-step m 'editing/cmd-undo "No further undo" "undo")
+      (let (undone (editor/buffer/undo-in-region b))
+        ;; ropes compare by content, natively — the same test as the two whole-buffer
+        ;; string copies it replaces, without making them
+        (if (= (buffer-rope undone) (buffer-rope b))
+          (message m "no change in the region to undo")
+          (message (ed-set-buf m undone)
+            "undid the region"))))))
+
+(defcommand cmd-redo
+  (m key)
+  "Redo one undone change (C-?, Emacs's `undo-redo`): reverse the most recent undo, without
+needing a break in between. Repeated C-? keeps redoing until every undo since the last edit is
+reversed, then says `No undo to redo` — it never goes on to undo the edits before them. After
+an edit there is nothing to redo: the undos it followed are a branch now, which C-/ after a
+break still reaches (Emacs's undo tree)."
+  (ed-undo-step m 'editing/cmd-redo "No further redo" "redo"))
+
+(defcommand cmd-repeat
+  (m key)
+  "Re-run the last command (C-x z). After the first C-x z, tap `z` to keep repeating
+— repeat-mode keeps the last-command pointing at the original command, not this one,
+so `z` re-invokes the original rather than recursing."
+  (let (to-repeat (:last-command m))
+    (if (or (nil? to-repeat) (= to-repeat 'editing/cmd-repeat))
+      (message m "No previous command to repeat")
+      (let (result ((reflect/eval to-repeat) m key))
+        (assoc result :this-command to-repeat)))))
+
+(register-inverse 'editing/cmd-transpose-chars 'editing/cmd-transpose-chars-backward)
+(register-inverse 'editing/cmd-transpose-words 'editing/cmd-transpose-words-backward)
+(register-inverse 'editing/cmd-transpose-lines 'editing/cmd-transpose-lines-backward)
+(register-inverse 'editing/cmd-transpose-sexps 'editing/cmd-transpose-sexps-backward)
+(register-prefix-consuming 'editing/cmd-upcase-word)
+(register-prefix-consuming 'editing/cmd-downcase-word)
+(register-prefix-consuming 'editing/cmd-capitalize-word)

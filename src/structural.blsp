@@ -1,0 +1,229 @@
+(defmodule structural
+  "Structural motion and editing over the buffer's parse — C-M-f/b/u/d/n/p, beginning and end of
+defun, paredit's slurp, barf, raise, splice and wrap, C-M-SPC: a tree-sitter mode moves over its
+held tree (`syntaxtree`), a Brood buffer over std's `sexp`. The held-tree helpers every structural
+query shares (`ed-with-held-tree`, `ed-structural-move`) live here."
+  (:use editor/buffer)
+  (:use bufferops)
+  (:use sexp)
+  (:use interactive)
+  (:use syntaxtree)
+  (:use task)
+  (:use model))
+
+;; ---- structural s-expression motion (brood-mode: C-M-f/b/u/d/a) -------------
+;; Each runs a `std/sexp` buffer command over the current buffer — navigation by
+;; the parse-source CST, not characters. `std/sexp` parses through the kernel's
+;; `parse-source-positioned` (positions tracked in Rust, one pass), so a re-parse
+;; per move is cheap — no model-side caching needed. Bound only in `brood-mode`
+;; (see `modes`).
+;; ---- structural editing (brood-mode: paredit slurp/barf/raise/splice/wrap) ---
+;; Each runs a `std/sexp` structural *edit* over the current buffer — a whole-buffer
+;; splice the module computes from the CST (one undo unit), or a no-op when the op
+;; doesn't apply (no sibling to slurp, top level for splice). Like the motions above
+;; they go through `ed-apply`; the edits self-guard on read-only via `replace-region`.
+
+;; Structural motion is mode-polymorphic: a tree-sitter-backed mode (ruby/elixir)
+;; carries a `:ts-lang` facet and moves via `editor/treesit`'s pure
+;; `(text lang point) -> point` motions; brood-mode (no `:ts-lang`) keeps the
+;; `std/sexp` motions. Same keys (`C-M-f/b/u/d/a`), same commands — the buffer's
+;; layer picks the backend (ROADMAP §C: the node abstraction lets the structural
+;; commands run over a tree-sitter tree unchanged).
+(defn ed-held-tree (m)
+  "The current buffer's held tree entry (`syntaxtree`), or nil — read once per command and
+handed to the structural queries, which use it only while the buffer they run on is still
+the text it was parsed from (`syntaxtree/held-tree-for`). With it a query reads the tree
+the loop keeps incrementally; without it, it parses the text (cached by text, so the first
+query after an edit to a large file pays a whole parse)."
+  (syntax-tree-entry m (ed-current-index m)))
+
+(sig ed-with-held-tree (model (model any -> model) -> model))
+
+(defn ed-with-held-tree (m f)
+  "`(f m held)` with the current buffer's tree brought up to its text first and `held` that
+entry ([[ed-held-tree]]). A large buffer's tree is reparsed off the loop and trails the text
+for a key or two after an edit (`syntaxtree/*tree-sync-max*`); a structural command is a
+deliberate key, so it pays one incremental update (`syntaxtree/ed-catch-up-syntax-tree`) —
+which the model keeps — rather than a whole-document parse of the text. Typing never comes
+here."
+  (let ([caught held] (ed-catch-up-syntax-tree m (ed-current-index m))) (f caught held)))
+
+(defn- ed-structural (b key ts-point sexp-fn held)
+  (let (lang (ed-mode-service b :ts-lang))
+    (if (nil? lang)
+      (sexp-fn b key)
+      (goto-char b (ts-point (buffer-rope b) lang (:point b) (held-tree-for held b lang))))))
+
+(defn ed-defun-bounds (b key held)
+  "`[start end]` of the top-level form around point, as the buffer's MODE sees one — the
+same beginning-/end-of-defun pair C-M-a / C-M-e move by (tree-sitter in a language mode,
+the sexp parser in Brood), and the paragraph in a buffer that has neither (Emacs' own
+fallback). `C-M-h` and `C-x n d` used to call the Brood parser on every buffer, marking
+or narrowing to nonsense in Elixir, Ruby or Markdown. `held` is the buffer's held tree
+entry ([[ed-held-tree]])."
+  (if (or (ed-mode-service b :ts-lang) (= (editor/layers/buffer-type-for b) :brood))
+    (let (s (ed-structural b key editor/treesit/point-defun-start sexp/beginning-of-defun held)
+          e (ed-structural s key editor/treesit/point-defun-end sexp/end-of-defun held))
+      [(buffer-point s) (buffer-point e)])
+    (let (s (backward-paragraph b)) [(buffer-point s) (buffer-point (forward-paragraph s))])))
+
+(defn ed-structural-move (held key ts-point sexp-fn)
+  "The mode-polymorphic structural move as one `buffer -> buffer` op — `ts-point` for a
+tree-sitter mode, `sexp-fn` for Brood. Naming the buffer op (rather than inlining the `fn`)
+is what lets the motions, the structural KILLS (`ed-kill-span` wants a `buffer -> buffer`)
+and `mark-sexp` all share a single definition of \"one sexp forward\". `held` is the
+buffer's held tree entry ([[ed-held-tree]])."
+  (fn (b) (ed-structural b key ts-point sexp-fn held)))
+
+(defcommand cmd-forward-sexp
+  (m key)
+  "Forward over the next s-expression (C-M-f) — and out of the list when nothing follows
+(paredit), which is why this is `sexp/forward-out` while the kills and marks below use
+the strict `sexp/forward` (a kill at `(a b|)` must kill nothing, not the `)`)."
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-apply m
+        (ed-structural-move held key editor/treesit/point-forward sexp/forward-out)))))
+
+(defcommand cmd-backward-sexp
+  (m key)
+  "Back over the previous s-expression (C-M-b) — and out before the open delimiter when
+nothing precedes (paredit)."
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-apply m
+        (ed-structural-move held key editor/treesit/point-backward sexp/backward-out)))))
+
+(defcommand cmd-forward-list
+  (m key)
+  "Forward over the next LIST, stepping past atom siblings rather than stopping at them
+(C-M-n) — the \"jump the whole next block\" motion."
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-apply m
+        (ed-structural-move held key editor/treesit/point-list-forward sexp/list-forward)))))
+
+(defcommand cmd-backward-list
+  (m key)
+  "Back over the previous LIST, stepping past atom siblings (C-M-p)."
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-apply m
+        (ed-structural-move held key editor/treesit/point-list-backward sexp/list-backward)))))
+
+(defcommand cmd-backward-up-list
+  (m key)
+  "Out of the enclosing list backward, to before its opening delimiter (C-M-u)."
+  (ed-with-held-tree m
+    (fn (m held) (ed-apply m (ed-structural-move held key editor/treesit/point-up sexp/up)))))
+
+(defcommand cmd-up-list
+  (m key)
+  "Out of the enclosing list forward, to past its closing delimiter (Emacs `up-list`) —
+the mirror of `backward-up-list`, and the quick way out of a form you've finished."
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-apply m
+        (ed-structural-move held key editor/treesit/point-up-forward sexp/up-forward)))))
+
+(defcommand cmd-down-list
+  (m key)
+  "Down into the next list, just past its opening delimiter (C-M-d)."
+  (ed-with-held-tree m
+    (fn (m held) (ed-apply m (ed-structural-move held key editor/treesit/point-down sexp/down)))))
+
+(defcommand cmd-beginning-of-defun
+  (m key)
+  "To the start of the enclosing definition (C-M-a)."
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-apply m
+        (ed-structural-move held
+          key editor/treesit/point-defun-start sexp/beginning-of-defun)))))
+
+(defcommand cmd-end-of-defun
+  (m key)
+  "To the end of the enclosing definition (C-M-e) — the close of the very form
+`beginning-of-defun` finds, so the pair brackets one defun."
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-apply m
+        (ed-structural-move held key editor/treesit/point-defun-end sexp/end-of-defun)))))
+
+(defcommand cmd-slurp-forward
+  (m key)
+  "Pull the form after the enclosing list inside it (paredit C-))."
+  (ed-apply m (fn (b) (sexp/slurp-forward b key))))
+
+(defcommand cmd-barf-forward
+  (m key)
+  "Expel the last form of the enclosing list (paredit C-})."
+  (ed-apply m (fn (b) (sexp/barf-forward b key))))
+
+(defcommand cmd-slurp-backward
+  (m key)
+  "Pull the form before the enclosing list inside it (paredit C-()."
+  (ed-apply m (fn (b) (sexp/slurp-backward b key))))
+
+(defcommand cmd-barf-backward
+  (m key)
+  "Expel the first form of the enclosing list (paredit C-{)."
+  (ed-apply m (fn (b) (sexp/barf-backward b key))))
+
+(defcommand cmd-raise-sexp
+  (m key)
+  "Replace the enclosing list with the form at point (paredit M-r)."
+  (ed-apply m (fn (b) (sexp/raise b key))))
+
+(defcommand cmd-splice-sexp
+  (m key)
+  "Remove the enclosing list's delimiters, keeping its contents (paredit M-s)."
+  (ed-apply m (fn (b) (sexp/splice b key))))
+
+(defcommand cmd-wrap-round
+  (m key)
+  "Wrap the form at point in a fresh (…), point landing just inside (paredit M-()."
+  (ed-apply m (fn (b) (sexp/wrap-round b key))))
+
+(defn ed-mark-by (m self move)
+  "Mark the span from point to where `move` (a `buffer -> buffer` point move) lands,
+leaving point where it is and activating the region so it highlights. When the previous
+command was `self`, extend from the existing mark instead of from point — the
+repeat-extends mechanism: each press grows the region by one more unit."
+  (let (b (ed-current-buf m)
+        extending (and (= (:last-command m) self) (buffer-mark b))
+        from (or (and extending (buffer-mark b)) (buffer-point b))
+        target (buffer-point (move (goto-char b from))))
+    (ed-set-buf m (assoc b :mark target))))
+
+(defcommand cmd-mark-sexp
+  (m key)
+  "Set the mark at the end of the next s-expression, leaving point — activating the
+region so it highlights (Emacs `mark-sexp`, C-M-SPC). Pressed repeatedly it extends the
+region by one more sexp each time (the mark advances; point stays put). With a negative
+argument (`M-- C-M-SPC` / `C-- C-M-SPC`) it marks the *previous* sexp instead, via the
+registered inverse (`cmd-mark-sexp-backward`). Marks by the STRICT sexp motion (never
+past the enclosing list, unlike `C-M-f`, which steps out); in a tree-sitter mode it marks
+a tree-sitter node."
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-mark-by m
+        'structural/cmd-mark-sexp
+        (ed-structural-move held key editor/treesit/point-forward sexp/forward)))))
+
+;; The inverse `cmd-mark-sexp` flips to under a negative argument: marks the PREVIOUS
+;; sexp (the mark moves back from point), extending backward on repeat. A plain `defn`
+;; (not a `defcommand`) — it isn't a standalone Emacs command, just the negative-arg
+;; target the dispatcher resolves via `command-inverse`.
+(defn cmd-mark-sexp-backward (m key)
+  (ed-with-held-tree m
+    (fn (m held)
+      (ed-mark-by m
+        'structural/cmd-mark-sexp-backward
+        (ed-structural-move held key editor/treesit/point-backward sexp/backward)))))
+
+(register-inverse 'structural/cmd-forward-sexp 'structural/cmd-backward-sexp)
+(register-inverse 'structural/cmd-forward-list 'structural/cmd-backward-list)
+(register-inverse 'structural/cmd-up-list 'structural/cmd-backward-up-list)
+(register-inverse 'structural/cmd-end-of-defun 'structural/cmd-beginning-of-defun)
+(register-inverse 'structural/cmd-mark-sexp 'structural/cmd-mark-sexp-backward)

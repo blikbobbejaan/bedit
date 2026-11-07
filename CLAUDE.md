@@ -505,10 +505,29 @@ src/input.blsp              dispatch: fold a key or tick into the next model, fi
                             SLICES of `*macro-slice-ms*` resumed by the `:macro-continue`
                             ticker, so C-g between them quits the run (its work kept) and other
                             input waits for it (`:macro-typeahead`)
-src/commands.blsp           the GENERAL editing commands, each a (model key) -> model — motion,
-                            editing, kill ring, buffers, prompts. A feature's commands
-                            live in its own module (dired, help, vim, registers, hexl,
-                            eval-commands, shell-command), bound by qualified symbol
+src/commands.blsp           the commands left once each family had a module: buffers and their
+                            prompts, M-x, the prefix argument, keyboard-quit, profiles and the
+                            everyday tail (buffer list, dabbrev, line utilities), and what a
+                            guest may run. Each command is a (model key) -> model, bound by
+                            qualified symbol; a family's commands live in its own module:
+src/motion.blsp             moving point (chars, words, screen rows with a goal column, paragraphs,
+                            C-v / M-v, C-l / M-r, shift-select, M-g g / M-g c)
+src/structural.blsp         C-M-* motion and paredit edits over the held tree or std's `sexp`, and
+                            the held-tree helpers structural queries share
+src/indent.blsp             TAB, RET (a line opened between a pair), region indent / dedent, C-M-q,
+                            and electric indent (a closer or a mode's block word reindents its line)
+src/typing.blsp             self-insert, newline, the delete keys, delete-selection, the electric
+                            bracket keys
+src/killing.blsp            the kills and yanks (coalescing, M-y, C-u N C-y), zap, rectangles, the
+                            middle click's PRIMARY yank
+src/editing.blsp            open-line, transposes (negative arguments drag backward), duplicate /
+                            join, case, read-only toggle, undo / redo
+src/region.blsp             the mark commands, narrowing, `ed-active-region`
+src/search-commands.blsp    the entry points of isearch, occur, the fuzzy line search and the
+                            query-replace prompts (the loops are isearch's and query-replace's)
+                            Other features' commands live with them (dired, help, vim, registers,
+                            hexl, eval-commands, shell-command). Split with brood's `nest move`,
+                            which moves a definition and points every reference at it
 src/comment.blsp            M-; comment-dwim (Emacs newcomment): the mode's `:comment-syntax` token,
                             or a block-only language's `:comment-block` pair round each line
 src/kmacro.blsp             C-x ( · C-x ) · C-x e, the keyboard-macro commands (Emacs kmacro);

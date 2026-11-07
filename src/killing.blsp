@@ -1,0 +1,424 @@
+(defmodule killing
+  "Killing and yanking: C-k C-w M-w C-y M-y and the word and sentence kills (consecutive kills
+coalesce into one ring entry), zap-to-char, rectangles (C-x r), and the middle click's yank of the
+PRIMARY selection, read off the loop. The ring itself is `clipboard`'s."
+  (:use editor/buffer)
+  (:use bufferops)
+  (:use sexp)
+  (:use interactive)
+  (:use task)
+  (:use results)
+  (:use pool)
+  (:use clipboard)
+  (:use minibuffer)
+  (:use model))
+
+;; ---- rectangles (Emacs C-x r k/M-w/d/y/o/c/t) --------------------------------
+;; The column-block editing ops of `bufferops` (`extract`/`delete`/`open`/`clear`/
+;; `string`/`insert-rectangle`), wired to the `C-x r` prefix and a rectangle kill ring on
+;; the model. A rectangle is point↔mark taken as two corners, so every one needs a mark.
+;; The kill ring is ONE saved list of rows (`:rectangle-kill`), not the line kill ring: a
+;; rectangle yank rebuilds the block, so its rows must stay a list, never flattened.
+;; ---- the middle click: yank the PRIMARY selection (Emacs `mouse-yank-primary`) ----
+;; PRIMARY is what is highlighted anywhere — a drag-select here sets it (`clipboard/ed-drag-select`)
+;; — and a middle click inserts it at the click, never touching the kill ring. Reading it waits
+;; on the app that owns it (brood ADR-536, ADR-553) or on a served session's client (ADR-562),
+;; so it is ASKED (`clipboard/ed-primary-ask`), the spot marked as C-y marks one, and the text goes
+;; in when the answer lands ([[ed-primary-answered]]).
+
+;; The structural kills: `ed-kill-span` over the same motions, so a killed sexp is
+;; whatever `C-M-f`/`C-M-b` would have moved over — the whole form however many lines it
+;; spans. Distinct from brood-mode's `C-k` (`cmd-sexp-kill`), which is paredit's
+;; line-bounded kill: that one refuses to break the parens, these take a balanced form.
+(defcommand cmd-kill-sexp
+  (m key)
+  "Kill the s-expression after point (C-M-k)."
+  (structural/ed-with-held-tree m
+    (fn (m held)
+      (ed-kill-span m
+        (structural/ed-structural-move held key editor/treesit/point-forward sexp/forward)))))
+
+(defcommand cmd-backward-kill-sexp
+  (m key)
+  "Kill the s-expression before point (C-M-DEL)."
+  (structural/ed-with-held-tree m
+    (fn (m held)
+      (ed-kill-span m
+        (structural/ed-structural-move held key editor/treesit/point-backward sexp/backward)))))
+
+(defn- ed-rect-edit (m f)
+  "Run rectangle op `f` (a `buffer -> buffer`) on the current buffer, or say there is no
+region when no mark is set — every rectangle op needs two corners."
+  (if (nil? (buffer-mark (ed-current-buf m))) (message m *no-region-message*) (ed-edit m f)))
+
+(defcommand cmd-kill-rectangle
+  (m key)
+  "Kill the rectangle (C-x r k): save its rows to the rectangle kill ring and delete the
+block, closing the gap. Yank it back with C-x r y."
+  (if (nil? (buffer-mark (ed-current-buf m)))
+    (message m *no-region-message*)
+    (let (rows (extract-rectangle (ed-current-buf m)))
+      (message (ed-edit (assoc m :rectangle-kill rows) delete-rectangle)
+        (str "killed a " (count rows) "-row rectangle")))))
+
+(defcommand cmd-copy-rectangle-as-kill
+  (m key)
+  "Copy the rectangle to the rectangle kill ring without deleting it (C-x r M-w)."
+  (if (nil? (buffer-mark (ed-current-buf m)))
+    (message m *no-region-message*)
+    (let (rows (extract-rectangle (ed-current-buf m)))
+      (message (assoc m :rectangle-kill rows) (str "copied a " (count rows) "-row rectangle")))))
+
+(defcommand cmd-delete-rectangle
+  (m key)
+  "Delete the rectangle without saving it (C-x r d)."
+  (ed-rect-edit m delete-rectangle))
+
+(defcommand cmd-open-rectangle
+  (m key)
+  "Shift the rectangle's text right, blanking the block with spaces (C-x r o)."
+  (ed-rect-edit m open-rectangle))
+
+(defcommand cmd-clear-rectangle
+  (m key)
+  "Blank the rectangle in place, keeping following columns put (C-x r c)."
+  (ed-rect-edit m clear-rectangle))
+
+(defcommand cmd-yank-rectangle
+  (m key)
+  "Insert the last killed/copied rectangle as a block at point (C-x r y)."
+  (let (rows (:rectangle-kill m))
+    (if (or (nil? rows) (empty? rows))
+      (message m "the rectangle kill ring is empty")
+      (ed-edit m (fn (b) (insert-rectangle b rows))))))
+
+(defcommand cmd-string-rectangle
+  (m key)
+  "Replace each line's block with a string read in the minibuffer (C-x r t)."
+  (if (nil? (buffer-mark (ed-current-buf m)))
+    (message m *no-region-message*)
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "String rectangle: " "")
+         :on-complete (fn (mm t) (ed-edit mm (fn (b) (string-rectangle b t))))})))
+
+;; ---- killing (Emacs-style: consecutive kills coalesce; M-y yank-pops) --------
+;; The model tracks `:last-command`/`:this-command` (set by the dispatch loop, see
+;; `input`) so a kill knows whether the *previous* command was also a kill (then it
+;; appends to the head entry rather than starting a new one), and so M-y
+;; (`cmd-yank-pop`) only fires right after a yank. The ring itself — `ed-push-kill`, the
+;; coalescing rule and `ed-drag-select` — lives in `clipboard`, beside what it shares text with.
+(def- ed-yank-commands '(killing/cmd-yank killing/cmd-yank-pop))
+
+(defn- ed-yank-command? (sym) (includes? ed-yank-commands sym))
+
+(defn ed-kill-span (m move)
+  "Kill from point to where `move` (a `buffer -> buffer` point move) lands: push
+the spanned text onto the kill ring (coalescing with an adjacent kill) and delete
+it. An empty span is a no-op. A buffer that refuses the delete (read-only) says so and
+the kill ring is left alone — nothing was killed."
+  (let (b (ed-current-buf m)
+        p0 (buffer-point b)
+        moved (move (set-mark b)) ; mark = point; point moves
+        text (buffer-region moved))
+    (if (or (nil? text) (= text ""))
+      m
+      (let ([m2 killed?] (ed-try-edit m (fn (_) (clear-mark (delete-region moved)))))
+        (if killed? (ed-push-kill m2 text (> (buffer-point moved) p0)) m2)))))
+
+;; kill (into the kill ring)
+(defn- ed-line-start-move (count)
+  "A point move to the start of the line `count` lines from point's (0 is its own line's
+start), clamped to the buffer: the end of the buffer past its last line."
+  (fn (buffer)
+    (let (rope (buffer-rope buffer)
+          target (+ (buffer-current-line buffer) count))
+      (goto-char buffer
+        (cond
+          (< target 0) 0
+          (>= target (text/line-count rope)) (buffer-length buffer)
+          else (text/line->char rope target))))))
+
+(defcommand cmd-kill-line
+  (m key)
+  "Kill from point to end of line (C-k); at end of line, kill the newline. With the init
+file's `:kill-whole-line` (Emacs's `kill-whole-line`), at the START of a line kill the line
+and its newline, so no empty line is left behind. With a prefix argument N (Emacs's), kill
+through N line starts — N whole lines from point, newlines included; 0 kills back to the
+line's start, and a negative N back N lines. Repeating it N times killed one line and its
+newline for `C-u 2`, and nothing for `C-u 0`."
+  (let (b (ed-current-buf m)
+        count (current-prefix-arg m))
+    (if (and (not (int? count)) (= (buffer-point b) (buffer-length b)))
+      ;; nothing after point: a failure, as Emacs's, so a keyboard macro run "until it fails"
+      ;; stops here instead of going round until C-g
+      (ed-ding m "End of buffer")
+      (ed-kill-span m
+        (cond
+          (int? count) (ed-line-start-move count)
+          (= (buffer-char-after b) "\n") forward-char
+          (and (= true (:kill-whole-line m)) (= (buffer-column b) 0))
+            (fn (bb) (forward-char (end-of-line bb)))
+          else end-of-line)))))
+
+(defcommand cmd-sexp-kill
+  (m key)
+  "Structure-aware kill (paredit C-k): kill to end of line, but never past the
+enclosing list's close delimiter, so it can't break the parens. Reuses the kill ring."
+  (ed-kill-span m (fn (b) (goto-char b (sexp/point-kill-end (buffer-rope b) (buffer-point b))))))
+
+(defcommand cmd-kill-word (m key) "Kill the word after point (M-d)." (ed-kill-span m forward-word))
+
+(defcommand cmd-backward-kill-word
+  (m key)
+  "Kill the word before point (M-DEL)."
+  (ed-kill-span m backward-word))
+
+(defcommand cmd-kill-sentence
+  (m key)
+  "Kill from point to the end of the sentence (M-k)."
+  (ed-kill-span m forward-sentence))
+
+(defcommand cmd-backward-kill-sentence
+  (m key)
+  "Kill from point back to the start of the sentence (C-x DEL)."
+  (ed-kill-span m backward-sentence))
+
+(defcommand cmd-kill-whole-line
+  (m key)
+  "Kill the whole current line, newline included."
+  (ed-kill-span (ed-apply m beginning-of-line) (fn (b) (forward-char (end-of-line b)))))
+
+(defcommand cmd-zap-to-char
+  (m key)
+  "Kill text from point up to and including the next occurrence of a typed character
+(M-z). Reads the target char (ed-read-char); a no-op-with-message when it isn't found."
+  (ed-read-char m
+    "Zap to char: "
+    (fn (mm ch)
+      (if (not (string? ch))
+        mm
+        ;; the same case rule as search (`isearch/search-fold?`): `a` zaps to the next `a`
+        ;; or `A`, and `A` zaps only to an `A`
+        (let (found (buffer-search-forward (ed-current-buf mm)
+                      ch
+                      (buffer-point (ed-current-buf mm))
+                      (isearch/search-fold? ch)))
+          (if (nil? found)
+            (ed-ding (message mm (str "not found: " ch)))
+            (ed-kill-span mm (fn (b) (goto-char b (inc found)))))))))) ; kill [point, found] to ring
+
+(defcommand cmd-kill-region
+  (m key)
+  "Delete the region and push its text onto the kill ring (C-w)."
+  (let (text (buffer-region (ed-current-buf m)))
+    (if (nil? text)
+      (message m *no-region-message*)
+      (ed-edit (ed-push-kill m text true) delete-region))))
+
+(defn- ed-link-abs-string (m loc)
+  "Format `loc` as an absolute `path:line` — the paste-able jump target."
+  (str (ed-location-path m (:file loc)) ":" (:line loc)))
+
+(defcommand cmd-copy-region
+  (m key)
+  "Push the region's text onto the kill ring without deleting it (M-w). With no region,
+on a results buffer's link line it copies the whole link — the link's absolute
+`path:line` — so Copy on a link grabs the link, matching the browser's 'copy link'."
+  (let (buf (ed-current-buf m)
+        text (buffer-region buf))
+    (cond
+      (not (nil? text)) (message (ed-apply (ed-push-kill m text true) clear-mark) "region copied")
+      else
+        (let (loc (ed-link-at-point m))
+          (if (nil? loc)
+            (message m "no region")
+            (let (link (ed-link-abs-string m loc))
+              (message (ed-push-kill m link true) (str "link copied: " link))))))))
+
+(defcommand cmd-yank
+  (m key)
+  "Insert the most recently killed/copied text at point (C-y), recording the
+inserted span + ring index in `:yank` so M-y (`cmd-yank-pop`) can replace it. First
+adopts the user's clipboard if another app copied something newer — ASKED for
+(`ed-clipboard-ask`), so a served session's yank does not stop the loop for the round trip
+to its client: the spot is marked now and the text goes in when the answer comes
+([[ed-yank-answered]]). A read-only buffer says so and records no span."
+  (let (count (current-prefix-arg m)
+        raw? (= true (:raw (:prefix-arg m))))
+    (if (and (int? count) (not raw?) (not (= count 1)))
+      ;; C-u N C-y: the Nth most recent kill, Emacs's, and M-y goes on from it
+      (ed-yank-nth m (dec count))
+      (let ([marked spot] (ed-yank-mark-spot m))
+        ;; the previous yank's span is not this one's: M-y must never reach it from here on;
+        ;; a bare C-u leaves point before the text instead of after it
+        (ed-clipboard-ask (dissoc marked :yank)
+          'killing/ed-yank-answered
+          (if raw? (assoc spot :point-before? true) spot))))))
+
+(defn- ed-yank-nth (m index)
+  "Insert the kill ring's entry `index` (0 the newest) at point, its span kept for M-y — what
+`C-u N C-y` yanks. Said when the ring holds fewer."
+  (let (ring (or (:kill-ring m) []))
+    (if (or (< index 0) (>= index (count ring)))
+      (message m
+        (str "the kill ring holds " (count ring) " entr" (if (= (count ring) 1) "y" "ies")))
+      (let (start (buffer-point (ed-current-buf m))
+            text (nth ring index)
+            [inserted yanked?] (ed-try-edit (dissoc m :yank)
+                                 (fn (bb) (typing/insert-replacing m bb text))))
+        (if yanked?
+          (assoc inserted
+            :yank {:start start :end (buffer-point (ed-current-buf inserted)) :index index})
+          inserted)))))
+
+(defn ed-yank-mark-spot (m)
+  "`[m' spot]` — where a yank whose text is not known yet will go: a marker at point in the
+current buffer, so text typed meanwhile cannot move it off its spot, and the `spot` that
+names it (the pool index, the buffer's name, text and point as they are now)."
+  (let (b (ed-current-buf m)
+        index (ed-current-index m)
+        spot-id (ref)
+        spot {:index index
+              :marker spot-id
+              :name (buffer-name b)
+              :rope (buffer-rope b)
+              :point (buffer-point b)}
+        marked (ed-set-buf-at m
+                 index
+                 (buffer-marker-set (ed-buf-at m index) spot-id (buffer-point b))))
+    [marked spot]))
+
+(defn ed-mouse-yank-primary (m)
+  "A middle click, point already moved to it ([[mouse/ed-mouse-set-point]]): insert the
+PRIMARY selection there (Emacs `mouse-yank-primary`) — the local window's, or a served
+session's client's. A click while a read is still out does nothing more."
+  (if (ed-primary-asking? m)
+    m
+    (let ([marked spot] (ed-yank-mark-spot m))
+      (ed-primary-ask (dissoc marked :yank)
+        'killing/ed-primary-answered spot 'killing/ed-primary-spot-quit))))
+
+(defn ed-primary-answered (m text spot)
+  "The rest of a middle click once the PRIMARY selection's `text` is known: inserted at point
+when nothing moved since the click, else at the spot it marked ([[ed-yank-at-spot]]). Not
+on the kill ring — a middle click is not a kill. An empty or unreadable selection (nil) is
+said and inserts nothing."
+  (cond
+    (or (not (string? text)) (= text ""))
+      (message (ed-yank-unmark m spot) "mouse-yank-primary: no primary selection")
+    (ed-yank-spot-unchanged? m spot)
+      (first (ed-try-edit (ed-yank-unmark m spot) (fn (b) (insert b text))))
+    else (ed-yank-at-spot m spot text)))
+
+(defn ed-primary-spot-quit (m spot)
+  "C-g while a middle click's read is out: the spot it marked is forgotten."
+  (ed-yank-unmark m spot))
+
+(defn ed-yank-answered (m clip spot)
+  "The rest of C-y once the clipboard's text `clip` is known ([[cmd-yank]]): the kill ring's
+head — `clip` adopted onto it when it is new, the ring's own head when the clipboard is
+empty or never answered. When nothing moved since C-y (the same buffer, text and point —
+always so when the clipboard answered at once) it is the plain yank: at point, over a region
+delete-selection replaces, its span kept for M-y. When the user went on meanwhile it goes in
+at the spot C-y marked, Emacs-like, and point stays where the user's typing left it."
+  (let ([m1 text] (ed-kill-head-with m clip)
+        cleared (ed-yank-unmark m1 spot))
+    (cond
+      (nil? text) (message cleared "kill ring is empty")
+      (ed-yank-spot-unchanged? cleared spot)
+        (let (b (ed-current-buf cleared)
+              ;; over a region delete-selection replaces, the yank starts where the region did
+              start (if (typing/selection-to-replace? cleared b)
+                      (first (buffer-region-bounds b))
+                      (buffer-point b))
+              [m2 yanked?] (ed-try-edit cleared (fn (bb) (typing/insert-replacing cleared bb text))))
+          (cond
+            (not yanked?) m2
+            ;; a bare C-u C-y: point at the start of the text, Emacs's
+            (:point-before? spot)
+              (assoc (ed-set-buf m2 (goto-char (ed-current-buf m2) start))
+                :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})
+            else (assoc m2 :yank {:start start :end (buffer-point (ed-current-buf m2)) :index 0})))
+      else (ed-yank-at-spot m1 spot text))))
+
+(defn ed-paste-text (m text)
+  "A terminal's bracketed paste (`[:paste text]`, brood ADR-586) into the current buffer:
+Emacs's `xterm-paste` — `text` goes onto the kill ring and is yanked, as one edit at point
+(over a region delete-selection replaces), its span kept for M-y. It arrives whole, so no
+character of it is typed: nothing is indented, paired or completed as it goes in. The
+clipboard is not written — the text came from it."
+  (let ([marked spot] (ed-yank-mark-spot (dissoc m :yank)))
+    (ed-yank-answered marked text spot)))
+
+(defn- ed-yank-spot-buffer (m spot)
+  "The pool buffer C-y marked its `spot` in, or nil when that slot holds another buffer now."
+  (let (b (when (< (:index spot) (count (:buffers m))) (ed-buf-at m (:index spot))))
+    (when (and b (= (buffer-name b) (:name spot))) b)))
+
+(defn- ed-yank-unmark (m spot)
+  "`m` with C-y's spot marker gone from its buffer."
+  (let (b (ed-yank-spot-buffer m spot))
+    (if (nil? b) m (ed-set-buf-at m (:index spot) (buffer-marker-delete b (:marker spot))))))
+
+(defn- ed-yank-spot-unchanged? (m spot)
+  "Whether nothing moved since C-y marked `spot`: the same buffer is current, with the same
+text and point."
+  (let (b (ed-current-buf m))
+    (and (= (ed-current-index m) (:index spot))
+      (= (buffer-name b) (:name spot))
+      (= (buffer-rope b) (:rope spot))
+      (= (buffer-point b) (:point spot)))))
+
+(defn- ed-yank-at-spot (m spot text)
+  "`text` inserted where C-y marked `spot` (its marker, which edits since have carried; the
+point it was asked at if the marker is gone), the marker removed, and the buffer's point
+kept where the user left it — moved along when the insert lands before it. No M-y span: the
+yank was not the last thing done. Into another buffer than the current one if the user
+switched meanwhile; said, and nothing inserted, if that buffer is gone or read-only."
+  (let (insert-at-spot (fn (b)
+                         (let (at (or (buffer-marker b (:marker spot))
+                                    (math/min (:point spot) (buffer-length b)))
+                               before (buffer-point b)
+                               inserted (insert (goto-char b at) text))
+                           (buffer-marker-delete (goto-char inserted
+                                                   (if (>= before at)
+                                                     (+ before (string/length text))
+                                                     before))
+                             (:marker spot))))
+        b (ed-yank-spot-buffer m spot))
+    (cond
+      (nil? b) (message m "yank: the buffer it was asked in is gone")
+      (read-only? b) (message (ed-yank-unmark m spot) "yank: that buffer is read-only")
+      (= (ed-current-index m) (:index spot)) (first (ed-try-edit m insert-at-spot))
+      else (ed-set-buf-at m (:index spot) (insert-at-spot b)))))
+
+(defcommand cmd-yank-pop
+  (m key)
+  "Replace the text of the immediately-preceding yank with the next-older kill,
+cycling the ring (M-y). Only valid right after a yank or yank-pop; otherwise it
+reports that the previous command was not a yank. The swap is one `replace-region`, so
+one undo takes the whole M-y back. A C-y still waiting for the clipboard (a served
+session's client asked, [[cmd-yank]]) has inserted nothing to cycle yet: M-y says so, and
+works on that yank once it is in."
+  (let (y (:yank m) ring (:kill-ring m))
+    (cond
+      (ed-clipboard-asking? m 'killing/ed-yank-answered)
+        (message m "yank not done yet: the clipboard has not answered")
+      (or (nil? y) (not (ed-yank-command? (:last-command m))) (empty? ring))
+        (message m "previous command was not a yank")
+      else
+        (let (n (count ring)
+              idx (let (i (inc (:index y))) (if (>= i n) 0 i))
+              [m2 swapped?] (ed-try-edit m
+                              (fn (b)
+                                (clear-mark (replace-region b (:start y) (:end y) (nth ring idx))))))
+          (if swapped?
+            (assoc m2 :yank {:start (:start y) :end (buffer-point (ed-current-buf m2)) :index idx})
+            m2)))))
+
+(register-prefix-consuming 'killing/cmd-kill-line)
+(register-prefix-consuming 'killing/cmd-yank)
+(register-inverse 'killing/cmd-kill-sexp 'killing/cmd-backward-kill-sexp)
+(register-inverse 'killing/cmd-kill-sentence 'killing/cmd-backward-kill-sentence)
+(register-inverse 'killing/cmd-kill-word 'killing/cmd-backward-kill-word)
