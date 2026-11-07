@@ -2,8 +2,8 @@
 ;; painted from `std/vt`.
 ;;
 ;; The project shell (bshell) and the project REPL host LINE-oriented programs: the
-;; buffer is the line editor, RET sends a line, and `ansi/render` is enough for the
-;; redraw a prompt does. A full-screen program — `claude`, `htop`, `vim`, a TUI test
+;; buffer is the line editor, RET sends a line, and decoding a stream's ANSI colours is
+;; enough for the redraw a prompt does. A full-screen program — `claude`, `htop`, `vim`, a TUI test
 ;; runner — is the other thing: it positions the cursor, scrolls a region, switches to
 ;; the alternate screen, colours everything and BLOCKS on a query it expects the
 ;; terminal to answer. That needs a terminal, and `std/vt` (ADR-384) is one as pure
@@ -56,36 +56,36 @@ program, the buffer's tail is its screen, everything above it is scrollback."
   "The buffer name for a `label` program in `root`: `*claude: ~/src/x*`."
   (str "*" label ": " (path/abbreviate root) "*"))
 
-(defn term-buffer? (b)
-  "Whether buffer `b` is a terminal buffer (mode `:type` `:term`)."
-  (= (:type b) :term))
+(defn term-buffer? (buffer)
+  "Whether `buffer` is a terminal buffer (mode `:type` `:term`), of either mode."
+  (= (:type buffer) :term))
 
-(defn- live-program (b)
-  "The worker pid of term buffer `b` while its program is still running, else nil."
-  (if (:term-exited b) nil (:term-proc b)))
+(defn- live-program (buffer)
+  "The worker pid of term `buffer` while its program is still running, else nil."
+  (if (:term-exited buffer) nil (:term-proc buffer)))
 
 (defn term-live (m)
   "Every terminal whose program C-x C-c would kill (`model/register-exit-query`): a term
 buffer whose program has not exited — claude, htop, the project REPL."
   (vec (seq/keep (:buffers m)
-         (fn (b)
-           (when (and (term-buffer? b) (live-program b))
-             (str (buffer-name b) ": " (or (:term-label b) "a program")))))))
+         (fn (buffer)
+           (when (and (term-buffer? buffer) (live-program buffer))
+             (str (buffer-name buffer) ": " (or (:term-label buffer) "a program")))))))
 
 (register-exit-query :terminal 'terminal/term-live)
 
 ;; check-allow: `:term-hstart` is the term buffer's own field, which the buffer record
 ;; does not declare; every write below keeps it an int
 (check-allow :trusted
-  (defn- history-start (b)
-    "The char offset where `b`'s live screen begins — everything before it is history."
-    (or (:term-hstart b) 0)))
+  (defn- history-start (buffer)
+    "The char offset where `buffer`'s live screen begins — everything before it is history."
+    (or (:term-hstart buffer) 0)))
 (sig history-start (buffer -> int))
 
 ;; ---- the worker: owns the pty child and the vt ----------------------------------------
-;; State: {:buffer nm :root dir :command cmd :cols :rows :palette :proc :vt :evicted}.
+;; State: {:buffer :root :command :cols :rows :palette :proc :vt :evicted :reply}.
 ;; The record constructors are named QUALIFIED because these sends run inside a
-;; `spawn`ed process, where the bare name is not bound (see bshell's note on the same).
+;; `spawn`ed process, where the bare name is not bound.
 
 (def *term-coalesce-ms* 8) ; how long after a chunk the worker waits for the next before rendering
 (defn- term-palette ()
@@ -93,11 +93,11 @@ buffer whose program has not exited — claude, htop, the project REPL."
 inverse video (`theme/ansi-palette`, which a build's coloured output reads too)."
   (theme/ansi-palette))
 
-(defn- term-write (state s)
-  "Write `s` to the child, tolerating one that has gone."
+(defn- term-write (state bytes)
+  "Write `bytes` to the child, tolerating one that has gone."
   (let (proc (:proc state))
-    (when (and proc (not (= s "")))
-      (check-allow :discarded-catch (try (os/write proc s) (catch _ nil))))))
+    (when (and proc (not (= bytes "")))
+      (check-allow :discarded-catch (try (os/write proc bytes) (catch _ nil))))))
 
 (defn- term-guarded-feed (state chunk)
   "`[vt faulted?]`: `vt/feed` of `chunk` — and when the emulator RAISES (a bug in it, met
@@ -117,13 +117,12 @@ to every key."
 (defn- term-feed (state chunk)
   "Fold `chunk` into the vt; answer what the program asked; keep the rows it scrolled off
 until the next render."
-  (let ([v faulted?] (term-guarded-feed state chunk))
-    (do
-      (fold (:replies v) nil (fn (_ r) (term-write state r)))
-      (assoc state
-        :vt v
-        :evicted (into (:evicted state) (:evicted v))
-        :vt-faulted? faulted?))))
+  (let ([fed faulted?] (term-guarded-feed state chunk))
+    (doseq (reply (:replies fed)) (term-write state reply))
+    (assoc state
+      :vt fed
+      :evicted (into (:evicted state) (:evicted fed))
+      :vt-faulted? faulted?)))
 
 (defn- term-password (state)
   "Whether the program is reading a password right now — its terminal's echo off in line
@@ -139,14 +138,13 @@ is output, so this is when the answer can change."
   "Send the editor the screen as it stands — with `:password`, whether the program is
 reading one (`term-password`) — the rows evicted since the last render read through the
 palette ahead of it, and start a fresh eviction list."
-  (let (pal (:palette state)
-        lines (into [] (map (:evicted state) (fn (row) (vt/line row pal)))))
-    (do
-      (send (:reply state)
-        (terminal/term-screen-event (:buffer state)
-          lines
-          (assoc (vt/screen (:vt state) pal) :password (term-password state))))
-      (assoc state :evicted []))))
+  (let (palette (:palette state)
+        lines (into [] (map (:evicted state) (fn (row) (vt/line row palette)))))
+    (send (:reply state)
+      (terminal/term-screen-event (:buffer state)
+        lines
+        (assoc (vt/screen (:vt state) palette) :password (term-password state))))
+    (assoc state :evicted [])))
 
 (defn- term-drain (state)
   "After a chunk: keep folding chunks that are already queued (a program writes a frame
@@ -177,7 +175,7 @@ as several), then render once the pipe goes quiet."
                                                         (:vt state))
                                                     ""))
                                                 (term-loop state)))
-    ([:term-palette pal] (term-loop (term-render (assoc state :palette pal))))
+    ([:term-palette palette] (term-loop (term-render (assoc state :palette palette))))
     ([:term-resize cols rows] (do
                                 (when (:proc state)
                                   (check-allow :discarded-catch
@@ -231,9 +229,9 @@ buffer's life. Returns its pid. Its screens go to the loop that opened it
                :palette (term-palette)})
     (spawn (term-boot state))))
 
-(defn term-on-close (buf)
+(defn term-on-close (buffer)
   "The term layer's `:on-close`: the buffer is going, so is its worker and the program."
-  (do (when (:term-proc buf) (send (:term-proc buf) [:shutdown])) buf))
+  (do (when (:term-proc buffer) (send (:term-proc buffer) [:shutdown])) buffer))
 
 ;; ---- the inbound events -------------------------------------------------------------
 
@@ -251,13 +249,14 @@ buffer's life. Returns its pid. Its screens go to the loop that opened it
 (def *term-scrollback-keep* 400000)
 (def *term-scrollback-spans* 40000) ; a second ceiling: the faces the view is handed per frame
 (defn- shift-spans (spans by)
-  (into [] (map spans (fn (s) (let ([from to f] s) [(+ from by) (+ to by) f])))))
+  ;; `spans` moved `by` chars
+  (into [] (map spans (fn ([from to face]) [(+ from by) (+ to by) face]))))
 
 (defn- clip-spans (spans at)
   "`spans` cut at offset `at`: those past it dropped, one straddling it shortened."
   (into []
-    (map (seq/filter spans (fn (s) (< (first s) at)))
-      (fn (s) (let ([from to f] s) [from (math/min to at) f])))))
+    (map (seq/filter spans (fn (span) (< (first span) at)))
+      (fn ([from to face]) [from (math/min to at) face]))))
 
 (defn- history-lines (lines base)
   "The evicted `lines` (`[text spans]` each, spans from 0) laid out one per line from
@@ -271,29 +270,29 @@ thousand lines evicts them in ONE event, and growing a vector per row is quadrat
                             [text spans] line
                             shifted (fold spans
                                       acc
-                                      (fn (a s)
-                                        (let ([from to f] s) (cons [(+ from pos) (+ to pos) f] a)))))
+                                      (fn (gathered [from to face])
+                                        (cons [(+ from pos) (+ to pos) face] gathered))))
                         [shifted (+ pos (string/length text) 1)])))
         text (string/join (map lines (fn (line) (str (first line) "\n"))) ""))
     [text (into [] (reverse acc)) end]))
 
-(defn- trim-history (b)
-  "`b` with its history cut back to `*term-scrollback-keep*` chars once it has grown past
+(defn- trim-history (buffer)
+  "`buffer` with its history cut back to `*term-scrollback-keep*` chars once it has grown past
 `*term-scrollback-chars*` — or past `*term-scrollback-spans*` faces, a program that colours
 every cell reaching that first; a no-op below both."
-  (let (hstart (history-start b)
-        hspans (:history-spans b)
+  (let (hstart (history-start buffer)
+        hspans (:history-spans buffer)
         excess (- (count hspans) (math/quot (* 2 *term-scrollback-spans*) 3)))
     (if (and (<= hstart *term-scrollback-chars*) (<= (count hspans) *term-scrollback-spans*))
-      b
+      buffer
       (let (by-chars (math/max 0 (- hstart *term-scrollback-keep*))
             ;; past the span ceiling: cut where the span a third of the way in begins
             by-spans (if (> excess 0) (first (nth hspans excess)) 0)
             at (math/max by-chars by-spans)
-            nl (index-of (buffer-text b) "\n" at)
-            cut (if (< nl 0) at (inc nl))
-            kept (seq/filter hspans (fn (s) (>= (first s) cut))))
-        (assoc (replace-region b 0 cut "")
+            newline (index-of (buffer-text buffer) "\n" at)
+            cut (if (< newline 0) at (inc newline))
+            kept (seq/filter hspans (fn (span) (>= (first span) cut))))
+        (assoc (replace-region buffer 0 cut "")
           :term-hstart (- hstart cut)
           :history-spans (shift-spans kept (- cut)))))))
 
@@ -302,41 +301,41 @@ every cell reaching that first; a no-op below both."
 ;; next screen would index off it — the shell's commands read the same field, so one
 ;; clamped reader serves both.
 
-(defn- pending-input (b)
+(defn- pending-input (buffer)
   "In line mode, what the user has typed past the program's cursor and not yet sent —
 kept across a redraw, as comint keeps the text after its process mark. \"\" otherwise."
-  (if (not (:term-line-mode b)) "" (input-text b)))
+  (if (not (:term-line-mode buffer)) "" (input-text buffer)))
 (sig pending-input (buffer -> string))
 
-(defn- term-apply-screen (b lines screen)
-  "Buffer `b` with the evicted `lines` appended to its history and `screen` written as
+(defn- term-apply-screen (buffer lines screen)
+  "`buffer` with the evicted `lines` appended to its history and `screen` written as
 its tail, `:history-spans` the history's faces and `:face-spans` the screen's — two
 sources the view slices apart (`spanpaint/ed-span-sources`), so a repaint of the screen never
 copies the history's tens of thousands of faces — its own point at the
 program's cursor — or, in line mode, at the end of the input still being typed, which
 is re-appended after the screen and marked as the input region. The buffer is read-only
 for the user in char mode; its producer unlocks it."
-  (let (hstart (history-start b)
-        line? (:term-line-mode b)
-        typed (pending-input b)
+  (let (hstart (history-start buffer)
+        line? (:term-line-mode buffer)
+        typed (pending-input buffer)
         ;; how far into the input the password prompt's marker sits (`passwd/mark-prompt`):
         ;; the redraw rewrites the input, so the marker is put back at the same distance
-        ahead (when (and line? (not (nil? (editor/buffer/buffer-marker b passwd/*prompt-marker*))))
-                (let ([start _] (input-region b)) (- (passwd/since-prompt b start) start)))
+        ahead (when (and line? (not (nil? (editor/buffer/buffer-marker buffer passwd/*prompt-marker*))))
+                (let ([start _] (input-region buffer)) (- (passwd/since-prompt buffer start) start)))
         ;; line mode shows the screen only up to the cursor: the input goes where the
         ;; program's prompt ends, not after its blank rows
         shown (if line? (string/substring (:text screen) 0 (:cursor screen)) (:text screen))
         spans (if line? (clip-spans (:spans screen) (:cursor screen)) (:spans screen))
         [htext hspans hend] (history-lines lines hstart)
-        unlocked (set-read-only b false)
+        unlocked (set-read-only buffer false)
         written (assoc (replace-region unlocked hstart (buffer-length unlocked) (str htext shown))
                   :term-hstart hend
                   ;; a vector `into` copies the whole history, so only when rows left the
                   ;; screen; otherwise the history keeps its cell (and its slicing memo)
                   :history-spans
                     (if (empty? hspans)
-                      (or (:history-spans b) [])
-                      (into (or (:history-spans b) []) hspans))
+                      (or (:history-spans buffer) [])
+                      (into (or (:history-spans buffer) []) hspans))
                   ;; the program's cursor as the VIEW paints it, and what the MOUSE needs
                   :cursor-hidden (not (:cursor-visible screen))
                   :cursor-shape (:cursor-style screen)
@@ -344,7 +343,7 @@ for the user in char mode; its producer unlocks it."
                   :term-alt-screen (:alt-screen screen)
                   ;; every row that ever left the screen: what tells a re-asked password
                   ;; prompt on a full screen from the one already answered
-                  :term-scrolled (+ (or (:term-scrolled b) 0) (count lines)))
+                  :term-scrolled (+ (or (:term-scrolled buffer) 0) (count lines)))
         ;; trim BEFORE the faces are laid out, so both halves share one offset
         trimmed (trim-history written)
         screen-start (history-start trimmed)
@@ -364,8 +363,8 @@ for the user in char mode; its producer unlocks it."
       (set-read-only faced true))))
 (sig term-apply-screen (buffer vector screen -> buffer))
 
-(defn- term-follow (m idx before after)
-  "Every pane on pool buffer `idx` whose point was watching the screen (at or past the
+(defn- term-follow (m index before after)
+  "Every pane on pool buffer `index` whose point was watching the screen (at or past the
 old `:term-hstart`) follows the program's cursor, and scrolls so the screen's first
 row is its top row — the pane SHOWS the program. A pane scrolled up into the history
 stays where the reader left it."
@@ -373,24 +372,24 @@ stays where the reader left it."
         cursor (buffer-point after)
         top (eolnotes/line-of (buffer-rope after) (history-start after)))
     (ed-map-panes m
-      (fn (w)
-        (if (and (= (:buffer w) idx) (or (nil? (:point w)) (>= (:point w) watching)))
-          (assoc w :point cursor :mark nil :top top)
-          w)))))
+      (fn (pane)
+        (if (and (= (:buffer pane) index) (or (nil? (:point pane)) (>= (:point pane) watching)))
+          (assoc pane :point cursor :mark nil :top top)
+          pane)))))
 
 (defn ed-ev-term-screen (m event textrows cols rows)
   "A `term-screen-event` → the buffer's tail becomes the screen, the evicted rows join
 its history, every pane watching the screen follows the cursor, and a pane that changed
 size since tells its program."
-  (let (idx (ed-buffer-index-by-name m (term-screen-event-buffer event)))
-    (if (nil? idx)
+  (let (index (ed-buffer-index-by-name m (term-screen-event-buffer event)))
+    (if (nil? index)
       m
-      (let (before (ed-buf-at m idx)
+      (let (before (ed-buf-at m index)
             screen (term-screen-event-screen event)
             after (term-apply-screen before (term-screen-event-lines event) screen))
-        (term-watch-password (term-sync-sizes (term-follow (ed-set-buf-at m idx after)
-                                                idx before after))
-          idx screen)))))
+        (term-watch-password (term-sync-sizes (term-follow (ed-set-buf-at m index after)
+                                                index before after))
+          index screen)))))
 
 ;; ---- a password the program asks for -------------------------------------------------------
 ;; In line mode the buffer is the line editor, so what is typed SHOWS and RET remembers it —
@@ -426,48 +425,48 @@ size since tells its program."
 what was typed into the input region since the prompt APPEARED is MOVED into the read — out
 of the buffer, where it showed, and out of its undo history (`passwd/take-since-prompt`) —
 and `seed` follows it. Text typed ahead of the prompt stays as the next input."
-  (let (idx (ed-buffer-index-by-name! m name)
-        b (ed-buf-at m idx)
-        line (string/trim (or (:line (:term-prompt-mark b)) ""))
+  (let (index (ed-buffer-index-by-name! m name)
+        terminal (ed-buf-at m index)
+        line (string/trim (or (:line (:term-prompt-mark terminal)) ""))
         prompt (if (= line "") "Password: " (str line " "))
-        [start end] (input-region b)
-        [taken typed] (if (nil? seed) [b ""] (passwd/take-since-prompt b start end)))
-    (passwd/ed-read-passwd (ed-set-buf-at m idx taken)
+        [start end] (input-region terminal)
+        [taken typed] (if (nil? seed) [terminal ""] (passwd/take-since-prompt terminal start end)))
+    (passwd/ed-read-passwd (ed-set-buf-at m index taken)
       prompt
-      (fn (m1 password) (term-send-secret m1 name password))
+      (fn (answered password) (term-send-secret answered name password))
       name
       (str typed (or seed "")))))
 
 (defn- term-send-secret (m name password)
   "Send `password` to terminal `name`'s program as a line — to the program only: not into
 the buffer, not into its history — and mark the request answered."
-  (let (idx (ed-buffer-index-by-name m name)
+  (let (index (ed-buffer-index-by-name m name)
         gone "the program has exited; nothing sent")
-    (if (nil? idx)
+    (if (nil? index)
       (message m gone)
-      (let (b (ed-buf-at m idx)
-            pid (live-program b))
+      (let (terminal (ed-buf-at m index)
+            pid (live-program terminal))
         (if (nil? pid)
           (message m gone)
           (do
             (send pid [:term-line password])
             (ed-set-buf-at m
-              idx
-              (assoc b :term-secret false :term-secret-answered (:term-prompt-mark b)))))))))
+              index
+              (assoc terminal :term-secret false :term-secret-answered (:term-prompt-mark terminal)))))))))
 
-(defn- term-watch-password (m idx screen)
-  "After screen `screen` folded into terminal `idx`: in line mode, note whether its program
+(defn- term-watch-password (m index screen)
+  "After screen `screen` folded into terminal `index`: in line mode, note whether its program
 is waiting for a password, and when it has just started to — and you are looking at it,
 with no other prompt open — read it (`term-open-password`). Elsewhere the first key typed
 there, or RET, asks (`passwd/secret-overlay`)."
-  (let (b (ed-buf-at m idx))
-    (if (not (:term-line-mode b))
+  (let (terminal (ed-buf-at m index))
+    (if (not (:term-line-mode terminal))
       m
       (let (line (screen-prompt screen)
             echo-off? (= true (:password screen))
-            mark {:scrolled (or (:term-scrolled b) 0) :cursor (:cursor screen) :line line}
+            mark {:scrolled (or (:term-scrolled terminal) 0) :cursor (:cursor screen) :line line}
             ;; echo back on (a definite false: nil is "cannot say") — the answer was read
-            answered (let (previous (:term-secret-answered b))
+            answered (let (previous (:term-secret-answered terminal))
                        (if (and (map? previous) (= false (:password screen)))
                          (assoc previous :echo-returned true)
                          previous))
@@ -475,15 +474,15 @@ there, or RET, asks (`passwd/secret-overlay`)."
                      (= (dissoc answered :echo-returned) mark)
                      (not (and (:echo-returned answered) echo-off?)))
             secret? (and (not stale?) (or echo-off? (passwd/password-prompt? line)))
-            asked? (and secret? (not (:term-secret b)))
-            flagged (assoc b
+            asked? (and secret? (not (:term-secret terminal)))
+            flagged (assoc terminal
                       :term-secret secret?
                       :term-prompt-mark mark
                       :term-secret-answered (if stale? answered nil))
             ;; what is typed from here on is the password's; what was typed before stays
-            noted (ed-set-buf-at m idx (if asked? (passwd/mark-prompt flagged) flagged)))
-        (if (and asked? (= idx (ed-current-index noted)) (ed-prompt-free? noted))
-          (term-open-password noted (buffer-name b) "")
+            noted (ed-set-buf-at m index (if asked? (passwd/mark-prompt flagged) flagged)))
+        (if (and asked? (= index (ed-current-index noted)) (ed-prompt-free? noted))
+          (term-open-password noted (buffer-name terminal) "")
           noted)))))
 
 ;; A prompt that arrives while you are looking at something else only marks the buffer
@@ -493,11 +492,11 @@ there, or RET, asks (`passwd/secret-overlay`)."
 (defn term-secret-pending? (m)
   "Whether the selected buffer is a line-mode terminal whose live program waits for a
 password that no read has been opened for yet — where a typed key belongs to a masked read."
-  (let (b (ed-current-buf m))
-    (and (= (:type b) :term)
-      (:term-line-mode b)
-      (= true (:term-secret b))
-      (not (nil? (live-program b)))
+  (let (terminal (ed-current-buf m))
+    (and (term-buffer? terminal)
+      (:term-line-mode terminal)
+      (= true (:term-secret terminal))
+      (not (nil? (live-program terminal)))
       (nil? (:minibuffer m)))))
 
 (defn term-secret-key (m input)
@@ -515,14 +514,14 @@ closes it."
                " — C-x k to close]\n"))
     (ed-update-named (passwd/ed-withdraw-read m (term-exit-event-buffer event))
       (term-exit-event-buffer event)
-      (fn (b)
-        (let (noted (insert (end-of-buffer (set-read-only b false)) note))
+      (fn (terminal)
+        (let (noted (insert (end-of-buffer (set-read-only terminal false)) note))
           (set-read-only (assoc noted :term-exited true :term-secret false) true))))))
 
 ;; ---- sizing: the vt is the size of the smallest pane that shows it ------------------------
 
-(defn- term-pane-size (pane buf)
-  [(panes/ed-pane-text-cols pane buf) (math/max 1 (panes/ed-pane-vrows pane buf))])
+(defn- term-pane-size (pane buffer)
+  [(panes/ed-pane-text-cols pane buffer) (math/max 1 (panes/ed-pane-vrows pane buffer))])
 
 (defn- term-wanted-sizes (m panes)
   "Pool index → the size its term program should have, for every term buffer with a live
@@ -533,17 +532,17 @@ made the program repaint, each repaint resized it to the other pane, without end
   (fold panes
     {}
     (fn (acc pane)
-      (let (idx (map/get-in pane [:payload :buffer])
-            buf (if (int? idx) (ed-buf-at m idx) nil))
-        (if (or (nil? buf) (not (term-buffer? buf)) (nil? (live-program buf)))
+      (let (index (map/get-in pane [:payload :buffer])
+            buffer (if (int? index) (ed-buf-at m index) nil))
+        (if (or (nil? buffer) (not (term-buffer? buffer)) (nil? (live-program buffer)))
           acc
-          (let ([cols rows] (term-pane-size pane buf)
-                prev (get acc idx))
+          (let ([cols rows] (term-pane-size pane buffer)
+                smallest (get acc index))
             (assoc acc
-              idx
-                (if (nil? prev)
+              index
+                (if (nil? smallest)
                   [cols rows]
-                  [(math/min cols (first prev)) (math/min rows (second prev))]))))))))
+                  [(math/min cols (first smallest)) (math/min rows (second smallest))]))))))))
 
 (defn term-sync-sizes (m)
   "Tell every term worker whose size changed — `[:term-resize cols rows]`, recorded on
@@ -554,22 +553,21 @@ panes is sized to fit all of them (`term-wanted-sizes`)."
       m
       (fold (term-wanted-sizes m (:panes layout))
         m
-        (fn (mm entry)
-          (let ([idx size] entry
-                buf (ed-buf-at mm idx))
-            (if (= size (:term-size buf))
-              mm
+        (fn (synced [index size])
+          (let (buffer (ed-buf-at synced index))
+            (if (= size (:term-size buffer))
+              synced
               (do
-                (send (live-program buf) [:term-resize (first size) (second size)])
-                (ed-set-buf-at mm idx (assoc buf :term-size size))))))))))
+                (send (live-program buffer) [:term-resize (first size) (second size)])
+                (ed-set-buf-at synced index (assoc buffer :term-size size))))))))))
 
-(defn- term-size-for (m buf)
-  "The size a new term buffer gets: the selected pane's text area for `buf` (a term
+(defn- term-size-for (m buffer)
+  "The size a new term buffer gets: the selected pane's text area for `buffer` (a term
 buffer draws no gutter), or 80×24 before any frame."
   (let (layout (panes/ed-layout-now m))
     (if (nil? layout)
       [80 24]
-      (term-pane-size (panes/ed-selected-pane (:panes layout)) buf))))
+      (term-pane-size (panes/ed-selected-pane (:panes layout)) buffer))))
 
 ;; ---- keys: everything goes to the program ------------------------------------------------
 
@@ -588,11 +586,10 @@ program's own cursor-key mode). Nothing to send once the program has exited."
     (m key)
     "C-y in a terminal buffer: paste the kill ring's head into the program — bracketed
 when the program asked for pastes to be marked, so it can tell one from typing."
-    (let ([m1 text] (ed-kill-head m)
-          pid (live-program (ed-current-buf m1)))
-      (do
-        (when (and text pid) (send pid [:term-paste text]))
-        (if (nil? text) (message m1 "kill ring is empty") m1)))))
+    (let ([headed text] (ed-kill-head m)
+          pid (live-program (ed-current-buf headed)))
+      (when (and text pid) (send pid [:term-paste text]))
+      (if (nil? text) (message headed "kill ring is empty") headed))))
 
 ;; ---- the commands --------------------------------------------------------------------------
 
@@ -615,8 +612,8 @@ in line mode when `line-mode?`."
                 :input-draft nil)
         [cols rows] (term-size-for m fresh)
         pid (term-connect (buffer-name fresh) root command cols rows)
-        buf (assoc fresh :term-proc pid :term-size [cols rows]))
-    (message (ed-open-buffer m buf)
+        buffer (assoc fresh :term-proc pid :term-size [cols rows]))
+    (message (ed-open-buffer m buffer)
       (str command
         (if line-mode?
           " (RET sends the line; C-c C-k for char mode)"
@@ -625,8 +622,8 @@ in line mode when `line-mode?`."
 (defn- term-open (m label command &optional (line-mode? false))
   "Switch to this project's `label` terminal, or start one running `command`."
   (let (root (or (ed-project-root m) (:dir (ed-current-buf m)) (file/cwd))
-        idx (ed-buffer-index-by-name m (term-buffer-name label root)))
-    (if (nil? idx) (term-start m label root command line-mode?) (ed-select m idx))))
+        index (ed-buffer-index-by-name m (term-buffer-name label root)))
+    (if (nil? index) (term-start m label root command line-mode?) (ed-select m index))))
 
 ;; ---- line mode ------------------------------------------------------------------------------
 ;; The program's screen ends at its cursor; from there the buffer is bedit's — an input
@@ -635,8 +632,8 @@ in line mode when `line-mode?`."
 ;; cleared on send rather than left to show twice.
 
 (defn- set-line-mode (m on)
-  (let (b (ed-current-buf m))
-    (if (not (term-buffer? b))
+  (let (terminal (ed-current-buf m))
+    (if (not (term-buffer? terminal))
       m
       ;; on: the tail past the cursor (the screen's blank rows) goes, the region starts at
       ;; the cursor; off: whatever was typed and not sent goes, the next redraw restores
@@ -644,9 +641,9 @@ in line mode when `line-mode?`."
       ;; who clicked up into the scrollback before pressing this would otherwise delete
       ;; everything below the click
       (let (cut (if on
-                  (math/min (or (:term-cursor b) (buffer-length b)) (buffer-length b))
-                  (first (input-region b)))
-            trimmed (replace-region (set-read-only b false) cut (buffer-length b) "")
+                  (math/min (or (:term-cursor terminal) (buffer-length terminal)) (buffer-length terminal))
+                  (first (input-region terminal)))
+            trimmed (replace-region (set-read-only terminal false) cut (buffer-length terminal) "")
             switched (assoc (set-read-only trimmed (not on))
                        :term-line-mode on
                        :input-start (if on cut nil)))
@@ -677,17 +674,17 @@ While the program waits for a PASSWORD (`term-watch-password`), RET reads it mas
 instead; what was typed since the prompt appeared is sent as the answer but never
 remembered, and leaves no undo step behind. Text typed ahead of the prompt is not the
 password: it stays as the next input."
-  (let (b (ed-current-buf m)
-        [start end] (input-region b)
-        line (string/substring (buffer-text b) start end)
-        secret (string/substring (buffer-text b) (passwd/since-prompt b start) end)
-        pid (live-program b))
+  (let (terminal (ed-current-buf m)
+        [start end] (input-region terminal)
+        line (string/substring (buffer-text terminal) start end)
+        secret (string/substring (buffer-text terminal) (passwd/since-prompt terminal start) end)
+        pid (live-program terminal))
     (cond
       (nil? pid) m
-      (and (:term-secret b) (= secret "")) (term-open-password m (buffer-name b))
+      (and (:term-secret terminal) (= secret "")) (term-open-password m (buffer-name terminal))
       ;; out of the buffer AND its undo history: it was the password
-      (:term-secret b)
-        (let (sent (term-send-secret m (buffer-name b) secret))
+      (:term-secret terminal)
+        (let (sent (term-send-secret m (buffer-name terminal) secret))
           (ed-set-buf sent (first (passwd/take-since-prompt (ed-current-buf sent) start end))))
       else
         (do
@@ -699,10 +696,10 @@ password: it stays as the next input."
 (defn term-send-invisible (m)
   "A terminal's `:send-invisible` service: in line mode, read a line masked for the program
 (`comint/cmd-send-invisible` is the command); in char mode the program reads its own keys."
-  (let (b (ed-current-buf m))
+  (let (terminal (ed-current-buf m))
     (cond
-      (and (:term-line-mode b) (live-program b)) (term-open-password m (buffer-name b))
-      (live-program b)
+      (and (:term-line-mode terminal) (live-program terminal)) (term-open-password m (buffer-name terminal))
+      (live-program terminal)
         (message m "char mode: the program reads its own keys (C-c C-j for line mode)")
       else (message m "no program here to send to"))))
 
@@ -743,10 +740,10 @@ run instead, in a buffer named after it."
     (assoc m
       :minibuffer
         {:edit (ed-mb-edit "Run in a terminal: " "")
-         :on-complete (fn (mm command)
+         :on-complete (fn (prompted command)
                         (if (string/blank? command)
-                          (message mm "no program")
-                          (term-open mm
+                          (message prompted "no program")
+                          (term-open prompted
                             (first (string/split (string/trim command) " "))
                             (string/trim command))))})))
 (interactive/register-prefix-consuming 'terminal/cmd-term)
@@ -783,18 +780,18 @@ C-c had been pressed (`C-x c t` runs the tests), since the program owns C-c itse
 ;; that did not ask for the mouse still gets the wheel as arrow keys, which is what every
 ;; terminal does for `less` and friends; anywhere else the wheel scrolls the buffer.
 
-(defn- term-screen-cell (m pane buf row col)
+(defn- term-screen-cell (m pane buffer row col)
   "The `[row col]` of the program's screen under window cell (`row`, `col`) in `pane`, or
 nil when that cell is above the screen (history) or off the text."
-  (let ([x y w h] (:rect pane)
+  (let ([x y _ _] (:rect pane)
         ;; a zoomed pane's cells are bigger than the window's: the click lands in fewer of them
-        [rw rh] (panes/ed-zoom-ratio pane)
-        text-row (math/floor (/ (- row y) rh))
-        text-col (math/floor (/ (- col x) rw))
-        screen-top (eolnotes/line-of (buffer-rope buf) (history-start buf))
-        screen-row (- (+ (panes/ed-pane-top pane buf) text-row) screen-top))
+        [width-ratio height-ratio] (panes/ed-zoom-ratio pane)
+        text-row (math/floor (/ (- row y) height-ratio))
+        text-col (math/floor (/ (- col x) width-ratio))
+        screen-top (eolnotes/line-of (buffer-rope buffer) (history-start buffer))
+        screen-row (- (+ (panes/ed-pane-top pane buffer) text-row) screen-top))
     (if (and (>= text-row 0)
-          (< text-row (panes/ed-pane-vrows pane buf))
+          (< text-row (panes/ed-pane-vrows pane buffer))
           (>= text-col 0)
           (>= screen-row 0))
       [screen-row text-col]
@@ -804,11 +801,11 @@ nil when that cell is above the screen (history) or off the text."
   "Fold a `[:mouse action button row col mods]` event over `pane` (which shows a term
 buffer) into the program, answering the model when the event was the program's — else
 nil, and the editor handles it as it would in any buffer."
-  (let (buf (panes/ed-pane-buf m pane)
-        pid (live-program buf)
+  (let (buffer (panes/ed-pane-buf m pane)
+        pid (live-program buffer)
         action (nth input 1)
         wheel? (includes? [:scroll-up :scroll-down] action)
-        cell (term-screen-cell m pane buf (nth input 3) (nth input 4)))
+        cell (term-screen-cell m pane buffer (nth input 3) (nth input 4)))
     (cond
       (nil? pid) nil
       ;; a program that did not ask for the mouse: a middle click pastes the PRIMARY selection
@@ -820,20 +817,21 @@ nil, and the editor handles it as it would in any buffer."
       ;; it would arrive AHEAD of the half-typed input, still unsent
       (and (= action :press)
         (= (nth input 2) :middle)
-        (not (:term-mouse buf))
-        (:term-line-mode buf))
-        (ed-primary-ask m 'terminal/term-primary-into-input (buffer-name buf))
-      (and (= action :press) (= (nth input 2) :middle) (not (:term-mouse buf)))
+        (not (:term-mouse buffer))
+        (:term-line-mode buffer))
+        (ed-primary-ask m 'terminal/term-primary-into-input (buffer-name buffer))
+      (and (= action :press) (= (nth input 2) :middle) (not (:term-mouse buffer)))
         (ed-primary-ask m 'terminal/term-primary-answered pid)
       (nil? cell) nil
-      (:term-mouse buf)
+      (:term-mouse buffer)
         (do
           (send pid [:term-mouse action (nth input 2) (first cell) (second cell) (nth input 5 [])])
           m)
       ;; a full-screen program without the mouse: the wheel is arrow keys, three a notch
-      (and wheel? (:term-alt-screen buf))
+      (and wheel? (:term-alt-screen buffer))
         (let (key (if (= action :scroll-up) :up :down))
-          (do (fold (range 3) nil (fn (_ _) (send pid [:term-key key]))) m))
+          (doseq (_ (range 3)) (send pid [:term-key key]))
+          m)
       else nil)))
 
 (defn term-paste-text (m text)
@@ -857,37 +855,34 @@ asked) — or said, when there is nothing selected anywhere."
   "The rest of a middle click in the LINE-mode terminal `name` once the PRIMARY selection's
 `text` is known: put into the input being typed — at point when point is in the input
 region, else at its end — never sent to the program ahead of it."
-  (let (i (ed-buffer-index-by-name m name))
+  (let (index (ed-buffer-index-by-name m name))
     (cond
       (or (not (string? text)) (= text "")) (message m "no primary selection to paste")
-      (nil? i) m
+      (nil? index) m
       else
-        (let (b (ed-buf-at m i)
-              start (or (:input-start b) (buffer-length b))
-              at (if (< (buffer-point b) start) (goto-char b (buffer-length b)) b))
-          (ed-set-buf-at m i (insert at text))))))
+        (let (terminal (ed-buf-at m index)
+              start (or (:input-start terminal) (buffer-length terminal))
+              at (if (< (buffer-point terminal) start) (goto-char terminal (buffer-length terminal)) terminal))
+          (ed-set-buf-at m index (insert at text))))))
 
 ;; ---- the mode line ---------------------------------------------------------------------
 
-(defn term-modeline (m buf)
+(defn term-modeline (m buffer)
   "The term layer's `:modeline` service: the program's state and which mode the keys are
 in — `● claude · char`, `○ exited`."
-  (if (:term-exited buf)
+  (if (:term-exited buffer)
     "○ exited"
-    (str "● " (or (:term-label buf) "program") " · " (if (:term-line-mode buf) "line" "char"))))
+    (str "● " (or (:term-label buffer) "program") " · " (if (:term-line-mode buffer) "line" "char"))))
 
 ;; ---- the theme ------------------------------------------------------------------------------
 
 (defn term-repalette (m)
   "After a theme switch: every running program's screen is re-read through the new
 palette. History keeps the colours it was written in — its cells are gone."
-  (do
-    (fold (:buffers m)
-      nil
-      (fn (_ b)
-        (when-let (pid (and (term-buffer? b) (live-program b)))
-          (send pid [:term-palette (term-palette)]))))
-    m))
+  (doseq (buffer (:buffers m))
+    (when-let (pid (and (term-buffer? buffer) (live-program buffer)))
+      (send pid [:term-palette (term-palette)])))
+  m)
 
 ;; term-mode: a full-screen program under a real terminal emulator (M-x term, M-x claude —
 ;; src/terminal.blsp). Its keys never reach a keymap: `term-overlay` hands every key but
@@ -934,18 +929,14 @@ palette. History keeps the colours it was written in — its cells are gone."
    :hooks {:on-close '(terminal/term-on-close)}})
 (register-type-layers :term (list 'terminal/term-mode-layer))
 
-(defn ed-terminal-buffer? (buf)
-  "Whether `buf` is a terminal buffer, of either mode."
-  (= (:type buf) :term))
-
 (defn- ed-terminals? (m)
   ;; whether any pooled buffer is a terminal: a resize and a theme switch ask first
-  (any? (:buffers m) ed-terminal-buffer?))
+  (any? (:buffers m) term-buffer?))
 
 (defn term-char-mode? (m)
   "Whether the selected pane shows a terminal buffer in CHAR mode: the program's keys. A term in
 line mode is edited like a shell, through the keymaps."
-  (let (b (ed-current-buf m)) (and (ed-terminal-buffer? b) (not (:term-line-mode b)))))
+  (let (terminal (ed-current-buf m)) (and (term-buffer? terminal) (not (:term-line-mode terminal)))))
 
 (defrecord term-overlay ()) ; a terminal buffer: every key is the program's but C-x (the editor's prefix) and C-y (paste into it)
 (impl Overlay
@@ -958,9 +949,8 @@ line mode is edited like a shell, through the keymaps."
 (register-overlay :term 90 (term-overlay))
 
 (defn term-resized (m)
-  "A resize step: a pty child lays out against a size it is TOLD. It has no other way to learn
-one — `iex` wraps its own input at the width it believes it has — so a REPL opened in an
-80-column window and then widened kept wrapping at 80 until it was restarted."
+  "A resize step: a pty child lays out against the size it is TOLD (`iex` wraps its input at
+the width it believes it has), so every terminal whose panes changed size is told."
   (if (ed-terminals? m) (term-sync-sizes m) m))
 
 (defn term-recoloured (m)
