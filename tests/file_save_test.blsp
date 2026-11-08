@@ -1,0 +1,150 @@
+;; A save and a large read OFF the loop: the buffer is marked saved only once its write has
+;; landed, and as of the text written; a failed write keeps it modified and says why; a save
+;; asked for while one is out waits its turn; C-x C-c waits for the writes; a large file shows
+;; `Loading…` until its text lands. Each test that wants to see a task in flight binds the
+;; module's switch and folds the reply itself, as the loop would.
+(defmodule file-save-test
+  (:use test)
+  (:use model)
+  (:use input) ; ed-update — a typed key
+  (:use pool) ; ed-visit-file / *read-off-loop* / ed-apply-read
+  (:use file-save) ; ed-save-buf-at / *write-off-loop* / *write-file* / ed-apply-save
+  (:use lifecycle :only []) ; cmd-save / cmd-quit
+  (:use main :only []) ; the released image: every row loaded
+  (:use editor/buffer))
+
+(purge-stale-temp "bedit-file-save-")
+
+(defn- fixture-file (text)
+  "A fresh file holding `text` in its own temp directory; its path."
+  (let (dir (temp-dir "bedit-file-save-")
+        _ (file/mkdir dir)
+        path (path/join dir "notes.txt"))
+    (do (file/spit path text) path)))
+
+(defn- visited (text)
+  "`[model path]`: a file holding `text`, visited."
+  (let (path (fixture-file text)) [(ed-find-file (ed-init (make-buffer "")) path) path]))
+
+(defn- type-key (m key) (ed-update m key 80 24))
+
+(defn- landed-save (m)
+  "`m` with the write that is out awaited and its reply folded, as the loop folds it."
+  (ed-apply-save m (task/await (:save-proc m) 5000)))
+
+(defn- landed-read (m)
+  (ed-apply-read m (task/await (:read-proc m) 5000)))
+
+(describe "a save is written off the loop"
+  (test "the buffer stays modified until the write lands, then is saved"
+    (let ([m path] (visited "old\n")
+          saving (binding (*write-off-loop* true) (lifecycle/cmd-save (type-key m "x") nil)))
+      (is (:save-proc saving))
+      (is (string/starts-with? (:echo saving) "Saving "))
+      (is (buffer-modified? (ed-current-buf saving)))
+      (let (saved (landed-save saving))
+        (assert= (file/slurp path) "xold\n")
+        (refute (buffer-modified? (ed-current-buf saved)))
+        (refute (:save-proc saved))
+        (assert= (:echo saved) (str "saved " path))
+        ;; restamped with the write's own time, so the next save asks nothing
+        (refute (editor/buffer-file/buffer-file-changed? (ed-current-buf saved))))))
+
+  (test "a write that fails keeps the buffer modified and says why"
+    (let ([m path] (visited "old\n")
+          failed (binding (*write-file* (fn (file content) (error "disk full")))
+                   (lifecycle/cmd-save (type-key m "x") nil)))
+      (assert= (file/slurp path) "old\n")
+      (is (buffer-modified? (ed-current-buf failed)))
+      (is (includes? (:echo failed) "disk full"))
+      (is (includes? (:echo failed) "still modified"))))
+
+  (test "an edit made while the write is out leaves the buffer modified"
+    (let ([m path] (visited "old\n")
+          saving (binding (*write-off-loop* true) (lifecycle/cmd-save (type-key m "x") nil))
+          edited (type-key saving "y")
+          landed (landed-save edited))
+      (assert= (file/slurp path) "xold\n")
+      (assert= (buffer-text (ed-current-buf landed)) "xyold\n")
+      (is (buffer-modified? (ed-current-buf landed)))
+      (is (includes? (:echo landed) "still modified"))))
+
+  (test "a second save while one is out waits its turn, then writes the newer text"
+    (binding (*write-off-loop* true)
+      (let ([m path] (visited "old\n")
+            first-out (lifecycle/cmd-save (type-key m "x") nil)
+            handle (:save-proc first-out)
+            second-asked (lifecycle/cmd-save (type-key first-out "y") nil))
+        ;; the same write is out; the second waits rather than racing it
+        (assert= (:save-proc second-asked) handle)
+        (assert= (count (:save-waiting second-asked)) 1)
+        (let (first-landed (landed-save second-asked))
+          (assert= (file/slurp path) "xold\n")
+          ;; the waiting save launched when the first landed
+          (is (:save-proc first-landed))
+          (refute (= (:save-proc first-landed) handle))
+          (let (second-landed (landed-save first-landed))
+            (assert= (file/slurp path) "xyold\n")
+            (refute (buffer-modified? (ed-current-buf second-landed)))
+            (refute (:save-waiting second-landed)))))))
+
+  (test "C-x C-c waits for the write in flight, then quits"
+    (let ([m path] (visited "old\n")
+          saving (binding (*write-off-loop* true) (lifecycle/cmd-save (type-key m "x") nil))
+          quitting (lifecycle/cmd-quit saving nil))
+      ;; not asked about (its save is out), and not quit before the write lands
+      (refute (:read-char quitting))
+      (refute (:done quitting))
+      (let (landed (landed-save quitting))
+        (assert= (file/slurp path) "xold\n")
+        (is (:done landed)))))
+
+  (test "C-x C-c whose write fails asks before exiting with the buffer modified"
+    (let ([m path] (visited "old\n")
+          saving (binding (*write-off-loop* true
+                           *write-file* (fn (file content) (error "disk full")))
+                   (lifecycle/cmd-save (type-key m "x") nil))
+          landed (landed-save (lifecycle/cmd-quit saving nil)))
+      (assert= (file/slurp path) "old\n")
+      (refute (:done landed))
+      (is (includes? (:echo landed) "Modified buffers exist")))))
+
+(describe "a large file is read off the loop"
+  (test "Loading… shows at once, read-only, and the file takes its place"
+    (let (path (fixture-file "a large file\n")
+          m (ed-init (make-buffer ""))
+          loading (binding (*read-off-loop* true *read-off-loop-bytes* 4) (ed-visit-file m path)))
+      (assert= (buffer-text (ed-current-buf loading)) "Loading…\n")
+      (is (read-only? (ed-current-buf loading)))
+      (is (nil? (ed-buffer-index-by-file loading path)))
+      (let (landed (landed-read loading))
+        (assert= (buffer-text (ed-current-buf landed)) "a large file\n")
+        (assert= (buffer-file (ed-current-buf landed)) path)
+        (is (nil? (ed-loading-index landed path)))
+        (assert= (count (:buffers landed)) (inc (count (:buffers m))))
+        (is (includes? (:echo landed) "opened")))))
+
+  (test "a read landing while you are elsewhere leaves you there"
+    (let (path (fixture-file "big\n")
+          m (ed-init (make-buffer ""))
+          loading (binding (*read-off-loop* true *read-off-loop-bytes* 1) (ed-visit-file m path))
+          elsewhere (ed-select loading 0)
+          landed (landed-read elsewhere))
+      (assert= (ed-current-index landed) 0)
+      (is (int? (ed-buffer-index-by-file landed path)))
+      (is (nil? (ed-loading-index landed path)))))
+
+  (test "killing the Loading… buffer cancels the read"
+    (let (path (fixture-file "big\n")
+          loading (binding (*read-off-loop* true *read-off-loop-bytes* 1)
+                    (ed-visit-file (ed-init (make-buffer "")) path))
+          killed (ed-kill-buffer-at loading
+                   (or (ed-loading-index loading path) (error "no Loading… buffer"))))
+      (refute (:read-proc killed))
+      (is (nil? (ed-buffer-index-by-file killed path)))))
+
+  (test "a small file opens at once"
+    (let (path (fixture-file "small\n")
+          opened (binding (*read-off-loop* true) (ed-visit-file (ed-init (make-buffer "")) path)))
+      (refute (:read-proc opened))
+      (assert= (buffer-text (ed-current-buf opened)) "small\n"))))

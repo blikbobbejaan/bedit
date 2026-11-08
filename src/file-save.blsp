@@ -2,13 +2,33 @@
   "Writing a pool buffer to its file: the plain save every path shares, the two halves of a
 save that lands later, and what a save tells the rest of the editor (the sidecar, a hosted
 slot's process, the project's file list). A buffer a file handler owns is that handler's to save
-(`model/register-file-handler`)."
+(`model/register-file-handler`).
+
+Every save of a plain file is written OFF the loop (`:save-proc`): `file/replace` makes a temp
+file, fsyncs it and renames it, which on a slow or network disk would freeze the editor. The
+buffer is made what its `.editorconfig` asks and its text taken at once ([[ed-save-prepare]]),
+the write runs in a task, and the buffer is marked saved when it has landed
+([[ed-save-landed]]) — only then, and only as of the text written: an edit made meanwhile
+leaves it modified, and a write that fails leaves it modified and says why. One write runs at a
+time; a save asked for while one is out waits its turn (`:save-waiting`) and takes the buffer's
+text when its turn comes, so two saves of one file never race. [[ed-when-saves-land]] is what
+C-x C-c and C-x s wait on. Headless — a test, a batch run — the write runs inline."
   (:use editor/buffer) ; buffer-file / buffer-rope / mark-buffer-saved
   (:use editor/buffer-file) ; buffer-stamp-file
   (:use editor/buffer-server) ; buffer-edit
   (:use sidecar :only [ed-forget-auto-save]) ; a saved file's sidecar removed
   (:use conventions :only [prepare-for-save]) ; .editorconfig's trailing whitespace / final newline
-  (:use model)) ; ed-buf-at / ed-set-buf-at / message / the file handlers
+  (:use model)) ; ed-buf-at / ed-set-buf-at / message / the file handlers / register-task-reply
+
+(defdyn *write-off-loop* nil)
+;; Whether a plain save's write runs in a task: nil follows the loop (off it when there is
+;; one, `model/ed-headless?`; inline in a test or a batch run). A test binds true to see a
+;; write in flight, and folds its reply itself ([[ed-apply-save]]).
+
+(defdyn *write-file* file/replace)
+;; `(file content)`, what a plain save writes with: `file/replace` (temp file, fsync, rename —
+;; a crash mid-save leaves the old file). Read when the save is LAUNCHED, so a test that binds
+;; it reaches the task too.
 
 ;; check-allow: a handler's operation is resolved late; every one answers a model
 (sig ed-save-handled (model int any -> model))
@@ -47,29 +67,32 @@ them a second time."
         (assoc (editor/buffer-client/link-propagate-buffers link original prepared)
           :synced prepared)))))
 
-(sig ed-save-buf-at (model int -> model))
-(defn ed-save-buf-at (m index)
-  "Write pool buffer `index` to its file: the plain save every path shares — `C-x C-s` on the
-current buffer, and `save-some-buffers` on any other at quit. The buffer comes back unmodified
-(`charset/save` sets its baseline) and its `#filename#` auto-save sidecar is deleted on success;
-reports the outcome in the echo area either way. The diff-hl gutter is NOT recomputed
-here: a save writes the working tree but touches neither the buffer text nor HEAD, so
-the buffer-vs-HEAD diff is unchanged, and the cached `:vcs-line-status` stays as it is.
-
-The buffer is first made what its `.editorconfig` asks (`conventions/prepare-for-save`:
-trailing whitespace trimmed, a final newline added) — edits on the buffer, so what is
-written is what is shown.
+;; check-allow: `then` is the caller's continuation (the formatter's), whose result the checker
+;; cannot see; every caller hands one that answers a model
+(check-allow :trusted
+  (sig ed-save-buf-at (model int &optional any any -> model))
+  (defn ed-save-buf-at (m index &optional (then nil) (abandon-note nil))
+    "Save pool buffer `index` to its file: the plain save every path shares — `C-x C-s` on the
+current buffer, and `save-some-buffers` on any other at quit. The buffer is first made what its
+`.editorconfig` asks (`conventions/prepare-for-save`: trailing whitespace trimmed, a final
+newline added — edits on the buffer, so what is written is what is shown), then written OFF the
+loop: `Saving …` is said at once and the buffer stays modified until the write lands. Landed, it
+is unmodified (as of the text written), stamped with the file's new time, its `#filename#`
+sidecar deleted, and `(then m)` runs; failed, it stays modified and the echo area says why,
+`abandon-note` after it. A save asked for while another write is out waits its turn
+([[ed-when-saves-land]] is the wait for all of them). The diff-hl gutter is NOT recomputed: a
+save touches neither the buffer text nor HEAD.
 
 A buffer a file handler owns is that handler's to save (`model/register-file-handler`)."
-  (let (handler (ed-buffer-handler (ed-buf-at m index)))
-    (if (nil? handler)
-      (ed-save-buf-with m index charset/save "")
-      (ed-save-handled m index handler))))
+    (let (handler (ed-buffer-handler (ed-buf-at m index)))
+      (if (nil? handler)
+        (ed-save-plain m index then abandon-note)
+        (ed-save-handled m index handler)))))
 
-(defn- ed-denied-hint (buffer reason)
-  ;; a file the user may not write: what a handler offers instead, Emacs's TRAMP. Not to a
-  ;; buffer a handler already writes, nor for any other failure.
-  (if (and (nil? (ed-buffer-handler buffer)) (includes? (string/lower reason) "permission denied"))
+(defn- ed-denied-hint (reason)
+  ;; a file the user may not write: what a handler offers instead, Emacs's TRAMP. For no other
+  ;; failure.
+  (if (includes? (string/lower reason) "permission denied")
     (or (seq/find (seq/keep (ed-file-handlers) :denied-hint) string?) "")
     ""))
 
@@ -85,42 +108,11 @@ A buffer a file handler owns is that handler's to save (`model/register-file-han
         (self)
         (fn (process-buffer) (mark-buffer-saved (buffer-stamp-file process-buffer)))))))
 
-(sig ed-save-buf-with (model int any string -> model))
-(defn ed-save-buf-with (m index write note)
-  "[[ed-save-buf-at]]'s save of pool buffer `index` with the file written by `write` — `(write
-buffer)`, answering the buffer stamped and unmodified, or raising (`charset/save` for a plain
-file, a file handler's writer for one of its own) — and `note` appended to the `saved …` the
-echo area says. Everything else is the plain save's: the `.editorconfig` fix-ups first, the
-sidecar removed, a hosted slot's process told."
-  (let (original (ed-buf-at m index)
-        prepared (prepare-for-save original))
-    (try
-      ;; `write` answers the buffer stamped with the file's new mtime, so the idle beat's
-      ;; change check (`autorevert/ed-revert-changed-files`) knows text and file agree again
-      (let (file (buffer-file prepared)
-            created? (and (string? file) (not (file/exists? file)))
-            saved (dissoc (write prepared) :disk-warned)
-            stored (dissoc (ed-set-buf-at m index saved) :status)
-            ;; the save's own edits reach a hosted slot's process BEFORE it is told the
-            ;; buffer is saved, below — left to the loop tail they would land after the
-            ;; mark and leave the process modified
-            shipped (ed-ship-save-edits (if created? (ed-project-files-forget stored file) stored)
-                      index original prepared))
-        (do
-          (ed-forget-auto-save original)
-          (ed-mark-process-saved m index)
-          (message shipped (str "saved " file note))))
-      (catch failure
-        (message m
-          (str "save failed: "
-            (error-message failure)
-            (ed-denied-hint original (error-message failure))))))))
-
 ;; ---- a save that lands later ----------------------------------------------------
-;; A file a handler writes OFF the loop (`model/register-file-handler`) is saved in two
-;; halves: the buffer made what its `.editorconfig` asks and its text taken now
-;; ([[ed-save-prepare]]), the buffer marked saved when the write has landed
-;; ([[ed-save-landed]]). Until then it stays modified; a write that fails leaves it so.
+;; Every save is made in two halves: the buffer made what its `.editorconfig` asks and its
+;; text taken now ([[ed-save-prepare]]), the buffer marked saved when the write has landed
+;; ([[ed-save-landed]]). Until then it stays modified; a write that fails leaves it so. A plain
+;; file's write is a task of this module's; a file handler's (sudoedit) is its own.
 
 (sig ed-save-prepare (model int -> any))
 (defn ed-save-prepare (m index)
@@ -131,16 +123,20 @@ and the buffer as it will be written. Nothing is written and nothing is marked s
         prepared (prepare-for-save original))
     [(ed-ship-save-edits (ed-set-buf-at m index prepared) index original prepared) prepared]))
 
-(sig ed-save-landed (model int any string -> model))
-(defn ed-save-landed (m index rope note)
+(sig ed-save-landed (model int any string &optional any -> model))
+(defn ed-save-landed (m index rope note &optional (mtime nil))
   "Pool buffer `index` once a write of its text `rope` has landed: marked saved and stamped with
-its file's new time, its sidecar removed and its hosted process told — when the buffer
-still holds that text. Edited while the write was out, only the baseline moves: the buffer
-stays modified, its newer text unwritten. `note` follows the `saved …` the echo area says."
+its file's new time (`mtime` when the writer read it, else asked now), its sidecar removed and
+its hosted process told — when the buffer still holds that text. Edited while the write was
+out, only the baseline moves: the buffer stays modified, its newer text unwritten. `note`
+follows the `saved …` the echo area says."
   (let (buffer (ed-buf-at m index)
         file (buffer-file buffer)
         current? (= (buffer-rope buffer) rope)
-        stamped (dissoc (buffer-stamp-file buffer) :disk-warned)
+        stamped (dissoc (if (nil? mtime)
+                          (buffer-stamp-file buffer)
+                          (assoc buffer :file-mtime mtime))
+                  :disk-warned)
         saved (if current? (mark-buffer-saved stamped) (assoc stamped :saved-rope rope)))
     (do
       (when current?
@@ -149,3 +145,179 @@ stays modified, its newer text unwritten. `note` follows the `saved …` the ech
         (ed-mark-process-saved m index))
       (message (dissoc (ed-set-buf-at m index saved) :status)
         (str "saved " file note (if current? "" " (edited since — still modified)"))))))
+
+;; ---- a plain file's write, off the loop ------------------------------------------
+;; One write at a time (`:save-proc`, its job on `:save-job`), the rest waiting their turn on
+;; `:save-waiting` as `{:file :then :abandon-note}` — the FILE, not the pool index, since a
+;; kill moves the pool while a write is out, and the text is taken when the turn comes, so a
+;; save queued behind another of the same buffer writes what the buffer holds by then.
+;; `:save-drains` are the continuations waiting for the queue to empty ([[ed-when-saves-land]]).
+
+(defn- write-off-loop? ()
+  (if (nil? *write-off-loop*) (not (ed-headless?)) *write-off-loop*))
+
+(defn write-work (writer file content)
+  "What a plain save's task does: `content` written to `file` with `writer`
+([[*write-file*]]), answering `{:mtime :created?}` — the file's new time, and whether the
+write made it — or `{:error reason}`. Never raises.
+
+    (:error (file-save/write-work (fn (f c) (error \"disk full\")) \"/tmp/x\" \"\"))   ;=> \"disk full\""
+  (try
+    (let (created? (not (file/exists? file)))
+      (do (writer file content) {:mtime (file/mtime file) :created? created?}))
+    (catch failure {:error (error-message failure)})))
+
+(defn ed-plain-index (m file)
+  "The pool index of the buffer visiting `file` as itself — not through a file handler — or
+nil: the buffer a plain write of `file` lands in."
+  (let (index (seq/index-where (:buffers m)
+                (fn (buffer) (and (= (buffer-file buffer) file) (nil? (ed-buffer-handler buffer))))))
+    (if (< index 0) nil index)))
+
+(defn ed-save-pending? (m file)
+  "Whether a plain save of `file` is out or waiting its turn: its own write is about to move the
+file's time, so the save asking again need not ask whether someone else changed it."
+  (or (= (:file (:save-job m)) file)
+    (any? (or (:save-waiting m) []) (fn (entry) (= (:file entry) file)))))
+
+(defn- ed-save-wait (m file then abandon-note)
+  "A save of `file` put on the queue behind the write that is out. A second save of a file
+already waiting, with no continuation of its own, is that one: it will write what the buffer
+holds when its turn comes."
+  (let (waiting (or (:save-waiting m) [])
+        queued? (and (nil? then) (any? waiting (fn (entry) (= (:file entry) file)))))
+    (message (if queued?
+               m
+               (assoc m
+                 :save-waiting (conj waiting {:file file :then then :abandon-note abandon-note})))
+      (str "saving " file " after the write in flight"))))
+
+(defn- ed-save-plain (m index then abandon-note)
+  ;; a plain file's save: queued behind the write that is out, else launched
+  (let (file (buffer-file (ed-buf-at m index)))
+    (cond
+      (nil? file)
+        (ed-save-pump (message m (str "save failed: buffer has no file" (or abandon-note ""))))
+      (:save-proc m) (ed-save-wait m file then abandon-note)
+      else (ed-save-launch m index file then abandon-note))))
+
+(defn- ed-save-launch (m index file then abandon-note)
+  "Pool buffer `index` prepared and its text handed to a task that writes `file` — inline when
+there is no loop ([[write-off-loop?]]). A text the buffer's coding cannot write is refused here,
+saying where."
+  (let ([prepared-model prepared] (ed-save-prepare m index)
+        content (charset/file-content prepared)
+        writer *write-file*
+        job {:file file :rope (buffer-rope prepared) :then then :abandon-note abandon-note})
+    (cond
+      (failure? content)
+        (ed-save-pump (message prepared-model
+                        (str "save failed: " (error-message content) (or abandon-note ""))))
+      (write-off-loop?)
+        (assoc (message prepared-model (str "Saving " file "…"))
+          :save-proc (task/task (fn () (write-work writer file content)))
+          :save-job job)
+      else (ed-save-finish prepared-model job (write-work writer file content)))))
+
+(defn ed-apply-save (m answer)
+  "Fold a plain save's write (`answer`, [[write-work]]'s; nil when its task failed) into the
+model: the buffer marked saved as of the text written, or the failure said — then the next save
+waiting its turn."
+  (let (job (:save-job m)
+        rest-m (dissoc m :save-proc :save-job))
+    (if (nil? job) rest-m (ed-save-finish rest-m job answer))))
+
+;; check-allow: `then` is the caller's continuation; it answers a model
+(check-allow :trusted
+  (defn- ed-save-finish (m job answer)
+    ;; the write behind `job` has landed (or failed): the buffer told, then the queue moves on
+    (let (file (:file job)
+          index (ed-plain-index m file)
+          reason (cond
+                   (nil? answer) "the write did not finish"
+                   (:error answer) (:error answer)
+                   else nil))
+      (ed-save-pump
+        (cond
+          reason
+            (message m
+              (str "save failed: "
+                reason
+                (ed-denied-hint reason)
+                " — "
+                file
+                " is still modified"
+                (or (:abandon-note job) "")))
+          ;; the buffer was killed while its text was written
+          (nil? index) (message m (str "saved " file))
+          else
+            (let (landed (ed-save-landed m index (:rope job) "" (:mtime answer))
+                  known (if (:created? answer) (ed-project-files-forget landed file) landed))
+              ((or (:then job) identity) known)))))))
+
+(defn- ed-save-pump (m)
+  "The next save waiting its turn launched once no write is out — passed over when its buffer
+was killed, or has nothing unsaved (the write before it wrote the same text) — and, the queue
+empty, what waited for it ([[ed-when-saves-land]])."
+  (let (waiting (or (:save-waiting m) []))
+    (cond
+      (:save-proc m) m
+      (empty? waiting) (ed-save-drained m)
+      else
+        (let (entry (first waiting)
+              rest-m (if (= 1 (count waiting))
+                       (dissoc m :save-waiting)
+                       (assoc m :save-waiting (vec (rest waiting))))
+              index (ed-plain-index rest-m (:file entry)))
+          (cond
+            (nil? index) (ed-save-pump rest-m)
+            (and (nil? (:then entry)) (not (buffer-modified? (ed-buf-at rest-m index))))
+              (ed-save-pump rest-m)
+            else (ed-save-launch rest-m index (:file entry) (:then entry) (:abandon-note entry)))))))
+
+(defn- ed-save-drained (m)
+  ;; no write out and none waiting: every continuation that waited for that, in order
+  (let (drains (or (:save-drains m) []))
+    (if (empty? drains)
+      m
+      (fold drains (dissoc m :save-drains) (fn (acc then) (then acc))))))
+
+;; check-allow: `then` is a continuation (the quit's, C-x s's); it answers a model
+(check-allow :trusted
+  (defn ed-when-saves-land (m then)
+    "`(then m)` once no plain save is out or waiting — at once when none is. What C-x C-c waits
+on before asking whether to exit with modified buffers, so a write in flight is never cut off
+by the quit; a failed write leaves its buffer modified, which that question then names. C-g
+stops the writes and drops the wait ([[ed-save-quit]])."
+    (if (and (nil? (:save-proc m)) (empty? (or (:save-waiting m) [])))
+      (then m)
+      (assoc m :save-drains (conj (or (:save-drains m) []) then)))))
+(sig ed-when-saves-land (model any -> model))
+
+(defn ed-save-quit (m)
+  "C-g's clean-up for a plain save (its task already killed): its buffer stays modified, the
+saves waiting are dropped, and so is what waited for them (a quit is cancelled)."
+  (let (job (:save-job m)
+        waiting (or (:save-waiting m) [])
+        dropped (dissoc m :save-job :save-waiting :save-drains))
+    (if (nil? job)
+      dropped
+      (ed-quit-note dropped
+        (str "saving "
+          (:file job)
+          " stopped — still modified"
+          (if (empty? waiting) "" (str ", " (count waiting) " more not saved"))
+          (or (:abandon-note job) ""))))))
+
+(defn ed-save-live (m)
+  "The plain saves C-x C-c would cut off (`model/register-exit-query`): the write out, and
+those waiting their turn."
+  (into (if (:save-job m) [(str "saving " (:file (:save-job m)))] [])
+    (map (or (:save-waiting m) []) (fn (entry) (str "saving " (:file entry) " (waiting)")))))
+
+(register-task-reply :save-proc
+  'file-save/ed-apply-save
+  nil
+  "saving"
+  {:cancel-on-quit? true :on-quit 'file-save/ed-save-quit})
+(register-exit-query :save 'file-save/ed-save-live)

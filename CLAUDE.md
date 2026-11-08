@@ -198,7 +198,7 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             machine only), `M-x sudo-edit` (the current file, its unsaved text kept),
                             `C-x C-w /sudo::PATH`. The buffer remembers (`:sudo`, `:sudo-user`, carried
                             to other frames and a restarted loop by `hosted-meta`): C-x C-s writes it
-                            through sudo in place (`file-save/ed-save-buf-with`), the mode line says
+                            through sudo in place (`file-save/ed-save-prepare` / `ed-save-landed`), the mode line says
                             `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
                             handed to sudo once and kept nowhere — sudo's own timestamp serves the
                             next save. Every sudo call is a task (`:sudo-proc`, one at a time, C-g
@@ -665,13 +665,24 @@ src/pool.blsp               the buffer pool and where its buffers are shown — 
                             `pane-split-edge`, brood ADR-590, its pane marked `:side`; a new frame
                             is `frames/frames-spawn-showing`), `ed-pop-to-file`
                             (next-error), find-file + its path prompt, the default dir and
-                            project root. What most modules `:use` instead of
+                            project root. A person's visit of a file over `*read-off-loop-bytes*`
+                            (2 MB; `ed-find-file-soon`, `ed-visit-file`'s opener) is read OFF the
+                            loop: a read-only `Loading…` buffer at once (`file-loading-buffer`, a root
+                            read's too), the file in its place in every pane showing it when the
+                            task lands (`:read-proc`, one at a time); killing it or C-g cancels.
+                            `ed-find-file` stays on the loop for callers acting on the buffer.
+                            What most modules `:use` instead of
                             `commands`: showing a report buffer needs none of the commands
 src/file-save.blsp          writing a pool buffer to its file: `ed-save-buf-at` (a buffer a file
                             handler owns is the handler's), `.editorconfig`'s fix-ups first,
-                            the sidecar removed, a hosted slot's process told; and the two
-                            halves of a save that lands later (`ed-save-prepare` /
-                            `ed-save-landed`, sudoedit's)
+                            the sidecar removed, a hosted slot's process told. Every plain save is
+                            two halves (`ed-save-prepare` / `ed-save-landed`, sudoedit's too): the
+                            write runs OFF the loop (`:save-proc`, `Saving …` said at once), the
+                            buffer marked saved only when it lands and as of the text written (an
+                            edit meanwhile stays modified; a failure stays modified, said). One
+                            write at a time, the rest on `:save-waiting` by FILE, taking the text
+                            when their turn comes; `ed-when-saves-land` is what C-x C-c and C-x s
+                            wait on. Headless, inline; tests bind `*write-off-loop*` / `*write-file*`
 src/menu.blsp               the right-click context menu's model ops (open / move / run /
                             close); an item names its command by SYMBOL, resolved when it
                             runs, so a redefined command reaches the menu too

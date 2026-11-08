@@ -76,12 +76,13 @@ the model, else `config/*large-file-warning-default*`)."
   (sig ed-visit-file (model string &optional any -> model))
   (defn ed-visit-file (m path &optional (open nil))
     "Open `path` as a person asked to — the find-file prompt, dired's RET, a recent or project
-file, embark's open: `open` (a `(model path) -> model`, [[ed-find-file]] by default; C-x 4 f
+file, embark's open: `open` (a `(model path) -> model`, [[ed-find-file-soon]] by default — a large
+file read off the loop; C-x 4 f
 passes its other-window one), after asking first when the file is large
 ([[ed-large-file-question]]). A caller that goes on to act on the buffer it opened (a jump,
 an edit a language server sent) calls `ed-find-file` itself, since a question would leave
 it acting on whichever buffer was current."
-    (let (opener (or open ed-find-file)
+    (let (opener (or open ed-find-file-soon)
           question (ed-large-file-question m path))
       (if (nil? question)
         (opener m path)
@@ -115,6 +116,157 @@ is built from. Raises when the file cannot be read."
   (let (bytes (file/slurp-bytes path)
         declared (editorconfig/declared-charset path))
     (or (charset/detect bytes declared) {:bytes bytes})))
+
+;; ---- a large file read off the loop -----------------------------------------------
+;; Reading and decoding a file of many megabytes (`ed-read-file`: the bytes, the charset
+;; detection, the UTF-8 decode) is seconds on a slow disk, so a person's visit of one
+;; ([[ed-find-file-soon]], what `ed-visit-file` opens with) shows a read-only `Loading…` buffer
+;; at once ([[file-loading-buffer]], as a file opened as root does) and reads in a task
+;; (`:read-proc`, its job on `:read-job`); the file replaces the placeholder in every pane
+;; showing it when it lands ([[ed-apply-read]]). One read at a time, the rest waiting on
+;; `:read-waiting`. Killing a placeholder cancels its read; C-g cancels them all. The
+;; large-file QUESTION (`ed-large-file-question`, 10 MB) is asked before any of this.
+
+(defdyn *read-off-loop-bytes* (* 2 1000 1000))
+;; A file over this many bytes is read off the loop by a person's visit; 0 reads every file
+;; there.
+
+(defdyn *read-off-loop* nil)
+;; Whether a large read runs in a task: nil follows the loop (off it when there is one,
+;; `model/ed-headless?`; inline in a test). A test binds true to see the `Loading…` buffer, and
+;; folds the reply itself ([[ed-apply-read]]).
+
+(defn file-loading-buffer (path name &optional (mark :file-loading))
+  "The buffer a file read off the loop shows until its text lands: `Loading…`, read-only,
+named `name` and with no file of its own (so no other buffer or frame takes it for the file) —
+`mark` (`:file-loading`; a root read's is `:sudo-loading`) names the path.
+
+    (:file-loading (pool/file-loading-buffer \"/var/log/big.log\" \"big.log <loading>\"))   ;=> \"/var/log/big.log\""
+  (assoc (set-read-only (make-buffer "Loading…\n" name) true) mark path))
+
+(defn ed-loading-index (m path)
+  "The pool index of the `Loading…` buffer a read of `path` shows ([[file-loading-buffer]]), or nil."
+  (let (index (seq/index-where (:buffers m) (fn (buffer) (= (:file-loading buffer) path))))
+    (if (< index 0) nil index)))
+
+(defn- read-off-loop? ()
+  (if (nil? *read-off-loop*) (not (ed-headless?)) *read-off-loop*))
+
+(defn- large-read? (path)
+  ;; a plain file big enough to read off the loop
+  (and (not (file/dir? path)) (int? (ed-large-file-size path *read-off-loop-bytes*))))
+
+(defn ed-find-file-soon (m path)
+  "Open `path` as [[ed-find-file]] does, but a plain file over `*read-off-loop-bytes*` is read
+OFF the loop: a read-only `Loading…` buffer is shown at once, and the file takes its place when
+read. A file already open, or already loading, is selected; any other path is opened at once.
+Headless — a test — it all runs inline."
+  (let (absolute (when (not (string/blank? path)) (path/normalize (path/absolute path)))
+        loading (when absolute (ed-loading-index m absolute)))
+    (cond
+      (or (nil? absolute) (ed-path-handler path)) (ed-find-file m path)
+      (ed-buffer-index-by-file m absolute) (ed-find-file m path)
+      (int? loading) (ed-select m loading)
+      (or (not (read-off-loop?)) (not (large-read? absolute))) (ed-find-file m path)
+      else
+        (ed-read-launch (ed-open-buffer m
+                          (file-loading-buffer absolute (str (path/basename absolute) " <loading>")))
+          absolute))))
+
+(defn- read-work (path)
+  ;; the read task: `ed-read-file`'s answer, or `{:error reason}` — never raises
+  (try (ed-read-file path) (catch failure {:error (error-message failure)})))
+
+(defn- ed-read-launch (m path)
+  ;; the read of `path` started, or put behind the one that is out
+  (if (:read-proc m)
+    (message (assoc m :read-waiting (conj (or (:read-waiting m) []) path))
+      (str "loading " path " after the file being read"))
+    (assoc (message m (str "Loading " path "… (C-g stops)"))
+      :read-proc (task/task (fn () (read-work path)))
+      :read-job {:path path})))
+
+(defn- ed-read-pump (m)
+  ;; the next read waiting launched, passed over when its `Loading…` buffer was killed
+  (let (waiting (or (:read-waiting m) []))
+    (if (or (:read-proc m) (empty? waiting))
+      m
+      (let (path (first waiting)
+            rest-m (if (= 1 (count waiting))
+                     (dissoc m :read-waiting)
+                     (assoc m :read-waiting (vec (rest waiting)))))
+        (if (nil? (ed-loading-index rest-m path))
+          (ed-read-pump rest-m)
+          (ed-read-launch rest-m path))))))
+
+(defn- ed-read-landed (m path placeholder answer)
+  "The file `path` read (`answer`, [[read-work]]'s) opened in place of its `Loading…` buffer:
+every pane showing that buffer shows the file, the rest of the layout as it was — a read that
+lands while you are in another buffer does not take you away from it — and the placeholder
+goes. A read that failed is said, and the placeholder (pool index `placeholder`) goes too."
+  (let (before (ed-current-index m)
+        opened (ed-find-file-with m path answer)
+        index (ed-current-index opened)
+        echo (:echo opened)
+        ;; the file opened (or was open already) unless the open failed and left the selection
+        shown (if (= index before)
+                opened
+                (ed-map-panes (assoc opened :layout (:layout m))
+                  (fn (window)
+                    (if (= (:buffer window) placeholder)
+                      (assoc window
+                        :buffer index
+                        :top (ed-top-showing opened index)
+                        :point nil
+                        :mark nil)
+                      window))))
+        killed (ed-kill-buffer-at shown placeholder))
+    ;; the open said, not the kill of the placeholder
+    (message killed echo)))
+
+(defn ed-apply-read (m answer)
+  "Fold a large file's read (`answer`, [[read-work]]'s; nil when its task failed) into the
+model — the file in place of its `Loading…` buffer, or why not — then the next read waiting."
+  (let (job (:read-job m)
+        rest-m (dissoc m :read-proc :read-job)
+        path (:path job)
+        placeholder (when path (ed-loading-index rest-m path)))
+    (ed-read-pump (cond
+                    (nil? job) rest-m
+                    (not (int? placeholder)) (message rest-m (str "opening " path " cancelled"))
+                    (nil? answer)
+                      (message (ed-kill-buffer-at rest-m placeholder)
+                        (str "open failed: reading " path " did not finish"))
+                    else (ed-read-landed rest-m path placeholder answer)))))
+
+(defn ed-read-quit (m)
+  "C-g's clean-up for a large read (its task already killed): its `Loading…` buffer goes, and
+so do those of the reads waiting."
+  (let (paths (into (if (:read-job m) [(:path (:read-job m))] []) (or (:read-waiting m) []))
+        dropped (fold paths
+                  (dissoc m :read-job :read-waiting)
+                  (fn (acc path)
+                    (let (index (ed-loading-index acc path))
+                      (if (nil? index) acc (ed-kill-buffer-at acc index))))))
+    (if (empty? paths)
+      dropped
+      (ed-quit-note dropped (str "loading " (string/join paths ", ") " stopped")))))
+
+(defn ed-read-cancel-killed (m killed)
+  "`m` with the read behind a killed `Loading…` buffer cancelled — its task stopped, so the
+file does not open after all. Any other kill leaves it as it is."
+  (let (loading (:file-loading (ed-buf-at m killed)))
+    (if (and loading (:read-proc m) (= loading (:path (:read-job m))))
+      ;; and the next read waiting goes ahead
+      (do (task/cancel (:read-proc m)) (ed-read-pump (dissoc m :read-proc :read-job)))
+      m)))
+
+(register-task-reply :read-proc
+  'pool/ed-apply-read
+  nil
+  "loading"
+  {:cancel-on-quit? true :on-quit 'pool/ed-read-quit})
+(register-slot-keeper :file-loading {:order 26 :drop 'pool/ed-read-cancel-killed})
 
 ;; ---- dired lives in src/dired.blsp, the hex view in src/hexl.blsp -----------------
 ;; Both build on this module, so it reaches them by qualified name rather than through its
@@ -611,7 +763,14 @@ to absolute (`path-absolute`) first, so the prompt can stay short/relative while
 buffer's `:file`, dedup, and project-relative name all key off a canonical path. A
 directory and a binary go to their presenters (`model/register-presenter`: dired, as Emacs's
 `find-file` on a directory; the hex view). A path a file handler claims goes to that handler
-(`model/register-file-handler`)."
+(`model/register-file-handler`). The read is on the loop: a caller that acts on the buffer it
+opened needs it now. A person's visit of a large file reads it off the loop
+([[ed-find-file-soon]])."
+  (ed-find-file-with m path nil))
+
+(defn- ed-find-file-with (m path preread)
+  ;; [[ed-find-file]], with the file's contents already read when `preread` is not nil
+  ;; ([[ed-read-file]]'s answer, or `{:error reason}`) — a large file read off the loop
   (cond
     (string/blank? path) (message m "(no file)")
     (ed-path-handler path) (ed-open-handled m path)
@@ -637,11 +796,16 @@ directory and a binary go to their presenters (`model/register-presenter`: dired
           ;; file is read ONCE (`ed-read-file`): the decode that tells text from binary
           ;; is the text the buffer is built from.
           else
-            (let (exists? (file/exists? path)
-                  contents (when exists? (try (ed-read-file path) (catch e {:error e}))))
+            (let (contents (cond
+                             (not (nil? preread)) preread
+                             (file/exists? path) (try (ed-read-file path) (catch e {:error e}))
+                             else nil))
               (cond
                 (:error contents)
-                  (message m (str "open failed: " (error-message (:error contents))))
+                  (message m
+                    (str "open failed: "
+                      (let (reason (:error contents))
+                        (if (string? reason) reason (error-message reason)))))
                 (:bytes contents)
                 ;; an image to its viewer, any other binary to the hex view
                   (ed-present m

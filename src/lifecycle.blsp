@@ -10,7 +10,7 @@ running (`model/register-exit-query`)."
   (:use sidecar :only [ed-forget-auto-save])
   (:use autorevert :only [ed-revert-at])
   (:use projects :only [file-display-name recent-files])
-  (:use file-save :only [ed-save-buf-at])
+  (:use file-save :only [ed-save-buf-at ed-save-pending? ed-when-saves-land])
   (:use pool)) ; find-file, the path prompt
 
 (defn ed-no-write-refusal (buffer verb)
@@ -160,10 +160,21 @@ it means and why they are not listed as answers."
             ;; re-asking, and re-asking is how you get stuck in a prompt you cannot leave
             else (next answered accepted)))))))
 
+(defn ed-unsaved-file-indices (m)
+  "The pool indices of the modified file buffers a quit or C-x s asks about: every one
+(`pool/ed-modified-file-indices`) but those whose save is already out or waiting
+(`file-save/ed-save-pending?`), which the questions would only ask again — the quit waits for
+them, and asks about one whose write failed."
+  (seq/reject (ed-modified-file-indices m)
+    (fn (index)
+      (let (buffer (ed-buf-at m index))
+        (and (nil? (ed-buffer-handler buffer)) (ed-save-pending? m (buffer-file buffer)))))))
+
 (defcommand cmd-save-some-buffers
   (m key)
   "Save each modified file buffer, asking about each (C-x s, Emacs `save-some-buffers`)."
-  (let (pending (ed-modified-file-indices m))
+  (let (pending (ed-unsaved-file-indices m)
+        files (map pending (fn (index) (buffer-file (ed-buf-at m index)))))
     (if (empty? pending)
       (message m "(no changes need saving)")
       ;; a run starts with an empty queue: one abandoned (C-g) must not be saved by this one
@@ -178,13 +189,32 @@ it means and why they are not listed as answers."
             (or (:superseded answered) [])
             0
             (fn (asked declined)
-              (let (saved-count (- accepted declined))
-                (ed-run-deferred-saves (message (dissoc asked :deferred-saves)
-                                         (if (= saved-count 0)
-                                           "(no buffers saved)"
-                                           (str "saved " (ed-count-noun saved-count "buffer"))))
-                  (:deferred-saves asked)
-                  identity)))))))))
+              (ed-run-deferred-saves (dissoc asked :deferred-saves)
+                (:deferred-saves asked)
+                ;; the count is said once every write has landed, and counts what did
+                (fn (deferred)
+                  (ed-when-saves-land deferred
+                    (fn (landed) (ed-say-saved landed files (- accepted declined)))))))))))))
+
+(defn- ed-say-saved (m files meant)
+  "C-x s's last word, once its writes have landed: how many of `files` (the ones it asked about)
+are saved now, against the `meant` the answers asked for — a write that failed said, not
+counted."
+  (let (saved (count (seq/filter files
+                       (fn (file)
+                         (let (index (ed-buffer-index-by-file m file))
+                           (and index (not (buffer-modified? (ed-buf-at m index))))))))
+        failed (- meant saved))
+    (message m
+      (cond
+        (> failed 0)
+          (str "saved "
+            (ed-count-noun saved "buffer")
+            "; "
+            failed
+            " not saved (see *Messages*)")
+        (= saved 0) "(no buffers saved)"
+        else (str "saved " (ed-count-noun saved "buffer"))))))
 
 (defn ed-live-processes-prompt (live)
   "The question C-x C-c asks when `live` (lines from `model/ed-live-processes`) is not
@@ -230,7 +260,8 @@ knows); the running processes are still asked about."
                    (fn (confirmed _)
                      (ed-run-deferred-saves (dissoc confirmed :deferred-saves)
                        (:deferred-saves confirmed)
-                       after-saves
+                       ;; and every plain write still out, so the quit never cuts one off
+                       (fn (deferred) (ed-when-saves-land deferred after-saves))
                        " — quit canceled"))))
         save (fn (asked index) (ed-save-or-queue asked index)))
     (if save-all?
@@ -252,7 +283,9 @@ is no answer to \"overwrite what another program wrote there?\", which C-x C-s a
         handler (ed-buffer-handler buffer)
         entry (when handler (ed-handler-call handler :later-entry nil buffer)))
     (cond
-      (and (nil? handler) (buffer-file-changed? buffer))
+      (and (nil? handler)
+        (not (ed-save-pending? m (buffer-file buffer)))
+        (buffer-file-changed? buffer))
         (assoc m :superseded (conj (or (:superseded m) []) index))
       (nil? entry) (ed-save-buf-at m index)
       else
@@ -313,7 +346,7 @@ way). ESC is *not* quit (it's `keyboard-escape-quit`; see `modes`)."
   (let (m (slowlog/flush-latency m 1))
     (if (:frame? m)
       (assoc m :done true)
-      (ed-quit-ask (dissoc m :deferred-saves :superseded) (ed-modified-file-indices m) false))))
+      (ed-quit-ask (dissoc m :deferred-saves :superseded) (ed-unsaved-file-indices m) false))))
 
 (defcommand cmd-save
   (m key)
@@ -338,8 +371,10 @@ another writer's changes unasked."
       (nil? (buffer-file buffer))
         (message m "no file to save (C-x C-f to open one, or run: nest run -- <path>)")
       ;; another writer changed the file since this buffer last agreed with it: saving
-      ;; would overwrite their work, so ask (Emacs: \"has changed since visited or saved\")
-      (buffer-file-changed? buffer)
+      ;; would overwrite their work, so ask (Emacs: \"has changed since visited or saved\").
+      ;; Not while this buffer's own write is out: that write is what moved the file
+      (and (not (and (nil? (ed-buffer-handler buffer)) (ed-save-pending? m (buffer-file buffer))))
+        (buffer-file-changed? buffer))
         (ed-confirm m
           (str (buffer-file buffer) " has changed since visited or saved. Save anyway? (y or n)")
           write
