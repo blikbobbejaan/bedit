@@ -1512,6 +1512,12 @@ tools/screenshot.blsp       a PNG of what the REAL editor paints, no display: `m
 tools/ci/platform-smoke.sh  CI's macOS / Windows run (`platform-smoke` in ci.yml): nest check, the
                             boot check and the test files where the OS shows through — what each
                             OS proves is docs/platforms.md
+tools/ci/real-window.sh     CI's REAL-window check (macOS, Windows, Linux under Xvfb and a headless
+                            Weston): `main` on a file in a window on a real display (no
+                            BROOD_GUI_HEADLESS), typed into — through the loop, and the OS's own
+                            input (xdotool / SendKeys / System Events) — saved with C-x C-s, the
+                            file read back, the window captured and checked not blank; the PNGs
+                            are a workflow artifact. The driver is `real-window.blsp`
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")

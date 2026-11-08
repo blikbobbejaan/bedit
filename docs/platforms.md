@@ -34,6 +34,46 @@ still there): the boot check, then `shell_command_test`, `bshell_test`, `compile
 `platform_test`, `recover_test` and `startup_test`, so the home really comes from
 `%USERPROFILE%` and no shell command can lean on `sh`.
 
+### The real window
+
+Everything above is headless. After it, the same job runs `tools/ci/real-window.sh` (the
+driver is `tools/ci/real-window.blsp`): bedit started through `main` on a file — the editor
+`nest run FILE` runs, with its startup, init file, fonts, timers and lifeline supervisor — in a
+window on the runner's own desktop, no `BROOD_GUI_HEADLESS`, with a throwaway `HOME`,
+`USERPROFILE` and XDG dirs. What it relies on: a GitHub-hosted macOS runner is a logged-in GUI
+session (the Aqua session the runner agent runs in), and a hosted Windows runner runs its jobs
+in an interactive desktop session, so a window opens on both; neither is documented as a
+promise by GitHub, so a change on their side shows up here as "the editor opened no window".
+
+1. it waits for the window and the loop, captures the window (`gui/capture`: the live
+   window's frame rasterised by its own renderer, brood ADR-609 — no screen-recording
+   permission is involved) and fails when the first text row is only background;
+2. **loop input**: it types `loop-input ` and C-x C-s as the window delivers keys to the loop
+   (sent to the loop's mailbox by its registered name), waits for the file ON DISK to start
+   with them, captures again and fails unless the first text row's pixels changed;
+3. **OS input**: it types `os-input ` and C-x C-s through the OS's own input — System Events'
+   `keystroke` on macOS, `WScript.Shell.SendKeys` on Windows — and waits for the file to have
+   it. That is the window's real keyboard path, the frontend's key translation included. It
+   is TRIED and reported, not required, on both: a hosted macOS runner may refuse it
+   (Accessibility permission for `osascript`, error 1002) and Windows's foreground lock may
+   keep the window from taking the keys. The log says which (`OS input: NOT proven …`).
+
+The step has a timeout (the driver kills the editor past `REAL_WINDOW_TIMEOUT_MS`, the step's
+`timeout-minutes` backs it), and the pictures (`before.png`, `after.png`, `os-input.png`,
+`failure.png` on a failure), the file as saved (`saved.txt`) and everything the editor printed
+(`editor.log`) are uploaded as the `real-window-<os>` artifact whether it passed or not.
+
+Linux gets the same check in a job of its own, `real-window-linux`, twice: under a private
+Xvfb, where the OS input (xdotool's XTEST) is REQUIRED — nothing there refuses it — and under
+a headless Weston (`weston --backend=headless`), where only the loop input runs (no input tool
+reaches a headless Weston), so winit's Wayland backend opens, paints and saves too. Locally:
+`tools/ci/real-window.sh nest /tmp/rw x11` (needs `xvfb-run`; opens nothing on your screen).
+
+What it does not prove: what the compositor does with the frame after the window presents
+it (the capture is the app's own rasterisation — ADR-609's limit), a GPU window (CI builds
+the CPU painter), the mouse, an input method, and on macOS and Windows the OS keyboard path
+whenever the log says `NOT proven`.
+
 Every run sends the project shell's history to a temp file (`BSHELL_HISTORY`); run the suite
 locally the same way, with `HOME` a temp directory too, or a test's commands land in your own
 history.
@@ -64,7 +104,9 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | auto-save sidecars: location, recovery | ✅ | ✅ |
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; `recover_test` reads the sidecar's ACL back with `icacls`) |
 | terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
-| a real window, font discovery, file watching (auto-revert) | not run — headless | not run — headless |
+| a real window: opens on the desktop, paints (captured, not blank), typed keys reach the loop, C-x C-s writes the file | ✅ `real-window.sh` | ✅ `real-window.sh` (Linux too: Xvfb and headless Weston) |
+| the OS keyboard reaching that window | tried each run (System Events), reported, not required | tried each run (SendKeys), reported, not required (Linux: required, xdotool under Xvfb) |
+| font discovery, file watching (auto-revert) | not run — headless | not run — headless |
 
 ## Fixed on the way
 
@@ -113,6 +155,6 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
   then only in the buffer and in its auto-save sidecar if the idle beat wrote one (`#file#`, M-x
   recover-this-file) — edits made after that sidecar are lost with the editor. A program reading the file while it is
   written can see half of it. Fixing it is brood's (`ReplaceFileW`, which keeps the DACL).
-- Not run anywhere but Linux: a real window, font discovery, file watching, a language server,
+- Not run anywhere but Linux: font discovery, file watching, a language server,
   git and mur themselves (their test files are not in the smoke set), and the remote / collab
   node links.
