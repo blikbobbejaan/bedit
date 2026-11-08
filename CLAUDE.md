@@ -478,7 +478,9 @@ src/glyphless.blsp          the invisible format characters SHOWN (Emacs glyphle
                             brood lays a zero width space, a BOM mid-text, a tag character out as
                             its `<200b>` escape (ADR-556, bound by `conventions/with-cell-layout`
                             from `:glyphless-chars`); this module gives the escape its face, and a
-                            bidi control (Trojan Source) a hazard face. The minibuffer shows them too
+                            bidi control (Trojan Source) a hazard face. The minibuffer shows them too.
+                            A no-break space (U+00A0, U+202F) is underlined in the escape colour
+                            (Emacs nobreak-char-display, `:nobreak-char-display`, on by default)
 src/rainbow.blsp             a tree-sitter buffer's brackets coloured by depth (Emacs rainbow-delimiters,
                             `:rainbow-delimiters`): delimiter tokens of the held parse, the window's top
                             depth from the tree; the Lisp modes colour theirs in their own lexer
