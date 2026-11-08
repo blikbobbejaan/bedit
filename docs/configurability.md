@@ -20,7 +20,10 @@
   is taken; the rest is refused and said. It sits under `.editorconfig` and over init.blsp.
 - **Stage 3, named themes** — `:theme` is a setting, themes are a registry
   (`themes/register-theme!`, `M-x theme-select`), and a package may add one.
-- **Not built:** named hooks (`add-hook`), command properties (`command-put`), a live
+- **Hooks as data** — `:hooks {:after-save [cmd …] :mode {rust [cmd …]}}`, commands by
+  their M-x names (`src/hooks.blsp`): after a save lands, and the first time a buffer is
+  current in a mode. Not an `add-hook` of functions: init.blsp defines none.
+- **Not built:** an `add-hook` of functions, command properties (`command-put`), a live
   `M-x set-variable`. Nothing in init.blsp can define a function.
 
 `M-x reload-config` re-reads the file and applies every setting, the keys, the theme and
@@ -151,7 +154,7 @@ belongs. Put both `key-describe` / `key-parse` in `std/editor/keymap` — and th
 "best-guess chord encoding" caveats littering `keymaps.blsp` (`(keyword "alt-%")`, …)
 go away.
 
-### Hooks — `add-hook` / `run-hooks` (not built)
+### Hooks — `add-hook` / `run-hooks` (built as `:hooks`, commands by name)
 
 `std/layers` already fans events across layers (`run-event`: `:activate` / `:on-focus`
 / `:on-close`). What's missing is the *named, user-extensible* hook — Emacs

@@ -1,0 +1,107 @@
+(defmodule hooks
+  "The user's HOOKS as data (Emacs's `after-save-hook` and `<mode>-hook`): init.blsp names
+commands, by their M-x names, to run at two seams —
+
+    (config
+      :hooks {:after-save [delete-trailing-whitespace]
+              :mode {markdown [auto-fill-mode]
+                     rust [format-buffer]}})
+
+`:after-save` runs after a file's write lands (`file-save/ed-save-landed`), with the saved
+buffer current, as Emacs runs `after-save-hook`. `:mode` runs a mode's commands the first
+time a buffer is current in that mode (a visit, M-x some-mode, a new scratch buffer): every
+named mode in its layer stack, the most general first — `text`, then `prog`, then `rust` —
+as a derived mode runs its parent's hook before its own. A mode is named as `:mode-keys`
+names one (`rust`, `rust-mode`, `:rust`).
+
+Each command runs in order; one that fails, or names no command, is said in the echo area
+and *Messages* and the rest still run. A command is the same late-bound symbol a key runs, so
+redefining it changes the hook too. Nothing here evaluates code from init.blsp."
+  (:use model) ; ed-current-buf / ed-set-buf / message / register-post-step
+  (:use editor/layers :only [active-layers]) ; a buffer's modes, most specific first
+  (:use editor/pane :only [pane-update-selected])) ; a saved buffer made current for its hook
+
+;; ---- running a hook's commands --------------------------------------------------------
+
+(defn- command-name (entry)
+  ;; a hook entry's M-x name: a symbol's or a string's text, a qualified one's last part
+  (last (string/split (->string entry) "/")))
+
+(defn run-commands (m entries label)
+  "`m` after each command `entries` names (M-x names, symbols or strings) has run in turn, as
+M-x runs it (`interactive/run-command`). A name that is no command, or a command that raises,
+is said — `label` names the hook — and the next one runs on the model as it was before it."
+  (fold (if (nil? entries) [] entries)
+    m
+    (fn (acc entry)
+      (let (name (command-name entry))
+        (try
+          (interactive/run-command acc
+            name
+            (fn (mm missing) (message mm (str label ": no command named " missing))))
+          (catch e (message acc (str label ": " name " failed: " (error-message e)))))))))
+
+;; ---- :mode — a mode's commands, the first time a buffer is current in it -----------------
+
+(defn- mode-names (buf)
+  ;; the named, non-system modes in `buf`'s layer stack, the most general first
+  (reverse (seq/keep (active-layers buf)
+             (fn (layer)
+               (when (and (not (:system layer)) (:name layer))
+                 (userkeys/ed-user-mode-name (:name layer)))))))
+
+(defn mode-commands (by-mode buf)
+  "The commands the `:mode` map `by-mode` names for `buf`: each named mode in its stack, the
+most general first, its commands in order."
+  (let (named (into {}
+                (map (vec by-mode)
+                  (fn ([mode entries]) [(userkeys/ed-user-mode-name mode) entries]))))
+    (vec (mapcat (mode-names buf) (fn (name) (or (get named name) []))))))
+
+(defn ed-mode-hooks-step (m)
+  "The post-step: when the current buffer is in a mode it has not been current in before, its
+modes' `:mode` hooks run ([[mode-commands]]). The buffer remembers the mode
+(`:hooked-mode`) before they run, so a hook's own commands cannot set them off again, and a
+buffer whose mode changes runs the new mode's. O(1) with no `:mode` hooks."
+  (let (by-mode (get (:hooks m) :mode))
+    (if (or (not (map? by-mode)) (empty? by-mode))
+      m
+      (let (buf (ed-current-buf m)
+            mode (ed-buf-mode-name buf))
+        (if (= (get buf :hooked-mode) mode)
+          m
+          (run-commands (ed-set-buf m (assoc buf :hooked-mode mode))
+            (mode-commands by-mode buf)
+            (str mode "-mode hook")))))))
+
+(register-post-step :mode-hooks {:order 40 :run 'hooks/ed-mode-hooks-step})
+
+;; ---- :after-save — after a file's write lands ---------------------------------------------
+
+(defn- with-slot-current (m index f)
+  "`(f m)` with pool buffer `index` current: shown in the selected pane while `f` runs, and
+the pane put back as it was afterwards when it still shows `index`."
+  (if (= index (ed-current-index m))
+    (f m)
+    (let (pane (ed-current-pane m)
+          shown (assoc m
+                  :layout
+                    (pane-update-selected (:layout m)
+                      (fn (payload) (assoc payload :buffer index :point nil :mark nil))))
+          after (f shown))
+      (assoc after
+        :layout
+          (pane-update-selected (:layout after)
+            (fn (payload) (if (= (:buffer payload) index) pane payload)))))))
+
+(sig ed-after-save (model int -> model))
+;; check-allow: the hook's commands are `(model key) -> model` by the command contract, but
+;; they come out of the command registry, which the checker reads as unknown
+(check-allow :trusted
+  (defn ed-after-save (m index)
+    "`m` after init.blsp's `:after-save` hooks have run for pool buffer `index`, just saved,
+with it current."
+    (let (entries (get (:hooks m) :after-save))
+      (if (or (nil? entries) (empty? entries))
+        m
+        (with-slot-current m index (fn (shown) (run-commands shown entries "after-save hook")))))))

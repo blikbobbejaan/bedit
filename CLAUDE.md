@@ -840,6 +840,12 @@ src/dirlocals.blsp          a project's `.bedit-locals.blsp` (Emacs's .dir-local
                             said in the visit's note. Resolved after .editorconfig and before
                             init.blsp (`conventions/dir-local`, `scroll/ed-local-setting`); C-h v
                             and M-x describe-indentation name it as the source
+src/hooks.blsp              init.blsp's `:hooks` (Emacs's after-save-hook / <mode>-hook) as DATA:
+                            `{:after-save [cmd …] :mode {rust [cmd …]}}`, each a command by its M-x
+                            name, run in order, one that fails said and the rest run.
+                            `:after-save` from `file-save/ed-save-landed`, the saved buffer made
+                            current; `:mode` a post-step, the first time a buffer is current in a
+                            mode (`:hooked-mode`), the most general mode first
 src/formatter.blsp          M-x format-buffer + format-on-save: the language's own
                             formatter (mix format, black, rubocop), declared per language
                             and run over the FILE, so a failing formatter costs nothing
