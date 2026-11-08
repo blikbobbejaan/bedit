@@ -581,6 +581,11 @@ src/comment.blsp            M-; comment-dwim (Emacs newcomment): the mode's `:co
                             or a block-only language's `:comment-block` pair round each line
 src/kmacro.blsp             C-x ( · C-x ) · C-x e, the keyboard-macro commands (Emacs kmacro);
                             the recording and the replay are `input`'s
+src/yankmedia.blsp          M-x yank-media (Emacs 29's): the clipboard's IMAGE (`os/clipboard-image`,
+                            read off the loop on `:yank-media-proc`, C-g cancels) handed to the mode's
+                            `:yank-media` facet; Markdown and Org save the PNG beside the file (name
+                            asked, `image-<timestamp>.png` by default) and insert `![](name)` /
+                            `[[file:name]]`. No handler, no image, a served session: said
 src/browse-kill-ring.blsp   M-x browse-kill-ring: *Kill Ring*, newest first, RET inserts the
                             entry where it was opened from (the ring is `clipboard`'s)
 src/window-commands.blsp    the window commands: tiled splits, windmove and Emacs's
