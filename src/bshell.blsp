@@ -182,6 +182,8 @@ a pty and a real emulator."
                                            :proc child
                                            :out (ansicolor/decoder)
                                            :err (ansicolor/decoder))))))
+    ;; `cd DIR` at the prompt (`cmd-bshell-send`): the next command runs there
+    ([:bshell-cd dir] (bshell-loop (assoc state :root dir)))
     ([:proc p data] (bshell-loop (bshell-forward state :out data)))
     ([:proc-err p data] (bshell-loop (bshell-forward state :err data)))
     ([:proc-closed p code] (do
@@ -476,51 +478,54 @@ shell idle and start *its* input region where the prompt ends (all per-buffer)."
 ;; and any `[exit N]` / `error:` line (red). Like every `:fontify` it's a pure
 ;; `text -> [start end face]` (ascending, non-overlapping) over the buffer. The `:fontify`
 ;; service only gets the text (not the buffer), so the prompt is detected *from the text*:
-;; the buffer's first line is its prompt (each project's is its own), so this is per-buffer
-;; correct without any global state. The faces are theme chrome (`theme/defchrome`), so
-;; M-x theme-select repaints a shell with everything else.
+;; a prompt line is `<dir> $ ` — the directory a `cd` may have changed — so this is
+;; per-buffer correct without any global state. The faces are theme chrome
+;; (`theme/defchrome`), so M-x theme-select repaints a shell with everything else.
 
 (theme/defchrome bshell-face-prompt {:fg *green* :bold true}) ; the bash-like prompt
 (theme/defchrome bshell-face-error {:fg *red*}) ; an [exit N] / error: line
-(defn- bshell-detect-prompt (text)
-  "The shell's prompt, detected from `text`: the buffer's first prompt is `<dir> $ `, so it's
-the text up to and including the first `\" $ \"`. `\"\"` when there's none. Per-buffer (each
-project's prompt is its own first line), so no global state is needed."
-  (let (at (index-of text " $ "))
-    (if (< at 0) "" (string/substring text 0 (+ at 3)))))
 
-(defn- bshell-span-for (line line-start prompt)
-  "A fontify span for the buffer `line` starting at offset `line-start`, given the session
-`prompt`, or nil."
-  (cond
-    (and (> (string/length prompt) 0) (string/starts-with? line prompt))
-      [line-start (+ line-start (string/length prompt)) bshell-face-prompt]
-    (or (string/starts-with? line "[exit ") (string/starts-with? line "error:"))
-      [line-start (+ line-start (string/length line)) bshell-face-error]
-    else nil))
+(defn- bshell-prompt-length (line)
+  "The length of the prompt `line` starts with — a directory (`~…`, `/…`, or a Windows drive's
+`C:…`, as `bshell-prompt` writes it) and `\" $ \"` — or nil when it is no prompt line."
+  (let (at (index-of line " $ "))
+    (when (and (> at 0)
+            (or (string/starts-with? line "~")
+              (string/starts-with? line "/")
+              (and (> at 1) (= (string/char-at line 1) ":"))))
+      (+ at 3))))
 
-(defn- bshell-line-spans (text pos prompt acc)
+(defn- bshell-span-for (line line-start)
+  "A fontify span for the buffer `line` starting at offset `line-start`, or nil."
+  (let (prompt-length (bshell-prompt-length line))
+    (cond
+      prompt-length [line-start (+ line-start prompt-length) bshell-face-prompt]
+      (or (string/starts-with? line "[exit ") (string/starts-with? line "error:"))
+        [line-start (+ line-start (string/length line)) bshell-face-error]
+      else nil)))
+
+(defn- bshell-line-spans (text pos acc)
   "Tail-recursive line scan from offset `pos`, collecting the non-nil per-line spans."
   (if (>= pos (string/length text))
     (reverse acc)
     (let (newline (index-of text "\n" pos)
           end (if (< newline 0) (string/length text) newline)
-          span (bshell-span-for (string/substring text pos end) pos prompt))
-      (bshell-line-spans text (+ end 1) prompt (if (nil? span) acc (cons span acc))))))
+          span (bshell-span-for (string/substring text pos end) pos))
+      (bshell-line-spans text (+ end 1) (if (nil? span) acc (cons span acc))))))
 
 (sig bshell-input-span (string -> (or nil (tuple int string))))
 (defn- bshell-input-span (text)
   "`[start substring]` of the current input — everything after the last prompt in `text`
 — or nil when no prompt is present. Lets the Brood services (highlight / bracket-match /
 eldoc) act on just the form you're typing, not the plain-text output."
-  (let (prompt (bshell-detect-prompt text))
-    (if (= prompt "")
-      nil
-      (let (at (string/last-index-of text prompt))
-        (if (< at 0)
-          nil
-          (let (start (+ at (string/length prompt)))
-            [start (string/substring text start (string/length text))]))))))
+  (let (start (second (fold (string/split text "\n")
+                        [0 nil]
+                        (fn (acc line)
+                          (let ([offset found] acc
+                                prompt-length (bshell-prompt-length line))
+                            [(+ offset (string/length line) 1)
+                              (if prompt-length (+ offset prompt-length) found)])))))
+    (when start [start (string/substring text start (string/length text))])))
 
 (sig bshell-input-form? ((or nil (tuple int string)) -> bool))
 (defn- bshell-input-form? (input)
@@ -540,7 +545,7 @@ ascending + non-overlapping."
   "The bshell `:fontify` service: colour each prompt line's prompt prefix and any
 `[exit N]` / `error:` line, plus **Brood syntax** for the input form you're typing. Spans
 are ascending + non-overlapping (the highlight-spans shape)."
-  (append (bshell-line-spans text 0 (bshell-detect-prompt text) '()) (bshell-input-spans text)))
+  (append (bshell-line-spans text 0 '()) (bshell-input-spans text)))
 
 (sig bshell-bracket-match (string int -> any))
 (defn bshell-bracket-match (full pos)
@@ -650,6 +655,52 @@ shell (each project has its own — like Emacs `project-eshell`). Reports when n
           (bshell-start m root)
           (ed-select m index))))))
 
+;; ---- cd: the directory the next command runs in ------------------------------
+;; Every command is its own `sh -c`, so a `cd` run there changes the directory of a shell
+;; that exits at once. A line that is only `cd [DIR]` is the shell's own instead, as a
+;; shell's builtin is: it moves the buffer's `:dir` (its default directory — the prompt,
+;; C-x C-f, filename completion) and the worker's `:root`, where the next command runs.
+;; `cd` alone goes home, `cd -` back where it was. A `cd` inside a longer line (`cd x &&
+;; make`) still runs in `sh -c`, where it applies to that line.
+
+(defn bshell-cd-argument (line)
+  "The directory argument when `line` is just a `cd` — `\"\"` for a bare `cd` — else nil.
+
+    (bshell/bshell-cd-argument \"cd src\")   ;=> \"src\"
+    (bshell/bshell-cd-argument \"cd\")   ;=> \"\"
+    (bshell/bshell-cd-argument \"cd src && make\")   ;=> nil"
+  (when-let (found (regex/find "^\\s*cd(?:\\s+([^\\s;&|<>`$()]+))?\\s*$" line))
+    (let (group (first (:groups found))) (if group (:text group) ""))))
+
+(defn bshell-cd-target (argument dir previous)
+  "Where `cd argument` from `dir` goes: `[directory nil]`, or `[nil why]` when it cannot —
+home for `\"\"`, `previous` for `-`, else `argument` against `dir` (`~` expanded), `.` and
+`..` resolved. The directory must exist."
+  (let (target (cond
+                 (= argument "") (path/home)
+                 (= argument "-") previous
+                 else (path/normalize (path/absolute argument dir))))
+    (cond
+      (nil? target) [nil (if (= argument "-") "cd: no previous directory" "cd: no home directory")]
+      (not (file/dir? target)) [nil (str "cd: no such directory: " argument)]
+      else [target nil])))
+
+(defn- bshell-cd (m name line)
+  "Run the `cd` `line` in shell buffer `name`: its directory moved, said by the next prompt,
+or why not, on a line of its own."
+  (let (dir (or (bshell-buffer-field m name :dir) ".")
+        [target why] (bshell-cd-target (bshell-cd-argument line)
+                       dir
+                       (bshell-buffer-field m name :bshell-previous-dir)))
+    (if target
+      (do
+        (send (bshell-buffer-field m name :bshell-proc) [:bshell-cd target])
+        (bshell-emit-prompt (bshell-set-buffer-field (bshell-set-buffer-field m name :dir target)
+                              name :bshell-previous-dir dir)
+          name
+          (bshell-prompt target)))
+      (bshell-emit-prompt (bshell-append m name (str "\n" why)) name (bshell-prompt dir)))))
+
 (defcommand cmd-bshell-send
   (m key)
   "RET in a bshell buffer: run the current input (everything from the prompt to the buffer's
@@ -669,6 +720,9 @@ holding what was typed since the prompt appeared, moved out of the buffer."
               line (string/trimr (input-text shell)))
           (cond
             (string/blank? line) (bshell-emit-prompt m name (bshell-prompt-for m name))
+            ;; `cd DIR` is the shell's own: each command is a fresh `sh -c`, where a cd
+            ;; would be lost with it
+            (bshell-cd-argument line) (bshell-cd (bshell-remember m line) name line)
             ;; an unclosed Brood form → newline at point, keep editing (don't submit)
             (not (bshell-complete-input? line)) (ed-set-buf m (insert shell "\n"))
             else
@@ -727,6 +781,9 @@ compilers), and its exit is reported as usual. Says so when nothing is running."
    :bracket-match 'bshell/bshell-bracket-match
    :eldoc 'bshell/bshell-eldoc
    :send-invisible 'bshell/bshell-send-invisible
+   ;; a quote typed at the prompt is the command's: no electric pair unless init.blsp's
+   ;; :electric-pair names bshell (electric's mode facet)
+   :electric-pair false
    :secret-pending? 'bshell/bshell-secret-pending?
    :secret-key 'bshell/bshell-secret-key
    ;; after every key, keep point out of the read-only prompt (layers §7)
