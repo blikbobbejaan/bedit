@@ -1,0 +1,453 @@
+(defmodule lsp-semantic
+  "LSP **semantic tokens** (`textDocument/semanticTokens/full` and `/full/delta`): what the
+language server knows a name IS — a parameter, a macro, a type, a definition — painted as a
+layer OVER the mode's own colouring (tree-sitter or a lexer), never instead of it, as eglot's
+`eglot-semantic-tokens-mode` does.
+
+Three halves, as every LSP feature here:
+
+- **pure**: the server's relative-encoded integer array decoded (`decode-tokens`), a delta
+  applied to the last array (`apply-delta`), a token's type and modifiers turned into one of
+  the editor's `:syntax/*` faces through the server's legend (`token-face`), the tokens turned
+  into `[start end face]` char spans of the text they were computed against (`token-spans`), and
+  those spans carried through what the buffer's edits did since (`shift-spans`), so an answer
+  that lands after a keystroke, and every keystroke until the next answer, paints where the text
+  went rather than where it was.
+- **the wire**: two request kinds (`lsp-semantic-tokens`, `lsp-semantic-tokens-delta`) under
+  the `LspRequest` ability, shaped and folded like every other lookup.
+- **the model**: the idle beat asks when the current buffer's text moved since the last ask
+  (`ed-semantic-due?`), the fold stamps the spans on the pool buffer (`:semantic-spans`, which
+  `spanpaint/ed-buffer-spans` lays over the mode's spans), and a post-step carries them through
+  the splice log after each event (`semantic-follow`). Per file under `:lsp-semantic`:
+  `{path {:seen buffer :spans [...] :data [...] :result-id :conn :requested rope}}`.
+
+On while the server offers it (`semanticTokensProvider`) unless init.blsp's
+`:lsp-semantic-tokens` says false; M-x lsp-semantic-tokens-mode toggles it."
+  (:use model) ; message / ed-current-buf / ed-buf-at / the registries the feature plugs into
+  (:use editor/buffer) ; buffer-rope / buffer-file / buffer-splices-since
+  (:use interactive) ; defcommand — M-x lsp-semantic-tokens-mode
+  (:use lsp-requests) ; the LspRequest ability the two request kinds implement
+  (:use lsp-servers)) ; ed-lsp-ask-server — one request path for every lookup
+
+;; ---- the faces --------------------------------------------------------------------
+;; The token types this client asks for (the protocol's standard set) and the modifiers. A
+;; server answers in ITS legend (rust-analyzer adds `lifetime`, `selfKeyword`, …); the type
+;; name is what maps to a face, so a type outside this list still colours when the table
+;; below names it.
+
+(def *token-types*
+  ["namespace"
+    "type" "class" "enum" "interface" "struct" "typeParameter" "parameter" "variable" "property"
+    "enumMember" "event" "function" "method" "macro" "keyword" "modifier" "comment" "string"
+    "number" "regexp" "operator" "decorator"])
+
+(def *token-modifiers*
+  ["declaration"
+    "definition" "readonly" "static" "deprecated" "abstract" "async" "modification" "documentation"
+    "defaultLibrary"])
+
+;; Type name -> face. The LEXICAL kinds (comment, string, number, regexp, operator) are left to
+;; the mode, which colours them already and tells a docstring from a string where a server
+;; does not: a token with no face paints nothing, and the mode's colour shows through.
+(def *token-faces*
+  {"namespace" :syntax/special
+   "type" :syntax/special
+   "class" :syntax/special
+   "enum" :syntax/special
+   "interface" :syntax/special
+   "struct" :syntax/special
+   "typeParameter" :syntax/special
+   "typeAlias" :syntax/special
+   "union" :syntax/special
+   "trait" :syntax/special
+   "builtinType" :syntax/special
+   "lifetime" :syntax/special
+   "decorator" :syntax/special
+   "attribute" :syntax/special
+   "parameter" :syntax/variable
+   "variable" :syntax/variable
+   "property" :syntax/variable
+   "event" :syntax/variable
+   "enumMember" :syntax/constant
+   "boolean" :syntax/constant
+   "function" :syntax/function
+   "method" :syntax/function
+   "macro" :syntax/function
+   "keyword" :syntax/keyword
+   "modifier" :syntax/keyword
+   "selfKeyword" :syntax/keyword
+   "selfTypeKeyword" :syntax/keyword})
+
+;; The faces a DEFINING occurrence takes instead: the name a `fn`, a `struct` binds — what the
+;; tree-sitter tables call `:syntax/definition` (brood ADR-614).
+(def- *definable* #{"function" "method" "macro" "type" "class" "enum" "interface" "struct"})
+
+;; `:syntax/variable` is this feature's own: a variable, a parameter, a field. Plain text unless
+;; a theme colours it (`theme/apply-syntax-theme!` styles it beside the other `:syntax/*`
+;; faces); registered here too, only when nothing has, so a load after the theme keeps its style.
+(when (nil? (editor/face/face :syntax/variable)) (editor/face/def-face :syntax/variable {}))
+
+(defn token-face (type modifiers)
+  "The face a token of type name `type` with modifier names `modifiers` (a set) paints in, or
+nil to leave the mode's colour. A definition of a function or type is `:syntax/definition`; a
+readonly variable `:syntax/constant`. `deprecated` changes nothing: a span has one face.
+
+    (lsp-semantic/token-face \"function\" #{\"declaration\"})   ;=> :syntax/definition
+    (lsp-semantic/token-face \"variable\" #{\"readonly\"})   ;=> :syntax/constant
+    (lsp-semantic/token-face \"string\" #{})   ;=> nil"
+  (let (base (get *token-faces* type))
+    (cond
+      (nil? base) nil
+      (and (contains? *definable* type)
+        (or (contains? modifiers "declaration") (contains? modifiers "definition")))
+        :syntax/definition
+      (and (= base :syntax/variable) (contains? modifiers "readonly")) :syntax/constant
+      else base)))
+
+(defn modifier-names (bits names)
+  "The modifier names set in `bits` (the token's bit set) against the legend's `names`.
+
+    (lsp-semantic/modifier-names 5 [\"declaration\" \"definition\" \"readonly\"])   ;=> #{\"declaration\" \"readonly\"}"
+  (if (or (not (int? bits)) (<= bits 0))
+    #{}
+    (into #{} (seq/keep (bit/positions bits) (fn (position) (nth names position nil))))))
+
+;; ---- pure: the integer array --------------------------------------------------------
+;; Five integers a token: line (relative to the previous token's), start (relative to the
+;; previous token's when on the same line, else absolute — UTF-16 units), length, type index,
+;; modifier bits.
+
+(defn decode-tokens (data)
+  "The tokens of a semantic-tokens `data` array as `[line units length type bits]`, absolute
+0-based line and UTF-16 start column, in order. A trailing partial group is dropped.
+
+    (lsp-semantic/decode-tokens [0 4 3 1 0 1 2 5 0 2 0 6 1 2 0])   ;=> [[0 4 3 1 0] [1 2 5 0 2] [1 8 1 2 0]]"
+  (let (data (if (vector? data) data (if (list? data) (into [] data) [])))
+    (letrec (step (fn (index line start acc)
+                    (if (> (+ index 5) (count data))
+                      acc
+                      (let (delta-line (nth data index)
+                            delta-start (nth data (+ index 1))
+                            next-line (+ line delta-line)
+                            next-start (if (= delta-line 0) (+ start delta-start) delta-start))
+                        (step (+ index 5)
+                          next-line
+                          next-start
+                          (conj acc
+                            [next-line
+                              next-start
+                              (nth data (+ index 2))
+                              (nth data (+ index 3))
+                              (nth data (+ index 4))]))))))
+      (step 0 0 0 []))))
+
+(defn apply-delta (data edits)
+  "The array a `/full/delta` answer's `edits` (`{:start :deleteCount :data}`, against `data`)
+make of the previous array `data`.
+
+    (lsp-semantic/apply-delta [1 2 3 4 5] [{:start 1 :deleteCount 2 :data [9]}])   ;=> [1 9 4 5]"
+  (let (data (if (vector? data) data (if (list? data) (into [] data) []))
+        size (count data)
+        sorted (seq/sort-by (or edits []) (fn (edit) (or (:start edit) 0)))
+        [built at] (fold sorted
+                     [[] 0]
+                     (fn (carried edit)
+                       (let ([out at] carried
+                             wanted (:start edit)
+                             deleted (:deleteCount edit)
+                             inserted (:data edit)
+                             start (math/max at (math/min size (if (int? wanted) wanted 0)))
+                             end (math/min size (+ start (if (int? deleted) deleted 0))))
+                         [(into (into out (seq/subvec data at start))
+                            (if (vector? inserted) inserted []))
+                           end]))))
+    (into built (seq/subvec data (if (int? at) at size) size))))
+
+;; ---- pure: tokens -> char spans ----------------------------------------------------
+
+(defn- astral? (text)
+  ;; whether `text` holds a character beyond the BMP — two UTF-16 units, so units are not chars
+  (any? (string/->codepoints text) (fn (code) (> code 65535))))
+
+(defn- units->index (text units astral)
+  "The char index in line `text` (its newline excluded) at UTF-16 column `units`."
+  (let (whole (string/length text) size (if (string/ends-with? text "\n") (dec whole) whole))
+    (if (not astral)
+      (math/min size (math/max 0 units))
+      (letrec (walk (fn (codes index used)
+                      (if (or (empty? codes) (>= used units) (>= index size))
+                        index
+                        (walk (rest codes)
+                          (inc index)
+                          (+ used (if (> (or (first codes) 0) 65535) 2 1))))))
+        (walk (string/->codepoints text) 0 0)))))
+
+(defn token-spans (tokens legend rope)
+  "`[start end face]` char spans of `rope` for decoded `tokens` ([[decode-tokens]]) read through
+the server's `legend` (`{:tokenTypes :tokenModifiers}`) — ascending, a token with no face
+([[token-face]]) or past the text left out. Each line is read once, however many tokens it has.
+
+    (lsp-semantic/token-spans [[0 4 3 0 0]] {:tokenTypes [\"function\"]} (text/from-string \"let foo = 1\"))   ;=> [[4 7 :syntax/function]]"
+  (let (types (or (:tokenTypes legend) [])
+        names (or (:tokenModifiers legend) [])
+        lines (text/line-count rope))
+    (second (fold tokens
+              [nil []]
+              (fn (carried token)
+                (let ([cached spans] carried
+                      [line units length type bits] token
+                      face (token-face (nth types type nil) (modifier-names bits names)))
+                  (if (or (nil? face) (not (int? line)) (>= line lines) (< line 0))
+                    carried
+                    (let (info (if (and cached (= (first cached) line))
+                                 cached
+                                 (let (text (text/line rope line))
+                                   [line (text/line->char rope line) text (astral? text)]))
+                          [_ line-start text astral] info
+                          from (units->index text units astral)
+                          to (units->index text (+ units length) astral))
+                      [info
+                        (if (> to from)
+                          (conj spans [(+ line-start from) (+ line-start to) face])
+                          spans)]))))))))
+
+;; ---- pure: carrying spans through edits --------------------------------------------
+
+(defn- first-touched (spans lo)
+  ;; the index of the first span ending after `lo` (spans ascending): those before it are
+  ;; untouched by an edit at `lo`. Bisection, so a keystroke at the end of a large file costs
+  ;; a few compares rather than a walk of every span above it.
+  (letrec (search (fn (low high)
+                    (if (>= low high)
+                      low
+                      (let (middle (math/floor (/ (+ low high) 2)))
+                        (if (> (second (nth spans middle)) lo)
+                          (search low middle)
+                          (search (inc middle) high))))))
+    (search 0 (count spans))))
+
+(defn shift-spans (spans splice)
+  "`spans` (ascending `[start end face]`) after splice `[lo hi replacement]`: a span before it
+stays, one after it moves by the change in length, one the edit was wholly inside (typing in
+the middle of a name) stretches, when what was typed has no space in it; any other span the
+edit touched is dropped until the server says again.
+
+    (lsp-semantic/shift-spans [[0 3 :a] [4 7 :b] [8 9 :c]] [5 5 \"xy\"])   ;=> [[0 3 :a] [4 9 :b] [10 11 :c]]
+    (lsp-semantic/shift-spans [[0 3 :a] [4 7 :b]] [2 5 \"\"])   ;=> [[2 4 :b]]"
+  (let ([lo hi replacement] splice
+        delta (- (string/length replacement) (- hi lo))
+        spans (if (vector? spans) spans (into [] spans))
+        split (first-touched spans lo)
+        solid (not (regex/match? "\\s" replacement)))
+    (into (seq/subvec spans 0 split)
+      (seq/keep (seq/subvec spans split (count spans))
+        (fn (span)
+          (let ([from to face] span)
+            (cond
+              (<= to lo) span
+              (>= from hi) [(+ from delta) (+ to delta) face]
+              (and solid (>= lo from) (<= hi to) (> (+ to delta) from)) [from (+ to delta) face]
+              ;; a deletion that began before the span and ended inside it leaves its tail
+              (and (< lo from) (< hi to) (= delta (- lo hi))) [lo (+ to delta) face]
+              else nil)))))))
+
+(defn carry-spans (spans seen current)
+  "`spans`, computed against buffer `seen`, carried to buffer `current` through every edit
+between them (`buffer-splices-since`) — or nil when the buffer's log cannot say what changed
+(the text replaced wholesale, a revert), for the caller to drop them."
+  (if (= (buffer-rope seen) (buffer-rope current))
+    spans
+    (let (splices (buffer-splices-since seen current))
+      (when (not (nil? splices)) (fold splices spans shift-spans)))))
+
+;; ---- the wire: two request kinds ----------------------------------------------------
+
+(defrecord lsp-semantic-tokens ()) ; textDocument/semanticTokens/full
+(defrecord lsp-semantic-tokens-delta ()) ; textDocument/semanticTokens/full/delta
+
+(defn shape-tokens (result)
+  "A semantic-tokens `result` as `{:result-id :data :edits}` — `:edits` only in a delta answer
+(`SemanticTokensDelta`), `:data` in a full one; nil for none.
+
+    (lsp-semantic/shape-tokens {:resultId \"2\" :data [0 1 2 0 0]})   ;=> {:result-id \"2\" :data [0 1 2 0 0] :edits nil}"
+  (when (map? result)
+    {:result-id (:resultId result) :data (:data result) :edits (:edits result)}))
+
+(impl LspRequest
+  lsp-semantic/lsp-semantic-tokens
+  (lsp-request-method (_) "textDocument/semanticTokens/full")
+  (lsp-request-params (_ request) {:textDocument {:uri (:uri request)}})
+  (lsp-request-shape (_ result) [:lsp-semantic-tokens (shape-tokens result)])
+  (lsp-request-fold (pending m payload) (ed-semantic-fold pending m payload)))
+
+(impl LspRequest
+  lsp-semantic/lsp-semantic-tokens-delta
+  (lsp-request-method (_) "textDocument/semanticTokens/full/delta")
+  (lsp-request-params (_ request)
+    {:textDocument {:uri (:uri request)} :previousResultId (:previous-result-id request)})
+  (lsp-request-shape (_ result) [:lsp-semantic-tokens (shape-tokens result)])
+  (lsp-request-fold (pending m payload) (ed-semantic-fold pending m payload)))
+
+(def client-capabilities
+  ;; what `initialize` tells a server this client takes (`lsp/lsp-init-params`)
+  {:requests {:full {:delta true} :range false}
+   :tokenTypes *token-types*
+   :tokenModifiers *token-modifiers*
+   :formats ["relative"]
+   :overlappingTokenSupport false
+   :multilineTokenSupport false})
+
+;; ---- the model ---------------------------------------------------------------------
+
+(defn semantic-on? (m)
+  "Whether semantic tokens are wanted: init.blsp's `:lsp-semantic-tokens` (on unless false)."
+  (not (= false (:lsp-semantic-tokens m))))
+
+(defn semantic-entry (m file)
+  "The live server for `file` that offers semantic tokens with a legend, or nil."
+  (seq/find (lsp/lsp-live-entries m file)
+    (fn (entry)
+      (map? (map/get-in entry [:caps :semanticTokensProvider :legend])))))
+
+(defn- delta-offered? (provider)
+  ;; `semanticTokensProvider.full` is `true` or `{:delta bool}`
+  (let (full (:full provider)) (and (map? full) (= true (:delta full)))))
+
+(defn ed-semantic-due? (m)
+  "True when the current buffer's tokens are due an ask: wanted, a live server offering them,
+and the text moved since the last ask. The idle job's `:stale?`, so false whenever the ask
+would not happen."
+  (let (buffer (ed-current-buf m)
+        file (buffer-file buffer))
+    (and (semantic-on? m)
+      (string? file)
+      (not (= (buffer-rope buffer) (map/get-in m [:lsp-semantic file :requested])))
+      (not (nil? (semantic-entry m file))))))
+
+(defn ed-semantic-request (m)
+  "Ask the current buffer's server for its semantic tokens — the delta since the last answer
+when the server offers deltas and that answer came from it, else the whole set. Quiet: the
+reader did not ask. The text the answer is about is the buffer as it is now (the ask pushes
+it first, `lsp-servers/ed-lsp-ask-server`), kept on the lookup as `:seen`."
+  (let (buffer (ed-current-buf m)
+        file (buffer-file buffer)
+        entry (semantic-entry m file)
+        provider (map/get-in entry [:caps :semanticTokensProvider])
+        store (map/get-in m [:lsp-semantic file])
+        delta? (and (delta-offered? provider)
+                 (= (:conn store) (:conn entry))
+                 (string? (:result-id store))
+                 (vector? (:data store)))
+        request (assoc {:uri (lsp-protocol/lsp-path->uri file) :lang (lsp/lsp-language-id file)}
+                  :previous-result-id (when delta? (:result-id store)))
+        marked (map/assoc-in m [:lsp-semantic file :requested] (buffer-rope buffer)))
+    (ed-lsp-ask-server marked
+      (:conn entry)
+      (if delta? (lsp-semantic-tokens-delta) (lsp-semantic-tokens))
+      request
+      {:path file
+       :seen buffer
+       :legend (:legend provider)
+       :previous-id (when delta? (:result-id store))}
+      :quiet)))
+
+(defn ed-launch-semantic (m)
+  "The idle beat's semantic tokens: ask when [[ed-semantic-due?]]. Never in a headless run,
+whose stand-in servers are the test process itself."
+  (if (or (ed-headless?) (not (ed-semantic-due? m))) m (ed-semantic-request m)))
+
+(defn- ed-semantic-stamp (m index path store)
+  "`m` with `store` filed for `path` and its spans stamped on pool buffer `index` — `:seen`
+becomes the stamped buffer, so the next carry starts from it."
+  (let (stamped (assoc (ed-buf-at m index) :semantic-spans (:spans store)))
+    (map/assoc-in (ed-set-buf-at m index stamped) [:lsp-semantic path] (assoc store :seen stamped))))
+
+(defn ed-semantic-fold (pending m payload)
+  "A semantic-tokens answer landing: the array rebuilt (a delta applied to the last one, when
+it is the answer the delta was asked against), decoded against the legend the request carried,
+turned into spans of the text it was about (`:seen`) and carried to the text now. Dropped for a
+closed file or with the feature off; a delta against an answer no longer kept forgets the
+result id, so the next ask is a whole one."
+  (let (path (:path pending)
+        store (or (map/get-in m [:lsp-semantic path]) {})
+        index (when path (ed-buffer-index-by-file m path)))
+    (cond
+      (or (nil? payload) (nil? index) (not (semantic-on? m))) m
+      else
+        (let (data (cond
+                     (not (nil? (:edits payload)))
+                       (when (and (:previous-id pending)
+                               (= (:previous-id pending) (:result-id store)))
+                         (apply-delta (:data store) (:edits payload)))
+                     else (into [] (or (:data payload) []))))
+          (if (nil? data)
+            (map/assoc-in m [:lsp-semantic path] (dissoc store :result-id :data :requested))
+            (let (seen (:seen pending)
+                  spans (token-spans (decode-tokens data) (:legend pending) (buffer-rope seen))
+                  carried (carry-spans spans seen (ed-buf-at m index)))
+              (ed-semantic-stamp m
+                index
+                path
+                (assoc store
+                  :spans (or carried [])
+                  :data data
+                  :result-id (:result-id payload)
+                  :conn (:conn pending)
+                  ;; spans the log could not carry are wrong: asked again on the next beat
+                  :requested (when carried (:requested store))))))))))
+
+(defn semantic-follow (m)
+  "The post-step: every file's spans carried through what this event did to its buffer
+([[carry-spans]]), restamped on it; a file whose buffer is gone forgotten. O(files) rope
+compares when nothing was typed."
+  (let (stores (or (:lsp-semantic m) {}))
+    (if (empty? stores)
+      m
+      (fold (%map-pairs stores)
+        m
+        (fn (acc pair)
+          (let ([path store] pair
+                index (ed-buffer-index-by-file acc path)
+                seen (:seen store))
+            (cond
+              (nil? index) (assoc acc :lsp-semantic (dissoc (:lsp-semantic acc) path))
+              (nil? seen) acc
+              (= (buffer-rope seen) (buffer-rope (ed-buf-at acc index))) acc
+              else
+                (let (carried (carry-spans (:spans store) seen (ed-buf-at acc index)))
+                  (ed-semantic-stamp acc
+                    index
+                    path
+                    (if (nil? carried)
+                      (assoc store :spans [] :requested nil)
+                      (assoc store :spans carried)))))))))))
+
+(defn- ed-semantic-clear (m)
+  ;; every buffer's spans taken off and the files forgotten
+  (assoc (fold (range (count (:buffers m)))
+           m
+           (fn (acc index)
+             (let (buffer (ed-buf-at acc index))
+               (if (contains? buffer :semantic-spans)
+                 (ed-set-buf-at acc index (dissoc buffer :semantic-spans))
+                 acc))))
+    :lsp-semantic {}))
+
+(defcommand cmd-lsp-semantic-tokens-mode
+  (m key)
+  "Toggle colouring by the language server's semantic tokens (Emacs eglot's semantic tokens):
+what a name IS — a parameter, a macro, a type, a definition — over the mode's own colours.
+On by default where the server offers it; init.blsp's `:lsp-semantic-tokens false` starts it off."
+  (if (semantic-on? m)
+    (message (assoc (ed-semantic-clear m) :lsp-semantic-tokens false) "lsp semantic tokens off")
+    (message (assoc m :lsp-semantic-tokens true :lsp-semantic {}) "lsp semantic tokens on")))
+
+;; ---- registration -------------------------------------------------------------------
+(register-event-handler :lsp-semantic-tokens 'lsp-commands/ed-ev-lsp-reply)
+;; after the text push (30) and the signature (50)
+(register-idle-job :lsp-semantic-tokens
+  {:order 55
+   :run 'lsp-semantic/ed-launch-semantic
+   :stale? 'lsp-semantic/ed-semantic-due?})
+;; after the snippet's carry (35), before anything that reads the colours
+(register-post-step :lsp-semantic {:order 45 :run 'lsp-semantic/semantic-follow})

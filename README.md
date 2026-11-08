@@ -63,7 +63,9 @@ the editor). brood-mode adds live syntax highlighting, bracket matching, eldoc,
 sexp-aware indentation, paredit-style structural editing, and advisory
 type-check diagnostics; ruby- and elixir-mode get fontification and structural
 motion via tree-sitter. An LSP client wires completion, goto-definition,
-references, hover, rename, and format into any server-backed buffer. Git is
+references, hover, rename, and format into any server-backed buffer, colours
+names by the server's semantic tokens over the mode's own highlighting, and
+shows code lenses (opt-in, `:lsp-code-lens`) as a row above their line. Git is
 integrated as a diff-hl change gutter plus a Magit-style status / diff / log /
 commit porcelain (`C-x g`).
 

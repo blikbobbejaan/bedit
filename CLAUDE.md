@@ -938,6 +938,25 @@ src/lsp-servers.blsp        the servers as the model holds them: where each star
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
                             lsp-commands can register fold impls while lsp stays deferred
+src/lsp-semantic.blsp       LSP SEMANTIC TOKENS (`semanticTokens/full`, `/full/delta`): the integer
+                            array decoded against the server's legend, a delta applied, each token
+                            type + modifiers a `:syntax/*` face (`:syntax/variable` is its own; a
+                            definition `:syntax/definition`; strings / comments / numbers left to
+                            the mode), stamped on the pool buffer as `:semantic-spans`, which
+                            `spanpaint/ed-buffer-spans` lays OVER the mode's colouring. Asked on the
+                            idle beat when the text moved (order 55); carried through the splice
+                            log by a post-step (order 45) until the next answer, never dropped on a
+                            keystroke. `:lsp-semantic-tokens` (default on where offered), M-x
+                            lsp-semantic-tokens-mode. Its request kinds and their `LspRequest` impls
+                            (all four halves) live here, not in lsp-requests / lsp-protocol
+src/lsp-lens.blsp           LSP CODE LENS (`codeLens`, `codeLens/resolve`): each lens a dim INLAY
+                            row above its line (`wrap/inlay-lines`, owner `:lsp-code-lens`), titles
+                            joined ` | `, indented as the line; anchored by a char offset carried
+                            through the splice log (post-step order 46), asked on the idle beat
+                            (order 60), unresolved ones resolved. M-x lsp-code-lens-run runs point's
+                            line's lens through `workspace/executeCommand` (a code action's path:
+                            its edits come back as `workspace/applyEdit`). `:lsp-code-lens`
+                            (default off), M-x lsp-code-lens-mode
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/filename.blsp           a typed path read the Emacs way (`substitute-in-file-name`, which is
                             std's `path/substitute` — this is the prompt's layer over it): the prompt
