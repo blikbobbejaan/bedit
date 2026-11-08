@@ -81,32 +81,58 @@ read back as a map is skipped, so a torn last line costs that one report."
                 (when (map? form) form))))
           [])))))
 
+(defn- whole-ms (ms)
+  ;; a report's milliseconds as a whole number: the watchdog measures floats, and a line
+  ;; written before a field existed has none (0)
+  (if (number? ms) (math/round ms) 0))
+
+(defn gc-heavy? (gc-ms ms)
+  "Whether a turn (or a cause's turns) of `ms` was MOSTLY garbage collection — `gc-ms`, the
+watchdog's `:gc-ms`, at least half of it: fixed by what the loop keeps alive, not by the code
+that ran.
+
+    (slowlog/gc-heavy? 60 100)   ;=> true
+    (slowlog/gc-heavy? 10 100)   ;=> false"
+  (and (> gc-ms 0) (>= (* 2 gc-ms) ms)))
+
+(defn- gc-note (gc-ms ms)
+  ;; what a turn's GC share adds to its line: nothing without any, `mostly GC` past half
+  (cond
+    (= gc-ms 0) ""
+    (gc-heavy? gc-ms ms) (str " (gc " gc-ms " ms, mostly GC)")
+    else (str " (gc " gc-ms " ms)")))
+
 (defn summary-lines (reports)
   "One line per CAUSE (a report's phase and tag) in `reports`, the costliest first: how many
-times it was slow, the time it took in all, its worst, and how many of those turns were
-stopped by the loop's ceiling rather than finishing.
+times it was slow, the time it took in all, its worst, how much of that was garbage
+collection (the watchdog's `:gc-ms`; `mostly GC` past half, so a turn the collector made slow
+is told from a slow fold), and how many of those turns were stopped by the loop's ceiling
+rather than finishing.
 
-    (slowlog/summary-lines [{:phase \"update\" :tag :lsp :ms 80} {:phase \"update\" :tag :lsp :ms 120}])   ;=> [\"  200 ms total    2×  worst 120 ms   update :lsp\"]"
+    (slowlog/summary-lines [{:phase \"update\" :tag :lsp :ms 80} {:phase \"update\" :tag :lsp :ms 120}])   ;=> [\"  200 ms total    2×  worst 120 ms   update :lsp\"]
+    (slowlog/summary-lines [{:phase \"view\" :tag :view :ms 90.4 :gc-ms 61.2}])   ;=> [\"   90 ms total    1×  worst 90 ms   view :view   (gc 61 ms, mostly GC)\"]"
   (let (groups (seq/group-by reports
                  (fn (report)
                    [(:phase report)
                      (if (string? (:tag report)) (:tag report) (pr-str (:tag report)))]))
         rows (map (seq groups)
                (fn ([[phase tag] group])
-                 (let (times (map group (fn (report) (or (:ms report) 0)))
+                 (let (times (map group (fn (report) (whole-ms (:ms report))))
                        stopped (count (seq/filter group :interrupted)))
                    {:total (reduce times 0 +)
+                    :gc (reduce (map group (fn (report) (whole-ms (:gc-ms report)))) 0 +)
                     :count (count group)
                     :worst (reduce times 0 math/max)
                     :stopped stopped
                     :what (str phase " " tag)}))))
     (vec (map (sort rows (fn (left right) (> (:total left) (:total right))))
            (fn (row)
-             (string/format "%5d ms total  %3d×  worst %d ms   %s%s"
+             (string/format "%5d ms total  %3d×  worst %d ms   %s%s%s"
                (:total row)
                (:count row)
                (:worst row)
                (:what row)
+               (let (note (gc-note (:gc row) (:total row))) (if (= note "") "" (str "  " note)))
                (if (> (:stopped row) 0) (str "   (" (:stopped row) " stopped)") "")))))))
 
 ;; ---- key-to-paint latency, as a distribution (brood ADR-612) -----------------------
@@ -211,20 +237,29 @@ since the last record ([[record-latency]]). O(1) without a window or with the lo
 
 (defn ed-ev-ui-slow (m input textrows cols rows)
   "A slow turn the watchdog reported ([[model/ed-report-slow]]): kept in the log
-([[record!]]) and appended to `*Messages*` — `slow update 73ms on [:timer :idle]` — and not
-echoed: the reader is in the middle of something, and the line is for whoever goes looking
-for why a key felt late.
+([[record!]]) and appended to `*Messages*` — `slow update 73ms (gc 40 ms, mostly GC) on
+[:timer :idle]`, the GC share when the watchdog measured one (`:gc-ms`) — and not echoed: the
+reader is in the middle of something, and the line is for whoever goes looking for why a key
+felt late.
 
 An INTERRUPTED turn (brood ADR-491) says so: `interrupted update 2000ms on
 :lsp-diagnostics`. One the reader stopped — a command (`:input` true), by C-g — also echoes
 `Quit`, as Emacs does; a background event the loop's ceiling stopped stays in the log, since
 nobody asked for it and an echo would interrupt whatever they are reading."
   (let (report (nth input 1)
-        {:keys [phase tag ms interrupted]} report
+        {:keys [phase tag interrupted]} report
+        ms (whole-ms (:ms report))
         _ (record! report)
         logged (ed-append-named m
                  "*Messages*"
-                 (str (if interrupted "interrupted " "slow ") phase " " ms "ms on " (pr-str tag))))
+                 (str (if interrupted "interrupted " "slow ")
+                   phase
+                   " "
+                   ms
+                   "ms"
+                   (gc-note (whole-ms (:gc-ms report)) ms)
+                   " on "
+                   (pr-str tag))))
     (if (and interrupted (:input report)) (assoc logged :echo "Quit") logged)))
 
 (register-event-handler :ui-slow 'slowlog/ed-ev-ui-slow)
