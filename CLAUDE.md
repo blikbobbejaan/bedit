@@ -433,6 +433,9 @@ src/modeline.blsp           a pane's mode line: its segments (`ed-statusbar-segm
                             hover tooltips. What `hittest` asks again, so `input` never imports the view
 src/overlayview.blsp        the cards over the panes as ui-kit widgets: the context menu and the
                             transient menu, paint and zones in one pass
+src/codecrumbs.blsp         the header line's crumbs for code: the definitions around point by name, off the
+                            held parse (each `deflanguage` names a `:breadcrumbs` that calls it); a Lisp's
+                            top-level form
 src/headerline.blsp         the HEADER LINE above each pane (Emacs breadcrumb-mode, on with `:header-line`):
                             the file by its project and path, then the mode's `:breadcrumbs` at point
                             (an Org heading's path); the layout takes the pane's top row for it
