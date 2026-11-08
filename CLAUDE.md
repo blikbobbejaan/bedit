@@ -1011,7 +1011,30 @@ src/wrap.blsp              where a line falls on screen rows: the pure break rul
                             rides the row) — per line, by `line-policy`. The row↔line owner
                             (panes), the view and the scroll clamp all read it; point past a
                             cut scrolls that one line sideways (`follow-point`, Emacs's
-                            current-line auto-hscroll), a click on `…` goes to the line's end
+                            current-line auto-hscroll), a click on `…` goes to the line's end.
+                            THE ROW GEOMETRY HELPER: `row-cell` (a char column of a row's line →
+                            the cell it is painted at) and `row-column` (a cell → the char under
+                            it; `clicked` makes a cut row's ellipsis the line's end), over a ROW
+                            ENTRY — the table's `[line from to inlay clip display]`, or an
+                            unwrapped pane's `[line hscroll nil nil]`. The caret, a click / drag /
+                            hover, C-n's goal column, C-v, the wheel, avy, the region's end band,
+                            the notes and a remote caret all convert through these two and nothing
+                            else; `line-row-entries` is a line's rows off the visible table. A
+                            row's `display` is `{:prefix :inline}`: the WRAP PREFIX (Emacs
+                            `wrap-prefix` / adaptive-wrap — a continuation row starts under its
+                            line's indent, `:indent`, or fill prefix, `:adaptive`; the init file's
+                            `:wrap-prefix` per mode, `scroll/ed-wrap-prefix-style`; dropped past
+                            half the row) and the row's INLINE annotations (`inlinetext`), both of
+                            which the breaks leave room for
+src/inlinetext.blsp         INLINE ANNOTATIONS (Emacs's `before-string` overlay, what an LSP
+                            inlay hint is): `{:at :text :face}` virtual text shown AT a position
+                            inside a line, owner-keyed (`set-annotations buf owner [...]`,
+                            `clear`), each anchor a buffer MARKER so edits carry it (left gravity:
+                            text typed at it lands after it, where the caret is painted). Never
+                            buffer text: it takes cells in the row table (`scroll/ed-row-extras`
+                            `:inline`, so the buffer lays out row-wise), point cannot be inside
+                            it, a click on it is its anchor, a copy never includes it; painted as
+                            VIRTUAL chunks (`spanpaint/ed-splice-inline`) in the hint voice
 src/folds.blsp              outline FOLDING in an editable buffer (org's TAB): a fold is a
                             marker on its heading, the mode's `:fold-extent` says what it
                             covers, and the row table gives the hidden lines no rows — so the

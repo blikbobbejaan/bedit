@@ -1,0 +1,126 @@
+(defmodule inlinetext
+  "**Inline annotations**: virtual text shown AT a buffer position, in the middle of a line —
+Emacs's `before-string` overlay, the thing an LSP inlay hint (`x: `, `: i32`) is. Never in
+the buffer's text: it takes screen cells (the row table wraps around it, `wrap/row-cell`
+counts it), point cannot be inside it, a click on it lands on its anchor, and copying text
+never includes it. Owner-keyed, as `eolnotes` is, so each producer replaces its own set
+without touching another's; each anchor is a buffer MARKER, so an edit carries it as Emacs
+carries an overlay."
+  (:use editor/buffer) ; buffer-marker-set / buffer-markers — an annotation's anchor
+  (:use memo)) ; defmemo — the per-line index the row table reads
+
+;; ---- the store -------------------------------------------------------------------------
+;; One buffer field, `:inline-annotations`, `{owner [{:marker id :text :face} …]}`: the text
+;; and face of each annotation and the id of the MARKER holding its anchor, `[:inline owner
+;; index]`. The marker is std's (`buffer-marker-set`), so every edit carries the anchor —
+;; text inserted or deleted before it moves it, a deletion around it collapses it to where
+;; the deletion was, and text typed AT it stays after it (left gravity), which is where the
+;; caret is painted: a position at an annotation is shown just past the annotation.
+
+(defn- marker-id (owner index) [:inline owner index])
+
+(defn- owner-store (buf)
+  ;; the annotation store, `{}` for a buffer with none — the field is plain data, and a
+  ;; buffer made before this module existed has none
+  (let (store (get buf :inline-annotations)) (if (map? store) store {})))
+
+(defn- drop-owner (buf owner)
+  ;; `buf` without `owner`'s annotations: their markers deleted and their entry gone
+  (let (store (owner-store buf)
+        entries (get store owner []))
+    (assoc (fold entries buf (fn (acc entry) (buffer-marker-delete acc (:marker entry))))
+      :inline-annotations (dissoc store owner))))
+
+(defn set-annotations (buf owner annotations)
+  "`buf` with `owner`'s inline annotations replaced by `annotations` — a sequence of `{:at
+offset :text string :face face}` (`:face` optional: the dim hint voice). Each `:at` is a
+char offset, clamped into the buffer, and becomes a marker, so later edits carry it. An
+empty sequence clears the owner's set ([[clear]]); another owner's set is never touched.
+
+    (count (inlinetext/annotations (inlinetext/set-annotations (editor/buffer/make-buffer \"f(1)\") :demo [{:at 2 :text \"x: \"}])))   ;=> 1"
+  (let (cleared (drop-owner buf owner)
+        wanted (seq/filter (or annotations [])
+                 (fn (annotation)
+                   (and (map? annotation)
+                     (int? (:at annotation))
+                     (string? (:text annotation))
+                     (not (= (:text annotation) "")))))
+        ordered (into [] (seq/sort-by wanted :at)))
+    (if (empty? ordered)
+      cleared
+      (let (placed (fold (seq/enumerate ordered)
+                     cleared
+                     (fn (acc [index annotation])
+                       (buffer-marker-set acc (marker-id owner index) (:at annotation) false))))
+        (assoc placed
+          :inline-annotations
+            (assoc (owner-store placed)
+              owner
+                (into []
+                  (map (seq/enumerate ordered)
+                    (fn ([index annotation])
+                      {:marker (marker-id owner index)
+                       :text (:text annotation)
+                       :face (:face annotation)})))))))))
+
+(defn clear (buf owner)
+  "`buf` without `owner`'s inline annotations."
+  (if (contains? (owner-store buf) owner) (drop-owner buf owner) buf))
+
+(defn owners (buf)
+  "The owners with inline annotations on `buf`, in no particular order."
+  (keys (owner-store buf)))
+
+(defn annotations (buf)
+  "Every inline annotation on `buf` as `{:at :text :face :owner}`, ascending by `:at` (its
+marker's position now) — `[]` for none. Two at one position keep owner then insertion
+order, which is the order they are painted in."
+  (let (store (owner-store buf))
+    (if (empty? store)
+      []
+      (let (markers (buffer-markers buf)
+            all (for (pair (seq/sort-by (%map-pairs store) (fn (pair) (pr-str (first pair))))
+                       entry
+                       (second pair)
+                       :when (int? (get markers (:marker entry))))
+                  {:at (get markers (:marker entry))
+                   :text (:text entry)
+                   :face (:face entry)
+                   :owner (first pair)}))
+        ;; `seq/sort-by` is stable, so equal anchors keep the owner order above
+        (into [] (seq/sort-by all :at))))))
+
+;; ---- the row table's view of them ------------------------------------------------------
+
+;; check-allow: a hit comes back out of the memo's store, which the checker reads as
+;; unknown; the store only ever holds what the body below built, a line-keyed map.
+(check-allow :trusted
+  (defmemo line-annotations-at 4 (rope store markers)
+    "`{line [[column width text face] …]}` for the annotations in `store` anchored by
+`markers` over `rope` — what [[line-annotations]] answers, remembered on the text, the store
+and the markers, which are the same values every frame until an edit or a producer moves
+them."
+    (fold (for (pair (seq/sort-by (%map-pairs store) (fn (pair) (pr-str (first pair))))
+                 entry
+                 (second pair)
+                 :when (int? (get markers (:marker entry))))
+            [(get markers (:marker entry)) entry])
+      {}
+      (fn (acc [at entry])
+        (let (position (math/max 0 (math/min at (text/length rope)))
+              line (text/char->line rope position)
+              column (- position (text/line->char rope line))
+              text (:text entry))
+          (assoc acc
+            line
+              (into []
+                (seq/sort-by (conj (get acc line [])
+                               [column (string/display-width text) text (:face entry)])
+                  first))))))))
+
+(defn line-annotations (buf)
+  "`{0-based line -> [[column width text face] …]}`, ascending by column within a line — the
+inline annotations as the row table lays them out (`scroll/ed-row-extras` hands them to
+`wrap`), or `{}` for a buffer with none."
+  (let (store (owner-store buf))
+    (if (empty? store) {} (line-annotations-at (buffer-rope buf) store (buffer-markers buf)))))
