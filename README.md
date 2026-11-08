@@ -73,7 +73,10 @@ It runs in a terminal too: `bedit -nw` (or `--no-window`), and by itself when
 there is no display to open a window on — over ssh, on a console — with the
 mouse, bracketed paste, and kills reaching your clipboard through the terminal
 (OSC 52). A root-owned file opens as root with `C-x C-f /sudo::/etc/hosts` or
-`M-x sudo-edit`; the password is asked for, masked, and never kept.
+`M-x sudo-edit`; the password is asked for, masked, and never kept. A file on a
+machine that has no bedit opens with `C-x C-f /ssh:host:/etc/nginx.conf` (TRAMP's
+syntax, `/ssh:user@host#port:path`) and saves back over ssh — see
+[`docs/working-from-another-computer.md`](docs/working-from-another-computer.md#editing-a-file-on-a-machine-that-has-no-bedit-ssh).
 `bedit -Q` starts clean, as Emacs's: no init file and no installed packages (`-q`
 skips only the init file, `--no-packages` only the packages) — how a bug is told
 from a setting or a package. `M-x report-bug` lists the packages that were loaded.

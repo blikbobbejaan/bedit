@@ -214,6 +214,35 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
                             and SIGHUP / SIGTERM auto-save every unsaved buffer before the
                             terminal is restored (`main/terminal-hangup`). Named to dodge std's `sudo`
+src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in ONE place, pure: `parse`,
+                            `spec`, `canonical` (a buffer's key), `dirname`, `remote-start` (a `/ssh:`
+                            typed over a path), and `remote?` — what every local tool asks before it
+                            touches a path. `~` / a relative path is the REMOTE home's. filename,
+                            sidecar, mincomplete and the handler all read it
+src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*program*`, a test's
+                            stand-in runs the scripts locally) with one SHARED connection per host
+                            (ControlMaster, the socket in `state/ssh/`, owner-only, ControlPersist
+                            5 min), BatchMode always — a failure classified (`classify`: host key
+                            never accepted, auth, connection dropped). Each operation is a POSIX sh
+                            script on ssh's stdin (`/bin/sh -s` is all the login shell parses; args
+                            `os/shell-quote`d): a read through base64 (bytes, a size limit asked
+                            first), an atomic write (staged beside the file with its mode, size +
+                            SHA-256 checked, renamed), `ls -1pa` for the prompt (kept 10 s, a
+                            table). A password opens the connection once (`connect-with-password`:
+                            SSH_ASKPASS helper reading ssh's own stdin, refusing yes/no questions)
+src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/ssh:`), the second file
+                            handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
+                            /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
+                            the spec, `:ssh` its mark, carried by `hosted-meta`), so no local tool
+                            takes it for a file here. Every ssh call a task (`:ssh-proc`, one at a
+                            time, C-g stops it): `Loading…` at once, a save stays modified until it
+                            lands (`file-save/ed-save-prepare` / `ed-save-landed`), a dropped
+                            connection said. A password the host wants is read masked
+                            (`passwd/ed-read-passwd`) and used once. charset as any file (binary →
+                            hex, large → asked); a directory opens the find-file prompt in it (no
+                            remote dired). Its sidecar is private (`sidecar/private-spec`); auto-revert,
+                            diff-hl, LSP, the formatter, editorconfig, dir-locals, compile, M-! and the
+                            project walk skip it (`sshpath/remote?`). The mode line says `@host`
 src/bugreport.blsp          M-x report-bug (Emacs's report-emacs-bug): every error the editor CATCHES
                             (a command, a render error frame, a fontify, a loop the supervisor
                             restarted) reaches its error sink (`model/register-error-sink`),
