@@ -283,10 +283,51 @@ server; `:shutdown` or the server dying stops it."
                                      {:event {:added (into [] (map added lsp-folder))
                                               :removed (into [] (map removed lsp-folder))}})])
                                 (lsp-loop state)))
-    ([:shutdown] (do (lsp-flush state) (os/close (:proc state)) :lsp-stopped))
+    ([:shutdown] (do (lsp-flush state) (lsp-stop state)))
     ;; a batch of what the server said is due ([[lsp-flush]]); with none waiting this only
     ;; wakes the loop once a minute to wait again
     (after (or (lsp-flush-wait state) 60000) (lsp-loop (lsp-flush-when-due state)))))
+
+;; ---- stopping a server the way the protocol asks --------------------------------------
+;; A server is told `shutdown` (a request: it finishes what it is doing and answers), then
+;; `exit` (a notification: it goes), and only a server that does neither in time has its pipe
+;; closed under it. Closing first is what left a server's lock files and half-written caches
+;; behind (rust-analyzer's, Expert's engine node). All of it runs in the CONNECTION process,
+;; so the editor that asked never waits.
+
+(defdyn *lsp-shutdown-ms* 1500)
+;; How long a server has to answer `shutdown`, and then again to exit after `exit`.
+
+(defn- lsp-await-stop (state id deadline)
+  "Read the server's output until the answer to request `id` (`:answered`), the server gone
+(`:closed`) or `deadline` (`os/now`, ms) passed (`:timeout`). Anything else it says is dropped:
+the connection is going."
+  (let (left (math/max 0 (math/floor (- deadline (os/now)))))
+    (receive
+      ([:proc p chunk] (let ([messages remaining] (jsonrpc/decode (str (:buf state) chunk)))
+                         (if (any? messages
+                               (fn (message) (and (= (:id message) id) (nil? (:method message)))))
+                           :answered (lsp-await-stop (assoc state :buf remaining) id deadline))))
+      ([:proc-err p chunk] (lsp-await-stop state id deadline))
+      ([:proc-closed p code] :closed)
+      (after left :timeout))))
+
+(defn lsp-stop (state)
+  "Stop the server of connection `state` as the protocol asks: `shutdown`, its answer awaited
+(at most `*lsp-shutdown-ms*`), then `exit` and its going awaited as long; a server still
+there, or one that cannot be written to, has its pipe closed. Answers `:lsp-stopped`."
+  (let (proc (:proc state)
+        id (or (:next-id state) 1)
+        asked (lsp-write-handshake proc (jsonrpc/request id "shutdown" nil))
+        answer (if asked (lsp-await-stop state id (+ (os/now) *lsp-shutdown-ms*)) :closed)
+        gone (cond
+               (= answer :closed) :closed
+               (lsp-write-handshake proc (jsonrpc/notification "exit" nil))
+                 (lsp-await-stop (assoc state :buf "") nil (+ (os/now) *lsp-shutdown-ms*))
+               else :timeout))
+    (when (not (= gone :closed))
+      (check-allow :discarded-catch (try (os/close proc) (catch _ nil))))
+    :lsp-stopped))
 
 (defn- lsp-init-params (root-uri)
   {:processId nil
@@ -369,7 +410,8 @@ its behalf would be worse than letting it say no itself."
     (not (or (nil? provider) (= provider false)))))
 
 (defn lsp-shutdown (conn)
-  "Stop a connection: kill the server and end the connection process."
+  "Stop a connection: the server told `shutdown` then `exit`, closed only when it does not go
+([[lsp-stop]], in the connection process — the caller never waits), and the connection ended."
   (send conn [:shutdown]))
 
 (defn lsp-close (conn uri)
