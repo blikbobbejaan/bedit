@@ -852,7 +852,14 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             recorded `:fingerprint`), moving one back to its pin, and a
                             live swap — drop a new .so in and reload, no restart. An install or
                             reload retypes every open line-lexer stand-in as its parsed mode
-                            (`model/ed-grammars-arrived`)
+                            (`model/ed-grammars-arrived`). A grammar is native code, so brood
+                            VETS a library in a child before its first load and refuses one that
+                            crashed or hung there, or that crashed bedit (brood ADR-660): an
+                            install vets with the grammar's own test corpus off the loop
+                            (`*grammar-vetter*`) and says a quarantine; the list shows one
+                            (QUARANTINED, why) without loading it; its language stands in with
+                            its line lexer, as a missing grammar's does (`model/grammar-loadable?`,
+                            `missing-note`)
 src/grammarcheck.blsp       does the installed grammar still have every node kind and field a
                             mode names? Each `deflanguage` registers the names its face table,
                             indent spec, injections and definitions use (std's

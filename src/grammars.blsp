@@ -241,9 +241,26 @@ user's directory) or `:unpinned` (no revision declared)."
         (if (> (count problems) 4) (str " (and " (- (count problems) 4) " more)") "")
         " — not the revision bedit expects: M-x grammar-update"))))
 
+(defdyn *grammar-verdict*
+  ;; the verdict kept on a grammar library (brood ADR-660) — a dynvar so a test can stand in a
+  ;; quarantine without building a grammar that crashes
+  editor/treesit/grammar-verdict)
+
+(defn- quarantine-cell (verdict)
+  ;; why a quarantined library is not loaded, and what ends it
+  (str "\n      QUARANTINED: "
+    (get verdict :reason "it crashed")
+    (if (get verdict :signal) (str " (" (get verdict :signal) ")") "")
+    (if (= (get verdict :by) :crash) " — it crashed bedit" " — it failed its vetting")
+    ". Not loaded; its language is coloured by its line lexer where it has one."
+    " A reinstall (M-x grammar-update) is vetted afresh"))
+
 (defn- grammar-row (pair)
   (let ([lang path] pair
-        abi (grammar-abi lang path)
+        verdict (*grammar-verdict* path)
+        quarantined? (= (get verdict :verdict) :quarantined)
+        ;; a quarantined library is never loaded to ask its ABI: the runtime refuses it
+        abi (if quarantined? "-" (grammar-abi lang path))
         size (check-allow :discarded-catch (try (get (file/stat path) :size) (catch _ nil))))
     (str "  "
       (string/pad-right (->string lang) 12)
@@ -255,7 +272,10 @@ user's directory) or `:unpinned` (no revision declared)."
       "  "
       path
       ;; a library that did not load has no contract to check; its ABI cell says why
-      (if (int? abi) (check-cell lang) ""))))
+      (cond
+        quarantined? (quarantine-cell verdict)
+        (int? abi) (check-cell lang)
+        else ""))))
 
 (defn grammar-report ()
   "The *Grammars* buffer's text: what is installed — each grammar's ABI, its revision against
@@ -288,7 +308,12 @@ and how to build another."
                      "    M-x grammar-reload"
                      ""
                      "A grammar built for a tree-sitter this runtime cannot drive is refused by ABI"
-                     "with the range it accepts — a message, never a crash."))
+                     "with the range it accepts — a message, never a crash."
+                     ""
+                     "A grammar is native code, so before its first load a child process tries it"
+                     "on its own test corpus and on awkward input; one that crashes or hangs there"
+                     "is QUARANTINED and never loaded into bedit. One that crashes bedit anyway is"
+                     "named in the crash report (M-x report-bug) and quarantined the same way."))
       "\n")))
 
 (defcommand cmd-grammar-list
@@ -348,15 +373,30 @@ grammar-update` offers."
   ;; build; a dynvar so a test can stand in for the network and the compiler
   editor/grammar-install/grammar-install)
 
+(defdyn *grammar-vetter*
+  ;; `(fn (library lang checkout) -> verdict)` — std's vetting in a child with the grammar's
+  ;; own test corpus (brood ADR-660); a dynvar so a test can stand in a verdict
+  editor/grammar-install/grammar-vet)
+
 (defn grammar-install-run (lang source)
   "Fetch `lang`'s grammar at its pinned revision and compile it into the grammar directory,
-writing its manifest: `{:ok path :commit sha}` or `{:error text}`. Runs off the loop — a fetch
-and a compile take seconds."
+writing its manifest, then VET the library in a child with the grammar's own test corpus
+(brood ADR-660) before anything loads it: `{:ok path :commit sha :verdict v}` or `{:error
+text}`. Runs off the loop — a fetch, a compile and a vetting take seconds."
   (let (url (if (map? source) (get source :url) source)
-        options (if (map? source)
-                  {:subdir (get source :subdir) :revision (get source :revision)}
-                  {}))
-    (*grammar-installer* url lang (ts-grammar-dir) (grammar-work-dir) options)))
+        subdir (when (map? source) (get source :subdir))
+        options (if (map? source) {:subdir subdir :revision (get source :revision)} {})
+        result (*grammar-installer* url lang (ts-grammar-dir) (grammar-work-dir) options))
+    (if (contains? result :ok)
+      (let (checkout (path/join (grammar-work-dir) (->string lang))
+            root (if subdir (path/join checkout subdir) checkout))
+        ;; check-allow :discarded-catch — a vetting that could not run is no verdict, and the
+        ;; load vets the library itself
+        (assoc result
+          :verdict
+            (check-allow :discarded-catch
+              (try (*grammar-vetter* (get result :ok) lang root) (catch _ nil)))))
+      result)))
 
 (defn- install-outcome (lang result)
   ;; one language's install, loaded and checked: the line that says how it went, and whether
@@ -364,6 +404,12 @@ and a compile take seconds."
   (cond
     (nil? result) [(str (->string lang) ": failed or timed out") false]
     (contains? result :error) [(str (->string lang) ": " (get result :error)) false]
+    (= (get (get result :verdict) :verdict) :quarantined)
+      [(str (->string lang)
+         ": built, but QUARANTINED — "
+         (get (get result :verdict) :reason)
+         " — not loaded")
+        false]
     else
       (do
         (grammarcheck/forget lang)
