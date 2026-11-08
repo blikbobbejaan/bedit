@@ -189,50 +189,79 @@ file's time, so the save asking again need not ask whether someone else changed 
   (or (= (:file (:save-job m)) file)
     (any? (or (:save-waiting m) []) (fn (entry) (= (:file entry) file)))))
 
-(defn- ed-save-wait (m file then abandon-note)
-  "A save of `file` put on the queue behind the write that is out. A second save of a file
-already waiting, with no continuation of its own, is that one: it will write what the buffer
-holds when its turn comes."
+(defn- ed-job-index (m job)
+  "The pool index of the buffer a save `job` (or a waiting entry) writes — the one visiting its
+`:file` plainly, or for a write to a NEW path (C-x C-w, [[ed-write-buf-as]]) the one its
+`:source` names: still under its old name and file until the write lands — or nil once it was
+killed."
+  (let (source (:source job))
+    (if (nil? source)
+      (ed-plain-index m (:file job))
+      (let (index (seq/index-where (:buffers m)
+                    (fn (buffer)
+                      (and (= (buffer-name buffer) (:name source))
+                        (= (buffer-file buffer) (:file source))))))
+        (if (< index 0) nil index)))))
+
+(defn- ed-save-wait (m entry)
+  "A save `entry` (`{:file :then :abandon-note}`, a write to a new path's `:source` and
+`:retarget` too) put on the queue behind the write that is out. A second save of a file already
+waiting, with no continuation of its own, is that one: it will write what the buffer holds when
+its turn comes."
   (let (waiting (or (:save-waiting m) [])
-        queued? (and (nil? then) (any? waiting (fn (entry) (= (:file entry) file)))))
-    (message (if queued?
-               m
-               (assoc m
-                 :save-waiting
-                   (conj waiting
-                     {:file file
-                      :then then
-                      :abandon-note abandon-note
-                      :from-hook (= true (:in-after-save m))})))
-      (str "saving " file " after the write in flight"))))
+        file (:file entry)
+        queued? (and (nil? (:then entry))
+                  (nil? (:source entry))
+                  (any? waiting (fn (other) (and (= (:file other) file) (nil? (:source other)))))))
+    (message (if queued? m (assoc m :save-waiting (conj waiting entry)))
+      (str (if (:source entry) "writing " "saving ") file " after the write in flight"))))
 
 (defn- ed-save-plain (m index then abandon-note)
   ;; a plain file's save: queued behind the write that is out, else launched
-  (let (file (buffer-file (ed-buf-at m index)))
+  (let (file (buffer-file (ed-buf-at m index))
+        entry {:file file
+               :then then
+               :abandon-note abandon-note
+               :from-hook (= true (:in-after-save m))})
     (cond
       (nil? file)
         (ed-save-pump (message m (str "save failed: buffer has no file" (or abandon-note ""))))
-      (:save-proc m) (ed-save-wait m file then abandon-note)
-      else (ed-save-launch m index file then abandon-note (= true (:in-after-save m))))))
+      (:save-proc m) (ed-save-wait m entry)
+      else (ed-save-launch m index entry))))
 
-(defn- ed-save-launch (m index file then abandon-note from-hook)
-  "Pool buffer `index` prepared and its text handed to a task that writes `file` — inline when
-there is no loop ([[write-off-loop?]]). `from-hook`: an `:after-save` hook asked for it. A text the buffer's coding cannot write is refused here,
-saying where."
+;; check-allow: `retarget` is the caller's (lifecycle's C-x C-w), resolved when the write lands;
+;; it answers a model
+(check-allow :trusted
+  (sig ed-write-buf-as (model int string any -> model))
+  (defn ed-write-buf-as (m index path retarget)
+    "Write pool buffer `index` to the NEW plain file `path` (C-x C-w) through the same off-loop
+write a save takes ([[ed-save-buf-at]]): `Writing …` at once, the buffer keeping its name and
+file while the write is out. Landed, `(retarget m index)` makes the buffer visit `path` (the
+caller's: its name, its hosted document, its old sidecar) and it is marked saved as of the text
+written; failed, it is left visiting what it did and the echo area says why. Queued behind a
+write already out, as any save is."
+    (let (buffer (ed-buf-at m index)
+          entry {:file path
+                 :source {:name (buffer-name buffer) :file (buffer-file buffer)}
+                 :retarget retarget})
+      (if (:save-proc m) (ed-save-wait m entry) (ed-save-launch m index entry)))))
+
+(defn- ed-save-launch (m index entry)
+  "Pool buffer `index` prepared and its text handed to a task that writes the `entry`'s file —
+inline when there is no loop ([[write-off-loop?]]). A text the buffer's coding cannot write is
+refused here, saying where."
   (let ([prepared-model prepared] (ed-save-prepare m index)
+        file (:file entry)
         content (charset/file-content prepared)
         writer *write-file*
-        job {:file file
-             :rope (buffer-rope prepared)
-             :then then
-             :abandon-note abandon-note
-             :from-hook from-hook})
+        job (assoc entry :rope (buffer-rope prepared))
+        failed (if (:source entry) "write failed: " "save failed: "))
     (cond
       (failure? content)
         (ed-save-pump (message prepared-model
-                        (str "save failed: " (error-message content) (or abandon-note ""))))
+                        (str failed (error-message content) (or (:abandon-note entry) ""))))
       (write-off-loop?)
-        (assoc (message prepared-model (str "Saving " file "…"))
+        (assoc (message prepared-model (str (if (:source entry) "Writing " "Saving ") file "…"))
           :save-proc
             (task/task (fn () (write-work writer file content)) {:timeout *write-timeout-ms*})
           :save-job job)
@@ -251,13 +280,22 @@ waiting its turn."
   (defn- ed-save-finish (m job answer)
     ;; the write behind `job` has landed (or failed): the buffer told, then the queue moves on
     (let (file (:file job)
-          index (ed-plain-index m file)
+          source (:source job)
+          index (ed-job-index m job)
           reason (cond
                    (nil? answer) "the write did not finish"
                    (:error answer) (:error answer)
                    else nil))
       (ed-save-pump
         (cond
+          (and reason source)
+            (message m
+              (str "write failed: "
+                reason
+                (ed-denied-hint reason)
+                " — "
+                (:name source)
+                (if (:file source) (str " still visits " (:file source)) " visits no file")))
           reason
             (message m
               (str "save failed: "
@@ -268,9 +306,15 @@ waiting its turn."
                 " is still modified"
                 (or (:abandon-note job) "")))
           ;; the buffer was killed while its text was written
-          (nil? index) (message m (str "saved " file))
+          (nil? index) (message m (str (if source "wrote " "saved ") file))
           else
-            (let (landed (ed-save-landed m index (:rope job) "" (:mtime answer) (:from-hook job))
+            (let (retargeted (if source ((:retarget job) m index) m)
+                  landed (ed-save-landed retargeted
+                           index
+                           (:rope job)
+                           ""
+                           (:mtime answer)
+                           (= true (:from-hook job)))
                   known (if (:created? answer) (ed-project-files-forget landed file) landed))
               ((or (:then job) identity) known)))))))
 
@@ -287,18 +331,15 @@ empty, what waited for it ([[ed-when-saves-land]])."
               rest-m (if (= 1 (count waiting))
                        (dissoc m :save-waiting)
                        (assoc m :save-waiting (vec (rest waiting))))
-              index (ed-plain-index rest-m (:file entry)))
+              index (ed-job-index rest-m entry))
           (cond
             (nil? index) (ed-save-pump rest-m)
-            (and (nil? (:then entry)) (not (buffer-modified? (ed-buf-at rest-m index))))
+            ;; a write to a new path is made whether or not the text changed
+            (and (nil? (:then entry))
+              (nil? (:source entry))
+              (not (buffer-modified? (ed-buf-at rest-m index))))
               (ed-save-pump rest-m)
-            else
-              (ed-save-launch rest-m
-                index
-                (:file entry)
-                (:then entry)
-                (:abandon-note entry)
-                (= true (:from-hook entry))))))))
+            else (ed-save-launch rest-m index entry))))))
 
 (defn- ed-save-drained (m)
   ;; no write out and none waiting: every continuation that waited for that, in order
@@ -319,11 +360,16 @@ drops the wait (`commands/cmd-keyboard-quit`) and leaves the writes to land."
       (assoc m :save-drains (conj (or (:save-drains m) []) then)))))
 (sig ed-when-saves-land (model any -> model))
 
+(defn- save-verb (entry)
+  ;; a save, or a write to a new path (C-x C-w)
+  (if (:source entry) "writing " "saving "))
+
 (defn ed-save-live (m)
   "The plain saves C-x C-c would cut off (`model/register-exit-query`): the write out, and
 those waiting their turn."
-  (into (if (:save-job m) [(str "saving " (:file (:save-job m)))] [])
-    (map (or (:save-waiting m) []) (fn (entry) (str "saving " (:file entry) " (waiting)")))))
+  (into (if (:save-job m) [(str (save-verb (:save-job m)) (:file (:save-job m)))] [])
+    (map (or (:save-waiting m) [])
+      (fn (entry) (str (save-verb entry) (:file entry) " (waiting)")))))
 
 (register-task-reply :save-proc
   'file-save/ed-apply-save
