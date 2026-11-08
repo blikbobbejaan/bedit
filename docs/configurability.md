@@ -14,6 +14,10 @@
   `M-x global-set-key` / `M-x local-set-key` bind a key live for the session into the
   same amendments (`:session-keys` on the model); M-x reload-config keeps them unless
   init.blsp now binds that key itself.
+- **Directory-local settings** (Emacs's `.dir-locals.el`): a project's
+  `.bedit-locals.blsp`, `(dir-locals :fill-column 100 :indent-width {python 4})`, read as
+  data by `src/dirlocals.blsp` for the files under it. Only a setting declared `:safe true`
+  is taken; the rest is refused and said. It sits under `.editorconfig` and over init.blsp.
 - **Stage 3, named themes** — `:theme` is a setting, themes are a registry
   (`themes/register-theme!`, `M-x theme-select`), and a package may add one.
 - **Not built:** named hooks (`add-hook`), command properties (`command-put`), a live

@@ -832,6 +832,14 @@ src/editorconfig.blsp       `.editorconfig` (editorconfig.org): the parser, the 
                             (`*` `**` `?` `[…]` `{a,b}` `{1..9}`), the walk up to `root = true`, and
                             the result in the editor's terms — read once when a file buffer is
                             made (`model/ed-stamp`). bedit's, not std's: nothing else wants it yet
+src/dirlocals.blsp          a project's `.bedit-locals.blsp` (Emacs's .dir-locals.el): `(dir-locals :key
+                            value …)`, DATA, the nearest above a visited file (a visit step,
+                            `:passing`) stamped on the buffer as `:dir-locals`. Only a setting
+                            declared `:safe true` (Emacs's safe-local-variable: the layout
+                            conventions, the display switches) is taken; the rest is refused and
+                            said in the visit's note. Resolved after .editorconfig and before
+                            init.blsp (`conventions/dir-local`, `scroll/ed-local-setting`); C-h v
+                            and M-x describe-indentation name it as the source
 src/formatter.blsp          M-x format-buffer + format-on-save: the language's own
                             formatter (mix format, black, rubocop), declared per language
                             and run over the FILE, so a failing formatter costs nothing
