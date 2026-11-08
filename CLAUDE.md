@@ -469,6 +469,11 @@ src/tabbar.blsp             TABS (Emacs tab-bar-mode, C-x t …): each tab a win
                             `hittest/ed-tab-bar-click`; lastsession saves the tabs. Per frame
 src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
                             `:show-whitespace`, per mode through `scroll/ed-mode-setting`)
+src/fillindicator.blsp      the fill-column rule (Emacs display-fill-column-indicator-mode,
+                            `:fill-column-indicator` per mode, M-x display-fill-column-indicator-mode
+                            per buffer): `│` at `conventions/fill-column` on each row that leaves
+                            it empty, a `:with-text` pane layer; hscroll moves it, a wrapped row is
+                            measured from its start, a clipped (truncated) row gets none
 src/glyphless.blsp          the invisible format characters SHOWN (Emacs glyphless-char-display):
                             brood lays a zero width space, a BOM mid-text, a tag character out as
                             its `<200b>` escape (ADR-556, bound by `conventions/with-cell-layout`
