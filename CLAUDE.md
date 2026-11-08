@@ -673,7 +673,11 @@ src/pool.blsp               the buffer pool and where its buffers are shown — 
                             loop: a read-only `Loading…` buffer at once (`file-loading-buffer`, a root
                             read's too), the file in its place in every pane showing it when the
                             task lands (`:read-proc`, one at a time); killing it or C-g cancels.
-                            `ed-find-file` stays on the loop for callers acting on the buffer.
+                            `ed-find-file` stays on the loop for callers acting on the buffer
+                            at once; a JUMP waits instead — `ed-pop-to-file` (next-error, the
+                            results buffers), `ed-find-file-then` (an LSP location, a compile
+                            error), lastsession's restore and the file named at startup
+                            (`reading-off-loop`) — and goes to its line when the file lands.
                             What most modules `:use` instead of
                             `commands`: showing a report buffer needs none of the commands
 src/file-save.blsp          writing a pool buffer to its file: `ed-save-buf-at` (a buffer a file
@@ -685,7 +689,9 @@ src/file-save.blsp          writing a pool buffer to its file: `ed-save-buf-at` 
                             edit meanwhile stays modified; a failure stays modified, said). One
                             write at a time, the rest on `:save-waiting` by FILE, taking the text
                             when their turn comes; `ed-when-saves-land` is what C-x C-c and C-x s
-                            wait on. Headless, inline; tests bind `*write-off-loop*` / `*write-file*`
+                            wait on. C-x C-w rides the same queue (`ed-write-buf-as`): the buffer
+                            visits the new path only once the write lands, and keeps its old one
+                            when it fails. Headless, inline; tests bind `*write-off-loop*` / `*write-file*`
 src/menu.blsp               the right-click context menu's model ops (open / move / run /
                             close); an item names its command by SYMBOL, resolved when it
                             runs, so a redefined command reaches the menu too

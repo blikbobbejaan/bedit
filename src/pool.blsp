@@ -152,52 +152,81 @@ named `name` and with no file of its own (so no other buffer or frame takes it f
 (defn- read-off-loop? ()
   (if (nil? *read-off-loop*) (not (ed-headless?)) *read-off-loop*))
 
-(defn- large-read? (path)
-  ;; a plain file big enough to read off the loop
+(defn large-read? (path)
+  "Whether `path` is a plain file big enough to read off the loop (over
+`*read-off-loop-bytes*`)."
   (and (not (file/dir? path)) (int? (ed-large-file-size path *read-off-loop-bytes*))))
 
-(defn ed-find-file-soon (m path)
-  "Open `path` as [[ed-find-file]] does, but a plain file over `*read-off-loop-bytes*` is read
+;; check-allow: `thunk` is the caller's; its result is handed back as it is
+(check-allow :trusted
+  (defn reading-off-loop (thunk)
+    "`(thunk)` with a large file's read sent OFF the loop although no loop runs yet — what the
+editor's startup opens its files under: the loop starts in this process next, so the read's
+answer lands in its mailbox."
+    (binding (*read-off-loop* true) (thunk))))
+
+;; check-allow: `then` is the caller's continuation (a jump's go-to-line), whose result the
+;; checker cannot see; every caller hands one that answers a model
+(check-allow :trusted
+  (sig ed-find-file-soon (model string &optional any -> model))
+  (defn ed-find-file-soon (m path &optional (then nil))
+    "Open `path` as [[ed-find-file]] does, but a plain file over `*read-off-loop-bytes*` is read
 OFF the loop: a read-only `Loading…` buffer is shown at once, and the file takes its place when
 read. A file already open, or already loading, is selected; any other path is opened at once.
-Headless — a test — it all runs inline."
-  (let (absolute (when (not (string/blank? path)) (path/normalize (path/absolute path)))
-        loading (when absolute (ed-loading-index m absolute)))
-    (cond
-      (or (nil? absolute) (ed-path-handler path)) (ed-find-file m path)
-      (ed-buffer-index-by-file m absolute) (ed-find-file m path)
-      (int? loading) (ed-select m loading)
-      (or (not (read-off-loop?)) (not (large-read? absolute))) (ed-find-file m path)
-      else
-        (ed-read-launch (ed-open-buffer m
-                          (file-loading-buffer absolute (str (path/basename absolute) " <loading>")))
-          absolute))))
+Headless — a test — it all runs inline.
+
+`then`, a `(fn (m index) …)`, is what the caller does with the file once it is open — a jump
+going to its line ([[ed-find-file-then]]): called at once with the current index when the
+file opened now, and with the file's pool index when a read off the loop lands (not when it
+fails or is cancelled, nor for a file that was already loading: the first open's stands)."
+    (let (absolute (when (not (string/blank? path)) (path/normalize (path/absolute path)))
+          loading (when absolute (ed-loading-index m absolute))
+          now (fn (opened) (if (nil? then) opened (then opened (ed-current-index opened)))))
+      (cond
+        (or (nil? absolute) (ed-path-handler path)) (now (ed-find-file m path))
+        (ed-buffer-index-by-file m absolute) (now (ed-find-file m path))
+        (int? loading) (ed-select m loading)
+        (or (not (read-off-loop?)) (not (large-read? absolute))) (now (ed-find-file m path))
+        else
+          (ed-read-launch (ed-open-buffer m (file-loading-buffer absolute (loading-name absolute)))
+            absolute then)))))
+
+(defn- loading-name (path) (str (path/basename path) " <loading>"))
+
+(defn ed-find-file-then (m path step)
+  "Open `path` ([[ed-find-file-soon]], so a large file is read off the loop) and apply `step`
+(a `buffer -> buffer`: a go-to-line, a go-to-position) to the file's buffer — now, or when its
+read lands. What a jump to a location (an LSP definition, a compile error) opens with: the
+editor answers at once, and point lands on the line once the file is there."
+  (ed-find-file-soon m
+    path
+    (fn (opened index) (ed-set-buf-at opened index (step (ed-buf-at opened index))))))
 
 (defn- read-work (path)
   ;; the read task: `ed-read-file`'s answer, or `{:error reason}` — never raises
   (try (ed-read-file path) (catch failure {:error (error-message failure)})))
 
-(defn- ed-read-launch (m path)
-  ;; the read of `path` started, or put behind the one that is out
+(defn- ed-read-launch (m path then)
+  ;; the read of `path` started, or put behind the one that is out; `then` runs when it lands
   (if (:read-proc m)
-    (message (assoc m :read-waiting (conj (or (:read-waiting m) []) path))
+    (message (assoc m :read-waiting (conj (or (:read-waiting m) []) {:path path :then then}))
       (str "loading " path " after the file being read"))
     (assoc (message m (str "Loading " path "… (C-g stops)"))
       :read-proc (task/task (fn () (read-work path)))
-      :read-job {:path path})))
+      :read-job {:path path :then then})))
 
 (defn- ed-read-pump (m)
   ;; the next read waiting launched, passed over when its `Loading…` buffer was killed
   (let (waiting (or (:read-waiting m) []))
     (if (or (:read-proc m) (empty? waiting))
       m
-      (let (path (first waiting)
+      (let (entry (first waiting)
             rest-m (if (= 1 (count waiting))
                      (dissoc m :read-waiting)
                      (assoc m :read-waiting (vec (rest waiting)))))
-        (if (nil? (ed-loading-index rest-m path))
+        (if (nil? (ed-loading-index rest-m (:path entry)))
           (ed-read-pump rest-m)
-          (ed-read-launch rest-m path))))))
+          (ed-read-launch rest-m (:path entry) (:then entry)))))))
 
 (defn- ed-read-landed (m path placeholder answer)
   "The file `path` read (`answer`, [[read-work]]'s) opened in place of its `Loading…` buffer:
@@ -237,12 +266,17 @@ model — the file in place of its `Loading…` buffer, or why not — then the 
                     (nil? answer)
                       (message (ed-kill-buffer-at rest-m placeholder)
                         (str "open failed: reading " path " did not finish"))
-                    else (ed-read-landed rest-m path placeholder answer)))))
+                    else
+                      (let (landed (ed-read-landed rest-m path placeholder answer)
+                            index (ed-buffer-index-by-file landed path)
+                            then (:then job))
+                        (if (or (nil? then) (nil? index)) landed (then landed index)))))))
 
 (defn ed-read-quit (m)
   "C-g's clean-up for a large read (its task already killed): its `Loading…` buffer goes, and
 so do those of the reads waiting."
-  (let (paths (into (if (:read-job m) [(:path (:read-job m))] []) (or (:read-waiting m) []))
+  (let (paths (into (if (:read-job m) [(:path (:read-job m))] [])
+                (map (or (:read-waiting m) []) :path))
         dropped (fold paths
                   (dissoc m :read-job :read-waiting)
                   (fn (acc path)
@@ -716,16 +750,59 @@ visits. A buffer that is no longer in the pool says so instead of jumping somewh
   "A report row's `path` made absolute: against the project root, or the cwd without one."
   (if (path/absolute? path) path (str (or (:project-root m) (file/cwd)) "/" path)))
 
-(defn ed-pop-to-file (m path line)
-  "Emacs `next-error` / `display-buffer-other-window`: show `path` at (1-based)
+;; check-allow: `after` is the caller's continuation (gitstage's smerge step); it answers a model
+(check-allow :trusted
+  (sig ed-pop-to-file (model any any &optional any -> model))
+  (defn ed-pop-to-file (m path line &optional (after nil))
+    "Emacs `next-error` / `display-buffer-other-window`: show `path` at (1-based)
 `line` in a pane OTHER than the current one — the results buffer stays visible —
 select that pane, and put point on the line. Reuses a pane already showing the file;
 splits a lone pane (the results buffer keeps the original). THE jump every
-results-buffer 'visit source' routes through, so the behaviour is uniform."
-  (if (string/blank? path)
-    (message m "(no file)")
-    (let ([m1 index] (ed-ensure-file-buffer m (path/absolute path)))
-      (ed-pop-to-index m1 index line))))
+results-buffer 'visit source' routes through, so the behaviour is uniform.
+
+A large file not yet open is read OFF the loop ([[ed-find-file-soon]]'s read): its `Loading…`
+buffer pops up at once, and point goes to the line when the file lands in its place. `after`, a
+`(fn (m) …)`, runs once point is on the line in the selected pane — at once, or when the read
+lands if the file is still the one being looked at then."
+    (cond
+      (string/blank? path) (message m "(no file)")
+      (ed-pop-later? m path) (ed-pop-to-loading m (path/normalize (path/absolute path)) line after)
+      else
+        (let ([m1 index] (ed-ensure-file-buffer m (path/absolute path))
+              popped (ed-pop-to-index m1 index line))
+          (if (nil? after) popped (after popped))))))
+
+(defn- ed-pop-later? (m path)
+  ;; a jump to `path` that reads it off the loop: a large plain file not open yet
+  (let (absolute (path/normalize (path/absolute path)))
+    (and (read-off-loop?)
+      (nil? (ed-path-handler path))
+      (nil? (ed-buffer-index-by-file m absolute))
+      (large-read? absolute))))
+
+;; check-allow: `after` is the caller's continuation; it answers a model
+(check-allow :trusted
+  (defn- ed-pop-to-loading (m path line after)
+    ;; [[ed-pop-to-file]] on a file read off the loop: its `Loading…` buffer added (or the one
+    ;; already loading) and popped to, the line gone to when the read lands
+    (let (loading (ed-loading-index m path))
+      (if (int? loading)
+        (ed-pop-to-index m loading)
+        (let (added (assoc m
+                      :buffers
+                        (into (:buffers m)
+                          [(ed-inherit-dir m
+                             (ed-stamp (file-loading-buffer path (loading-name path))))]))
+              popped (ed-pop-to-index added (dec (count (:buffers added)))))
+          (ed-read-launch popped
+            path
+            (fn (landed index)
+              (let (placed (if (nil? line)
+                             landed
+                             (ed-set-buf-at landed
+                               index
+                               (ed-goto-line (ed-buf-at landed index) line))))
+                (if (and after (= (ed-current-index placed) index)) (after placed) placed)))))))))
 
 ;; ---- the jump stack (Emacs's xref marker stack) ---------------------------------
 ;; Where a jump came FROM, newest first: what a command that takes point away to another
