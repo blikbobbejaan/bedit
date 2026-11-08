@@ -1,0 +1,437 @@
+(defmodule sshremote
+  "The TRANSPORT under `/ssh:` paths (`sshedit`): the system `ssh` binary run through brood's
+`os/cmd`, one connection SHARED by every operation on a host (OpenSSH's ControlMaster, its
+socket under the editor's state folder, owner-only, kept `*persist-seconds*` after the last
+use), and the remote half of each operation as a POSIX `sh` script.
+
+- **Nothing the remote LOGIN shell parses but `/bin/sh -s`.** The script — its arguments
+  quoted for POSIX sh (`os/shell-quote`) and set with `set --`, and a write's bytes as Base64
+  in a here-document — goes on ssh's standard input. So a path with a space, a quote, a `$`
+  or a newline-free metacharacter is one argument, whatever shell the account logs into
+  (bash, zsh, fish, csh).
+- **Bytes, not text.** A read comes back through `base64`, so a binary or a file in another
+  coding arrives exactly; the editor decodes it as it decodes any file (`charset`).
+- **A write is atomic.** The bytes are staged in a temporary file in the file's own
+  directory (given the file's mode first: `cp -p`), checked against the byte count and
+  SHA-256 sent with them, then renamed over the file. A file with other hard links, or in a
+  directory the user may not write, is copied into instead. A write cut short leaves the
+  file as it was. A symbolic link is written through.
+- **Never a prompt on the loop.** Every operation runs `BatchMode=yes`: ssh fails at once
+  rather than asking. A failure is CLASSIFIED ([[classify]]) — the host key unknown or
+  changed (never accepted for you), authentication refused (a password may be asked for,
+  [[connect-with-password]]), the connection failed or dropped — and said.
+- **A password is used once.** [[connect-with-password]] opens the shared connection with it:
+  `SSH_ASKPASS` names a helper ([[askpass-helper]]) that reads the password from ssh's own
+  standard input — never the environment, never a file — and refuses every other question
+  (a host-key confirmation above all). The connection then serves the operations without it.
+
+`*program*` names the ssh run — a test binds a stand-in that runs the script locally, so no
+test reaches a network. Pure command construction ([[ssh-argv]], the scripts) is separate
+from the call ([[run]]).")
+
+;; ---- the program and the shared connection --------------------------------------------
+
+(defdyn *program* "ssh")
+;; The ssh program run — a path or a name on PATH. A test binds a stand-in script.
+
+(def *persist-seconds* 300)
+;; How long the shared connection outlives its last operation (ControlPersist).
+
+(def *connect-timeout-seconds* 15)
+;; How long a connection may take to come up before ssh gives up (ConnectTimeout).
+
+(def *alive-interval-seconds* 15)
+;; How often a quiet connection is checked (ServerAliveInterval): a dropped network is noticed
+;; within twice this, instead of an operation waiting on a dead socket until its task times out.
+
+(def *socket-path-max* 100)
+;; The longest control socket path used as is: a Unix socket's path is limited (108 bytes on
+;; Linux, 104 on macOS) and ssh appends a random suffix while it makes one.
+
+(defdyn *control-dir* nil)
+;; Where the sockets go when bound — a test's own folder. nil: [[control-dir]]'s rule.
+
+(defn control-dir ()
+  "Where the shared connections' sockets live: `state/ssh` under the editor's config folder
+(owner-only; [[ensure-control-dir]]) — or, when that path is too long for a Unix socket,
+`$XDG_RUNTIME_DIR/bedit-ssh`, else `/tmp/bedit-ssh-USER`. `*control-dir*` overrides it."
+  (let (preferred (or *control-dir* (path/join (config-paths/config-dir) "state" "ssh")))
+    (if (or *control-dir* (<= (+ (string/length preferred) 1 40 17) *socket-path-max*))
+      preferred
+      (let (runtime (os/env "XDG_RUNTIME_DIR"))
+        (if (and (string? runtime) (not (string/blank? runtime)))
+          (path/join runtime "bedit-ssh")
+          (path/join "/tmp" (str "bedit-ssh-" (or (os/user-name) "user"))))))))
+
+(defn ensure-control-dir ()
+  "Make [[control-dir]] owner-only (0700) — the sockets in it ARE the connections: whoever can
+reach one runs commands as you on that host. Its path."
+  (let (dir (control-dir)) (do (file/mkdir-private dir) dir)))
+
+(defn ssh-options (parts &optional (batch true))
+  "The ssh options every operation on `parts`' host runs with: the shared connection
+(`ControlMaster=auto`, `ControlPath=DIR/%C`, `ControlPersist`), a connect timeout, keep-alives
+that notice a dropped network, no terminal, no escape character — and `BatchMode=yes` unless
+`batch` is false (the one call a password opens, [[connect-with-password]]). The user's own
+`~/.ssh/config` still applies: a `ProxyJump`, an `IdentityFile`, a host alias.
+
+    (includes? (sshremote/ssh-options {:host \"h\"}) \"BatchMode=yes\")   ;=> true"
+  (let (dir (control-dir))
+    (into []
+      (append ["-o"
+                "ControlMaster=auto"
+                "-o"
+                (str "ControlPath=" dir "/%C")
+                "-o"
+                (str "ControlPersist=" *persist-seconds*)
+                "-o"
+                (str "ConnectTimeout=" *connect-timeout-seconds*)
+                "-o"
+                (str "ServerAliveInterval=" *alive-interval-seconds*)
+                "-o"
+                "ServerAliveCountMax=2"
+                "-o"
+                (if batch "BatchMode=yes" "BatchMode=no")
+                "-T"
+                "-e"
+                "none"]
+        (if batch [] ["-o" "NumberOfPasswordPrompts=1"])
+        (if (:port parts) ["-p" (str (:port parts))] [])
+        (if (:user parts) ["-l" (:user parts)] [])))))
+
+(defn ssh-argv (parts remote-command &optional (batch true))
+  "The arguments ssh runs `remote-command` (one string, for the login shell) on `parts`' host
+with: [[ssh-options]], `--` (so nothing after it is an option), the host, the command.
+
+    (last (sshremote/ssh-argv {:host \"h\"} \"/bin/sh -s\"))   ;=> \"/bin/sh -s\""
+  (into (ssh-options parts batch) ["--" (:host parts) remote-command]))
+
+(def *script-command* "/bin/sh -s")
+;; The one command the remote login shell parses: a POSIX shell reading the script from its
+;; standard input. Nothing in it any shell treats specially.
+
+(def- ssh-env
+  ;; ssh's own messages in English, read only to tell what failed
+  {"LC_ALL" "C" "LANG" "C"})
+
+;; ---- the remote scripts -----------------------------------------------------------------
+
+(defn script-with (arguments body)
+  "A script running `body` with `arguments` as its `$1`, `$2`, … — each quoted for POSIX sh
+(`os/shell-quote`), so the remote shell reads it back exactly — and the first resolved
+against the remote home when it starts with `~` (as `$p`).
+
+    (string/starts-with? (sshremote/script-with [\"/a b\" \"it's\"] \"\") \"set -- '/a b' 'it'\")   ;=> true"
+  (str "set --"
+    (string/join (map arguments (fn (argument) (str " " (os/shell-quote argument)))) "")
+    "\n"
+    "p=$1\n"
+    "case $p in \"~\") p=$HOME ;; \"~/\"*) p=$HOME/${p#??} ;; esac\n"
+    body))
+
+(def- mtime-line
+  ;; the file's modification time in seconds, GNU and BSD stat alike, 0 when neither answers
+  "m=$(stat -c %Y -- \"$p\" 2>/dev/null || stat -f %m -- \"$p\" 2>/dev/null || echo 0)\n")
+
+(def- read-body
+  ;; `$2` the largest file sent without asking (0: any). Answers a header — the KIND, the
+  ;; resolved path, then for a file its mtime and size — and for a file small enough its bytes
+  ;; as Base64. Exit 4 is the script's own failure, said on stderr.
+  (str "limit=$2\n"
+    "if [ -d \"$p\" ]; then printf 'dir\\n%s\\n' \"$p\"; exit 0; fi\n" "if [ ! -e \"$p\" ]; then\n"
+    "  d=$(dirname -- \"$p\")\n"
+    "  if [ ! -d \"$d\" ]; then echo \"$d: no such directory\" >&2; exit 4; fi\n"
+    "  printf 'new\\n%s\\n' \"$p\"; exit 0\n" "fi\n"
+    "if [ ! -r \"$p\" ]; then echo \"$p: Permission denied\" >&2; exit 4; fi\n" mtime-line
+    "s=$(wc -c < \"$p\" | tr -d ' ')\n"
+    "if [ \"$limit\" -gt 0 ] && [ \"$s\" -gt \"$limit\" ]; then printf 'large\\n%s\\n%s\\n%s\\n' \"$p\" \"$m\" \"$s\"; exit 0; fi\n"
+    "printf 'file\\n%s\\n%s\\n%s\\n' \"$p\" \"$m\" \"$s\"\n" "base64 < \"$p\" || exit 4\n"))
+
+(defn read-script (path &optional (limit 0))
+  "The script that reads the remote file `path` ([[parse-read]] reads its answer): nothing
+sent past `limit` bytes (0: no limit) but the size, so a large file is asked about first.
+
+    (includes? (sshremote/read-script \"/etc/x y\") \"set -- '/etc/x y' 0\")   ;=> true"
+  (script-with [path (str limit)] read-body))
+
+(def- write-body
+  ;; `$2` the byte count, `$3` the SHA-256; the bytes follow as a here-document the script is
+  ;; given. Staged beside the file, checked, renamed over it (a copy into it where a rename
+  ;; would part it from its hard links or cannot be made). Answers the new mtime.
+  (str "expected=$2; digest=$3\n"
+    "if [ -L \"$p\" ]; then r=$(readlink -f -- \"$p\" 2>/dev/null) && [ -n \"$r\" ] && p=$r; fi\n"
+    "d=$(dirname -- \"$p\")\n"
+    "if [ ! -d \"$d\" ]; then echo \"$d: no such directory\" >&2; exit 4; fi\n"
+    "if [ -e \"$p\" ] && [ ! -w \"$p\" ]; then echo \"$p: Permission denied\" >&2; exit 4; fi\n"
+    "if printf 'aGk=' | base64 -d >/dev/null 2>&1; then dec='base64 -d'\n"
+    "elif printf 'aGk=' | base64 -D >/dev/null 2>&1; then dec='base64 -D'\n"
+    "else echo 'no base64 on this host to receive the file' >&2; exit 4; fi\n" "inplace=0\n"
+    "stage=$(mktemp \"$d/.bedit-write.XXXXXX\" 2>/dev/null) || { inplace=1; stage=$(mktemp \"${TMPDIR:-/tmp}/.bedit-write.XXXXXX\") || exit 4; }\n"
+    "trap 'rm -f -- \"$stage\"' EXIT\n" "trap 'exit 4' HUP INT TERM\n"
+    "newmode=$(printf '%o' $((0666 & ~$(umask))))\n"
+    "if [ -e \"$p\" ]; then cp -p -- \"$p\" \"$stage\" 2>/dev/null || chmod \"$newmode\" \"$stage\"; else chmod \"$newmode\" \"$stage\"; fi\n"
+    "$dec > \"$stage\" <<'BEDIT_EOF' || exit 4\n"))
+
+(def- write-tail
+  (str "BEDIT_EOF\n"
+    "size=$(wc -c < \"$stage\" | tr -d ' ')\n"
+    "if [ \"$size\" != \"$expected\" ]; then echo \"$size of $expected bytes arrived; the file is unchanged\" >&2; exit 4; fi\n"
+    "if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum < \"$stage\" | cut -d' ' -f1)\n"
+    "elif command -v shasum >/dev/null 2>&1; then got=$(shasum -a 256 < \"$stage\" | cut -d' ' -f1)\n"
+    "else got=$digest; fi\n"
+    "if [ \"$got\" != \"$digest\" ]; then echo 'the bytes arrived changed; the file is unchanged' >&2; exit 4; fi\n"
+    "links=1\n" "if [ -e \"$p\" ]; then links=$(ls -ld -- \"$p\" | awk '{print $2}'); fi\n"
+    "if [ $inplace = 1 ] || [ \"$links\" -gt 1 ]; then\n"
+    "  cat -- \"$stage\" > \"$p\" || { echo \"$p: could not be written\" >&2; exit 4; }\n"
+    "elif ! mv -f -- \"$stage\" \"$p\"; then echo \"$p: could not be replaced\" >&2; exit 4; fi\n"
+    mtime-line "printf '%s\\n' \"$m\"\n"))
+
+(defn wrap-base64 (text &optional (width 76))
+  "Base64 `text` cut into lines of `width` characters, the last one ended too — what a
+here-document carries to `base64 -d` on the remote.
+
+    (sshremote/wrap-base64 \"abcdef\" 4)   ;=> \"abcd\\nef\\n\""
+  (if (= text "")
+    ""
+    (str (regex/replace (str ".{1," width "}") text "$0\n"))))
+
+(defn write-script (path content)
+  "The script that writes `content` (bytes, or text as UTF-8) over the remote file `path`,
+atomically ([[parse-write]] reads its answer): the bytes as Base64 in a here-document, their
+count and SHA-256 sent with them.
+
+    (includes? (sshremote/write-script \"/srv/a\" \"hi\") \"aGk=\\nBEDIT_EOF\")   ;=> true"
+  (let (bytes (if (string? content) (string/->bytes content) (bytes/concat content)))
+    (str (script-with [path (str (bytes/length bytes)) (hash/sha256-bytes bytes)] write-body)
+      (wrap-base64 (encoding/base64-encode-bytes bytes))
+      write-tail)))
+
+(def- list-body
+  ;; the resolved directory, then its entries as `ls -1pa` gives them (a directory with `/`)
+  (str "cd -- \"$p\" 2>/dev/null || { echo \"$p: cannot list\" >&2; exit 4; }\n"
+    "pwd\n" "ls -1pa\n"))
+
+(defn list-script (path)
+  "The script that lists the remote directory `path` ([[parse-list]] reads its answer).
+
+    (includes? (sshremote/list-script \"~/src\") \"ls -1pa\")   ;=> true"
+  (script-with [path] list-body))
+
+;; ---- reading the answers ----------------------------------------------------------------
+
+(defn- lines-of (text)
+  (string/split (string/replace text "\r" "") "\n"))
+
+(defn parse-read (stdout)
+  "What a read script answered, as data: `{:kind :file :path :mtime :size :bytes}`,
+`{:kind :large :path :mtime :size}` (past the limit: asked about first), `{:kind :new :path}`
+(no file yet), `{:kind :dir :path}` — `:path` resolved by the remote shell (`~` expanded) —
+or a failure when the answer does not read.
+
+    (sshremote/parse-read \"new\\n/home/me/x\\n\")   ;=> {:kind :new :path \"/home/me/x\"}
+    (:bytes (sshremote/parse-read \"file\\n/a\\n10\\n2\\naGk=\\n\"))   ;=> #b\"hi\""
+  (let (lines (lines-of stdout)
+        kind (first lines)
+        path (second lines))
+    (cond
+      (or (nil? path) (= path "")) (failure (str "ssh: an answer that does not read: " stdout))
+      (= kind "dir") {:kind :dir :path path}
+      (= kind "new") {:kind :new :path path}
+      (or (= kind "file") (= kind "large"))
+        (let (mtime (string/->number (or (nth lines 2 nil) ""))
+              size (string/->number (or (nth lines 3 nil) "")))
+          (if (or (not (int? mtime)) (not (int? size)))
+            (failure (str "ssh: an answer that does not read: " kind))
+            (if (= kind "large")
+              {:kind :large :path path :mtime mtime :size size}
+              (let (bytes (encoding/base64-decode-bytes (string/join (drop lines 4) "")))
+                (if (failure? bytes)
+                  (failure "ssh: the file's bytes arrived damaged")
+                  {:kind :file :path path :mtime mtime :size size :bytes bytes})))))
+      else (failure (str "ssh: an answer that does not read: " kind)))))
+
+(defn parse-write (stdout)
+  "The new modification time (seconds) a write script answered, or nil when it said none.
+
+    (sshremote/parse-write \"1700000000\\n\")   ;=> 1700000000"
+  (let (number (string/->number (string/trim stdout)))
+    (when (int? number) number)))
+
+(defn parse-list (stdout)
+  "What a list script answered: `{:dir resolved :names [...]}`, the names sorted, a
+directory's ending in `/`, `.` and `..` left out.
+
+    (sshremote/parse-list \"/srv\\n./\\n../\\nb\\na/\\n\")   ;=> {:dir \"/srv\" :names [\"a/\" \"b\"]}"
+  (let (lines (seq/reject (lines-of stdout) (fn (line) (= line ""))))
+    {:dir (first lines)
+     :names (vec (sort (seq/reject (rest lines) (fn (line) (or (= line "./") (= line "../"))))))}))
+
+;; ---- what failed --------------------------------------------------------------------------
+
+(defn- methods-of (stderr)
+  ;; the authentication methods a `Permission denied (publickey,password).` names
+  (let (found (regex/find "Permission denied \\(([^)]*)\\)" stderr))
+    (if (nil? found) [] (string/split (or (:text (first (:groups found))) "") ","))))
+
+(defn classify (result parts)
+  "What an ssh `result` (`os/cmd`'s map) means: nil when ssh did its part (the script's own
+exit is read by the caller), else `{:error kind :reason text}` — `:host-key` (the host's key is
+not known, or changed: never accepted here), `:auth` (no key or agent worked; `:password?`
+when the host would take a password), `:connection` (the host could not be reached, or the
+connection dropped), `:timeout`. ssh's own failures exit 255.
+
+    (:error (sshremote/classify {:exit 255 :stderr \"Host key verification failed.\\n\"} {:host \"h\"}))   ;=> :host-key"
+  (let (stderr (or (:stderr result) "")
+        said (string/trim stderr)
+        who (sshpath/host-label parts))
+    (cond
+      (:timed-out result) {:error :timeout :reason (str "ssh: " who " did not answer in time")}
+      (not (= 255 (:exit result))) nil
+      (includes? stderr "Host key verification failed")
+        {:error :host-key
+         :reason (str "ssh: "
+                   who "'s host key is not known, or has CHANGED — check it with `ssh " who
+                   "` in a terminal; bedit never accepts a host key for you")}
+      (includes? stderr "Permission denied")
+        (let (methods (methods-of stderr))
+          {:error :auth
+           :password? (or (includes? methods "password") (includes? methods "keyboard-interactive"))
+           :reason (str "ssh: "
+                     who
+                     " refused every key and the agent ("
+                     (string/join methods ",")
+                     ")")})
+      else
+        {:error :connection
+         :reason (str "ssh: the connection to "
+                   who
+                   " failed or dropped"
+                   (if (= said "") "" (str ": " said)))})))
+
+;; ---- running ------------------------------------------------------------------------------
+
+(def *operation-timeout-ms* 120000)
+;; How long one operation may take before ssh is killed and it is said to have failed.
+
+(defn- ssh-call (parts remote-command stdin batch extra-env)
+  ;; one ssh run, its result classified: `:failed` set when ssh itself failed
+  (let (_ (ensure-control-dir)
+        result (os/cmd *program*
+                 (ssh-argv parts remote-command batch)
+                 {:stdin stdin :env (merge ssh-env extra-env) :timeout-ms *operation-timeout-ms*})
+        failed (classify result parts))
+    (if (nil? failed) result (assoc result :failed failed))))
+
+(defn run (parts script)
+  "Run `script` on `parts`' host — `/bin/sh -s` reading it from ssh's standard input — and
+answer `os/cmd`'s map, or for a failure of ssh's own the map with `:failed` set to
+[[classify]]'s answer. Batch mode: ssh never asks anything. Blocks: run it in a task."
+  (ssh-call parts *script-command* script true {}))
+
+(defn- script-failure (result)
+  ;; the remote script's own failure (exit 4 and the rest), as a failure carrying its reason
+  (let (said (string/trim (or (:stderr result) "")))
+    (failure (if (= said "") (str "the remote command exited " (:exit result)) said))))
+
+(defn read-file (parts path &optional (limit 0))
+  "Read the remote file `path` on `parts`' host: [[parse-read]]'s answer, a failure carrying
+the remote reason, or `{:failed …}` ([[classify]]) when ssh itself failed. Blocks."
+  (let (result (run parts (read-script path limit)))
+    (cond
+      (:failed result) {:failed (:failed result)}
+      (= 0 (:exit result)) (parse-read (:stdout result))
+      else (script-failure result))))
+
+(defn write-file (parts path content)
+  "Write `content` over the remote file `path` on `parts`' host ([[write-script]]):
+`{:mtime seconds}`, a failure carrying the remote reason, or `{:failed …}` when ssh itself
+failed — a connection that dropped mid-write leaves the file as it was. Blocks."
+  (let (result (run parts (write-script path content)))
+    (cond
+      (:failed result) {:failed (:failed result)}
+      (= 0 (:exit result)) {:mtime (parse-write (:stdout result))}
+      else (script-failure result))))
+
+(defn list-dir (parts path)
+  "List the remote directory `path` on `parts`' host: [[parse-list]]'s answer, a failure, or
+`{:failed …}`. Blocks."
+  (let (result (run parts (list-script path)))
+    (cond
+      (:failed result) {:failed (:failed result)}
+      (= 0 (:exit result)) (parse-list (:stdout result))
+      else (script-failure result))))
+
+;; ---- a password, once ---------------------------------------------------------------------
+
+(def askpass-source
+  ;; SSH_ASKPASS's helper. ssh runs it with the question as $1 and its OWN standard input,
+  ;; which the password call fills with the password and nothing else. A yes/no question — a
+  ;; host key to accept, above all — is refused (exit 1: ssh takes it as "no").
+  (str "#!/bin/sh\n"
+    "case \"$1\" in *yes/no*|*fingerprint*|*'(yes'*) exit 1 ;; esac\n"
+    "IFS= read -r secret || exit 1\n" "printf '%s\\n' \"$secret\"\n"))
+
+(defn askpass-helper ()
+  "The SSH_ASKPASS helper's path in [[control-dir]], written (owner-only, executable) when it
+is missing or out of date."
+  (let (dir (ensure-control-dir)
+        helper (path/join dir "askpass"))
+    (do
+      (when (not (= (check-allow :discarded-catch (try (file/slurp helper) (catch _ nil)))
+                   askpass-source))
+        (file/spit-private helper askpass-source))
+      (os/cmd "chmod" ["700" helper])
+      helper)))
+
+(defn connect-with-password (parts password)
+  "Open the shared connection to `parts`' host with `password` (a password, or a key's
+passphrase — what ssh asks first), so the operations that follow run through it without one.
+The password reaches ssh's askpass helper on standard input and goes nowhere else: not the
+environment, not a file, not the model. True, or `{:failed …}` ([[classify]]) — a wrong
+password is `:auth`."
+  ;; the remote command is `true`, which reads nothing: were the password ever not taken by
+  ;; the helper (a key that works after all), no shell on the host would run it as a command
+  (let (result (ssh-call parts
+                 "true"
+                 (str password "\n")
+                 false
+                 {"SSH_ASKPASS" (askpass-helper)
+                  "SSH_ASKPASS_REQUIRE" "force"
+                  "DISPLAY" (or (os/env "DISPLAY") ":0")}))
+    (cond
+      (:failed result) {:failed (:failed result)}
+      else true)))
+
+;; ---- the directory listings the path prompt completes from -------------------------------
+;; A remote directory's entries, kept a few seconds per directory, so typing within it asks
+;; the host once. A table, not model state: the prompt's completion asks from a task.
+
+(def- *listings* (table/new))
+
+(def *listing-fresh-ms* 10000)
+;; How long a remote listing is trusted. A failure is kept as long, so a host that refuses
+;; is not asked on every key.
+
+(defn cached-listing (dir-spec)
+  "The entries of the remote directory `dir-spec` (an ssh path) listed within the last
+`*listing-fresh-ms*` — a sorted vector, a directory's names ending in `/` — `[]` for a
+directory that could not be listed, or nil when it has not been asked lately."
+  (let (hit (table/get *listings* dir-spec))
+    (when (and hit (< (- (os/now) (first hit)) *listing-fresh-ms*)) (second hit))))
+
+(defn fetch-listing (dir-spec)
+  "List the remote directory `dir-spec` now and keep the answer ([[cached-listing]]): its
+entries, or `[]` when it cannot be listed (no connection without a password, no such
+directory). Blocks: the prompt calls it from a task."
+  (let (parts (sshpath/parse dir-spec)
+        answer (if (nil? parts) nil (list-dir parts (:path parts)))
+        names (if (and (map? answer) (vector? (:names answer))) (:names answer) []))
+    (do
+      (when (>= (table/count *listings*) 64)
+        (doseq (entry (table/snapshot *listings*)) (table/delete *listings* (first entry))))
+      (table/put *listings* dir-spec [(os/now) names])
+      names)))
+
+(defn forget-listing (dir-spec)
+  "Drop what is kept of the remote directory `dir-spec`: a save made a new entry there."
+  (table/delete *listings* dir-spec))

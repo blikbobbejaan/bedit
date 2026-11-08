@@ -1,0 +1,182 @@
+(defmodule sshpath
+  "The TRAMP `/ssh:` path — a file on another machine, reached through `ssh` (`sshedit`):
+`/ssh:host:/etc/nginx.conf`, `/ssh:user@host:path`, `/ssh:user@host#2222:path`, an IPv6
+host in brackets (`/ssh:[::1]:/etc/hosts`). Read and spelled in ONE place, so the prompt
+(`filename`), the sidecars (`sidecar`), the completion (`mincomplete`) and the handler agree
+on what a path names. Pure: no process, no disk.
+
+The path after the host is the REMOTE machine's: `~` is the remote home, a relative path is
+under it (`/ssh:host:notes` is `/ssh:host:~/notes`), and an empty one is the home itself.
+The remote shell resolves `~` when the file is read ([[canonical]] keeps it as typed).")
+
+(def *prefix* "/ssh:")
+
+(defn remote? (path)
+  "Whether `path` names a file on another machine through ssh: a string that starts with
+`/ssh:`. Every local tool asks this before it touches a path (auto-revert, diff-hl, LSP,
+compile, the project walk).
+
+    (sshpath/remote? \"/ssh:web1:/etc/hosts\")   ;=> true
+    (sshpath/remote? \"/etc/hosts\")   ;=> false
+    (sshpath/remote? nil)   ;=> false"
+  (and (string? path) (string/starts-with? path *prefix*)))
+
+(defn- bad-name? (name)
+  ;; a user or host that could be read as an option by ssh, or that holds a blank
+  (or (not (string? name)) (string/starts-with? name "-") (not (nil? (regex/find "\\s" name)))))
+
+(defn- split-user (rest)
+  ;; `[user host-and-path]`: the user when an `@` comes before the first `:`
+  (let (at (index-of rest "@")
+        colon (index-of rest ":"))
+    (if (and (> at 0) (or (< colon 0) (< at colon)))
+      [(string/substring rest 0 at) (string/substring rest (inc at) (string/length rest))]
+      [nil rest])))
+
+(defn- split-host (text)
+  ;; `[host after]` — a bracketed IPv6 host up to its `]`, else up to the first `:` or `#`;
+  ;; nil when a bracket never closes
+  (if (string/starts-with? text "[")
+    (let (close (index-of text "]"))
+      (when (> close 0)
+        [(string/substring text 1 close) (string/substring text (inc close) (string/length text))]))
+    (let (end (first (sort (seq/filter [(index-of text ":") (index-of text "#")]
+                             (fn (index) (>= index 0))))))
+      (when (int? end)
+        [(string/substring text 0 end) (string/substring text end (string/length text))]))))
+
+(defn- split-port (after)
+  ;; `[port path]` from what follows the host: `#2222:path` or `:path`; nil when malformed
+  (cond
+    (string/starts-with? after ":") [nil (string/substring after 1 (string/length after))]
+    (string/starts-with? after "#")
+      (let (colon (index-of after ":")
+            digits (when (> colon 1) (string/substring after 1 colon))
+            port (when (and digits (regex/matches? "[0-9]+" digits)) (string/->number digits)))
+        (when (and (int? port) (> port 0) (< port 65536))
+          [port (string/substring after (inc colon) (string/length after))]))
+    else nil))
+
+(defn parse (spec)
+  "The parts of the TRAMP ssh path `spec` as `{:user :host :port :path}` — `:user` and `:port`
+nil when it names none — or nil when `spec` is not one: no `/ssh:` prefix, no host, no `:`
+after it, a port that is not a number, or a user or host that starts with `-` or holds a
+blank (which ssh would take for an option).
+
+    (sshpath/parse \"/ssh:web1:/etc/hosts\")   ;=> {:user nil :host \"web1\" :port nil :path \"/etc/hosts\"}
+    (sshpath/parse \"/ssh:me@web1#2222:notes\")   ;=> {:user \"me\" :host \"web1\" :port 2222 :path \"notes\"}
+    (:host (sshpath/parse \"/ssh:[::1]:/x\"))   ;=> \"::1\"
+    (sshpath/parse \"/ssh:-oProxyCommand=x:/etc\")   ;=> nil
+    (sshpath/parse \"/etc/hosts\")   ;=> nil"
+  (when (remote? spec)
+    (let ([user rest] (split-user (string/substring spec 5 (string/length spec)))
+          host-split (split-host rest)
+          host (when host-split (first host-split))
+          port-split (when host-split (split-port (second host-split))))
+      (when (and port-split
+              (string? host)
+              (not (string/blank? host))
+              (not (bad-name? host))
+              (or (nil? user) (and (not (string/blank? user)) (not (bad-name? user)))))
+        {:user user :host host :port (first port-split) :path (second port-split)}))))
+(sig parse (any -> (or nil map)))
+
+(defn host-label (parts)
+  "Who `parts` connects to, as a person reads it: `user@host#port`, the parts it names.
+
+    (sshpath/host-label {:user \"me\" :host \"web1\" :port 2222})   ;=> \"me@web1#2222\"
+    (sshpath/host-label {:host \"web1\"})   ;=> \"web1\""
+  (str (if (:user parts) (str (:user parts) "@") "")
+    (if (includes? (:host parts) ":") (str "[" (:host parts) "]") (:host parts))
+    (if (:port parts) (str "#" (:port parts)) "")))
+
+(defn spec (parts)
+  "The TRAMP path `parts` spell — [[parse]] read back.
+
+    (sshpath/spec {:host \"web1\" :path \"/etc/hosts\"})   ;=> \"/ssh:web1:/etc/hosts\"
+    (sshpath/spec {:user \"me\" :host \"::1\" :port 22 :path \"~\"})   ;=> \"/ssh:me@[::1]#22:~\""
+  (str *prefix* (host-label parts) ":" (:path parts)))
+
+(defn remote-path (path)
+  "The remote path `path` (what follows the host) in its one spelling: `.` and `..`
+collapsed, a trailing `/` dropped, a relative path under the home (`~/…`), an empty one the
+home (`~`).
+
+    (sshpath/remote-path \"/etc/../srv/a/\")   ;=> \"/srv/a\"
+    (sshpath/remote-path \"notes\")   ;=> \"~/notes\"
+    (sshpath/remote-path \"\")   ;=> \"~\"
+    (sshpath/remote-path \"/\")   ;=> \"/\""
+  (let (rooted (cond
+                 (or (= path "") (= path "~") (= path "~/")) "~"
+                 (or (string/starts-with? path "/") (string/starts-with? path "~/")) path
+                 else (str "~/" path))
+        normal (path/normalize rooted))
+    (cond
+      (= normal ".") "~"
+      (and (> (string/length normal) 1) (string/ends-with? normal "/"))
+        (string/substring normal 0 (dec (string/length normal)))
+      else normal)))
+
+(defn canonical (text)
+  "The ssh path `text` in its one spelling ([[remote-path]] for its path), or nil when it is
+not one — what a buffer visiting it is keyed by, so `/ssh:h:/etc/./hosts` and
+`/ssh:h:/etc/hosts` are one buffer.
+
+    (sshpath/canonical \"/ssh:h:/etc/./hosts\")   ;=> \"/ssh:h:/etc/hosts\"
+    (sshpath/canonical \"/ssh:h:\")   ;=> \"/ssh:h:~\""
+  (when-let (parts (parse text))
+    (spec (assoc parts :path (remote-path (:path parts))))))
+
+(defn with-path (spec-text path)
+  "The ssh path `spec-text` with its remote path replaced by `path` — the same host, user and
+port.
+
+    (sshpath/with-path \"/ssh:me@h:/etc/hosts\" \"/srv\")   ;=> \"/ssh:me@h:/srv\""
+  (when-let (parts (parse spec-text)) (spec (assoc parts :path path))))
+
+(defn path-of (spec-text)
+  "The remote path of the ssh path `spec-text` (what follows the host), or nil.
+
+    (sshpath/path-of \"/ssh:h:/etc/hosts\")   ;=> \"/etc/hosts\""
+  (:path (parse spec-text)))
+
+(defn dirname (spec-text)
+  "The directory holding the file the ssh path `spec-text` names, as an ssh path.
+
+    (sshpath/dirname \"/ssh:h:/etc/hosts\")   ;=> \"/ssh:h:/etc\"
+    (sshpath/dirname \"/ssh:h:~/notes\")   ;=> \"/ssh:h:~\"
+    (sshpath/dirname \"/ssh:h:/etc\")   ;=> \"/ssh:h:/\""
+  (when-let (parts (parse spec-text))
+    (let (path (remote-path (:path parts))
+          parent (cond
+                   (or (= path "/") (= path "~")) path
+                   else
+                     (let (slash (string/last-index-of path "/"))
+                       (cond
+                         (= slash 0) "/"
+                         (> slash 0) (string/substring path 0 slash)
+                         else "~"))))
+      (spec (assoc parts :path parent)))))
+
+(defn connection (parts)
+  "What two paths share when one ssh connection serves both: `[user host port]`.
+
+    (sshpath/connection (sshpath/parse \"/ssh:me@h:/a\"))   ;=> [\"me\" \"h\" nil]"
+  [(:user parts) (:host parts) (:port parts)])
+
+(defn remote-start (text)
+  "Where the ssh path in typed `text` starts — 0 when `text` is one, the index of a `/ssh:`
+right after a `/` when one was typed over a path (`~/src//ssh:h:/etc`, a restart) — or nil
+when `text` names no remote file. The LAST such restart counts.
+
+    (sshpath/remote-start \"/ssh:h:/etc\")   ;=> 0
+    (sshpath/remote-start \"~/src//ssh:h:/etc\")   ;=> 6
+    (sshpath/remote-start \"~/src/ssh:h\")   ;=> nil"
+  (letrec (scan (fn (from found)
+                  (let (index (index-of text *prefix* from))
+                    (cond
+                      (< index 0) found
+                      (or (= index 0) (= (string/substring text (dec index) index) "/"))
+                        (scan (inc index) index)
+                      else (scan (inc index) found)))))
+    (scan 0 nil)))

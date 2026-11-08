@@ -49,15 +49,62 @@ shared Tab action behind find-file, project find-file, switch-buffer and M-x."
 `$HOME/`, a `$$` all stay as they are, so a candidate reads the way you wrote it), the
 directory that prefix names (`filename/expand`: absolute, a relative one under `base`), and
 the fragment being completed, read as a name (`$$` is `$`). With no `/`, the directory
-is `base` (else `.`) and there is nothing to reattach."
-  (let (live (string/substring typed (filename/shadow-end typed base) (string/length typed))
-        i (ed-last-slash live (dec (string/length live))))
-    (if (< i 0)
-      {:dir (or base ".") :prefix "" :frag (filename/substitute live base)}
-      (let (prefix (string/substring live 0 (inc i)))
-        {:dir (without-trailing-slash (filename/expand prefix base))
-         :prefix prefix
-         :frag (filename/substitute (string/substring live (inc i) (string/length live)) base)}))))
+is `base` (else `.`) and there is nothing to reattach. A remote path is
+[[ed-split-remote]]'s."
+  (if (sshpath/remote-start typed)
+    (ed-split-remote typed)
+    (let (live (string/substring typed (filename/shadow-end typed base) (string/length typed))
+          i (ed-last-slash live (dec (string/length live))))
+      (if (< i 0)
+        {:dir (or base ".") :prefix "" :frag (filename/substitute live base)}
+        (let (prefix (string/substring live 0 (inc i))
+              dir (filename/expand prefix base))
+          {:dir (if (sshpath/remote? dir) (sshpath/canonical dir) (without-trailing-slash dir))
+           :prefix prefix
+           :frag (filename/substitute (string/substring live (inc i) (string/length live)) base)})))))
+
+(defn- ed-split-remote (typed)
+  "[[ed-split-path]] for a typed REMOTE path (`/ssh:h:/etc/ng`): the path it means
+(`filename/substitute`, its restarts applied) split at its last `/` — the prefix with the host
+(`/ssh:h:/etc/`), the remote directory it names in its one spelling (`sshpath/canonical`, the
+key its listing is kept under), the fragment. With no `/` after the host, the directory is the
+remote home. While the host is still being typed, no directory (`:dir` nil)."
+  (let (meant (filename/substitute typed)
+        remote (filename/remote-split meant)
+        path (when remote (:path remote)))
+    (if (nil? path)
+      {:dir nil :prefix typed :frag ""}
+      (let (i (ed-last-slash path (dec (string/length path))))
+        (if (< i 0)
+          {:dir (sshpath/canonical (:prefix remote)) :prefix (:prefix remote) :frag path}
+          (let (head (str (:prefix remote) (string/substring path 0 (inc i))))
+            {:dir (sshpath/canonical head)
+             :prefix (path/escape-env head)
+             :frag (string/substring path (inc i) (string/length path))}))))))
+
+(defn- remote-candidates (p names)
+  "The entries in a remote directory's `names` (its cached listing, a directory's ending in `/`)
+completing split-path `p`, spelled as candidates: the prefix with the host, the name escaped."
+  (map (seq/filter names (fn (name) (string/starts-with? name (:frag p))))
+    (fn (name) (str (:prefix p) (path/escape-env name)))))
+
+(defn remote-listing-wanted? (text &optional base)
+  "Whether completing path `text` needs a remote directory LISTED first: it names a directory on
+another machine whose entries are not kept (`sshremote/cached-listing`). What makes the path
+prompt ask off the loop (its `:async-when`) rather than on the key."
+  (and (or (sshpath/remote? base) (includes? text sshpath/*prefix*))
+    (let (dir (:dir (ed-split-path text base)))
+      (and (sshpath/remote? dir) (nil? (sshremote/cached-listing dir))))))
+
+(defn ed-remote-candidates-fetched (text recent n &optional base)
+  "[[ed-path-candidates-top]] for `text` once its remote directory has been listed — the listing
+fetched now (`sshremote/fetch-listing`). Blocks on the network: the path prompt runs it off the
+loop (its `:async-source`)."
+  (let (dir (:dir (ed-split-path text base)))
+    (do
+      (when (and (sshpath/remote? dir) (nil? (sshremote/cached-listing dir)))
+        (sshremote/fetch-listing dir))
+      (ed-path-candidates-top text recent n base))))
 
 (defn- without-trailing-slash (dir)
   "`dir` without the `/` that ends it — except the root, which is only that."
@@ -116,7 +163,11 @@ as you type (shares `ed-dir-matches` with `ed-complete-path`). Each is spelled a
 the directory, the entry's name escaped (`path-candidate`), so putting one on the line, or
 accepting it, reads back as that file. A relative `text` lists under `base`."
   (let (p (ed-split-path text base))
-    (map (ed-dir-matches p) (fn (nm) (path-candidate p nm)))))
+    (cond
+      (nil? (:dir p)) ()
+      ;; a remote directory completes from its kept listing, never the local disk
+      (sshpath/remote? (:dir p)) (remote-candidates p (or (sshremote/cached-listing (:dir p)) []))
+      else (map (ed-dir-matches p) (fn (nm) (path-candidate p nm))))))
 
 ;; ---- name completion (against a fixed candidate list) -----------------------
 
@@ -217,21 +268,28 @@ them first (most recent first), then the rest by name. Lists the directory once 
 to it and stats only the entries returned. In input spelling, like `ed-path-candidates`;
 a relative `text` lists under `base`."
   (let (p (ed-split-path text base)
-        listing (current-listing (:dir p) (:frag p)))
-    (if (nil? listing)
-      ()
-      (let (names listing
-            frag (:frag p)
-            ;; the recent files among the candidates, spelled as the candidates are
-            present (seq/keep recent (fn (r) (recent-candidate p names r)))
-            present-set (into #{} present)
-            total (count names)
-            want (math/max 0 (- n (count present))))
-        (letrec (walk (fn (i acc)
-                        (if (or (>= (count acc) want)
-                              (>= i total)
-                              (not (string/starts-with? (nth names i) frag)))
-                          (reverse acc)
-                          (let (cand (path-candidate p (nth names i)))
-                            (walk (inc i) (if (contains? present-set cand) acc (cons cand acc)))))))
-          (take (append present (walk (first-at-or-after names frag 0 total) '())) n))))))
+        remote? (sshpath/remote? (:dir p))
+        listing (cond
+                  (nil? (:dir p)) nil
+                  remote? nil
+                  else (current-listing (:dir p) (:frag p))))
+    (cond
+      (nil? (:dir p)) ()
+      remote? (take (remote-candidates p (or (sshremote/cached-listing (:dir p)) [])) n)
+      (nil? listing) ()
+      else
+        (let (names listing
+              frag (:frag p)
+              ;; the recent files among the candidates, spelled as the candidates are
+              present (seq/keep recent (fn (r) (recent-candidate p names r)))
+              present-set (into #{} present)
+              total (count names)
+              want (math/max 0 (- n (count present))))
+          (letrec (walk (fn (i acc)
+                          (if (or (>= (count acc) want)
+                                (>= i total)
+                                (not (string/starts-with? (nth names i) frag)))
+                            (reverse acc)
+                            (let (cand (path-candidate p (nth names i)))
+                              (walk (inc i) (if (contains? present-set cand) acc (cons cand acc)))))))
+            (take (append present (walk (first-at-or-after names frag 0 total) '())) n))))))
