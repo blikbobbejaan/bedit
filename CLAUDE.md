@@ -91,7 +91,10 @@ feature work — surfacing it is half the point of this project.
 src/main.blsp               entry point — window / daemon startup (--serve/--attach), runs the ui-run loop;
                             `-nw` / `--no-window` runs it in the TERMINAL over brood's terminal
                             display (brood ADR-586/587), and so does no display at all (no
-                            $DISPLAY / $WAYLAND_DISPLAY, ssh), with a one-line note
+                            $DISPLAY / $WAYLAND_DISPLAY, ssh), with a one-line note. A hung-up terminal
+                            and a window whose compositor or X server died (`[:hangup :display-lost]`,
+                            brood ADR-631) end the loop the same way: every unsaved buffer to its
+                            sidecar first (`display-hangup`), no restart
 src/startup.blsp            the ONE startup path the window and `--serve` share: the runtime's
                             (grammars, slow-turn log, savehist, colours + `:theme`, packages), a
                             model's (init.blsp's model settings, recentf, save-place), a window's
