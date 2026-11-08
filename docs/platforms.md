@@ -64,7 +64,8 @@ The step has a timeout (the driver kills the editor past `REAL_WINDOW_TIMEOUT_MS
 (`editor.log`) are uploaded as the `real-window-<os>` artifact whether it passed or not.
 
 Linux gets the same check in a job of its own, `real-window-linux`, twice: under a private
-Xvfb, where the OS input (xdotool's XTEST) is REQUIRED — nothing there refuses it — and under
+Xvfb, where the OS input (xdotool's XTEST) is tried and reported — not yet required: its keys did
+not reach the window in CI's first run, with no window manager to give it the focus — and under
 a headless Weston (`weston --backend=headless`), where only the loop input runs (no input tool
 reaches a headless Weston), so winit's Wayland backend opens, paints and saves too. Locally:
 `tools/ci/real-window.sh nest /tmp/rw x11` (needs `xvfb-run`; opens nothing on your screen).
@@ -105,7 +106,7 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; `recover_test` reads the sidecar's ACL back with `icacls`) |
 | terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
 | a real window: opens on the desktop, paints (captured, not blank), typed keys reach the loop, C-x C-s writes the file | ✅ `real-window.sh` | ✅ `real-window.sh` (Linux too: Xvfb and headless Weston) |
-| the OS keyboard reaching that window | tried each run (System Events), reported, not required | tried each run (SendKeys), reported, not required (Linux: required, xdotool under Xvfb) |
+| the OS keyboard reaching that window | tried each run (System Events), reported, not required | tried each run (SendKeys), reported, not required (Linux too, xdotool under Xvfb, until its keys are seen arriving) |
 | font discovery, file watching (auto-revert) | not run — headless | not run — headless |
 
 ## Fixed on the way
