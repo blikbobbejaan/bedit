@@ -402,7 +402,8 @@ src/scrollbar.blsp          the overlay scrollbar: the thumb as render ops, the 
 src/mouse.blsp              `[:mouse …]` folded into the model: a click, a drag selection, the
                             scrollbar's thumb, a divider's resize, the wheel on the pane under the
                             pointer. A middle click places point (`ed-mouse-set-point`) and commands
-                            yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`)
+                            yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`).
+                            A C-M-drag selects a rectangle (`:rectangle?` on the `:text-drag`)
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
                             feature: a pane body's layers share ONE geometry map, the mode
                             line's feature chips come from the statusbar registry, and what
@@ -571,7 +572,9 @@ src/killing.blsp            the kills and yanks (coalescing, M-y, C-u N C-y), za
                             middle click's PRIMARY yank
 src/editing.blsp            open-line, transposes (negative arguments drag backward), duplicate /
                             join, case, read-only toggle, undo / redo
-src/region.blsp             the mark commands, narrowing, `ed-active-region`
+src/region.blsp             the mark commands, narrowing, `ed-active-region`, rectangle-mark-mode (C-x SPC:
+                            `:rectangle-mark` on the buffer, painted as a block, C-w / M-w / C-y act
+                            on it through `killing`; dropped by a post-step once the mark goes)
 src/search-commands.blsp    the entry points of isearch, occur, the fuzzy line search and the
                             query-replace prompts (the loops are isearch's and query-replace's)
                             Other features' commands live with them (dired, help, vim, registers,
