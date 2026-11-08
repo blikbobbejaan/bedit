@@ -1001,7 +1001,9 @@ src/ansicolor.blsp          a program's ANSI colours on the buffer its output st
                             A lone `\r` rewrites its output line (`carriage` / `insert-output`,
                             Emacs's comint-carriage-motion): a progress counter shows one count
 src/wrap.blsp              where a line falls on screen rows: the pure break rule (a line →
-                            `[from to]` row segments, word-wrapped at the pane width) and the
+                            `[from to]` row segments, wrapped at the pane width where Unicode lets a line break —
+                            UAX #14, brood's `string/break-opportunities`: CJK between characters)
+                            and the
                             ONE row of a truncated line (`one-row`: cut before the cells its
                             ellipsis takes, never halving a wide glyph; a clip `[cut ellipsis]`
                             rides the row) — per line, by `line-policy`. The row↔line owner
