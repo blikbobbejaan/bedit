@@ -1,0 +1,178 @@
+;; tests/snippet_test.blsp — snippets (src/snippet.blsp): the template syntax, an expansion's
+;; text and fields, TAB / S-TAB through them, typing over a default, mirrors following their
+;; field, the expansion as one undo step, what ends a snippet, the mode's table with
+;; init.blsp's `:snippets` over the built-in one, and a snippet taken from the completion popup.
+;; A language server's snippet completion is in tests/lsp_test.blsp.
+
+(defmodule snippet-test
+  (:use test)
+  (:use model)
+  (:use input)
+  (:use snippet)
+  (:use complete-at-point) ; cmd-complete and the source table it asks
+  (:use editor/buffer))
+
+(defn- file-model (text file point)
+  (let (m (ed-init (make-buffer text file file)))
+    (ed-set-buf m (goto-char (ed-current-buf m) point))))
+(defn- cur (m) (ed-current-buf m))
+(defn- press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+(defn- text-of (m) (buffer-text (cur m)))
+(defn- point-of (m) (buffer-point (cur m)))
+(defn- region-of (m) (buffer-region-bounds (cur m)))
+(defn- stops-of (parsed) (vec (map (:stops parsed) (fn (s) [(:number s) (:start s) (:end s)]))))
+
+(defn- expanded (text file template)
+  ;; `template` expanded at the end of a `file` buffer holding `text`
+  (let (m (file-model text file (string/length text)))
+    (snippet-insert m (string/length text) (string/length text) template)))
+
+(describe "the template syntax"
+  (test "tab stops, placeholders and the final point"
+    (let (parsed (parse "def ${1:name}(${2:args})\n  $0\nend"))
+      (assert= (:text parsed) "def name(args)\n  \nend")
+      (assert= (stops-of parsed) [[1 4 8] [2 9 13] [0 17 17]])))
+  (test "escapes, a choice, a nested placeholder"
+    (assert= (:text (parse "cost \\$5 \\} \\\\")) "cost $5 } \\")
+    (assert= (:text (parse "${1|left,right|}")) "left")
+    (let (parsed (parse "${1:f(${2:x})}"))
+      (assert= (:text parsed) "f(x)")
+      (assert= (stops-of parsed) [[1 0 4] [2 2 3]])))
+  (test "variables: known, with a default, unknown"
+    (assert= (:text (parse "$TM_FILENAME_BASE ${TM_FILENAME}"
+                      {"TM_FILENAME_BASE" "a" "TM_FILENAME" "a.rb"}))
+      "a a.rb")
+    (assert= (:text (parse "${NOPE:fallback}")) "fallback")
+    (assert= (:text (parse "$NOPE")) "NOPE"))
+  (test "a `$` that starts nothing is itself, a transform is a plain mirror"
+    (assert= (:text (parse "a $ b ${")) "a $ b ${")
+    (assert= (:text (parse "${1:x} ${1/(.*)/${1:/upcase}/}!")) "x !")))
+
+(describe "the ranges a field keeps"
+  (test "the field being typed in grows at its edges, the others do not"
+    (assert= (carry-range [2 4] [4 4 "xy"] true) [2 6])
+    (assert= (carry-range [2 4] [2 2 "xy"] true) [2 6])
+    (assert= (carry-range [2 4] [4 4 "xy"] false) [2 4])
+    (assert= (carry-range [4 6] [4 4 "xy"] false) [6 8])
+    (assert= (carry-range [4 4] [4 4 "xy"] false) [6 6]))
+  (test "a deletion pulls a range in"
+    (assert= (carry-range [2 6] [1 3 ""] false) [1 4])
+    (assert= (carry-range [2 6] [2 6 "z"] true) [2 3])))
+
+(describe "an expansion"
+  (test "inserts the text, the first field selected, point at its start"
+    (let (m (expanded "" "a.rb" "def ${1:name}\n  $0\nend"))
+      (assert= (text-of m) "def name\n  \nend")
+      (assert= (region-of m) [4 8])
+      (assert= (point-of m) 4)
+      (is (snippet-active? m))))
+  (test "keeps the indent of the line it starts on"
+    (assert= (text-of (expanded "  " "a.rb" "if ${1:x}\n  $0\nend")) "  if x\n    \n  end"))
+  (test "fills in the file's name"
+    (assert= (text-of (expanded "" "/tmp/probe-file.blsp" "defmodule ${1:$TM_FILENAME_BASE}"))
+      "defmodule probe-file"))
+  (test "with no field but `$0`, point goes there and nothing stays active"
+    (let (m (expanded "" "a.txt" "(${0})"))
+      (assert= (text-of m) "()")
+      (assert= (point-of m) 1)
+      (is (not (snippet-active? m)))))
+  (test "a mirror starts as its field's text"
+    (assert= (text-of (expanded "" "a.txt" "${1:a} = ${1}")) "a = a"))
+  (test "is one undo step, its mirrors included"
+    (let (m (expanded "x " "a.txt" "${1:a} = $1;"))
+      (assert= (text-of m) "x a = a;")
+      (assert= (buffer-text (undo (cur m))) "x "))))
+
+(describe "filling the fields"
+  (test "typing replaces the default, TAB moves on, the last TAB goes to $0"
+    (let (m (press (expanded "" "a.rb" "def ${1:name}(${2:args})\n  $0\nend")
+              ["r" "u" "n" :tab "x" :tab]))
+      (assert= (text-of m) "def run(x)\n  \nend")
+      (assert= (point-of m) 13)
+      (is (not (snippet-active? m)))))
+  (test "…with delete-selection on as well"
+    (let (m (press (assoc (expanded "" "a.rb" "f(${1:a}, ${2:b})") :delete-selection true)
+              ["x" "y" :tab "z"]))
+      (assert= (text-of m) "f(xy, z)")))
+  (test "TAB keeps a default, S-TAB goes back with it selected"
+    (let (m (press (expanded "" "a.rb" "f(${1:a}, ${2:b})") [:tab :back-tab]))
+      (assert= (text-of m) "f(a, b)")
+      (assert= (region-of m) [2 3])
+      (is (snippet-active? m))))
+  (test "moving in a field keeps its default, and then typing adds to it"
+    (let (m (press (expanded "" "a.txt" "<${1:ab}>") [:ctrl-f "x"]))
+      (assert= (text-of m) "<axb>")))
+  (test "an empty field takes what is typed, and the next field moves along"
+    (assert= (text-of (press (expanded "" "a.txt" "<$1>$2</>") ["a" "b" :tab "c"])) "<ab>c</>"))
+  (test "a mirror follows its field as you type, and as you delete"
+    (let (typed (press (expanded "" "a.txt" "begin ${1:x}\nend $1") ["f" "o" "o"]))
+      (assert= (text-of typed) "begin foo\nend foo")
+      (assert= (text-of (press typed [:backspace])) "begin fo\nend fo")))
+  (test "a mirror before its field follows too, point staying in the field"
+    (let (m (press (expanded "" "a.txt" "$1 = ${1:v}") ["a" "b"]))
+      (assert= (text-of m) "ab = ab")
+      (assert= (point-of m) 7)))
+  (test "typing and the mirrors it changed undo together"
+    (let (m (press (expanded "" "a.txt" "${1:x} $1") ["q"]))
+      (assert= (text-of m) "q q")
+      (assert= (buffer-text (undo (cur m))) "x x"))))
+
+(describe "what ends a snippet"
+  (test "C-g"
+    (is (not (snippet-active? (press (expanded "" "a.txt" "${1:a} ${2:b}") [:ctrl-g])))))
+  (test "point leaving it, after which TAB is the keymap's again"
+    (let (moved (press (expanded "head\n" "a.txt" "${1:a} ${2:b}") [(keyword "alt-<")]))
+      (is (not (snippet-active? moved)))
+      (is (not (= (region-of (press moved [:tab])) [7 8])))))
+  (test "another buffer becoming the current one"
+    (let (m (expanded "" "a.txt" "${1:a} ${2:b}")
+          other (ed-set-buf m (assoc (cur m) :name "elsewhere")))
+      (is (nil? (:snippet (snippet-follow other)))))))
+
+(describe "the mode's snippets"
+  (test "the built-in table reaches the language's buffers"
+    (let (m (file-model "" "a.ex" 0))
+      (assert= (get (mode-snippets m (cur m)) "def") "def ${1:name}(${2:args}) do\n  $0\nend"))
+    (let (m (file-model "" "a.ts" 0)) (is (contains? (mode-snippets m (cur m)) "describe")))
+    (let (m (file-model "" "a.txt" 0)) (is (empty? (mode-snippets m (cur m))))))
+  (test "init.blsp's `:snippets` adds, overrides and drops, prog reaching every code mode"
+    (let (m (assoc (file-model "" "a.rb" 0)
+              :snippets {'ruby {"def" "def ${1:x}; end" "it" nil} 'prog {"todo" "TODO: $0"}})
+          table (mode-snippets m (cur m)))
+      (assert= (get table "def") "def ${1:x}; end")
+      (is (not (contains? table "it")))
+      (assert= (get table "todo") "TODO: $0")))
+  (test "the setting is checked, and reaches the model"
+    (is (config/snippets-valid? {'ruby {"def" "def $1"}}))
+    (is (not (config/snippets-valid? {'ruby ["def"]})))
+    (is (empty? (config/config-warnings {:snippets {'ruby {"def" "def $1"}}})))
+    (is (not (empty? (config/config-warnings {:snippets {'ruby {:def 1}}}))))
+    (assert= (:snippets (config/apply-to-model (file-model "" "a.rb" 0)
+                          {:snippets {'ruby {"x" "y"}}}))
+      {'ruby {"x" "y"}}))
+  (test "C-c & expands the key before point"
+    (let (m (press (file-model "  case" "a.ex" 6) [:ctrl-c "&"]))
+      (assert= (text-of m) "  case value do\n    pattern ->\n      \n  end")
+      (assert= (region-of m) [7 12])))
+  (test "C-c & with no key before point asks for one"
+    (let (m (press (file-model "" "a.py" 0) [:ctrl-c "&"]))
+      (is (:minibuffer m))
+      (let (done (press m ["d" "e" "f" :enter]))
+        (assert= (text-of done) "def name(args):\n    pass")
+        (assert= (region-of done) [4 8])))))
+
+(describe "snippets in the completion popup"
+  (test "a key is a candidate, and taking it expands it"
+    (binding (*completion-sources* (list 'snippet/snippet-complete-source))
+      (let (done (cmd-complete (file-model "cla" "a.rb" 3) :tab))
+        (assert= (text-of done) "class Name\n  \nend")
+        (assert= (region-of done) [6 10])
+        (is (snippet-active? done)))))
+  (test "a key already typed whole is not offered"
+    (is (nil? (snippet-complete-source (file-model "def" "a.rb" 3)))))
+  (test "Tab's common prefix is plain text, even when it is a key"
+    (binding (*completion-sources* (list 'snippet/snippet-complete-source))
+      (let (m (assoc (file-model "a" "a.rb" 1) :snippets {'ruby {"ab" "X$1" "abc" "Y$1"}})
+            done (cmd-complete m :tab))
+        (assert= (text-of done) "ab")
+        (is (not (snippet-active? done)))))))

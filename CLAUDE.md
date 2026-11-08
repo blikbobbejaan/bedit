@@ -834,7 +834,25 @@ src/complete-at-point.blsp  completion-at-point (the in-buffer Tab popup) — mu
                             mode (`completion-auto-for?`): the user's `:completion-auto` entry
                             for the mode, else the mode's `:completion-auto` facet — off in
                             text-mode (prose completes on demand, C-M-i), on in prog-mode and the
-                            line-lexed config formats
+                            line-lexed config formats. A source's `:snippets` (`{candidate
+                            template}`) makes taking that candidate expand it (`snippet`)
+src/snippet.blsp            SNIPPETS (Emacs's yasnippet / tempel): templates in the LSP snippet
+                            syntax (`$1`, `${2:default}`, `$0`, a number twice is a mirror,
+                            `${1|a,b|}`, `$TM_FILENAME_BASE`), parsed here (no second caller for a
+                            std parser: std's `template` is `{{var}}` rendering). Per mode: a small
+                            built-in set (Brood, Elixir, Ruby, JS/TS, Rust, Python) under init.blsp's
+                            `:snippets`. C-c & (M-x snippet-expand) expands the key before point or
+                            asks; the keys are completion candidates (`:rank :after`); an LSP item
+                            with `insertTextFormat` 2 expands too (`snippetSupport true`, the cut
+                            at the first stop kept where it cannot). While one is active (`:snippet`
+                            on the model; overlay rank 105) TAB / S-TAB move between fields, the
+                            field selected with point at its start and its default replaced by
+                            the first thing typed; C-g or point leaving it ends it. Fields are
+                            positions carried through the buffer's splice log
+                            (`buffer-splices-since`) by a post-step — the field being typed in
+                            grows at both edges, which std's left-gravity markers cannot say —
+                            and mirrors are rewritten in the typing's own undo group; the
+                            expansion is one undo step
 src/lsp-protocol.blsp       the protocol, pure: what each answer means, positions in UTF-16 units, the
                             document sync, what each request puts on the wire, and the connection
                             as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server

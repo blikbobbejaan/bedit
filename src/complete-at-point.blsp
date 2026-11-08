@@ -13,7 +13,8 @@ buffer-word source, the buffer's language mode (`:complete-at` → brood-mode gl
 and any added source (an LSP server via `src/lsp.blsp`). Each is a fn
 `(model) -> nil | [start prefix items]` plus an optional OPTIONS map as a fourth element:
 `:cache true` (the popup narrows by filtering these items rather than asking again),
-`:docs {candidate doc}` (the info panel), `:rank :after` (below every other source's
+`:docs {candidate doc}` (the info panel), `:snippets {candidate template}` (taking that
+candidate expands the template, `snippet`), `:rank :after` (below every other source's
 candidates), `:claims-region true` (this answer's region wins) and `:continue \"/\"` (a
 candidate ending so completes on). The first non-nil answer — or the one claiming it — fixes
 the region and the rest merge in. `cape` adds file and other-buffer sources. The LOOK
@@ -398,13 +399,17 @@ locally instead of asked. The `cache` answered is what the popup keeps for next 
             agreeing (seq/filter results (fn (r) (= (first r) start)))
             late? (fn (r) (= :after (:rank (answer-opts r))))
             items-of (fn (rs) (mapcat rs (fn (r) (nth r 2))))
-            docs (fold agreeing {} (fn (acc r) (merge acc (or (:docs (answer-opts r)) {})))))
+            docs (fold agreeing {} (fn (acc r) (merge acc (or (:docs (answer-opts r)) {}))))
+            ;; a candidate that is a SNIPPET (a server's `insertTextFormat` 2, a snippet key): its
+            ;; template, which taking the candidate expands ([[complete-apply]])
+            snippets (fold agreeing {} (fn (acc r) (merge acc (or (:snippets (answer-opts r)) {})))))
         {:start start
          :prefix (second lead)
          :items (complete-order (items-of (seq/reject agreeing late?))
                   (items-of (seq/filter agreeing late?)))
          :cache next-cache
          :docs docs
+         :snippets snippets
          :pending pending
          :continue (:continue (answer-opts lead))}))))
 
@@ -459,6 +464,7 @@ doc panel to carry over (it paints only while its candidate is the selected one)
        :at (popup-anchor m)
        :cache (:cache found)
        :docs (:docs found)
+       :snippets (:snippets found)
        :continue (:continue found)
        :auto (:auto opts)
        :sources (:sources opts)
@@ -542,7 +548,7 @@ the common prefix WHOLE — a path's `/` and `.` are not segments to stop at."
         (empty? items) (message m (str "no completions for \"" prefix "\""))
         ;; one candidate, or a common prefix that extends what was typed: Tab goes to the end
         ;; of the next segment of it ([[complete-step]]), not the whole word
-        (= (count items) 1) (complete-apply m start (step (first items)))
+        (= (count items) 1) (complete-apply m start (step (first items)) (:snippets found))
         else
           (let (common (lcp items))
             (if (> (string/length common) (string/length prefix))
@@ -563,7 +569,7 @@ the common prefix WHOLE — a path's `/` and `.` are not segments to stop at."
         step (fn (word) (complete-step prefix word (completion-separators m))))
     (cond
       (empty? items) (message (assoc m :completion nil) (str "no completions for \"" prefix "\""))
-      (= (count items) 1) (complete-apply m (:start c) (step (first items)))
+      (= (count items) 1) (complete-apply m (:start c) (step (first items)) (:snippets c))
       else
         (let (common (lcp items))
           (if (> (string/length common) (string/length prefix))
@@ -596,11 +602,18 @@ taken now. Unchanged when no popup is waiting on `corr`, or it now describes ano
                             :gathered gathered
                             :incomplete
                               (or (:incomplete waiting) (not (:cache (answer-opts answer)))))))
+            snippets (merge (or (:snippets c) {}) (or (:snippets (answer-opts answer)) {}))
             cache (if cacheable?
-                    (assoc (:cache c) source [(:start c) prefix gathered {:cache true}])
+                    (assoc (:cache c)
+                      source [(:start c) prefix gathered {:cache true :snippets snippets}])
                     (:cache c))
             docs (merge (or (:docs c) {}) (or (:docs (answer-opts answer)) {}))
-            updated (assoc c :items items :pending pending :cache cache :docs docs))
+            updated (assoc c
+                      :items items
+                      :pending pending
+                      :cache cache
+                      :docs docs
+                      :snippets snippets))
         (cond
           (and (= (:waiting c) :tab) (empty? pending)) (tab-decision m updated items)
           (= (:waiting c) :tab) (assoc m :completion updated)
@@ -642,17 +655,26 @@ so it does not look again until you type."
 followed by the same popup a moment later."
   (assoc m :completion nil :completion-auto-at (auto-stamp m)))
 
-(defn- complete-apply (m start word)
+(defn- complete-apply (m start word &optional (snippets {}))
   "Replace the text in [start, point) with `word` — and as much of the word after point as
 it takes over ([[complete-absorbed]]) — and close the popup. Point ends after `word`, which
 is marked as answered for the auto trigger: a word just completed is not one to offer
-completions for until you type again."
+completions for until you type again.
+
+A `word` that is one of `snippets` (`{candidate template}`, its sources' `:snippets`) is
+expanded instead (`snippet/snippet-insert`, resolved when it runs): its fields to fill, point in
+the first. Only the WHOLE candidate is: a Tab that stops at a segment of it inserts the plain
+text, as before."
   (let (buf (ed-current-buf m)
         p (buffer-point buf)
         typed (text/slice (buffer-rope buf) start p)
         taken (complete-absorbed typed (complete-word-suffix buf) word (completion-separators m))
-        buf2 (replace-region buf start (+ p taken) word)
-        m2 (assoc (ed-set-buf m buf2) :completion nil :status "modified"))
+        template (get snippets word)
+        m2 (assoc (if (string? template)
+                    ((reflect/eval 'snippet/snippet-insert) m start (+ p taken) template)
+                    (ed-set-buf m (replace-region buf start (+ p taken) word)))
+             :completion nil
+             :status "modified"))
     (assoc m2 :completion-auto-at (auto-stamp m2))))
 
 (defn- complete-motion (m motion)
@@ -684,7 +706,7 @@ A candidate ending in its source's `:continue` (a directory's `/`) completes on:
 reopens on what is inside it, as cape-file under Corfu does."
   (let (c (:completion m)
         word (nth (:items c) (math/max 0 (:index c)))
-        m2 (complete-apply m (:start c) word))
+        m2 (complete-apply m (:start c) word (:snippets c)))
     (if (and (:continue c) (string/ends-with? word (:continue c)))
       (complete-reopen m2 c (complete-at m2 {} (or (:sources c) *completion-sources*)))
       m2)))

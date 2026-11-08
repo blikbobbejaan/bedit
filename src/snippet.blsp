@@ -1,0 +1,606 @@
+(defmodule snippet
+  "Snippets — a template typed out with fields to fill (Emacs's yasnippet / tempel, VS Code's
+snippets). A template is written in the LSP / TextMate snippet syntax: `$1` and `${2:default}`
+are FIELDS, visited in number order; `$0` is where point ends (the end of the expansion when
+the template has none); a number used twice is MIRRORED — the later copies follow the first as
+you type; `${1|one,two|}` is a choice (its first option inserted); `$TM_FILENAME_BASE` and the
+other `TM_` variables are filled in, `${NAME:default}` falling back to its default; `\\$`,
+`\\}` and `\\\\` are the literal characters.
+
+Where templates come from:
+
+- the MODE's table: a small built-in set ([[*builtin-snippets*]]: Brood, Elixir, Ruby,
+  JavaScript / TypeScript, Rust, Python) under the user's `:snippets` from init.blsp, keyed
+  by mode as every per-mode setting is (`prog` reaches every code mode, a language's own
+  entry wins). `C-c &` (M-x snippet-expand) expands the key before point, or asks for one;
+  the keys are completion candidates too (`:rank :after`), and taking one expands it;
+- a language server's completion (`insertTextFormat` 2): `complete-at-point` hands the
+  template to [[snippet-insert]] when the candidate taken is the server's whole item.
+
+While a snippet is ACTIVE (`:snippet` on the model): TAB / S-TAB go to the next / previous
+field, its text selected and point at its start; what is typed there first replaces the
+default (yasnippet's rule, delete-selection or not), a motion first keeps it; the last TAB
+goes to `$0` and ends it; C-g or moving point out of the expansion ends it. The fields move
+with every edit —
+carried through the buffer's own splice log (`buffer-splices-since`) after each event by a
+post-step, the field being typed in GROWING at both edges where the others do not — and a
+mirror is rewritten in the same undo group as the typing it follows. The expansion itself is
+one undo step."
+  (:use editor/buffer) ; the rope, point / mark, replace-region, the splice log
+  (:use model) ; the current buffer, message, the post-step and overlay registries
+  (:use interactive) ; defcommand
+  (:use pool :only [ed-name-prompt]) ; the snippet-insert prompt
+  (:use complete-words :only [complete-word-before-point]) ; the key before point
+  (:use complete-at-point :only [complete-append-source!]) ; the keys offered as completions
+  (:use editor/ui :only [Overlay overlay-active? overlay-owns? overlay-handle])) ; TAB / S-TAB / C-g
+
+;; ---- the template syntax (LSP's snippet grammar) ----------------------------------------
+;; A recursive descent over the template's characters. Every parse step answers
+;; `[next text stops]`: the index after what it read, the plain text it stands for and its tab
+;; stops `{:number :start :end}`, positions in the WHOLE expansion's text (`offset` is where the
+;; step's text begins). Nothing in it is an error: a `$` that starts nothing is a literal `$`,
+;; an unclosed `${` closes at the end.
+
+(def- escapable #{"$" "}" "\\"})
+(def- choice-escapable #{"$" "}" "\\" "," "|"})
+(def- digits #{"0" "1" "2" "3" "4" "5" "6" "7" "8" "9"})
+
+(defn- digit? (character) (contains? digits character))
+
+(defn- name-start? (character)
+  (and (string? character) (regex/matches? "[A-Za-z_]" character)))
+
+(defn- name-char? (character)
+  (and (string? character) (regex/matches? "[A-Za-z0-9_]" character)))
+
+(defn- read-while (chars index pred)
+  ;; the index just past the run of `chars` from `index` that satisfy `pred`
+  (if (pred (nth chars index nil)) (read-while chars (inc index) pred) index))
+
+(defn- slice (chars from to) (string/join (seq/subvec chars from to) ""))
+
+(defn- stop (number start end) {:number number :start start :end end})
+
+(defn- variable-value (variables name fallback)
+  ;; a variable's value, else the default the template gave, else its name (the LSP rule for
+  ;; a variable nobody defines)
+  (let (value (get variables name))
+    (cond (string? value) value (string? fallback) fallback else name)))
+
+(defn- skip-escaped (chars index escapes)
+  ;; the index after a `\` escape at `index` when it escapes one of `escapes`, else nil
+  (when (and (= (nth chars index nil) "\\") (contains? escapes (nth chars (inc index) nil)))
+    (+ index 2)))
+
+(defn- skip-transform (chars index)
+  ;; past a transform's `regex/format/options}` (its first `/` already read): the regex to the
+  ;; next unescaped `/`, the format to the one after — past the `${…}` it may hold — then the
+  ;; options to the `}` that closes it
+  (letrec (go (fn (at slashes depth)
+                (let (character (nth chars at nil)
+                      escaped (skip-escaped chars at #{"$" "}" "\\" "/"}))
+                  (cond
+                    (nil? character) at
+                    escaped (go escaped slashes depth)
+                    (and (> slashes 0) (= depth 0) (= character "/"))
+                      (go (inc at) (dec slashes) depth)
+                    (and (= slashes 1) (= character "{")) (go (inc at) slashes (inc depth))
+                    (and (= slashes 1) (= character "}") (> depth 0))
+                      (go (inc at) slashes (dec depth))
+                    (and (= slashes 0) (= character "}")) (inc at)
+                    else (go (inc at) slashes depth)))))
+    (go index 2 0)))
+
+(defn- skip-choice (chars index)
+  ;; past the `|}` that ends a choice
+  (letrec (go (fn (at)
+                (let (escaped (skip-escaped chars at choice-escapable))
+                  (cond
+                    (nil? (nth chars at nil)) at
+                    escaped (go escaped)
+                    (and (= (nth chars at) "|") (= (nth chars (inc at) nil) "}")) (+ at 2)
+                    else (go (inc at))))))
+    (go index)))
+
+(defn- parse-choice (chars index)
+  ;; `[next text]` for a choice's options from `index`: the first option is the text
+  (letrec (go (fn (at pieces)
+                (let (character (nth chars at nil)
+                      escaped (skip-escaped chars at choice-escapable))
+                  (cond
+                    (nil? character) [at (string/join pieces "")]
+                    escaped (go escaped (conj pieces (nth chars (inc at))))
+                    (= character ",") [(skip-choice chars (inc at)) (string/join pieces "")]
+                    (and (= character "|") (= (nth chars (inc at) nil) "}"))
+                      [(+ at 2) (string/join pieces "")]
+                    else (go (inc at) (conj pieces character))))))
+    (go index [])))
+
+(check-allow :non-tail-recursion
+  (defn- parse-run (chars index offset closer? variables)
+    ;; text and stops from `index` to the end — or, `closer?`, to the unescaped `}` that ends
+    ;; a placeholder's default (left unread, at the index answered)
+    (letrec (go (fn (at pieces length stops)
+                  (let (character (nth chars at nil)
+                        escaped (skip-escaped chars at escapable))
+                    (cond
+                      (nil? character) [at (string/join pieces "") stops]
+                      (and closer? (= character "}")) [at (string/join pieces "") stops]
+                      escaped (go escaped (conj pieces (nth chars (inc at))) (inc length) stops)
+                      (= character "$")
+                        (let ([next text more] (parse-dollar chars at (+ offset length) variables))
+                          (go next
+                            (conj pieces text)
+                            (+ length (string/length text))
+                            (into stops more)))
+                      else (go (inc at) (conj pieces character) (inc length) stops)))))
+      (go index [] 0 [])))
+
+  (defn- parse-braced-number (chars index dollar offset variables)
+    ;; `${N}`, `${N:default}`, `${N|a,b|}` or `${N/…/…/}` from the number at `index`
+    (let (end (read-while chars index digit?)
+          number (string/->number (slice chars index end))
+          after (nth chars end nil))
+      (case after
+        "}" [(inc end) "" [(stop number offset offset)]]
+        ":"
+          (let ([close text inner] (parse-run chars (inc end) offset true variables))
+            [(inc close) text (into [(stop number offset (+ offset (string/length text)))] inner)])
+        "|"
+          (let ([next text] (parse-choice chars (inc end)))
+            [next text [(stop number offset (+ offset (string/length text)))]])
+        ;; a transformed copy is a mirror, shown untransformed
+        "/" [(skip-transform chars (inc end)) "" [(stop number offset offset)]]
+        [(inc dollar) "$" []])))
+
+  (defn- parse-braced-variable (chars index dollar offset variables)
+    ;; `${NAME}`, `${NAME:default}` or `${NAME/…/…/}` from the name at `index`
+    (let (end (read-while chars index name-char?)
+          name (slice chars index end)
+          after (nth chars end nil))
+      (case after
+        "}" [(inc end) (variable-value variables name nil) []]
+        ":"
+          (let ([close text inner] (parse-run chars (inc end) offset true variables))
+            (if (string? (get variables name))
+              [(inc close) (get variables name) []]
+              [(inc close) text inner]))
+        "/" [(skip-transform chars (inc end)) (variable-value variables name nil) []]
+        [(inc dollar) "$" []])))
+
+  (defn- parse-dollar (chars index offset variables)
+    ;; whatever the `$` at `index` begins
+    (let (next (nth chars (inc index) nil))
+      (cond
+        (digit? next)
+          (let (end (read-while chars (inc index) digit?))
+            [end "" [(stop (string/->number (slice chars (inc index) end)) offset offset)]])
+        (name-start? next)
+          (let (end (read-while chars (inc index) name-char?))
+            [end (variable-value variables (slice chars (inc index) end) nil) []])
+        (= next "{")
+          (let (inside (nth chars (+ index 2) nil))
+            (cond
+              (digit? inside) (parse-braced-number chars (+ index 2) index offset variables)
+              (name-start? inside) (parse-braced-variable chars (+ index 2) index offset variables)
+              else [(inc index) "$" []]))
+        else [(inc index) "$" []]))))
+
+(defn parse (template &optional (variables {}))
+  "`{:text :stops}` for a snippet `template`: the plain text it expands to and its tab stops
+`{:number :start :end}` in the order they appear, positions in that text. `variables` maps a
+variable's name to its value.
+
+    (:text (snippet/parse \"def ${1:name}($2)\"))   ;=> \"def name()\"
+    (:stops (snippet/parse \"f(${1:a}, $1)\"))   ;=> [{:number 1 :start 2 :end 3} {:number 1 :start 5 :end 5}]
+    (:text (snippet/parse \"${1|one,two|} \\\\$x ${TM_FILENAME:none}\"))   ;=> \"one $x none\""
+  (let ([_ text stops] (parse-run (vec (string/->list template)) 0 0 false variables))
+    {:text text :stops stops}))
+
+;; ---- fields, and keeping them where their text is -----------------------------------
+;; A FIELD is a tab stop number: its RANGE (the stop holding text, else its first) and its
+;; MIRRORS (every other stop of that number). The active snippet keeps them as positions and
+;; carries them through each splice `[lo hi text]` itself, because a field needs a gravity the
+;; buffer's markers do not have: the field being typed in grows at BOTH edges (text typed at
+;; its end, or into it once empty, is its text), while every other range takes in nothing at
+;; its edges — the next field's start, a `$0` right after this one, move on past the typing.
+
+(defn- carry-delete (position lo hi)
+  (cond
+    (<= position lo) position
+    (< position hi) lo
+    else (- position (- hi lo))))
+
+(sig carry-range ((tuple int int) (tuple int int string) any -> (tuple int int)))
+(defn carry-range (range splice grow?)
+  "`range` `[start end]` after `splice` `[lo hi text]` — the text in `[lo, hi)` replaced by
+`text`. A `grow?` range takes text inserted at either of its edges in; any other takes in only
+what lands strictly inside it, and an empty one at the insertion moves past it.
+
+    (snippet/carry-range [2 4] [4 4 \"xy\"] true)   ;=> [2 6]
+    (snippet/carry-range [2 4] [4 4 \"xy\"] false)   ;=> [2 4]
+    (snippet/carry-range [4 4] [4 4 \"xy\"] false)   ;=> [6 6]
+    (snippet/carry-range [2 6] [1 3 \"\"] false)   ;=> [1 4]"
+  (let ([start end] range
+        [lo hi text] splice
+        width (string/length text)
+        start (carry-delete start lo hi)
+        end (carry-delete end lo hi))
+    (cond
+      (= width 0) [start end]
+      grow? [(if (> start lo) (+ start width) start) (if (>= end lo) (+ end width) end)]
+      else
+        [(if (>= start lo) (+ start width) start)
+          (if (or (> end lo) (>= start lo)) (+ end width) end)])))
+
+(defn- carry-position (position splice)
+  ;; a position (point) through `splice`: at the edit's start it stays
+  (first (carry-range [position position] splice false)))
+
+(defn- carry-state (state splice growing)
+  ;; every range of the snippet `state` through `splice`, field `growing` (an index, or nil)
+  ;; and the whole expansion's extent taking in text at their edges
+  (assoc state
+    :extent (carry-range (:extent state) splice true)
+    :fields
+      (vec (map (seq/enumerate (:fields state))
+             (fn ([index field])
+               (assoc field
+                 :range (carry-range (:range field) splice (= index growing))
+                 :mirrors (vec (map (:mirrors field) (fn (range) (carry-range range splice false))))))))))
+
+(defn- nav-order (numbers)
+  ;; the field numbers in TAB order: ascending, `$0` last
+  (let (sorted (sort (seq/distinct (seq/reject numbers (fn (number) (= number 0))))))
+    (conj (vec sorted) 0)))
+
+(defn- fields-of (stops offset width)
+  "The fields of an expansion's `stops`, in TAB order, at buffer offset `offset`; a `$0` at its
+end (`width` its length) when the template names none."
+  (let (shift (fn (s) [(+ offset (:start s)) (+ offset (:end s))])
+        groups (fold stops
+                 {}
+                 (fn (acc s) (assoc acc (:number s) (conj (get acc (:number s) []) s)))))
+    (vec (map (nav-order (map stops :number))
+           (fn (number)
+             (let (group (get groups number []))
+               (if (empty? group)
+                 {:number 0 :range [(+ offset width) (+ offset width)] :mirrors []}
+                 (let (primary (or (seq/find group (fn (s) (> (:end s) (:start s)))) (first group)))
+                   {:number number
+                    :range (shift primary)
+                    :mirrors (vec (map (seq/reject group (fn (s) (= s primary))) shift))}))))))))
+
+(defn- set-mirror (state field-index mirror-index range)
+  (let (fields (:fields state)
+        field (nth fields field-index))
+    (assoc state
+      :fields
+        (assoc fields
+          field-index (assoc field :mirrors (assoc (:mirrors field) mirror-index range))))))
+
+(defn- sync-mirrors (buf state)
+  "`[buf state]` with every mirror's text made its field's: each one that differs rewritten in
+the CURRENT undo group (`amalgamate-undo`), so a keystroke and the mirrors it changed undo
+together, point and every range carried past the rewrite."
+  (let (jobs (mapcat (seq/enumerate (:fields state))
+               (fn ([index field])
+                 (map (range (count (:mirrors field))) (fn (mirror) [index mirror])))))
+    (fold jobs
+      [buf state]
+      (fn (acc job)
+        (let ([current carried] acc
+              [field-index mirror-index] job
+              field (nth (:fields carried) field-index)
+              [start end] (:range field)
+              want (text/slice (buffer-rope current) start end)
+              [from to] (nth (:mirrors field) mirror-index))
+          (if (= want (text/slice (buffer-rope current) from to))
+            acc
+            (let (splice [from to want]
+                  point (buffer-point current)
+                  edited (goto-char (replace-region (amalgamate-undo current) from to want)
+                           (carry-position point splice)))
+              [edited
+                (set-mirror (carry-state carried splice nil)
+                  field-index
+                  mirror-index
+                  [from (+ from (string/length want))])])))))))
+
+;; ---- the active snippet -------------------------------------------------------------
+;; `:snippet` on the model: `{:buffer :seen :extent :fields :current}` — the buffer it is in (by
+;; name), the buffer as the snippet last saw it (what the next event's splices are counted
+;; from), the expansion's `[start end]`, its fields in TAB order (`$0` last) and the one being
+;; filled.
+
+(defn snippet-active? (m)
+  "Whether a snippet is being filled in the current buffer."
+  (let (state (:snippet m))
+    (and (map? state) (= (:buffer state) (buffer-name (ed-current-buf m))))))
+
+(defn- finish (m) (assoc m :snippet nil))
+
+(defn- enter-field (m state index)
+  ;; point to the start of field `index`, its text selected (the mark at its end) and FRESH: what
+  ;; is typed there first replaces it ([[clear-fresh]]). The last field (`$0`) ends the snippet
+  (let (fields (:fields state)
+        [start end] (:range (nth fields index))
+        buf (ed-current-buf m)
+        placed (if (< start end)
+                 (goto-char (set-mark (goto-char buf end)) start)
+                 (goto-char (clear-mark buf) start))
+        moved (ed-set-buf m placed))
+    (if (>= index (dec (count fields)))
+      (finish moved)
+      (assoc moved :snippet (assoc state :current index :seen placed :fresh (< start end))))))
+
+(defn- clear-fresh (buf state before splices)
+  "`[buf state]` with a fresh field's default gone once something is typed into it — yasnippet's
+rule, with or without delete-selection: the first edit of the event a plain insertion within the
+field as it was (`before`, its range), the text around the insertion is deleted, in the same undo
+group. Any other edit only makes the field no longer fresh."
+  (let ([start end] before
+        splice (first splices)
+        [lo hi text] splice
+        width (string/length text))
+    (if (and (= lo hi) (> width 0) (>= lo start) (<= lo end))
+      (fold [[(+ lo width) (+ end width)] [start lo]]
+        [buf state]
+        (fn (acc cut)
+          (let ([current carried] acc
+                [from to] cut)
+            (if (>= from to)
+              acc
+              (let (removal [from to ""])
+                [(goto-char (replace-region (amalgamate-undo current) from to "")
+                   (carry-position (buffer-point current) removal))
+                  (carry-state carried removal (:current carried))])))))
+      [buf state])))
+
+(defn- line-indent (buf position)
+  ;; the whitespace the line holding `position` starts with
+  (let (rope (buffer-rope buf)
+        line-start (text/line->char rope (text/char->line rope position))
+        before (text/slice rope line-start position))
+    (string/substring before 0 (string/span before 0 " \t"))))
+
+(defn- variables (buf start)
+  ;; the TextMate variables a template may name, for an expansion at `start` in `buf`
+  (let (file (or (buffer-file buf) "")
+        rope (buffer-rope buf)
+        line (text/char->line rope start)
+        name (if (= file "") (buffer-name buf) (path/basename file)))
+    {"TM_FILENAME" name
+     "TM_FILENAME_BASE" (path/stem name)
+     "TM_FILEPATH" file
+     "TM_DIRECTORY" (if (= file "") "" (path/dirname file))
+     "TM_LINE_INDEX" (str line)
+     "TM_LINE_NUMBER" (str (inc line))
+     "TM_SELECTED_TEXT" (or (buffer-region buf) "")
+     "TM_CURRENT_WORD" ""}))
+
+(defn snippet-insert (m start end template)
+  "`m` with the text in `[start, end)` of the current buffer replaced by `template` expanded —
+one undo step — and its first field selected (point at `$0`, and no snippet left active, when it
+has none). A new line in the template keeps the indent of the line it starts on.
+
+The seam every caller expands through: `C-c &`, a snippet picked from the completion popup, a
+language server's snippet completion."
+  (let (buf (ed-current-buf m)
+        indent (line-indent buf start)
+        parsed (parse (string/replace template "\n" (str "\n" indent)) (variables buf start))
+        text (:text parsed)
+        width (string/length text)
+        replaced (goto-char (replace-region buf start end text) (+ start width))
+        state {:buffer (buffer-name buf)
+               :extent [start (+ start width)]
+               :fields (fields-of (:stops parsed) start width)
+               :current 0}
+        [synced filled] (sync-mirrors replaced state))
+    (enter-field (assoc (ed-set-buf m synced) :status "modified") filled 0)))
+
+(defn snippet-next-field (m)
+  "Go to the active snippet's next field (TAB); past the last, to `$0`, which ends it."
+  (let (state (:snippet m)) (enter-field m state (inc (:current state)))))
+
+(defn snippet-previous-field (m)
+  "Go back to the active snippet's previous field (S-TAB); at the first it stays there."
+  (let (state (:snippet m)) (enter-field m state (math/max 0 (dec (:current state))))))
+
+(defn snippet-follow (m)
+  "The post-step: the active snippet carried through what this event did to its buffer — its
+fields moved with the splices since it last looked, its mirrors rewritten to follow their
+fields — and ended once point leaves it, its text is gone, its buffer is no longer the current
+one, or the log cannot say what changed. O(1) with no snippet, or nothing typed."
+  (let (state (:snippet m))
+    (if (nil? state)
+      m
+      (let (buf (ed-current-buf m)
+            seen (:seen state))
+        (if (not (= (buffer-name buf) (:buffer state)))
+          (finish m)
+          ;; `()` is nil: an unchanged text is told from a log that cannot say by the ropes
+          (let (unchanged? (= (buffer-rope seen) (buffer-rope buf))
+                splices (if unchanged? [] (buffer-splices-since seen buf)))
+            (if (and (nil? splices) (not (= (buffer-text seen) (buffer-text buf))))
+              (finish m)
+              (let (carried (fold splices
+                              state
+                              (fn (acc splice) (carry-state acc splice (:current acc))))
+                    [cleared unfresh] (if (and (:fresh state) (not (empty? splices)))
+                                        (clear-fresh buf
+                                          (assoc carried :fresh false)
+                                          (:range (nth (:fields state) (:current state)))
+                                          splices)
+                                        ;; point moved without an edit: the default is kept
+                                        [buf
+                                          (if (= (buffer-point seen) (buffer-point buf))
+                                            carried
+                                            (assoc carried :fresh false))])
+                    [synced filled] (if (empty? splices)
+                                      [cleared unfresh]
+                                      (sync-mirrors cleared unfresh))
+                    [lo hi] (:extent filled)
+                    point (buffer-point synced)
+                    written (if (= synced buf) m (ed-set-buf m synced)))
+                (if (or (< point lo) (> point hi) (= lo hi))
+                  (finish written)
+                  (assoc written :snippet (assoc filled :seen synced)))))))))))
+
+(register-post-step :snippet {:order 35 :run 'snippet/snippet-follow})
+
+;; TAB and S-TAB are the snippet's while one is active in the current buffer, and C-g ends it
+;; on the way to its usual quit. Every other key passes by to the keymap (no `overlay-exit`):
+;; typing is how a field is filled. Ranked after the completion popup (whose TAB takes a
+;; candidate first) and the password read; before the inline preview.
+(defrecord snippet-overlay ())
+(impl Overlay
+  snippet-overlay
+  (overlay-active? (_ m) (snippet-active? m))
+  (overlay-owns? (_ m input) (contains? #{:tab :back-tab :ctrl-g} input))
+  (overlay-handle (_ m input)
+    (case input
+      :tab (snippet-next-field m)
+      :back-tab (snippet-previous-field m)
+      ((reflect/eval 'input/ed-dispatch) (finish m) input))))
+
+(register-overlay :snippet 105 (snippet-overlay))
+
+;; ---- the mode's snippets ----------------------------------------------------------------
+
+(def *builtin-snippets*
+  ;; A few per language, keyed by mode (the layer's name); init.blsp's `:snippets` adds to
+  ;; and overrides them. Brood's are written for inside the `(` electric pairs already typed.
+  {:brood {"defn" "defn ${1:name} (${2:args})\n  \"${3:What it does.}\"\n  $0"
+           "fn" "fn (${1:args}) $0"
+           "let" "let (${1:name} ${2:value})\n  $0"
+           "if" "if ${1:test}\n  ${2:then}\n  ${3:else}"
+           "cond" "cond\n  ${1:test} ${2:result}\n  else $0"
+           "describe" "describe \"${1:subject}\"\n  (test \"${2:does something}\"\n    $0)"
+           "test" "test \"${1:does something}\"\n  $0"
+           "defmodule" "defmodule ${1:$TM_FILENAME_BASE}\n  \"${2:What it is.}\"\n  $0"}
+   :elixir {"def" "def ${1:name}(${2:args}) do\n  $0\nend"
+            "defp" "defp ${1:name}(${2:args}) do\n  $0\nend"
+            "defmodule" "defmodule ${1:Name} do\n  $0\nend"
+            "fn" "fn ${1:args} -> $0 end"
+            "if" "if ${1:condition} do\n  $0\nend"
+            "case" "case ${1:value} do\n  ${2:pattern} ->\n    $0\nend"
+            "describe" "describe \"${1:subject}\" do\n  $0\nend"
+            "test" "test \"${1:does something}\" do\n  $0\nend"}
+   :ruby {"def" "def ${1:name}\n  $0\nend"
+          "class" "class ${1:Name}\n  $0\nend"
+          "if" "if ${1:condition}\n  $0\nend"
+          "case" "case ${1:value}\nwhen ${2:pattern}\n  $0\nend"
+          "each" "each do |${1:item}|\n  $0\nend"
+          "describe" "describe ${1:Subject} do\n  $0\nend"
+          "it" "it \"${1:does something}\" do\n  $0\nend"}
+   :javascript {"fn" "function ${1:name}(${2:args}) {\n  $0\n}"
+                "arrow" "(${1:args}) => $0"
+                "if" "if (${1:condition}) {\n  $0\n}"
+                "switch" "switch (${1:value}) {\n  case ${2:pattern}:\n    $0\n    break;\n}"
+                "describe" "describe(\"${1:subject}\", () => {\n  $0\n});"
+                "it" "it(\"${1:does something}\", () => {\n  $0\n});"
+                "test" "test(\"${1:does something}\", () => {\n  $0\n});"}
+   :rust {"fn" "fn ${1:name}(${2:args}) {\n    $0\n}"
+          "if" "if ${1:condition} {\n    $0\n}"
+          "match" "match ${1:value} {\n    ${2:pattern} => $0,\n}"
+          "impl" "impl ${1:Type} {\n    $0\n}"
+          "test" "#[test]\nfn ${1:name}() {\n    $0\n}"}
+   :python {"def" "def ${1:name}(${2:args}):\n    ${0:pass}"
+            "class" "class ${1:Name}:\n    ${0:pass}"
+            "if" "if ${1:condition}:\n    ${0:pass}"
+            "match" "match ${1:value}:\n    case ${2:pattern}:\n        ${0:pass}"
+            "test" "def test_${1:name}():\n    ${0:pass}"}})
+
+(def- language-aliases
+  ;; modes that take another's table: TypeScript and TSX write JavaScript's
+  {"typescript" :javascript "tsx" :javascript})
+
+(defn- user-entry (user name)
+  ;; the user's table for mode `name`, however init.blsp spelled the mode
+  (or (get user (keyword name)) (get user (symbol name)) (get user name) {}))
+
+(defn mode-snippets (m buf)
+  "`{key template}` — every snippet `buf`'s mode offers: for each layer of its mode stack, the
+general first (`text`, then `prog`, then the language), the built-in table and then the user's
+init.blsp `:snippets` entry, each over the one before. A user's `nil` takes a key away."
+  (let (user (or (:snippets m) {})
+        names (reverse (map (seq/filter (editor/layers/active-layers buf)
+                              (fn (layer) (not (:system layer))))
+                         (fn (layer) (->string (:name layer)))))
+        merged (fold names
+                 {}
+                 (fn (acc name)
+                   (merge acc
+                     (get *builtin-snippets* (get language-aliases name (keyword name)) {})
+                     (user-entry user name)))))
+    (into {} (seq/filter merged (fn ([_ template]) (string? template))))))
+
+(defn- key-before-point (m)
+  ;; `[start key template]` when the word before point is one of the mode's snippet keys
+  (let (buf (ed-current-buf m)
+        [start word] (complete-word-before-point buf)
+        template (get (mode-snippets m buf) word))
+    (when (and (not (= word "")) template) [start word template])))
+
+(defcommand cmd-snippet-insert
+  (m key)
+  "Pick one of the mode's snippets by its key and expand it at point — over the region when
+one is active, whose text the template may place with `$TM_SELECTED_TEXT`."
+  (let (table (mode-snippets m (ed-current-buf m)))
+    (if (empty? table)
+      (message m "no snippets for this mode")
+      (assoc m
+        :minibuffer
+          (ed-name-prompt "Snippet: "
+            (sort (keys table))
+            (fn (mm chosen)
+              (let (template (get table chosen)
+                    buf (ed-current-buf mm)
+                    [from to] (or (buffer-region-bounds buf)
+                                [(buffer-point buf) (buffer-point buf)]))
+                (if (nil? template)
+                  (message mm (str "no snippet: " chosen))
+                  (snippet-insert mm from to template)))))))))
+
+(defcommand cmd-snippet-expand
+  (m key)
+  "Expand the snippet whose key is the word before point (C-c &), or pick one when it is none —
+the mode's snippets, built in and from init.blsp's `:snippets`."
+  (let (found (key-before-point m))
+    (if (nil? found)
+      (cmd-snippet-insert m key)
+      (let ([start _ template] found)
+        (snippet-insert m start (buffer-point (ed-current-buf m)) template)))))
+
+(defcommand cmd-snippet-next-field
+  (m key)
+  "Go to the active snippet's next field (TAB while one is active); the last goes to `$0`."
+  (if (snippet-active? m) (snippet-next-field m) (message m "no active snippet")))
+
+(defcommand cmd-snippet-previous-field
+  (m key)
+  "Go back to the active snippet's previous field (S-TAB while one is active)."
+  (if (snippet-active? m) (snippet-previous-field m) (message m "no active snippet")))
+
+;; ---- the keys as completion candidates ----------------------------------------------------
+
+(defn snippet-complete-source (m)
+  "A completion source (`complete-at-point/*completion-sources*`): the mode's snippet keys that
+extend the word before point, after every other source's candidates (`:rank :after`), each
+with its template as the info card's text and under `:snippets`, so taking one expands it."
+  (let (buf (ed-current-buf m)
+        table (mode-snippets m buf))
+    (when (not (empty? table))
+      (let ([start prefix] (complete-word-before-point buf)
+            matching (seq/filter (keys table)
+                       (fn (key) (and (string/starts-with? key prefix) (not (= key prefix))))))
+        (when (and (not (= prefix "")) (not (empty? matching)))
+          [start
+            prefix
+            matching
+            {:rank :after
+             :snippets (into {} (map matching (fn (key) [key (get table key)])))
+             :docs (into {} (map matching (fn (key) [key (str "snippet\n\n" (get table key))])))}])))))
+
+(complete-append-source! 'snippet/snippet-complete-source)
