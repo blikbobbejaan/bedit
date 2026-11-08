@@ -7,6 +7,7 @@ default directory, the line motions — and a header each way would be a cycle."
   (:use modes :only []) ; register-special-type runs at load, after modes declares its kinds
   (:use editor/keymap :only [keymap-bind]) ; the mode keymap below
   (:use minibuffer)
+  (:use lifecycle :only [ed-map-y-or-n]) ; R and C ask about each target that exists
   (:use model) ; message / ed-current-buf / ed-set-buf — the model a listing lives on
   (:use pool) ; ed-visit-file / ed-default-dir / ed-path-prompt / ed-show-named
   (:use editor/buffer) ; make-buffer / buffer-text / goto-char — the listing buffer
@@ -705,73 +706,203 @@ message on blank input)."
     (fn (mm dir typed)
       (ed-dired-op mm dir "mkdir" (fn () (file/mkdir (path/join dir typed)))))))
 
+;; ---- running an operation: R, C, D and x over the marked entries -------------------
+;; Emacs's dired acts on the MARKED entries when any are marked, else on the one at point.
+;; Each entry is acted on by itself: one that fails is reported and stays marked to try
+;; again, the rest are done and unmarked. The work is a thunk over paths alone, never the
+;; model, so [[ed-dired-launch]] can run it wherever it likes.
+
+(defn- ed-dired-chosen (m)
+  "What an operation acts on: the marked entries in the listing's order, else the entry at
+point — none on `.`, `..` or the header."
+  (let (marks (into #{} (or (ed-dired-state m :dired-marks) '()))
+        under (ed-dired-name-at m))
+    (if (empty? marks)
+      (if (ed-dired-entry? under) [under] [])
+      (into []
+        (seq/filter (or (ed-dired-state m :dired-names) []) (fn (name) (contains? marks name)))))))
+
+(defn- dired-run-each (items act)
+  "`act` (`item -> any`) run on each of `items`, a failure caught and kept rather than
+stopping the rest: `{:done items :failed [[item reason]]}`."
+  (fold items
+    {:done [] :failed []}
+    (fn (acc item)
+      (try
+        (do (act item) (update acc :done conj item))
+        (catch e (update acc :failed conj [item (error-message e)]))))))
+
+(defn- dired-entries-phrase (done)
+  ;; what a report says was acted on: the one entry by name, else how many
+  (if (= (count done) 1) (str (first done)) (str (count done) " entries")))
+
+(defn- ed-dired-report (m verb report)
+  "`m` saying how `report` ([[dired-run-each]], over entry names) went: `verb` and what, or
+the first failure and how many failed."
+  (let (done (:done report)
+        failed (:failed report))
+    (message m
+      (if (empty? failed)
+        (str verb " " (dired-entries-phrase done))
+        (let ([item reason] (first failed))
+          (str verb
+            ": "
+            (count failed)
+            " of "
+            (+ (count done) (count failed))
+            " failed — "
+            item
+            ": "
+            reason))))))
+
+(defn- ed-dired-refresh (m dir)
+  "`m` with `dir`'s listing read again when it is the buffer shown (point kept on its line);
+a listing not shown is read again when it is next opened."
+  (if (= (ed-dired-state m :dired-dir) dir)
+    (ed-show-dired m dir (inc (buffer-current-line (ed-current-buf m))))
+    m))
+
+(defn- ed-dired-unmark-done (m dir names)
+  "`m` with `names` taken off the marks and flags of `dir`'s listing — what an operation
+finished with; one that failed stays marked to try again."
+  (let (finished (into #{} names)
+        keep (fn (listed) (seq/reject (or listed '()) (fn (name) (contains? finished name)))))
+    (ed-update-named m
+      dir
+      (fn (buffer)
+        (assoc buffer
+          :dired-marks (keep (:dired-marks buffer))
+          :dired-flags (keep (:dired-flags buffer)))))))
+
+(defn- ed-dired-launch (m label work finish)
+  "Run `work` (a `() -> report` thunk over paths, never the model) and fold `(finish m
+report)`; `label` names what is running."
+  (finish m (work)))
+
+;; ---- R and C: rename / move and copy -------------------------------------------------
+
 (defn- ed-dired-target (dir name typed)
   "Where R or C of `name` in `dir` to `typed` goes: `typed` under `dir`, or INTO it when it names
 a directory (Emacs's dired), keeping the name."
   (let (target (path/join dir typed))
     (if (file/dir? target) (path/join target name) target)))
 
-(defn- ed-dired-confirm-overwrite (m source target verb go)
-  "`(go m)` when `target` does not exist — else ask first, naming it, as Emacs's dired asks. A
-target that IS the source is refused."
-  (cond
-    (= (path/normalize source) (path/normalize target))
-      (message m (str verb ": " target " is the file itself"))
-    (file/exists? target)
-      (ed-confirm m (str target " exists; overwrite it? (y or n)") go (str verb " canceled"))
-    else (go m)))
+(defn- dired-transfer-words (kind)
+  ;; how R (`:rename`) and C (`:copy`) are said
+  (if (= kind :rename)
+    {:prompt "Rename" :running "renaming" :done "Renamed" :word "rename"}
+    {:prompt "Copy" :running "copying" :done "Copied" :word "copy"}))
+
+(defn- dired-inside? (source target)
+  "Whether `target` is `source` itself or under it — a move or copy that cannot be made."
+  (let (from (path/normalize source)
+        to (path/normalize target))
+    (or (= from to) (string/starts-with? to (str from "/")))))
+
+(defn- dired-transfer-one (kind move)
+  "Rename or copy (`kind`) one `move` (`{:name :source :target}`): a whole directory, across
+filesystems too. A directory already at the target is never replaced."
+  (if (file/dir? (:target move))
+    (error (str (:target move) " is a directory, not replaced"))
+    (if (= kind :rename)
+      (fileops/move-path (:source move) (:target move))
+      (fileops/copy-tree (:source move) (:target move)))))
+
+(defn- ed-dired-transfer-run (m dir kind moves)
+  "Rename or copy (`kind`) every one of `moves` from `dir`, then: a buffer visiting a renamed
+file (or one under a renamed directory) follows it (`pool/ed-file-moved`), the entries done
+are unmarked, and the listing is read again."
+  (let (words (dired-transfer-words kind))
+    (ed-dired-launch m
+      (str (:running words) " " (dired-entries-phrase (map moves :name)))
+      (fn () (dired-run-each moves (fn (move) (dired-transfer-one kind move))))
+      (fn (mm report)
+        (let (done (:done report)
+              followed (if (= kind :rename)
+                         (fold done
+                           mm
+                           (fn (acc move) (ed-file-moved acc (:source move) (:target move))))
+                         mm))
+          (ed-dired-report (ed-dired-refresh (ed-dired-unmark-done followed dir (map done :name))
+                             dir)
+            (:done words)
+            {:done (map done :name)
+             :failed (map (:failed report) (fn ([move reason]) [(:name move) reason]))}))))))
+
+(defn- ed-dired-transfer-ask (m dir kind moves)
+  "Rename or copy `moves`, asking first about each target that exists — `y`, `n`, `!` for it and
+every one after, `q` to stop asking (Emacs's dired-do-copy) — and refusing one onto itself or
+into itself."
+  (let (word (:word (dired-transfer-words kind))
+        usable (seq/reject moves (fn (move) (dired-inside? (:source move) (:target move))))
+        clashes (seq/filter usable (fn (move) (file/exists? (:target move))))
+        fresh (seq/reject usable (fn (move) (file/exists? (:target move)))))
+    (cond
+      (empty? usable)
+        (let (move (first moves))
+          (message m
+            (if (= (path/normalize (:source move)) (path/normalize (:target move)))
+              (str word ": " (:target move) " is the file itself")
+              (str word ": " (:target move) " is inside " (:name move)))))
+      (empty? clashes) (ed-dired-transfer-run m dir kind fresh)
+      else
+        (ed-map-y-or-n (dissoc m :dired-accepted)
+          clashes
+          (fn (move) (str (:target move) " exists; overwrite it?"))
+          (fn (answered move)
+            (assoc answered :dired-accepted (conj (or (:dired-accepted answered) []) move)))
+          (fn (answered accepted)
+            (let (chosen (into (into [] fresh) (or (:dired-accepted answered) []))
+                  cleared (dissoc answered :dired-accepted))
+              (if (empty? chosen)
+                (message cleared (str word " canceled"))
+                (ed-dired-transfer-run cleared dir kind chosen))))))))
+
+(defn- ed-dired-transfer (m kind)
+  "R or C (`kind`): the marked entries — or the one at point — renamed or copied to where the
+prompt says. One entry goes to the name typed, or into it when it is a directory; several go
+into the directory typed."
+  (let (names (ed-dired-chosen m)
+        words (dired-transfer-words kind)
+        many? (> (count names) 1))
+    (if (empty? names)
+      (message m (str "not on a " (if (= kind :rename) "renamable" "copyable") " entry"))
+      (ed-dired-prompt m
+        (if many?
+          (str (:prompt words) " " (count names) " marked into: ")
+          (str (:prompt words) " " (first names) " to: "))
+        (if many? "" (first names))
+        (fn (mm dir typed)
+          (if (and many? (not (file/dir? (path/join dir typed))))
+            (message mm (str (:word words) ": " typed " is not a directory"))
+            (ed-dired-transfer-ask mm
+              dir
+              kind
+              (map names
+                (fn (name)
+                  {:name name
+                   :source (path/join dir name)
+                   :target (ed-dired-target dir name typed)})))))))))
 
 (defcommand cmd-dired-rename
   (m key)
-  "Rename or move the file on the current line (R): into a directory when the answer names one;
-an existing file is asked about before it is replaced; a buffer visiting the file (or a file
-under a renamed directory) follows it to the new name (`pool/ed-file-moved`)."
-  (let (name (ed-dired-name-at m))
-    (if (not (ed-dired-entry? name))
-      (message m "not on a renamable entry")
-      (ed-dired-prompt m
-        (str "Rename " name " to: ")
-        name
-        (fn (mm dir typed)
-          (let (source (path/join dir name)
-                target (ed-dired-target dir name typed))
-            (ed-dired-confirm-overwrite mm
-              source
-              target
-              "rename"
-              (fn (sure)
-                (try
-                  (do
-                    (file/rename source target)
-                    (ed-show-dired (ed-file-moved sure source target) dir))
-                  (catch e (message sure (str "rename failed: " (error-message e)))))))))))))
+  "Rename or move the marked entries — or the one at point (R): into a directory when the
+answer names one; an existing file is asked about before it is replaced; a buffer visiting a
+file (or a file under a renamed directory) follows it to the new name (`pool/ed-file-moved`)."
+  (ed-dired-transfer m :rename))
 
 (defcommand cmd-dired-copy
   (m key)
-  "Copy the file on the current line (C): into a directory when the answer names one; an
-existing file is asked about before it is replaced."
-  (let (name (ed-dired-name-at m))
-    (if (not (ed-dired-entry? name))
-      (message m "not on a copyable entry")
-      (ed-dired-prompt m
-        (str "Copy " name " to: ")
-        name
-        (fn (mm dir typed)
-          (let (source (path/join dir name)
-                target (ed-dired-target dir name typed))
-            (ed-dired-confirm-overwrite mm
-              source
-              target
-              "copy"
-              (fn (sure) (ed-dired-op sure dir "copy" (fn () (file/cp source target)))))))))))
+  "Copy the marked entries — or the one at point (C), a directory with everything in it: into a
+directory when the answer names one; an existing file is asked about before it is replaced."
+  (ed-dired-transfer m :copy))
 
 ;; ---- deleting: D (marked, else the entry at point) and x (the flagged) ---------------
 ;; Emacs's `delete-by-moving-to-trash`: what D and x delete goes to the desktop's trash
 ;; (`fileops/move-to-trash`), where a file manager can restore it — unless init.blsp's
 ;; `:delete-by-moving-to-trash` is false, or the machine has no trash this can reach
 ;; (Windows), and then it is deleted for good after a question that says how many files a
-;; directory takes with it. Each entry is deleted on its own: one that fails is reported and
-;; stays marked, the rest go.
+;; directory takes with it.
 
 (defn- ed-dired-trash-wanted? (m)
   "Whether init.blsp asks for deletes to go to the trash — the default."
@@ -808,68 +939,20 @@ how many files deleting it takes."
         dir? (= true (and stat (:dir? stat) (not (:symlink? stat)))))
     {:label (if dir? (str name "/") name) :dir? dir? :files (fileops/count-files path)}))
 
-(defn- dired-run-each (items act)
-  "`act` (`item -> any`) run on each of `items`, a failure caught and kept rather than
-stopping the rest: `{:done items :failed [[item reason]]}`."
-  (fold items
-    {:done [] :failed []}
-    (fn (acc item)
-      (try
-        (do (act item) (update acc :done conj item))
-        (catch e (update acc :failed conj [item (error-message e)]))))))
-
-(defn- dired-entries-phrase (done)
-  ;; what a report says was acted on: the one entry by name, else how many
-  (if (= (count done) 1) (str (first done)) (str (count done) " entries")))
-
-(defn- ed-dired-report (m verb report)
-  "`m` saying how `report` ([[dired-run-each]]) went: `verb` and what, or the first failure
-and how many failed."
-  (let (done (:done report)
-        failed (:failed report))
-    (message m
-      (if (empty? failed)
-        (str verb " " (dired-entries-phrase done))
-        (let ([item reason] (first failed))
-          (str verb
-            ": "
-            (count failed)
-            " of "
-            (+ (count done) (count failed))
-            " failed — "
-            item
-            ": "
-            reason))))))
-
-(defn- ed-dired-refresh (m dir)
-  "`m` with `dir`'s listing read again when it is the buffer shown (point kept on its line);
-a listing not shown is read again when it is next opened."
-  (if (= (ed-dired-state m :dired-dir) dir)
-    (ed-show-dired m dir (inc (buffer-current-line (ed-current-buf m))))
-    m))
-
-(defn- ed-dired-unmark-done (m dir names)
-  "`m` with `names` taken off the marks and flags of `dir`'s listing — what an operation
-finished with; one that failed stays marked to try again."
-  (let (finished (into #{} names)
-        keep (fn (listed) (seq/reject (or listed '()) (fn (name) (contains? finished name)))))
-    (ed-update-named m
-      dir
-      (fn (buffer)
-        (assoc buffer
-          :dired-marks (keep (:dired-marks buffer))
-          :dired-flags (keep (:dired-flags buffer)))))))
-
 (defn- ed-dired-delete-now (m dir names location)
   "Delete `names` under `dir` — into the trash `location`, or for good when it is nil — then
 take the deleted off the marks and flags and list `dir` again."
-  (let (report (dired-run-each names
-                 (fn (name)
-                   (let (path (path/join dir name))
-                     (if location (fileops/move-to-trash path location) (fileops/remove-path path))))))
-    (ed-dired-report (ed-dired-refresh (ed-dired-unmark-done m dir (:done report)) dir)
-      (if location "Trashed" "Deleted")
-      report)))
+  (ed-dired-launch m
+    (str (if location "trashing " "deleting ") (dired-entries-phrase names))
+    (fn ()
+      (dired-run-each names
+        (fn (name)
+          (let (path (path/join dir name))
+            (if location (fileops/move-to-trash path location) (fileops/remove-path path))))))
+    (fn (mm report)
+      (ed-dired-report (ed-dired-refresh (ed-dired-unmark-done mm dir (:done report)) dir)
+        (if location "Trashed" "Deleted")
+        report))))
 
 (defn- ed-dired-delete-asking (m dir names what)
   "Ask before deleting `names` under `dir` (`what` they are: `marked`, `flagged`), then do it:
@@ -901,15 +984,10 @@ flagged."
   "Delete the marked entries — or the entry under point when none are marked — after a y/n
 confirm (D, Emacs `dired-do-delete`): to the trash, or for good when
 `:delete-by-moving-to-trash` is false."
-  (let (dir (ed-dired-state m :dired-dir)
-        marks (or (ed-dired-state m :dired-marks) '())
-        under (ed-dired-name-at m)
-        targets (if (empty? marks)
-                  (if (ed-dired-entry? under) (list under) '())
-                  marks))
-    (if (empty? targets)
+  (let (names (ed-dired-chosen m))
+    (if (empty? names)
       (message m "not on a deletable entry")
-      (ed-dired-delete-asking m dir targets "marked"))))
+      (ed-dired-delete-asking m (ed-dired-state m :dired-dir) names "marked"))))
 
 ;; ---- dired-mode: the read-only directory browser ----------------------------
 ;; The dired buffer (dired/cmd-dired) lists a directory; it's stamped :dired, made
