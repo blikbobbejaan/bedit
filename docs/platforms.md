@@ -60,6 +60,7 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | clipboard seam | ✅ | ✅ |
 | key mapping (Option-as-Meta, AltGr) | ✅ brood unit tests | ✅ brood unit tests |
 | missing-font warning | ✅ (names Font Book) | ✅ (names the Fonts settings) |
+| a save survives a crash mid-write | ✅ `file/replace`: a synced temp file renamed over the file (brood ADR-621), owner, mode and a symlink kept | ⚠️ a plain write in place (`file/replace` is `fs::write` off Unix: a rename there loses the file's DACL, and `ReplaceFileW` is untried) — see Not fixed |
 | auto-save sidecars: location, recovery | ✅ | ✅ |
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; `recover_test` reads the sidecar's ACL back with `icacls`) |
 | terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
@@ -105,6 +106,13 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
   `os/user-name` (`%USERNAME%` there).
 
 ## Not fixed
+- A save on Windows is not atomic. brood's `file/replace`, which every save goes through
+  (`file-save`, `charset/save`), renames a synced temp file over the file on Unix, but off Unix
+  it is a plain write: the file is truncated, then written (brood ADR-621, Limits). A crash, a
+  power cut or a full disk between the two leaves the file empty or cut short, and the text is
+  then only in the buffer and in its auto-save sidecar if the idle beat wrote one (`#file#`, M-x
+  recover-this-file) — edits made after that sidecar are lost with the editor. A program reading the file while it is
+  written can see half of it. Fixing it is brood's (`ReplaceFileW`, which keeps the DACL).
 - Not run anywhere but Linux: a real window, font discovery, file watching, a language server,
   git and mur themselves (their test files are not in the smoke set), and the remote / collab
   node links.
