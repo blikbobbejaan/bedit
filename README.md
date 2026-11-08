@@ -72,6 +72,9 @@ there is no display to open a window on — over ssh, on a console — with the
 mouse, bracketed paste, and kills reaching your clipboard through the terminal
 (OSC 52). A root-owned file opens as root with `C-x C-f /sudo::/etc/hosts` or
 `M-x sudo-edit`; the password is asked for, masked, and never kept.
+`bedit -Q` starts clean, as Emacs's: no init file and no installed packages (`-q`
+skips only the init file, `--no-packages` only the packages) — how a bug is told
+from a setting or a package. `M-x report-bug` lists the packages that were loaded.
 
 The editor is also remotely hostable: `--serve` / `--attach` give the Emacs
 daemon/emacsclient model, and `--serve --shared` turns it into real multiplayer
