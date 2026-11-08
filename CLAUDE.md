@@ -876,6 +876,12 @@ src/filename.blsp           a typed path read the Emacs way (`substitute-in-file
                             and `pool/ed-path-list-prompt` (recent files, projects, git init/clone)
                             — hand their consumer the ABSOLUTE path (`filename/expand`)
 src/completion.blsp         shared fuzzy ranking + vertical-menu card (complete + plume)
+src/fileops.blsp            what dired's file operations need past brood's `file/`: a tree copied
+                            (`copy-tree`), moved across filesystems (`move-path`), counted, and
+                            the TRASH D / x delete into (`move-to-trash`: freedesktop's
+                            `$XDG_DATA_HOME/Trash` with its `.trashinfo`, macOS's ~/.Trash, none
+                            on Windows; `*trash-home*` a test binds; a test run otherwise gets
+                            its scratch home's). Brood's `file/trash` to be
 src/fileperm.blsp           the `ls -l` permission string (`rwx`, `perms-string`) — dired + plume marginalia
 src/plume.blsp              the minibuffer completion UI — vertical list + marginalia + N/M counter (our Vertico/Marginalia)
 src/debugger.blsp           the editor as the debugger (ADR-174/184): C-c d session, *Spy* trace

@@ -12,6 +12,7 @@ default directory, the line motions — and a header each way would be a cycle."
   (:use editor/buffer) ; make-buffer / buffer-text / goto-char — the listing buffer
   (:use interactive) ; defcommand — the dired commands, on M-x
   (:use fileperm) ; perms-string — the `ls -l` permission column
+  (:use fileops :only []) ; copy, move and delete trees, the trash — loaded with dired
   (:use projects) ; recent-files — the Dired prompt floats recent directories up
   (:use theme)) ; the palette the listing is coloured from
 ;; ---- dired (a directory browser, C-x d / C-x C-j) -----------------------------------
@@ -21,7 +22,8 @@ default directory, the line motions — and a header each way would be a cycle."
 ;; `:dired-names` (entry names in display order), `:dired-marks` and `:dired-flags` — so the
 ;; command under point recovers its target by INDEX (the current line minus the one header line →
 ;; `:dired-names[i]`), robust to any filename (spaces included), never re-parsing
-;; formatted columns. File ops are the `file/` primitives (mkdir, rename, cp, rm, rmdir).
+;; formatted columns. File ops are the `file/` primitives (mkdir, rename, cp) and `fileops`
+;; (a whole tree copied or moved, the trash D and x delete into).
 ;;
 ;; The listing is the classic GNU `ls -l` layout (emacs `diredfl`): each row is
 ;; `<mark><perms> <nlink> <owner> <group> <size> <Mon DD HH:MM> <name>`, one `file-stat`
@@ -763,34 +765,142 @@ existing file is asked about before it is replaced."
               "copy"
               (fn (sure) (ed-dired-op sure dir "copy" (fn () (file/cp source target)))))))))))
 
-(defn- ed-dired-delete-targets (mm dir names)
-  "Delete each entry `names` under `dir` (a dir recursively, else a file), then clear the
-marks and re-render; report the first failure in the echo area."
-  (try
-    (do
-      (doseq (name names)
-        (let (path (path/join dir name)) (if (file/dir? path) (file/rmdir path) (file/rm path))))
-      (ed-show-dired (ed-dired-clear-marks mm dir) dir))
-    (catch e (message mm (str "delete failed: " (error-message e))))))
+;; ---- deleting: D (marked, else the entry at point) and x (the flagged) ---------------
+;; Emacs's `delete-by-moving-to-trash`: what D and x delete goes to the desktop's trash
+;; (`fileops/move-to-trash`), where a file manager can restore it — unless init.blsp's
+;; `:delete-by-moving-to-trash` is false, or the machine has no trash this can reach
+;; (Windows), and then it is deleted for good after a question that says how many files a
+;; directory takes with it. Each entry is deleted on its own: one that fails is reported and
+;; stays marked, the rest go.
+
+(defn- ed-dired-trash-wanted? (m)
+  "Whether init.blsp asks for deletes to go to the trash — the default."
+  (not (= (:delete-by-moving-to-trash m) false)))
+
+(defn dired-delete-question (entries what how)
+  "The y/n question before deleting `entries` (`{:label :dir? :files}` each: a name, a
+directory's with its slash, and how many files deleting it takes) — `what` names a group of
+them (`marked`, `flagged`); `how` is `:trash`, `:delete`, or `:no-trash` (deleting for good
+because there is no trash to move to).
+
+    (dired/dired-delete-question [{:label \"a.txt\" :dir? false :files 1}] \"marked\" :trash)   ;=> \"Move a.txt to the trash? (y/n)\"
+    (dired/dired-delete-question [{:label \"sub/\" :dir? true :files 214}] \"marked\" :delete)   ;=> \"Delete sub/ and its 214 files for good? (y/n)\"
+    (dired/dired-delete-question [{:label \"a\" :dir? false :files 1} {:label \"b/\" :dir? true :files 3}] \"flagged\" :delete)   ;=> \"Delete 2 flagged (4 files in all) for good? (y/n)\""
+  (let (single? (= (count entries) 1)
+        any-dir? (any? entries :dir?)
+        files (fold entries 0 (fn (total entry) (+ total (:files entry))))
+        named (if single? (:label (first entries)) (str (count entries) " " what)))
+    (if (= how :trash)
+      (str "Move " named " to the trash? (y/n)")
+      (str (if (= how :no-trash) "No trash here — delete " "Delete ")
+        named
+        (cond
+          (not any-dir?) ""
+          single? (str " and its " (ed-count-noun files "file"))
+          else (str " (" (ed-count-noun files "file") " in all)"))
+        " for good? (y/n)"))))
+
+(defn- ed-dired-delete-entry (dir name)
+  "The question's view of entry `name` under `dir`: its label, whether it is a directory, and
+how many files deleting it takes."
+  (let (path (path/join dir name)
+        stat (file/stat path)
+        dir? (= true (and stat (:dir? stat) (not (:symlink? stat)))))
+    {:label (if dir? (str name "/") name) :dir? dir? :files (fileops/count-files path)}))
+
+(defn- dired-run-each (items act)
+  "`act` (`item -> any`) run on each of `items`, a failure caught and kept rather than
+stopping the rest: `{:done items :failed [[item reason]]}`."
+  (fold items
+    {:done [] :failed []}
+    (fn (acc item)
+      (try
+        (do (act item) (update acc :done conj item))
+        (catch e (update acc :failed conj [item (error-message e)]))))))
+
+(defn- dired-entries-phrase (done)
+  ;; what a report says was acted on: the one entry by name, else how many
+  (if (= (count done) 1) (str (first done)) (str (count done) " entries")))
+
+(defn- ed-dired-report (m verb report)
+  "`m` saying how `report` ([[dired-run-each]]) went: `verb` and what, or the first failure
+and how many failed."
+  (let (done (:done report)
+        failed (:failed report))
+    (message m
+      (if (empty? failed)
+        (str verb " " (dired-entries-phrase done))
+        (let ([item reason] (first failed))
+          (str verb
+            ": "
+            (count failed)
+            " of "
+            (+ (count done) (count failed))
+            " failed — "
+            item
+            ": "
+            reason))))))
+
+(defn- ed-dired-refresh (m dir)
+  "`m` with `dir`'s listing read again when it is the buffer shown (point kept on its line);
+a listing not shown is read again when it is next opened."
+  (if (= (ed-dired-state m :dired-dir) dir)
+    (ed-show-dired m dir (inc (buffer-current-line (ed-current-buf m))))
+    m))
+
+(defn- ed-dired-unmark-done (m dir names)
+  "`m` with `names` taken off the marks and flags of `dir`'s listing — what an operation
+finished with; one that failed stays marked to try again."
+  (let (finished (into #{} names)
+        keep (fn (listed) (seq/reject (or listed '()) (fn (name) (contains? finished name)))))
+    (ed-update-named m
+      dir
+      (fn (buffer)
+        (assoc buffer
+          :dired-marks (keep (:dired-marks buffer))
+          :dired-flags (keep (:dired-flags buffer)))))))
+
+(defn- ed-dired-delete-now (m dir names location)
+  "Delete `names` under `dir` — into the trash `location`, or for good when it is nil — then
+take the deleted off the marks and flags and list `dir` again."
+  (let (report (dired-run-each names
+                 (fn (name)
+                   (let (path (path/join dir name))
+                     (if location (fileops/move-to-trash path location) (fileops/remove-path path))))))
+    (ed-dired-report (ed-dired-refresh (ed-dired-unmark-done m dir (:done report)) dir)
+      (if location "Trashed" "Deleted")
+      report)))
+
+(defn- ed-dired-delete-asking (m dir names what)
+  "Ask before deleting `names` under `dir` (`what` they are: `marked`, `flagged`), then do it:
+to the trash when that is wanted and there is one, else for good."
+  (let (wanted? (ed-dired-trash-wanted? m)
+        location (when wanted? (fileops/trash-location))
+        how (cond
+              location :trash
+              wanted? :no-trash
+              else :delete)
+        entries (map names (fn (name) (ed-dired-delete-entry dir name))))
+    (ed-confirm m
+      (dired-delete-question entries what how)
+      (fn (mm) (ed-dired-delete-now mm dir names location)))))
 
 (defcommand cmd-dired-do-flagged-delete
   (m key)
-  "Delete every entry flagged `D` after a y/n confirm (x, Emacs
-`dired-do-flagged-delete`); says so when nothing is flagged."
+  "Delete every entry flagged `D` after a y/n confirm (x, Emacs `dired-do-flagged-delete`):
+to the trash, or for good when `:delete-by-moving-to-trash` is false; says so when nothing is
+flagged."
   (let (dir (ed-dired-state m :dired-dir)
         flags (or (ed-dired-state m :dired-flags) '()))
     (if (empty? flags)
       (message m "(no files flagged for deletion)")
-      (ed-confirm m
-        (if (= (count flags) 1)
-          (str "Delete " (first flags) "? (y/n)")
-          (str "Delete " (count flags) " flagged? (y/n)"))
-        (fn (mm) (ed-dired-delete-targets mm dir flags))))))
+      (ed-dired-delete-asking m dir flags "flagged"))))
 
 (defcommand cmd-dired-delete
   (m key)
-  "Delete the marked entries — or the entry under point when none are marked — after a
-y/n confirm (D, Emacs `dired-do-delete`)."
+  "Delete the marked entries — or the entry under point when none are marked — after a y/n
+confirm (D, Emacs `dired-do-delete`): to the trash, or for good when
+`:delete-by-moving-to-trash` is false."
   (let (dir (ed-dired-state m :dired-dir)
         marks (or (ed-dired-state m :dired-marks) '())
         under (ed-dired-name-at m)
@@ -799,11 +909,7 @@ y/n confirm (D, Emacs `dired-do-delete`)."
                   marks))
     (if (empty? targets)
       (message m "not on a deletable entry")
-      (ed-confirm m
-        (if (empty? marks)
-          (str "Delete " (first targets) "? (y/n)")
-          (str "Delete " (count targets) " marked? (y/n)"))
-        (fn (mm) (ed-dired-delete-targets mm dir targets))))))
+      (ed-dired-delete-asking m dir targets "marked"))))
 
 ;; ---- dired-mode: the read-only directory browser ----------------------------
 ;; The dired buffer (dired/cmd-dired) lists a directory; it's stamped :dired, made
