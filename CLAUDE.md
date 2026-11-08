@@ -299,6 +299,9 @@ src/theme.blsp              every colour the editor paints (Catppuccin Mocha), r
                             mode line is recessed (the mantle, secondary text; colour only for a
                             state: modified `●`, `Def`, a failing check); the gutter is the base, its
                             current number lavender
+src/systemtheme.blsp        with no `:theme` named, the window follows the desktop's light or dark setting
+                            (brood's `gui/color-scheme`): `:theme-light` / `:theme-dark` at startup, and a
+                            change re-themes live (asked again every 30 s, off the loop)
 src/themes.blsp             the theme registry (M-x theme-select): a live picker that swaps the
                             whole palette AND the window font — a theme is a plain map, so
                             adding one is data (theme.blsp is the palette; this is the registry).
