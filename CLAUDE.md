@@ -894,7 +894,9 @@ src/lsp-protocol.blsp       the protocol, pure: what each answer means, position
                             document sync, what each request puts on the wire, and the connection
                             as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
-                            hover, rename, format, imenu, and `publishDiagnostics` folded into
+                            hover, rename, format, imenu, INLAY HINTS (the lines on screen on the idle beat, as
+                            `inlinetext` annotations owned by `:lsp-inlay`; opt-in per mode by
+                            `:lsp-inlay-hints`, M-x lsp-inlay-hints-mode per buffer), and `publishDiagnostics` folded into
                             the model's diagnostics, so every language gets the underline / ⚠ note
                             / gutter mark the Brood checker used to have to itself. Answers
                             server->client requests too (`client/registerCapability` — a server

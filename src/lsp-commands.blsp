@@ -679,6 +679,103 @@ applies the edits to every affected file (left modified for you to save)."
                           (if (string/blank? new-name)
                             (message mm "rename cancelled")
                             (ed-lsp-do-rename mm new-name)))}))))
+;; ---- inlay hints: types and parameter names shown inside the line -------------------
+;; Eglot's `eglot-inlay-hints-mode`: the server's `textDocument/inlayHint` for the lines on
+;; screen, asked on the idle beat once the text and the view have settled, shown as INLINE
+;; annotations (`inlinetext`, owner `:lsp-inlay`) in the dim hint voice — never buffer text,
+;; so they take cells but no chars. Opt-in, as eglot's is: the init file's `:lsp-inlay-hints`
+;; per mode, or M-x lsp-inlay-hints-mode for one buffer. Between an edit and the next answer
+;; the hints already shown ride their markers; the answer replaces them whole.
+
+(def *inlay-owner* :lsp-inlay)
+
+(defn ed-inlay-hints-on? (m buffer)
+  "Whether `buffer` shows its server's inlay hints: its own toggle (M-x
+lsp-inlay-hints-mode) when it has one, else the init file's `:lsp-inlay-hints` for its mode
+(a directory file's first, `scroll/ed-local-setting`), off by default."
+  (let (own (:lsp-inlay-hints buffer))
+    (if (or (= own true) (= own false))
+      own
+      (= true (scroll/ed-local-setting :lsp-inlay-hints (:lsp-inlay-hints m) buffer false)))))
+
+(defn- ed-inlay-lines (m)
+  ;; `[first last]` — the lines the selected pane shows (its top and the rows below it)
+  (let (top (ed-current-top m)) [top (+ top (or (:view-rows m) 50))]))
+
+(defn ed-inlay-hints-due? (m)
+  "True when the current buffer's inlay hints want asking for: they are on
+([[ed-inlay-hints-on?]]), it has a file and a live server that offers them, and the text or
+the lines on screen moved since the last ask (`:inlay-hints-at`). The idle job's `:stale?`,
+so a buffer with hints off — or a server without them — never keeps the beat armed."
+  (let (buffer (ed-current-buf m)
+        file (buffer-file buffer))
+    (and file
+      (ed-inlay-hints-on? m buffer)
+      (ed-lsp-live m)
+      (lsp/lsp-capable? (ed-lsp-caps m :inlayHintProvider) :inlayHintProvider)
+      (not (= [file (buffer-rope buffer) (ed-inlay-lines m)] (:inlay-hints-at m))))))
+
+(defn ed-launch-inlay-hints (m)
+  "The idle beat's inlay hints: ask the server for the lines on screen
+([[ed-inlay-hints-due?]] decides when), stamping `:inlay-hints-at` with the file, text and
+lines asked about. Quiet: never starts a server, never messages. Off the loop, as every
+lookup is — the answer folds in [[ed-apply-inlay-hints]]."
+  (if (or (ed-headless?) (not (ed-inlay-hints-due? m)))
+    m
+    (let (context (ed-lsp-here m :inlayHintProvider)
+          buffer (ed-current-buf m)
+          lines (ed-inlay-lines m)
+          at [(buffer-file buffer) (buffer-rope buffer) lines])
+      (ed-lsp-ask-server (assoc m :inlay-hints-at at)
+        (:conn context)
+        (lsp-inlay-hints)
+        (assoc context :lines lines)
+        {:at at}
+        :quiet))))
+
+(defn ed-inlay-annotations (rope hints)
+  "The server's `hints` (`lsp-protocol/lsp-inlay-hint-list`) as inline annotations over
+`rope` — `{:at offset :text}`, each line's UTF-16 column converted to a char offset
+(`lsp-protocol/lsp-units->column`). A hint on a line the text no longer has is dropped."
+  (into []
+    (seq/keep hints
+      (fn (hint)
+        (let (line (:line hint)
+              units (:units hint))
+          (when (and (int? line) (int? units) (>= line 0) (< line (text/line-count rope)))
+            {:at (+ (text/line->char rope line) (lsp-protocol/lsp-units->column rope line units))
+             :text (:text hint)}))))))
+
+(defn ed-apply-inlay-hints (m at hints)
+  "Fold an inlay-hint answer asked `at` (`[file rope lines]`) into the model: the current
+buffer's `:lsp-inlay` annotations replaced by `hints` — only while it is still that file,
+at that text, with its hints on. An answer about text that has moved since is dropped (the
+next idle beat asks again), as an answer for a buffer switched away from is."
+  (let (buffer (ed-current-buf m)
+        [file rope _lines] at)
+    (if (and (= (buffer-file buffer) file)
+          (= (buffer-rope buffer) rope)
+          (ed-inlay-hints-on? m buffer))
+      (ed-set-buf m
+        (inlinetext/set-annotations buffer *inlay-owner* (ed-inlay-annotations rope hints)))
+      m)))
+
+(impl LspRequest
+  lsp-requests/lsp-inlay-hints
+  (lsp-request-fold (pending m payload) (ed-apply-inlay-hints m (:at pending) payload)))
+
+(defcommand cmd-lsp-inlay-hints-mode
+  (m key)
+  "Toggle the language server's inlay hints in this buffer (Emacs `eglot-inlay-hints-mode`):
+parameter names and inferred types shown inside the line, never in the text. Off, the
+hints shown go at once; on, the next idle beat asks for the lines on screen."
+  (let (buffer (ed-current-buf m)
+        on? (not (ed-inlay-hints-on? m buffer))
+        toggled (assoc buffer :lsp-inlay-hints on?))
+    (message (ed-set-buf (dissoc m :inlay-hints-at)
+               (if on? toggled (inlinetext/clear toggled *inlay-owner*)))
+      (if on? "lsp-inlay-hints-mode on" "lsp-inlay-hints-mode off"))))
+
 ;; ---- registration: the events and idle-beat jobs this module owns ----------------
 ;; Registered at load, so neither the dispatcher's event table nor its idle beat names a
 ;; language server. Every `:lsp-…` event comes from a connection `ed-lsp-start` made, so none
@@ -710,3 +807,11 @@ applies the edits to every affected file (left modified for you to save)."
   {:order 50
    :run 'lsp-commands/ed-launch-signature
    :stale? 'lsp-commands/ed-signature-due?})
+
+;; …and the inlay hints for the lines on screen, after the signature (50): the same settled
+;; text, asked once it has stopped moving
+(register-event-handler :lsp-inlay-hints 'lsp-commands/ed-ev-lsp-reply)
+(register-idle-job :lsp-inlay-hints
+  {:order 55
+   :run 'lsp-commands/ed-launch-inlay-hints
+   :stale? 'lsp-commands/ed-inlay-hints-due?})
