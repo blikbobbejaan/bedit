@@ -641,6 +641,9 @@ src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (re
                             another coding or the hex view): how a file reads is a guess, and this
                             overrules it either way. A file edited as root reads through sudo
                             (`sudoedit/ed-sudo-revert`, M-x revert-buffer too)
+src/imageview.blsp          an image (PNG, JPEG, GIF, WebP, BMP) opens as a picture: brood's gui/image-thumb
+                            decodes it to fit the pane, painted in half-block cells (window and
+                            terminal alike) over the theme's background; one that does not decode is hex
 src/hexl.blsp               hexl-mode: a binary file opened as a read-only hex view (pool's
                             find-file reaches it late-bound); the mode's `:no-write` facet is
                             what makes C-x C-s / C-x C-w refuse it
