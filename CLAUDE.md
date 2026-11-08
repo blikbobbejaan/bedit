@@ -279,7 +279,10 @@ src/userkeys.blsp           init.blsp's `:keys` (global-set-key) and `:mode-keys
                             INTO the layers dispatch resolves (`ed-user-scope`, which
                             `userkeys/ed-scope` returns) — so C-h k / where-is report them too. A
                             mode's bindings go into the layer of that name, even one whose module
-                            loads later; the global ones into the profile's base layer
+                            loads later; the global ones into the profile's base layer.
+                            M-x global-set-key / local-set-key (help's, over C-h k's key read)
+                            bind live into the same `:user-keys`, kept as `:session-keys`
+                            across a reload unless init.blsp binds that key (`ed-merge-session-keys`)
 src/about.blsp              M-x version · --version · C-h C-a *About bedit* — bedit's version,
                             the brood under it and the build date, all from project-release/build-info
                             (named to dodge std's `version`, whose `version/newer?` packages uses)

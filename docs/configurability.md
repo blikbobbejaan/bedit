@@ -11,10 +11,13 @@
   `:keys` (Emacs `global-set-key`) and `:mode-keys` (`define-key` in one mode's map),
   read by std's `key-parse` (brood ADR-535) and compiled by `src/userkeys.blsp`. A
   binding's command is its M-x name; `nil` unbinds. `C-h k` and `C-h w` report them.
+  `M-x global-set-key` / `M-x local-set-key` bind a key live for the session into the
+  same amendments (`:session-keys` on the model); M-x reload-config keeps them unless
+  init.blsp now binds that key itself.
 - **Stage 3, named themes** — `:theme` is a setting, themes are a registry
   (`themes/register-theme!`, `M-x theme-select`), and a package may add one.
 - **Not built:** named hooks (`add-hook`), command properties (`command-put`), a live
-  `M-x set-variable` / `global-set-key`. Nothing in init.blsp can define a function.
+  `M-x set-variable`. Nothing in init.blsp can define a function.
 
 `M-x reload-config` re-reads the file and applies every setting, the keys, the theme and
 the font without a restart; the problems it finds go to *Messages* and the echo area.
