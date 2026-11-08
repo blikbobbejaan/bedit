@@ -100,26 +100,46 @@ bedit --attach ed --as alice -nw
 ## Over the network — `--listen`
 
 Every attach is a Brood **node link**, and node links run over TCP. `--listen
-[HOST:]PORT` makes the daemon bind TCP instead of the per-user Unix socket:
+[HOST:]PORT` makes the daemon listen on TCP as well as the per-user Unix socket:
 
 ```bash
-# host machine (copy ~/.config/brood/cookie to the other machine first — it authenticates)
+# host machine: it prints the attach command, with a fresh GUEST cookie for this session
 bedit --name ed --serve --shared --listen 0.0.0.0:7457 --as wilhelm notes.txt
+#   attach:  BEDIT_COOKIE=3f9c… bedit --attach ed@0.0.0.0:7457 [--as NAME]
 
-# any machine that can reach it:
-bedit --attach ed@HOST:7457 --as alice
+# any machine that can reach it (substitute the host's address for 0.0.0.0):
+BEDIT_COOKIE=3f9c… bedit --attach ed@HOST:7457 --as alice
+
+# or keep the cookie in an owner-only file (bedit refuses a file others can read)
+umask 077; echo 3f9c… > ~/.config/bedit/state/ed.cookie
+bedit --attach ed@HOST:7457 --cookie-file ~/.config/bedit/state/ed.cookie
 ```
 
 - A bare port binds **loopback only** (`127.0.0.1`); to be reachable from another machine,
   say so: `0.0.0.0:PORT` (every interface) or `HOST:PORT` (one).
-- The **cookie** (`~/.config/brood/cookie`) must match on both ends — that's the auth.
-- **Attaching is full trust.** A node link ships code: whoever holds the cookie can run
-  anything, as you, on every Brood node you run — not just edit this session's buffers.
-  Hand the cookie only to someone you would give a shell on this machine. (The cookie is
-  machine-wide today; a per-session cookie and a link that cannot ship code are the
-  missing Brood pieces — see issues.md S8.)
+- **The cookie is a guest cookie, minted per session** (brood ADR-415), not the machine's
+  `~/.config/brood/cookie`. It reaches only the session server: it cannot ship code or
+  reach your other Brood nodes. `--invite alice,bob` mints one per person with the name
+  bound, so the daemon knows who attached rather than taking `--as` on trust. The machine
+  cookie still links two of your own machines with full trust; never hand it out.
+- **Pass the cookie in the environment (`BEDIT_COOKIE`) or a file (`--cookie-file PATH`,
+  mode 0600), not as `--cookie VALUE`.** A command line is visible to every user on the
+  machine through `ps`; a process's environment is readable only by its owner (and root).
+  `--cookie VALUE` still works, and warns on stderr that it was visible. Precedence:
+  `--cookie-file`, then `$BEDIT_COOKIE`, then `--cookie`.
+- **Node links are encrypted.** Every link, TCP and Unix socket alike, is authenticated by
+  an HMAC over the cookie (the cookie itself never goes on the wire), then runs an
+  ephemeral X25519 key exchange folded into that HMAC, and seals every frame with
+  ChaCha20-Poly1305 (brood ADR-089, `crates/lisp/src/dist.rs` "Channel security"). An
+  observer on the network sees neither your keys nor your text, a forged or altered frame
+  fails its tag and ends the link, and the per-link ephemeral keys give forward secrecy. So
+  `--listen 0.0.0.0` across machines is safe on an untrusted network **as long as the
+  cookie stays secret**: the cookie is the only credential, there is no certificate, and
+  anyone who holds it is a guest of the session. It is not a defence against someone who
+  can read the cookie (a shared terminal log, a chat message, shell history).
 - Dual-listen: the per-user Unix socket stays bound alongside TCP, so local attaches
-  keep the bare-NAME form while remote machines use `@HOST:PORT`.
+  keep the bare-NAME form (and need no cookie: the machine's own reaches them) while remote
+  machines use `@HOST:PORT`.
 - Verified over a real TCP link (loopback: two runtimes, full presence + edit fan-out);
   cross-machine is the same code path — try it from the second machine.
 
@@ -132,7 +152,7 @@ bedit --attach ed@HOST:7457 --as alice
 | Presence: named, coloured remote carets + join/leave echoes (`--as`) | ✅ |
 | `follow` (C-x f): ride a participant's caret — the pairing view | ✅ |
 | Echo suppression (own round-trip never flickers fast typing) | ✅ |
-| Cross-machine over TCP (`--listen`, cookie-authenticated) | ✅ (loopback-verified; try your second machine) |
+| Cross-machine over TCP (`--listen`, guest cookie, encrypted link) | ✅ (loopback-verified; try your second machine) |
 | Delta pushes (splices/marker moves on the wire — the document never ships) | ✅ |
 | Concurrent typing merges exactly (OT for disjoint edits; same-span resyncs) | ✅ |
 | Shared selections (everyone's region, tinted in their colour) | ✅ |

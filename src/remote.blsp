@@ -53,6 +53,54 @@ pair scan — no dependence on `index-of` semantics for vectors)."
     (= (first args) flag) (second args)
     else (remote-arg-after (rest args) flag)))
 
+;; ---- the attach cookie: never on argv ---------------------------------------------------
+;; A guest cookie is a secret, and argv is not: `ps` shows every process's command line to
+;; every user on the machine. So the cookie comes from the environment (`BEDIT_COOKIE`,
+;; readable only by this user through /proc) or from an owner-only file (`--cookie-file`).
+;; `--cookie VALUE` still works, with a warning that it was visible.
+
+;; The environment variable `bedit --attach` reads a session's guest cookie from.
+(def *cookie-env*
+  "BEDIT_COOKIE")
+
+(defn- remote-cookie-from-file (path)
+  "The cookie in the file at `path` (its first line, trimmed), as `{:cookie c}`, or
+`{:error why}` when it is missing, empty, or readable by anyone but its owner — a secret in
+a group- or world-readable file is refused, as ssh refuses such a key."
+  (let (stat (file/stat path))
+    (cond
+      (nil? stat) {:error (str "--cookie-file " path ": no such file")}
+      (not (= (bit/and (or (:mode stat) 0) 63) 0))
+        {:error (str "--cookie-file "
+                  path ": readable by others — make it owner-only (chmod 600 " path ")")}
+      else
+        (let (cookie (string/trim (first (string/split (file/slurp path) "\n"))))
+          (if (= cookie "")
+            {:error (str "--cookie-file " path ": empty")}
+            {:cookie cookie})))))
+
+(defn remote-attach-cookie (args &optional env-lookup)
+  "The guest cookie `bedit --attach` presents, from `args` and the environment, as
+`{:cookie c :warning w :error e}` (each key only when it applies; no `:cookie` means the
+machine cookie, which reaches only this machine's own daemons). First `--cookie-file PATH`
+(an owner-only file), then `$BEDIT_COOKIE`, then `--cookie VALUE` — which warns, because a
+command line is visible to every user in `ps`. `env-lookup` reads a variable (default
+`os/env`), so a test need not set one."
+  (let (lookup (or env-lookup os/env)
+        path (remote-arg-after args "--cookie-file")
+        from-env (lookup *cookie-env*)
+        on-argv (remote-arg-after args "--cookie"))
+    (cond
+      (not (nil? path)) (remote-cookie-from-file path)
+      (and (not (nil? from-env)) (not (= (string/trim from-env) "")))
+        {:cookie (string/trim from-env)}
+      (not (nil? on-argv))
+        {:cookie on-argv
+         :warning (str "bedit: --cookie puts the session's secret on the command line, where `ps` "
+                    "shows it to every user on this machine — use " *cookie-env*
+                    "=… or --cookie-file PATH instead")}
+      else {})))
+
 (defn remote-serve? (args)
   "Whether `args` (from `(argv)`) requests daemon mode (`--serve`)."
   (includes? args "--serve"))
@@ -77,12 +125,14 @@ background daemon). Without it, `--serve` also opens the host's own window (see 
 (defn remote-positional (args)
   "The first positional argument (a file path) in `args` — skipping flags (`--x`) AND the
 value token of a value-taking flag (`--name` / `--attach` / `--as` / `--listen` / `--cookie` /
+`--cookie-file` /
 `--invite`), and Emacs's `-nw`. So `--serve --shared` and `--serve --shared notes.txt` both parse correctly: nil
 and \"notes.txt\" respectively (a bare `--serve` never swallows the following `--shared` as a
 filename). nil if none."
   (cond
     (empty? args) nil
-    (includes? ["--name" "--attach" "--as" "--listen" "--cookie" "--invite"] (first args))
+    (includes? ["--name" "--attach" "--as" "--listen" "--cookie" "--cookie-file" "--invite"]
+      (first args))
       (remote-positional (rest (rest args)))
     (or (string/starts-with? (first args) "--") (= (first args) "-nw"))
       (remote-positional (rest args))
@@ -110,7 +160,7 @@ LOOPBACK (127.0.0.1): reaching the daemon from another machine is a choice you s
 `--listen 0.0.0.0:PORT`, because a node link is full code execution for whoever holds the
 cookie — or nil for the default per-user Unix socket (same machine
 only). With `--listen`, machines elsewhere attach as `bedit --attach NAME@HOST:PORT`
-(the shared cookie in ~/.config/brood/cookie must match on both ends). Dual-listen: the
+with the session's guest cookie in `$BEDIT_COOKIE` (the attach hint prints it). Dual-listen: the
 per-user Unix socket stays bound too, so local attaches keep the bare-NAME form."
   (let (value (remote-arg-after args "--listen"))
     (cond
@@ -174,11 +224,17 @@ end), and one line per `--invite`d person with their own."
   (let (addr (remote-listen-addr (argv)))
     (if (nil? addr)
       (str "bedit --attach " name)
-      (let (base (str "bedit --attach " name "@" addr " --cookie "))
-        (string/join (cons (str base (:session guests))
-                       (map (:invites guests)
-                         (fn ([person cookie]) (str "\n    for " person ":  " base cookie))))
-          "")))))
+      (string/join (cons (remote-attach-line name addr (:session guests))
+                     (map (:invites guests)
+                       (fn ([person cookie])
+                         (str "\n    for " person ":  " (remote-attach-line name addr cookie)))))
+        ""))))
+
+(defn remote-attach-line (name addr cookie)
+  "The command that attaches to daemon `name` listening at `addr` with guest `cookie`: the
+cookie in the ENVIRONMENT (`BEDIT_COOKIE=… bedit --attach NAME@ADDR`), never as an argument,
+so the attaching process's command line in `ps` does not carry it."
+  (str *cookie-env* "=" cookie " bedit --attach " name "@" addr))
 
 (defn remote-main? (args)
   "True when `args` (the CLI tokens `main` received) requested daemon (`--serve`) or client
@@ -670,13 +726,17 @@ session ends (C-x C-c) or the link drops. Blocks until then. Needs a GUI-enabled
 whose `std` includes `attach-display` (rebuild `../brood` with `./configure --with-gui &&
 make install`) — a clear error says so if it's missing."
   (if (bound? 'editor/attach/attach-display)
-    (editor/attach/attach-display spec
-      ;; set up from THIS machine's init file, read without writing one: the window and
-      ;; its fonts are here. The session's kills and yanks reach this machine's clipboard
-      ;; through it (brood ADR-539)
-      (ed-window (config/peek-init))
-      ;; the session's guest cookie (`--cookie`, from the daemon's attach hint), else the
-      ;; machine cookie — which only reaches a daemon on this machine's own nodes
-      (remote-arg-after (argv) "--cookie")
-      {:name (remote-participant (argv))})
+    (let (found (remote-attach-cookie (argv)))
+      (when (:error found) (error (str "ed-attach: " (:error found))))
+      (when (:warning found) (io/puts (:warning found) :to *err*))
+      (editor/attach/attach-display spec
+        ;; set up from THIS machine's init file, read without writing one: the window and
+        ;; its fonts are here. The session's kills and yanks reach this machine's clipboard
+        ;; through it (brood ADR-539)
+        (ed-window (config/peek-init))
+        ;; the session's guest cookie ($BEDIT_COOKIE / --cookie-file, from the daemon's
+        ;; attach hint), else the machine cookie — which only reaches a daemon on this
+        ;; machine's own nodes
+        (:cookie found)
+        {:name (remote-participant (argv))}))
     (error "ed-attach: this nest's std lacks attach-display — rebuild Brood: (cd ../brood && ./configure --with-gui && make install)")))
