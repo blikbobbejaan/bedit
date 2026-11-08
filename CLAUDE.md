@@ -216,7 +216,8 @@ src/bugreport.blsp          M-x report-bug (Emacs's report-emacs-bug): every err
                             (a command, a render error frame, a fontify, a loop the supervisor
                             restarted) reaches its error sink (`model/register-error-sink`),
                             described as data by brood's `crash-report/describe-error` (redacted,
-                            no buffer text) and kept in state/errors.blsp once per kind a session;
+                            no buffer text) and kept in state/errors.blsp once per kind a session; a bedit that DIED on a signal
+                            left a brood record (ADR-635), taken in at the next start (`adopt-crashes!`);
                             the first time, the echo area points at M-x report-bug. *Bug Report*
                             shows exactly what would be sent, editable, under your note; C-c C-c
                             sends it off the loop to `:bug-report-url` (the hive), C-c C-k drops
