@@ -452,6 +452,12 @@ src/pulse.blsp              a flash on the line after a JUMP (Emacs pulsar, `:pu
 src/winner.blsp             C-c ← / C-c → window-layout undo and redo (Emacs winner-mode, `:winner`): a
                             post-step row keeps the layouts the window SHAPE changed from, carried
                             with their buffers' text (`model/register-layout-keeper`)
+src/tabbar.blsp             TABS (Emacs tab-bar-mode, C-x t …): each tab a window LAYOUT and its own
+                            winner history (`:tabs`, `:tab-index`; the live tab's layout is `:layout`).
+                            The row shows with `:tab-bar` or 2+ tabs and takes row 0 from the layout
+                            (`panes/ed-tab-bar-rows`, `ed-body-rect`); a kept tab follows a kill (a
+                            slot keeper) and its text (a layout keeper); a click is
+                            `hittest/ed-tab-bar-click`; lastsession saves the tabs. Per frame
 src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
                             `:show-whitespace`, per mode through `scroll/ed-mode-setting`)
 src/glyphless.blsp          the invisible format characters SHOWN (Emacs glyphless-char-display):

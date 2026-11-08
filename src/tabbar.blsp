@@ -1,0 +1,339 @@
+(defmodule tabbar
+  "TABS, as Emacs 27's `tab-bar-mode` has them: each tab is a WINDOW LAYOUT of its own — its
+splits and the buffers they show — not a buffer (that is `tab-line-mode`). A row at the top
+of the frame lists them, the current one raised, each named after its selected window's
+buffer unless renamed (`C-x t r`). It shows while the init file's `:tab-bar` is on, and by
+itself whenever there is more than one tab (Emacs's `tab-bar-show` 1); the layout gives the
+panes the rows under it (`panes/ed-tab-bar-rows`), so nothing below has to know it is there.
+
+The model keeps `:tabs`, a vector of `{:name :layout …}`, and `:tab-index`, the current one.
+The current tab's layout is the live `:layout`; the others are kept as they were left, with
+their pool indexes following a kill (a slot keeper) and their windows following edits to
+the text (a layout keeper), so going back to a tab shows what it showed. A tab also keeps
+its own winner history (`*tab-keeps*`), as Emacs's `tab-bar-history-mode` does, so `C-c ←`
+never undoes into another tab's layout. Each frame has its own tabs: a frame is a model."
+  (:use editor/buffer) ; buffer-name
+  (:use editor/display) ; rect / text / zone / zone-cursor-ops — the row's ops and its zones
+  (:use editor/pane :only [pane-map pane-selected-payload pane-delete-others])
+  (:use interactive) ; defcommand
+  (:use minibuffer :only [ed-mb-edit]) ; the rename prompt's line
+  (:use model) ; message / ed-current-index / register-slot-keeper / register-layout-keeper …
+  (:use panes :only [ed-tab-bar-rows]) ; whether the row shows: the layout's rule
+  (:use pool) ; the prompts and the opening a new tab's buffer goes through
+  (:use projects :only [recent-files])
+  (:use theme) ; the palette the tab faces are formulas over
+  (:use ui-kit :only [ui-space-cells])) ; the spacing table
+
+;; Chrome, recessed as the mode line and the header line are: the bar on the mantle, the
+;; current tab raised to the editor's own background, so it reads as the page you are on.
+(theme/defchrome face-tab-bar {:fg *fg-chrome-dim* :bg *mantle*}) ; the row, and a tab not shown
+(theme/defchrome face-tab-current {:fg *fg-chrome* :bg *base*}) ; the tab shown
+(theme/defchrome face-tab-close {:fg *fg-tertiary*}) ; a tab's ×
+
+(def *tab-name-max* 20) ; a tab's name is cut to this many cells (Emacs's tab-bar-tab-name-truncated-max)
+
+;; What a tab keeps of the model besides its layout: winner's history of it.
+(def *tab-keeps* [:winner-undo :winner-redo :winner-seen])
+
+;; ---- the tabs ---------------------------------------------------------------------
+
+(defn tabs (m)
+  "`m`'s tabs, at least one: `:tabs`, or the one tab a frame starts with."
+  (let (kept (:tabs m)) (if (and (vector? kept) (not (empty? kept))) kept [{}])))
+
+(defn current-tab (m)
+  "The index of the tab `m` shows."
+  (let (index (:tab-index m))
+    (if (and (int? index) (>= index 0) (< index (count (tabs m)))) index 0)))
+
+(defn- usable-layout (m layout)
+  ;; a kept `layout` with every window on a buffer that is gone (killed while its tab was
+  ;; away: the slot keeper left it nil) showing the current buffer instead, as Emacs shows
+  ;; another buffer in a window whose buffer was killed
+  (let (size (count (:buffers m))
+        fallback (ed-current-index m))
+    (pane-map layout
+      (fn (payload)
+        (let (index (:buffer payload))
+          (if (and (int? index) (< index size))
+            payload
+            (assoc (dissoc payload :point :mark :top-row) :buffer fallback :top 0)))))))
+
+(defn tab-layout (m index)
+  "The window layout of tab `index`: the live one for the tab shown."
+  (if (= index (current-tab m))
+    (:layout m)
+    (let (kept (:layout (nth (tabs m) index)))
+      (if (nil? kept) (:layout m) (usable-layout m kept)))))
+
+(defn tab-name (m index)
+  "Tab `index`'s name: the one it was given (`C-x t r`), else its selected window's buffer's."
+  (let (given (:name (nth (tabs m) index)))
+    (if (and (string? given) (not (string/blank? given)))
+      given
+      (let (shown (:buffer (pane-selected-payload (tab-layout m index))))
+        (buffer-name (ed-buf-at m (if (int? shown) shown 0)))))))
+
+(defn- moved-keys (to from)
+  ;; `to` with each of `*tab-keeps*` as `from` has it, absent where `from` has none
+  (fold *tab-keeps*
+    to
+    (fn (acc key)
+      (let (value (get from key)) (if (nil? value) (dissoc acc key) (assoc acc key value))))))
+
+(defn- saved-tabs (m)
+  ;; the tabs with the shown one holding the live layout and its winner history
+  (let (all (tabs m)
+        here (current-tab m))
+    (assoc all here (moved-keys (assoc (nth all here) :layout (:layout m)) m))))
+
+(defn select-tab (m index)
+  "`m` showing tab `index`: the tab it leaves keeps its layout, the one it goes to brings its
+own back. Unchanged for the tab already shown or one that does not exist."
+  (let (all (tabs m)
+        here (current-tab m))
+    (if (or (= index here) (not (int? index)) (< index 0) (>= index (count all)))
+      m
+      (let (saved (saved-tabs m)
+            tab (nth saved index)
+            kept (:layout tab))
+        (moved-keys (assoc m
+                      :tabs saved
+                      :tab-index index
+                      :layout (if (nil? kept) (:layout m) (usable-layout m kept)))
+          tab)))))
+
+(defn new-tab (m &optional (layout nil))
+  "`m` with a new tab right of the one shown, showing `layout` (the current layout by
+default, Emacs's `tab-bar-new-tab-choice` nil), and selected. Its winner history starts
+empty."
+  (let (saved (saved-tabs m)
+        position (inc (current-tab m))
+        grown (vec (append (take saved position) [{}] (drop saved position))))
+    (moved-keys (assoc m :tabs grown :tab-index position :layout (or layout (:layout m))) {})))
+
+(defn close-tab (m index)
+  "`m` without tab `index`. Closing the tab shown shows the one to its right, else the one to
+its left. The only tab is never closed (Emacs's `Attempt to delete the sole tab`)."
+  (let (all (tabs m)
+        here (current-tab m))
+    (cond
+      (<= (count all) 1) (ed-ding m "Attempt to delete the sole tab")
+      (or (not (int? index)) (< index 0) (>= index (count all))) m
+      (= index here)
+        (let (next (if (< (inc index) (count all)) (inc index) (dec index))
+              shown (select-tab m next))
+          (assoc shown
+            :tabs (vec (seq/remove-nth (:tabs shown) index))
+            :tab-index (if (> next index) (dec next) next)))
+      else
+        (assoc m
+          :tabs (vec (seq/remove-nth all index))
+          :tab-index (if (> here index) (dec here) here)))))
+
+(defn rename-tab (m name)
+  "`m` with the tab shown named `name`; a blank name gives it back its buffer's."
+  (let (all (tabs m)
+        here (current-tab m)
+        tab (nth all here))
+    (assoc m
+      :tabs (assoc all here (if (string/blank? name) (dissoc tab :name) (assoc tab :name name)))
+      :tab-index here)))
+
+(defn- step-tab (m delta)
+  ;; the tab `delta` places along, wrapping round
+  (select-tab m (math/mod (+ (current-tab m) delta) (count (tabs m)))))
+
+;; ---- what follows the pool and the text -------------------------------------------
+
+(defn tabs-follow-kill (m killed)
+  "The slot keeper's `:drop`: every kept tab's windows on pool slot `killed` aimed at nothing
+(shown on the current buffer when the tab is next shown), those above it moved down one."
+  (if (nil? (:tabs m))
+    m
+    (assoc m
+      :tabs
+        (vec (map (:tabs m)
+               (fn (tab)
+                 (if (nil? (:layout tab))
+                   tab
+                   (assoc tab
+                     :layout
+                       (pane-map (:layout tab)
+                         (fn (payload)
+                           (assoc payload :buffer (shift-slot-index (:buffer payload) killed))))))))))))
+
+(register-slot-keeper :tabs {:order 60 :drop 'tabbar/tabs-follow-kill})
+
+(defn carry-kept (m buffer-name carry)
+  "The layout keeper: every kept tab's windows on the buffer named `buffer-name` passed
+through the pane function `carry`, as an edit to that buffer's text moves them
+(`model/register-layout-keeper`)."
+  (if (nil? (:tabs m))
+    m
+    (let (size (count (:buffers m))
+          showing? (fn (payload)
+                     (let (index (:buffer payload))
+                       (and (int? index)
+                         (< index size)
+                         (= (buffer-name (ed-buf-at m index)) buffer-name)))))
+      (assoc m
+        :tabs
+          (vec (map (:tabs m)
+                 (fn (tab)
+                   (if (nil? (:layout tab))
+                     tab
+                     (assoc tab
+                       :layout
+                         (pane-map (:layout tab)
+                           (fn (payload) (if (showing? payload) (carry payload) payload))))))))))))
+
+(register-layout-keeper :tabs 'tabbar/carry-kept)
+
+;; ---- the row ----------------------------------------------------------------------
+
+(defn tab-bar-widget (m cols)
+  "The tab bar across row 0, `cols` wide, as a ui-kit widget `{:ops :zones}`: each tab its
+name (cut to `*tab-name-max*` cells) and a ×, the current one raised. A tab's zone is `[:tab
+index]`, its ×'s `[:close index]` over it — what the view paints and the click
+(`hittest/ed-tab-bar-click`) reads, from this one pass."
+  (let (inset (ui-space-cells :row-inset)
+        gap (ui-space-cells :key-gap)
+        here (current-tab m)
+        [ops zones _] (fold (range (count (tabs m)))
+                        [[(rect 0 0 cols 1 face-tab-bar)] [] 0]
+                        (fn ([ops zones col] index)
+                          (if (>= col cols)
+                            [ops zones col]
+                            (let (label (string/clip-cells (tab-name m index) *tab-name-max* "…")
+                                  close-col (+ col inset (string/display-width label) gap)
+                                  width (- (+ close-col 1 inset) col)
+                                  current? (= index here)
+                                  painted (if current?
+                                            [(rect 0
+                                               col
+                                               (math/min width (- cols col))
+                                               1
+                                               face-tab-current)
+                                              (text 0 (+ col inset) label face-tab-current)]
+                                            [(text 0 (+ col inset) label face-tab-bar)])
+                                  tab-zone (zone [col 0 width 1] [:tab index] :pointer)
+                                  close-zone (zone [close-col 0 (+ 1 inset) 1]
+                                               [:close index]
+                                               :pointer))
+                              [(into ops (conj painted (text 0 close-col "×" face-tab-close)))
+                                (into zones [tab-zone close-zone])
+                                (+ col width gap)])))))
+    {:ops ops :zones zones}))
+
+(defn tab-bar-ops (m cols rows)
+  "The frame overlay: the tab bar's ops on row 0 while it shows, else none."
+  (if (= 0 (ed-tab-bar-rows m))
+    '()
+    (let (widget (tab-bar-widget m cols))
+      (append (:ops widget) (or (zone-cursor-ops (:zones widget)) '())))))
+
+;; Under every other overlay: a card or a candidate list may cover the row.
+(register-frame-overlay :tab-bar {:rank 5 :run 'tabbar/tab-bar-ops})
+
+(defn tab-bar-clicked (m id)
+  "`m` after a left click on the tab bar zone `id`: `[:tab i]` shows tab i, `[:close i]`
+closes it."
+  (match id
+    ([:tab index] (select-tab m index))
+    ([:close index] (close-tab m index))
+    (_ m)))
+
+;; ---- the commands (C-x t …) -------------------------------------------------------
+
+(defcommand cmd-tab-new
+  (m key)
+  "A new tab showing the layout this one shows (C-x t 2, Emacs's tab-new)."
+  (new-tab m))
+
+(defcommand cmd-tab-close
+  (m key)
+  "Close the tab shown (C-x t 0, Emacs's tab-close); the one to its right is shown."
+  (close-tab m (current-tab m)))
+
+(defcommand cmd-tab-next
+  (m key)
+  "Show the next tab, wrapping round (C-x t o, C-<tab>; Emacs's tab-next)."
+  (step-tab m 1))
+
+(defcommand cmd-tab-previous
+  (m key)
+  "Show the previous tab, wrapping round (C-x t O, C-S-<tab>; Emacs's tab-previous)."
+  (step-tab m -1))
+
+(defcommand cmd-tab-rename
+  (m key)
+  "Name the tab shown (C-x t r, Emacs's tab-rename); an empty name gives it back its buffer's."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "Rename tab (empty for the buffer's name): " "")
+       :on-complete (fn (prompted name) (rename-tab prompted (string/trim name)))}))
+
+(defn- index-named (m name)
+  ;; the index of the first tab called `name`, or nil
+  (seq/find (range (count (tabs m))) (fn (index) (= (tab-name m index) name))))
+
+(defcommand cmd-tab-switch
+  (m key)
+  "Show the tab named — completing over the others' names (C-x t RET, Emacs's tab-switch). A
+name no tab has makes a new tab with that name, as Emacs's does."
+  (let (here (current-tab m)
+        names (seq/keep (range (count (tabs m)))
+                (fn (index) (when (not (= index here)) (tab-name m index)))))
+    (assoc m
+      :minibuffer
+        (ed-name-prompt "Switch to tab: "
+          (vec names)
+          (fn (prompted name)
+            (let (index (index-named prompted name))
+              (cond
+                (string/blank? name) prompted
+                (nil? index) (rename-tab (new-tab prompted) name)
+                else (select-tab prompted index))))))))
+
+(defn- single-window-tab (m)
+  ;; `m` with a new tab of one window, the selected one's: where C-x t b / f open
+  (new-tab m (pane-delete-others (:layout m))))
+
+(defcommand cmd-switch-to-buffer-other-tab
+  (m key)
+  "A buffer in a new tab of one window (C-x t b, Emacs's switch-to-buffer-other-tab)."
+  (let (current (buffer-name (ed-current-buf m))
+        names (seq/reject (ed-recent-buffers m) (fn (name) (= name current))))
+    (assoc m
+      :minibuffer
+        (ed-name-prompt "Switch to buffer in other tab: "
+          names
+          (fn (prompted name)
+            (cond
+              (string/blank? name) (message prompted "no buffer")
+              (nil? (ed-buffer-index-by-name prompted name))
+                (message prompted (str "no buffer named " name))
+              else (ed-switch-to-named (single-window-tab prompted) name)))))))
+
+(defn find-file-other-tab (m path)
+  "Open `path` in a new tab of one window: C-x t f's destination."
+  (ed-find-file (single-window-tab m) path))
+
+(defcommand cmd-find-file-other-tab
+  (m key)
+  "Find a file in a new tab of one window (C-x t f, Emacs's find-file-other-tab) — the `C-x
+C-f` prompt, opening into a tab instead of this window."
+  (assoc m
+    :minibuffer
+      (ed-find-file-prompt (str (ed-default-dir m) "/")
+        (if (:recent-files m) (recent-files) [])
+        (fn (prompted path) (ed-visit-file prompted path find-file-other-tab))
+        "Find file in other tab: ")))
+
+(defcommand cmd-tab-bar-mode
+  (m key)
+  "Show the tab bar always, or only while there is more than one tab (Emacs's tab-bar-mode;
+the init file's `:tab-bar`)."
+  (let (on (not (:tab-bar m)))
+    (message (assoc m :tab-bar on) (if on "tab-bar-mode on" "tab-bar-mode off"))))
