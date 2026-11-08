@@ -478,12 +478,14 @@ scan of the rows for one that is clipped."
                 avail (math/max 1 (- w (string/display-width ellipsis)))
                 slack (math/max 0 (math/min margin (math/quot (dec avail) 2)))
                 shown (one-row text (math/max 0 (+ (- point-cell avail) 1 slack)) w ellipsis)
-                shown-clip (nth shown 2 nil))
+                shown-clip (nth shown 2 nil)
+                display (row-display (nth rows k)))
             (assoc rows
               k
-                (if (nil? shown-clip)
-                  [line (first shown) (second shown) nil]
-                  [line (first shown) (second shown) nil shown-clip]))))))))
+                (cond
+                  display [line (first shown) (second shown) nil shown-clip display]
+                  (nil? shown-clip) [line (first shown) (second shown) nil]
+                  else [line (first shown) (second shown) nil shown-clip]))))))))
 
 (defn- rope-line-segments (rope line w &optional (extras {}))
   "The row segments of line `line` of `rope`, `w` cells wide, under the line's policy in the
@@ -542,6 +544,17 @@ spans to the BUFFER's stops, as in every function here that is handed the buffer
 segments — none at all when a fold hides it. What a walk up or down the lines counts."
     (conventions/with-cell-layout buf (fn () (rope-line-rows (buffer-rope buf) line w extras)))))
 
+(defn- segment-entry (line seg)
+  ;; a text row's entry from one of its line's segments: a clipped row keeps its clip as a
+  ;; fifth field, for the painter and a click
+  (if (nth seg 2 nil)
+    [line (first seg) (second seg) nil (nth seg 2)]
+    [line (first seg) (second seg) nil]))
+
+(defn- rope-line-entries (rope line w extras)
+  ;; `line-row-entries` over the rope, under the caller's cell layout
+  (into [] (map (rope-line-segments rope line w extras) (fn (seg) (segment-entry line seg)))))
+
 (defn- inlay-rows (texts line limit acc)
   "`acc` plus inlay rows `[line 0 nil text]`, one per text of `texts`, up to `limit`."
   (fold texts acc (fn (a text) (if (>= (count a) limit) a (conj a [line 0 nil text])))))
@@ -571,11 +584,7 @@ first `skip` of `line`'s own rows left out (a pane started part-way down its top
               to (math/min (count segs) (+ from room)))
           (fold (seq/subvec segs from to)
             with-inlays
-            (fn (a seg)
-              ;; a clipped row keeps its clip as a fifth field, for the painter and a click
-              (if (nth seg 2 nil)
-                (conj a [line (first seg) (second seg) nil (nth seg 2)])
-                (conj a [line (first seg) (second seg) nil])))))))))
+            (fn (a seg) (conj a (segment-entry line seg)))))))))
 
 ;; The row table is memoised (`defmemo`, std/memo) on `[rope top skip w limit inlays]`: it is
 ;; asked from the pure `view`, from three hit-test sites in `panes`, and from
@@ -649,6 +658,167 @@ megabyte line wraps into thousands of rows.
 
     (wrap/row-of [[0 10] [10 19]] 10)   ;=> 1"
   (if (empty? segs) 0 (segment-index (if (vector? segs) segs (vec segs)) col)))
+
+;; ---- a row's cells: THE row↔column conversion -----------------------------------------
+;; Every question "which screen cell is char column C of this row on?" and its inverse
+;; "which char is under cell X of this row?" is answered by `row-cell` and `row-column`,
+;; and by nothing else. A ROW ENTRY is a row of the table — `[line from to inlay clip
+;; display]`, the trailing fields optional — or one an unwrapped pane stands for,
+;; `[line hscroll nil nil]` (`to` nil: the row runs to the line's end). What sits on a row
+;; besides its chars is in `display`, `{:prefix :inline}`:
+;;
+;;   :prefix  cells of blank before the row's first char (a wrapped line's continuation
+;;            row starts under its indentation — `wrap-prefix`)
+;;   :inline  `[[column width text face] …]`, ascending: virtual text painted just before
+;;            char `column`, `width` cells wide — never in the buffer (`inlinetext`)
+;;
+;; A position AT an inline annotation's column is painted after it (the char there is), so
+;; the cursor never sits inside one and text typed there appears where the cursor is.
+
+(sig row-display (any -> (or nil map)))
+(defn row-display (row)
+  "What row entry `row` shows besides its chars — `{:prefix :inline}` — or nil."
+  (let (display (nth row 5 nil)) (if (map? display) display nil)))
+
+(sig row-prefix (any -> int))
+(defn row-prefix (row)
+  "The blank cells before row entry `row`'s first char (0 for most rows)."
+  (let (prefix (get (row-display row) :prefix)) (if (int? prefix) prefix 0)))
+
+(defn row-inline (row)
+  "The inline annotations painted on row entry `row`, `[[column width text face] …]`
+ascending by column — `[]` for none."
+  (let (inline (get (row-display row) :inline)) (if (vector? inline) inline [])))
+
+(defn- row-inline-from (row start)
+  ;; the row's inline annotations at or after char `start` — a row shown from part-way along
+  ;; its line (`follow-point`) leaves the ones before it off the left edge
+  (seq/filter (row-inline row) (fn (annotation) (>= (first annotation) start))))
+
+(sig rope-line-length (any int -> int))
+(defn- rope-line-length (rope line)
+  ;; the chars of line `line` of `rope`, its newline not counted
+  (nth (rope-line-source rope line) 2))
+
+(sig cells-from-bol (any int int int -> int))
+(defn- cells-from-bol (rope bol from to)
+  ;; the cells of chars `[from, to)` of the line at `bol`, both ends measured from the
+  ;; line's start (a tab spans to the LINE's stop — ADR-342)
+  (cond
+    (>= from to) 0
+    (= from 0) (string/display-width (text/slice rope bol (+ bol to)))
+    else
+      (- (string/display-width (text/slice rope bol (+ bol to)))
+        (string/display-width (text/slice rope bol (+ bol from))))))
+
+(sig clamp-int (int int int -> int))
+(defn- clamp-int (low high value)
+  ;; `value` held within `[low, high]` — `if`s, so the checker keeps the int
+  (cond
+    (< value low) low
+    (> value high) high
+    else value))
+
+(sig row-int (any int -> int))
+(defn- row-int (row index)
+  ;; field `index` of row entry `row` as an int (0 when it is not one): a row is untyped data
+  (let (value (nth row index nil)) (if (int? value) value 0)))
+
+(sig row-cell (any any int -> int))
+(defn row-cell (rope row column)
+  "The cell, counted from the text area's left edge, that char column `column` of row entry
+`row`'s line is painted at: the row's prefix, the cells of its chars from its first to
+`column` (measured on the line's tab stops), and every inline annotation at or before
+`column` (a position at an annotation's column is painted after it). A column left of the
+row's first char is its first; past the line's end, its end. THE row → cell conversion: the
+caret, a remote caret, a fold's ellipsis, the region's end-of-line band, a note's place, a
+C-n goal column and avy's labels all ask here.
+
+    (wrap/row-cell (text/from-string \"abcdef\") [0 2 nil nil] 5)   ;=> 3"
+  (let (line (row-int row 0)
+        bol (text/line->char rope line)
+        len (rope-line-length rope line)
+        start (clamp-int 0 len (row-int row 1))
+        at (clamp-int start len column)
+        inline (fold (row-inline-from row start)
+                 0
+                 (fn (acc annotation)
+                   (let (column (first annotation)
+                         width (second annotation))
+                     (if (and (int? column) (int? width) (<= column at)) (+ acc width) acc)))))
+    (+ (row-prefix row) (cells-from-bol rope bol start at) inline)))
+
+(sig index-at-cell (any int int int int -> int))
+(defn- index-at-cell (rope bol from to cells)
+  ;; the char of `[from, to)` on the line at `bol` whose cell holds `cells` (counted from
+  ;; `from`'s), `to` when it is past them — measured as the row is painted
+  (if (>= from to)
+    from
+    (+ from
+      (string/width->index (text/slice rope (+ bol from) (+ bol to))
+        (if (< cells 0) 0 cells)
+        (cells-from-bol rope bol 0 from)))))
+
+(sig row-column-walk (any int int int int int any -> int))
+(defn- row-column-walk (rope bol end target position x annotations)
+  "Tail-recursive: the char under cell `target` of a row whose chars run from `position`
+(cell `x`) to `end`, with `annotations` (`[column width …]`, ascending) still ahead."
+  (if (empty? annotations)
+    (index-at-cell rope bol position end (- target x))
+    (let (annotation (first annotations)
+          anchor (first annotation)
+          width (second annotation)
+          column (clamp-int position end (if (int? anchor) anchor end))
+          span (cells-from-bol rope bol position column)
+          wide (if (int? width) width 0))
+      (cond
+        (< target (+ x span)) (index-at-cell rope bol position column (- target x))
+        (< target (+ x span wide)) column
+        else (row-column-walk rope bol end target column (+ x span wide) (rest annotations))))))
+
+(sig row-column (any any number &optional bool -> int))
+(defn row-column (rope row cell &optional (clicked false))
+  "The char column of row entry `row`'s line under cell `cell` (counted from the text area's
+left edge) — [[row-cell]]'s inverse, by the same measure: the row's prefix lands on its
+first char, a cell on an inline annotation on the annotation's column (its anchor), a wide
+glyph's second cell before it. Clamped to the row: past its text, its last position (on a
+row its line continues past, the char before the next row's first). With `clicked`, a cell
+past a CUT row's cut (its clip) is the line's end — the ellipsis is not a char, and the
+chars behind it were not on screen to be clicked; without it (a C-n goal column) the cell
+reads the line on past the cut, as Emacs's truncated lines keep the column. THE cell → char
+conversion: a click, a drag, a hover, C-n's goal column.
+
+    (wrap/row-column (text/from-string \"abcdef\") [0 2 nil nil] 3)   ;=> 5"
+  (let (line (row-int row 0)
+        to (nth row 2 nil)
+        clip (nth row 4 nil)
+        bol (text/line->char rope line)
+        len (rope-line-length rope line)
+        start (clamp-int 0 len (row-int row 1))
+        end (if (int? to) (clamp-int start len to) len)
+        last (if (< end len) (clamp-int start end (dec end)) end)
+        floored (math/floor cell)
+        target (- (if (int? floored) floored 0) (row-prefix row))
+        found (row-column-walk rope bol end target start 0 (row-inline-from row start))
+        column (if (< found last) found last)
+        cut (when (vector? clip) (first clip)))
+    (if (and clicked (int? cut) (>= column cut)) len column)))
+
+(defn line-row-entries (buf line w &optional (extras {}))
+  "The row entries of buffer line `line`'s TEXT at text width `w` (`[line from to nil clip
+display]`, no inlay rows), as the row table holds them — or, when `w` is 0 (no wrapping),
+its one whole row `[line 0 nil nil]`. What a walk by screen rows off the visible table asks
+(C-n's goal column, the wheel carrying point, C-v)."
+  (if (<= w 0)
+    [[line 0 nil nil]]
+    (conventions/with-cell-layout buf
+      (fn () (rope-line-entries (buffer-rope buf) line w (or extras {}))))))
+
+(sig row-entry-of (any int -> any))
+(defn row-entry-of (entries column)
+  "Which of a line's row `entries` ([[line-row-entries]]) holds char column `column` —
+[[row-of]] over their segments."
+  (nth entries (row-of (map entries (fn (entry) [(second entry) (nth entry 2)])) column)))
 
 (sig row-count-step (any int int int map int int -> int))
 (defn- row-count-step (rope line to-line w inlays limit acc)
