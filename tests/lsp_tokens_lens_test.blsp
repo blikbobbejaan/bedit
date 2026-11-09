@@ -271,7 +271,8 @@ taken and ignored."
                            {:range {:start {:line 1 :character 2}}
                             :command {:title "Run test" :command "run.test" :arguments [7]}}
                            nil])
-          caps {:codeLensProvider {:resolveProvider true}}
+          caps {:codeLensProvider {:resolveProvider true}
+                :executeCommandProvider {:commands ["run.test"]}}
           m (assoc (serving (ed-init (make-buffer "a\n  fn t() {}\n" "s.rs" "/tmp/lens.rs"))
                      conn caps)
               :lsp-code-lens true)
@@ -309,3 +310,236 @@ taken and ignored."
   (test "no lens on point's line is said"
     (let (m (assoc (ed-init (make-buffer "x" "s.rs" "/tmp/lens3.rs")) :lsp-code-lens true))
       (is (includes? (:echo (cmd-lsp-code-lens-run m nil)) "no code lens")))))
+
+;; ---- running a lens: server commands, client commands, the mouse ---------------------
+(defn- asked-within (ms)
+  (receive ([:asked question] question) (after ms nil)))
+
+(defn- lensed (conn caps text path raw)
+  "A model showing `text` as file `path`, served by `conn` with `caps`, holding the lenses of
+the raw server answer `raw` as if it had just landed."
+  (let (m (assoc (serving (ed-init (make-buffer text "s.rs" path)) conn caps) :lsp-code-lens true))
+    (ed-lens-fold {:path path :seen (ed-current-buf m) :conn conn} m (parse-lenses raw))))
+
+(defn- lens (line title command & arguments)
+  {:range {:start {:line line :character 0}}
+   :command {:title title :command command :arguments (into [] arguments)}})
+
+(describe "lsp code lens: what a lens runs"
+  (test "a rust-analyzer runnable becomes its cargo command, in its folder"
+    (assert= (runnable-command {:kind "cargo"
+                                :args {:cargoArgs ["run"
+                                                    "--package" "lens-fixture" "--bin"
+                                                    "lens-fixture"]
+                                       :executableArgs []
+                                       :cwd "/p/crate"
+                                       :workspaceRoot "/p"}})
+      ["cargo run --package lens-fixture --bin lens-fixture" "/p/crate"])
+    (assert= (runnable-command {:kind "cargo"
+                                :args {:cargoArgs ["test" "--package" "x"]
+                                       :executableArgs ["tests::adds" "--exact" "--show-output"]
+                                       :workspaceRoot "/p"
+                                       :environment {:RUST_BACKTRACE "short"}
+                                       :overrideCargo "my cargo"}})
+      ["RUST_BACKTRACE=short 'my cargo' test --package x -- tests::adds --exact --show-output" "/p"])
+    (assert= (runnable-command {:kind "shell" :args {:program "make" :args ["check"] :cwd "/p"}})
+      ["make check" "/p"])
+    (is (nil? (runnable-command {:kind "debugger"})))
+    (is (nil? (runnable-command nil))))
+  (test "a server command goes back to the server; a command it does not list is not sent"
+    (let (conn (stand-in [nil])
+          m (lensed conn
+              {:executeCommandProvider {:commands ["run.test"]}}
+              "fn t() {}\n"
+              "/tmp/lens-run.rs"
+              [(lens 0 "Run test" "run.test" 7) (lens 0 "Vendor" "vendor.thing")])
+          [run vendor] (map/get-in m [:lsp-lenses "/tmp/lens-run.rs" :lenses]))
+      ;; two lenses on the line: M-x lsp-code-lens-run offers a picker
+      (is (:minibuffer (cmd-lsp-code-lens-run (ed-set-buf m (goto-char (ed-current-buf m) 0)) nil)))
+      (let (ran (ed-lens-run m run)
+            [kind request] (asked))
+        (assert= kind (lsp-execute-command))
+        (assert= request {:command "run.test" :arguments [7]})
+        (deliver ran))
+      (is (includes? (:echo (ed-lens-run m vendor))
+            "vendor.thing is a client command bedit does not run"))
+      (is (nil? (asked-within 200)))))
+  (test "rust-analyzer's client commands: showReferences jumps, debug is said, a bad runnable said"
+    (let (uri (lsp-protocol/lsp-path->uri "/tmp/lens-refs.rs")
+          m (lensed (self)
+              {}
+              "struct S;\n\nimpl S {}\n"
+              "/tmp/lens-refs.rs"
+              [(lens 0
+                 "1 implementation"
+                 "rust-analyzer.showReferences"
+                 uri
+                 {:line 0 :character 7}
+                 [{:uri uri :range {:start {:line 2 :character 5} :end {:line 2 :character 6}}}])
+                (lens 0 "Debug" "rust-analyzer.debugSingle" {:kind "cargo"})
+                (lens 0 "Run" "rust-analyzer.runSingle" {:kind "unknown"})])
+          [references debug run] (map/get-in m [:lsp-lenses "/tmp/lens-refs.rs" :lenses])
+          jumped (ed-lens-run m references))
+      (assert= (buffer-current-line (ed-current-buf jumped)) 2)
+      (is (includes? (:echo (ed-lens-run m debug)) "no debugger"))
+      (is (includes? (:echo (ed-lens-run m run)) "nothing bedit knows how to run"))))
+  (test "the lens under a cell of its row"
+    (let (rope (text/from-string "  fn x\n")
+          lenses [{:offset 2 :title "Run"} {:offset 2 :title "Debug"}])
+      ;; `  Run | Debug`: the indentation and `Run |` are Run's, the rest Debug's
+      (assert= (:title (lens-at-cell lenses rope 0 0)) "Run")
+      (assert= (:title (lens-at-cell lenses rope 0 4)) "Run")
+      (assert= (:title (lens-at-cell lenses rope 0 8)) "Debug")
+      (assert= (:title (lens-at-cell lenses rope 0 40)) "Debug")
+      (is (nil? (lens-at-cell lenses rope 1 0)))))
+  (test "a click on a lens row runs that lens, a click on the text below it moves point"
+    (let (conn (stand-in [nil])
+          m (lensed conn
+              {:executeCommandProvider {:commands ["run.main" "debug.main"]}}
+              "x\nfn main() {}\n"
+              "/tmp/lens-click.rs"
+              [(lens 1 "Run" "run.main") (lens 1 "Debug" "debug.main")])
+          layout (panes/ed-body-layout m 80 24)
+          pane (seq/find (:panes layout) (fn (pane) (:selected pane)))
+          buffer (ed-current-buf m))
+      (is (not (nil? pane)))
+      (when pane
+        (let ([x y _w _h] (:rect pane)
+              found (seq/find (range y (+ y 10))
+                      (fn (row) (= (first (or (panes/ed-pane-inlay-row pane buffer row) [])) 1)))
+              row (if (int? found) found -1)
+              text-x (+ x (panes/ed-pane-gutter-width buffer pane)))
+          (is (int? found))
+          (assert= (panes/ed-pane-inlay-row pane buffer row) [1 "Run | Debug"])
+          ;; on `Debug`
+          (let (clicked (mouse/ed-mouse m [:mouse :press :left row (+ text-x 7) [] 1] 80 24)
+                [kind request] (asked))
+            (assert= kind (lsp-execute-command))
+            (assert= (:command request) "debug.main")
+            (deliver clicked))
+          ;; the row below is the line's text: point moves there, nothing is run
+          (let (moved (mouse/ed-mouse m [:mouse :press :left (inc row) (+ text-x 3) [] 1] 80 24))
+            (assert= (buffer-point (ed-current-buf moved)) 5)
+            (is (nil? (asked-within 200)))))))))
+
+;; ---- a server asking the client to ask again ----------------------------------------
+(describe "lsp: refresh requests"
+  (test "the client says it takes them, and the client commands it runs"
+    (let (caps (:capabilities (lsp/lsp-init-params "file:///p")))
+      (assert= (map/get-in caps [:workspace :semanticTokens :refreshSupport]) true)
+      (assert= (map/get-in caps [:workspace :inlayHint :refreshSupport]) true)
+      (assert= (map/get-in caps [:workspace :codeLens :refreshSupport]) true)
+      (is (includes? (map/get-in caps [:experimental :commands :commands])
+            "rust-analyzer.runSingle"))
+      (is (includes? (map/get-in caps [:experimental :commands :commands])
+            "rust-analyzer.showReferences"))))
+  (test "a refresh is answered null and handed on; a registration only answered"
+    (let (state {:proc :fake :buf "" :next-id 8 :pending {} :opened {} :version 1}
+          frames (str (jsonrpc/frame (json/encode {:jsonrpc "2.0"
+                                                   :id 5
+                                                   :method "workspace/semanticTokens/refresh"}))
+                   (jsonrpc/frame (json/encode {:jsonrpc "2.0"
+                                                :id 6
+                                                :method "workspace/codeLens/refresh"}))
+                   (jsonrpc/frame (json/encode {:jsonrpc "2.0"
+                                                :id 7
+                                                :method "client/registerCapability"
+                                                :params {:registrations []}})))
+          [after replies] (lsp-protocol/lsp-ingest state frames))
+      (is (empty? replies))
+      (assert= (count (:outbox after)) 3)
+      (is (includes? (first (:outbox after)) "\"id\":5"))
+      (is (includes? (first (:outbox after)) "\"result\":null"))
+      (assert= (:refreshes after) [:lsp-refresh-semantic-tokens :lsp-refresh-code-lens])))
+  (test "semantic tokens: every buffer of that server on screen asked again, as a delta"
+    (let (conn (stand-in [{:resultId "1" :data [0 3 4 0 1]}
+                           {:resultId "2" :edits [{:start 4 :deleteCount 1 :data [0]}]}])
+          caps {:semanticTokensProvider {:legend {:tokenTypes ["function"]
+                                                  :tokenModifiers ["declaration"]}
+                                         :full {:delta true}}}
+          m (serving (ed-init (make-buffer "fn main() {}" "s.rs" "/tmp/sem-refresh.rs")) conn caps)
+          asking (ed-semantic-request m)
+          _ (asked)
+          landed (deliver asking)
+          _ (refute (ed-semantic-due? landed))
+          refreshed (ed-ev-semantic-refresh landed [:lsp-refresh-semantic-tokens conn] nil 80 24)
+          [kind request] (asked))
+      ;; against the last answer, which the server keeps: it sends what changed
+      (assert= kind (lsp-semantic-tokens-delta))
+      (assert= (:previous-result-id request) "1")
+      (assert= (:semantic-spans (ed-current-buf (deliver refreshed))) [[3 7 :syntax/function]])))
+  (test "semantic tokens: a refresh from another server asks nothing"
+    (let (conn (stand-in [])
+          caps {:semanticTokensProvider {:legend {:tokenTypes ["function"]} :full true}}
+          m (serving (ed-init (make-buffer "fn main() {}" "s.rs" "/tmp/sem-other.rs")) conn caps))
+      (ed-ev-semantic-refresh m [:lsp-refresh-semantic-tokens (self)] nil 80 24)
+      (is (nil? (asked-within 200)))))
+  (test "code lenses: asked again"
+    (let (conn (stand-in [[(lens 0 "Run" "run")]])
+          m (assoc (serving (ed-init (make-buffer "fn main() {}" "s.rs" "/tmp/lens-refresh.rs"))
+                     conn
+                     {:codeLensProvider {}})
+              :lsp-code-lens true)
+          refreshed (ed-ev-lens-refresh m [:lsp-refresh-code-lens conn] nil 80 24)
+          [kind _] (asked))
+      (assert= kind (lsp-code-lens))
+      (assert= (wrap/inlay-lines (ed-current-buf (deliver refreshed))) {0 ["Run"]})))
+  (test "inlay hints: the lines on screen asked again, the range ending inside the text"
+    (let (conn (stand-in [[{:position {:line 0 :character 5} :label ": i32"}]])
+          m (assoc (serving (ed-init (make-buffer "let x = 1;\n  y" "s.rs" "/tmp/inlay-refresh.rs"))
+                     conn
+                     {:inlayHintProvider true})
+              :lsp-inlay-hints true)
+          refreshed (lsp-commands/ed-ev-inlay-refresh m [:lsp-refresh-inlay-hints conn] nil 80 24)
+          [kind request] (asked))
+      (assert= kind (lsp-inlay-hints))
+      (assert= (:lines request) [0 1])
+      (assert= (:end-units request) 3)
+      (assert= (map/get-in (lsp-request-params kind request) [:range :end]) {:line 1 :character 3})
+      (assert= (map (inlinetext/annotations (ed-current-buf (deliver refreshed)))
+                 (fn (hint) [(:at hint) (:text hint)]))
+        '([5 ": i32"])))))
+
+(describe "lsp inlay hints: the range and the buffer"
+  (test "the range is cut to the text"
+    (assert= (lsp-commands/inlay-range (text/from-string "ab\ncd") [0 48])
+      {:lines [0 1] :end-units 2})
+    (assert= (lsp-commands/inlay-range (text/from-string "a\nb\nc\n") [0 1])
+      {:lines [0 1] :end-units nil})
+    ;; a UTF-16 length past an emoji
+    (assert= (:end-units (lsp-commands/inlay-range (text/from-string "a😀") [0 9])) 3))
+  (test "an answer lands on the buffer of its file, current or not"
+    (let (m (assoc (ed-init (make-buffer "a" "a.rs" "/tmp/inlay-a.rs")) :lsp-inlay-hints true)
+          other (make-buffer "f(1)" "b.rs" "/tmp/inlay-b.rs")
+          two (assoc m :buffers (conj (:buffers m) other))
+          index (ed-buffer-index-by-file two "/tmp/inlay-b.rs")
+          landed (lsp-commands/ed-apply-inlay-hints two
+                   ["/tmp/inlay-b.rs" (buffer-rope other) [0 1]]
+                   [{:line 0 :units 2 :text "x: "}]))
+      (assert= (map (inlinetext/annotations (ed-buf-at landed (or index -1))) :text) '("x: "))
+      ;; the current buffer untouched
+      (assert= (inlinetext/annotations (ed-current-buf landed)) [])))
+  (test "an older answer landing after a newer one is dropped, not painted over it"
+    (let (conn (stand-in [[{:position {:line 0 :character 1} :label "old"}]
+                           [{:position {:line 0 :character 2} :label "new"}]])
+          m (assoc (serving (ed-init (make-buffer "f(1)" "s.rs" "/tmp/inlay-order.rs"))
+                     conn
+                     {:inlayHintProvider true})
+              :lsp-inlay-hints true)
+          twice (lsp-commands/ed-inlay-request-at (lsp-commands/ed-inlay-request-at m 0 conn [0 1])
+                  0
+                  conn
+                  [0 1])
+          _ (asked)
+          _ (asked)
+          first-reply (receive ((and reply [:lsp-inlay-hints _ _]) reply) (after 2000 nil))
+          second-reply (receive ((and reply [:lsp-inlay-hints _ _]) reply) (after 2000 nil))
+          ;; the newer lands first, then the older
+          landed (lsp-commands/ed-ev-lsp-reply (lsp-commands/ed-ev-lsp-reply twice
+                                                 second-reply nil 80 24)
+                   first-reply nil 80 24))
+      (assert= (map (inlinetext/annotations (ed-current-buf landed)) :text) '("new"))))
+  (test "the buffers a server shows"
+    (let (m (serving (ed-init (make-buffer "x" "s.rs" "/tmp/shown.rs")) (self) {}))
+      (assert= (ed-lsp-shown m (self)) [[0 0]])
+      (assert= (ed-lsp-shown m :someone-else) []))))

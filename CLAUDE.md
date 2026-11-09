@@ -139,7 +139,9 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             collab's name), faces a producer stamped on its text
                             (`register-text-faces`: ansicolor), a paste a program takes whole
                             (`register-paste-taker`) and a key kept out of a macro
-                            (`register-macro-guard`: both passwd). A buffer process's
+                            (`register-macro-guard`: both passwd), what a click on an INLAY
+                            row does, by the row's owner (`register-inlay-click`: a code lens
+                            runs). A buffer process's
                             `[:buffer-updated …]` is hosted's handler, replaced by collab's
                             when collab loads; a process down goes to every down handler
                             (hosted and collab recover their slots). The core names no feature: a
@@ -463,7 +465,9 @@ src/mouse.blsp              `[:mouse …]` folded into the model: a click, a dra
                             scrollbar's thumb, a divider's resize, the wheel on the pane under the
                             pointer. A middle click places point (`ed-mouse-set-point`) and commands
                             yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`).
-                            A C-M-drag selects a rectangle (`:rectangle?` on the `:text-drag`)
+                            A C-M-drag selects a rectangle (`:rectangle?` on the `:text-drag`).
+                            A press on an INLAY row (`panes/ed-pane-inlay-row`) goes to its
+                            owner's `model/register-inlay-click` (a code lens runs), else to its line
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
                             feature: a pane body's layers share ONE geometry map, the mode
                             line's feature chips come from the statusbar registry, and what
@@ -974,15 +978,22 @@ src/snippet.blsp            SNIPPETS (Emacs's yasnippet / tempel): templates in 
                             expansion is one undo step
 src/lsp-protocol.blsp       the protocol, pure: what each answer means, positions in UTF-16 units, the
                             document sync, what each request puts on the wire, and the connection
-                            as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server
+                            as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server. A server's
+                            REFRESH request (`workspace/semanticTokens|inlayHint|codeLens/refresh`,
+                            `*lsp-refresh-requests*`) is answered null and queued on `:refreshes`,
+                            which the connection sends the editor as `[:lsp-refresh-… conn]`
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
                             hover, rename, format, imenu, INLAY HINTS (the lines on screen on the idle beat, as
                             `inlinetext` annotations owned by `:lsp-inlay`; opt-in per mode by
-                            `:lsp-inlay-hints`, M-x lsp-inlay-hints-mode per buffer), and `publishDiagnostics` folded into
+                            `:lsp-inlay-hints`, M-x lsp-inlay-hints-mode per buffer; the range cut to the text, `inlay-range`,
+                            since rust-analyzer answers a position past it with no hints), and `publishDiagnostics` folded into
                             the model's diagnostics, so every language gets the underline / ⚠ note
                             / gutter mark the Brood checker used to have to itself. Answers
                             server->client requests too (`client/registerCapability` — a server
-                            BLOCKS on that reply) and starts the server IN the project root, which
+                            BLOCKS on that reply), advertises `refreshSupport` for semantic tokens,
+                            inlay hints and lenses and the client commands it runs
+                            (`experimental.commands`, `lsp-lens/*client-commands*` — rust-analyzer
+                            sends no lens without them), and starts the server IN the project root, which
                             is how one that builds the project finds it. Elixir is Expert
                             (expert-lsp.org), which narrates its own startup — forwarded to
                             *Messages*, because it answers nothing until its engine is up.
@@ -1000,7 +1011,9 @@ src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, g
                             lists them
 src/lsp-servers.blsp        the servers as the model holds them: where each starts, which projects
                             share one, filing them under `:lsp-servers`, a server dying or merged,
-                            the document push, what they published, asking one. lsp-commands is the
+                            the document push, what they published, asking one — about any pool
+                            buffer (`ed-lsp-ask-server-at`, `ed-lsp-push-text-at`), and which of a
+                            server's buffers are on screen (`ed-lsp-shown`, what a refresh re-asks). lsp-commands is the
                             commands and the folds of their answers
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
@@ -1014,16 +1027,23 @@ src/lsp-semantic.blsp       LSP SEMANTIC TOKENS (`semanticTokens/full`, `/full/d
                             idle beat when the text moved (order 55); carried through the splice
                             log by a post-step (order 45) until the next answer, never dropped on a
                             keystroke. `:lsp-semantic-tokens` (default on where offered), M-x
-                            lsp-semantic-tokens-mode. Its request kinds and their `LspRequest` impls
+                            lsp-semantic-tokens-mode. A server's refresh asks each of its buffers on
+                            screen again (a delta against the last answer, as VS Code asks). Its request kinds and their `LspRequest` impls
                             (all four halves) live here, not in lsp-requests / lsp-protocol
 src/lsp-lens.blsp           LSP CODE LENS (`codeLens`, `codeLens/resolve`): each lens a dim INLAY
                             row above its line (`wrap/inlay-lines`, owner `:lsp-code-lens`), titles
                             joined ` | `, indented as the line; anchored by a char offset carried
                             through the splice log (post-step order 46), asked on the idle beat
-                            (order 60), unresolved ones resolved. M-x lsp-code-lens-run runs point's
-                            line's lens through `workspace/executeCommand` (a code action's path:
-                            its edits come back as `workspace/applyEdit`). `:lsp-code-lens`
-                            (default off), M-x lsp-code-lens-mode
+                            (order 60), unresolved ones resolved, asked again on the server's refresh.
+                            A CLICK on a lens row (`model/register-inlay-click`) or M-x
+                            lsp-code-lens-run runs the lens: a SERVER command (one it lists in
+                            `executeCommandProvider`) through `workspace/executeCommand` (a code
+                            action's path: its edits come back as `workspace/applyEdit`), a CLIENT
+                            command through `*client-commands*` — rust-analyzer's `runSingle` as
+                            its cargo command in *compilation* (`runnable-command`,
+                            `compile/compile-run`), `showReferences` / `gotoLocation` a jump or a
+                            picker, `debugSingle` said — and any other said, never sent.
+                            `:lsp-code-lens` (default off), M-x lsp-code-lens-mode
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/filename.blsp           a typed path read the Emacs way (`substitute-in-file-name`, which is
                             std's `path/substitute` — this is the prompt's layer over it): the prompt
@@ -1556,6 +1576,13 @@ tools/ci/real-window.sh     CI's REAL-window check (macOS, Windows, Linux under 
                             input (xdotool / SendKeys / System Events) — saved with C-x C-s, the
                             file read back, the window captured and checked not blank; the PNGs
                             are a workflow artifact. The driver is `real-window.blsp`
+tools/ci/lsp-rust.sh        CI's REAL language server check (`lsp-rust-analyzer` in ci.yml): the LSP
+                            client against rust-analyzer on tools/ci/fixtures/lens-fixture, through
+                            the editor's own loop headless (`lsp-rust.blsp`) — inlay hints at their
+                            positions, semantic token faces on their ranges and a delta after an
+                            edit, lenses above their lines (resolved, moved with the text), the
+                            refresh requests heard, and a lens CLICK running `cargo run` and
+                            jumping to an impl
 tools/ci/ssh-real.sh        CI's REAL-sshd check (`ssh-real` in ci.yml): OpenSSH's server on
                             localhost (a throwaway host key and config, root through sudo so it can
                             check a password, a throwaway password user), host aliases for a key

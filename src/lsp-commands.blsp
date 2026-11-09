@@ -281,7 +281,7 @@ which syncs the document first, incrementally."
 that line by `lsp-protocol/lsp-units->column`)."
   (ed-goto-line-col buffer line (lsp-protocol/lsp-units->column (buffer-rope buffer) line units)))
 
-(defn- ed-lsp-goto-loc (m loc)
+(defn ed-lsp-goto-loc (m loc)
   "Jump to LSP location `loc` (`{:path :line :char}`), opening its file if needed; pushes
 the location it leaves on the jump stack first (`ed-push-jump`), so M-, returns there. A large
 file is read off the loop, point going to the location when it lands (`ed-find-file-then`)."
@@ -294,7 +294,7 @@ file is read off the loop, point going to the location when it lands (`ed-find-f
 references/definition picker."
   (str (projects/project-relative (:project-root m) (:path loc)) ":" (+ 1 (:line loc))))
 
-(defn- ed-lsp-locations-prompt (m prompt locs)
+(defn ed-lsp-locations-prompt (m prompt locs)
   "A Vertico minibuffer over LSP `locs`; the chosen one opens its file and jumps (M-, returns)."
   (let (labeled (map locs (fn (loc) [(ed-lsp-loc-label m loc) loc]))
         labels (map labeled first))
@@ -722,16 +722,48 @@ lines asked about. Quiet: never starts a server, never messages. Off the loop, a
 lookup is — the answer folds in [[ed-apply-inlay-hints]]."
   (if (or (ed-headless?) (not (ed-inlay-hints-due? m)))
     m
-    (let (context (ed-lsp-here m :inlayHintProvider)
-          buffer (ed-current-buf m)
-          lines (ed-inlay-lines m)
-          at [(buffer-file buffer) (buffer-rope buffer) lines])
-      (ed-lsp-ask-server (assoc m :inlay-hints-at at)
-        (:conn context)
-        (lsp-inlay-hints)
-        (assoc context :lines lines)
-        {:at at}
-        :quiet))))
+    (let (buffer (ed-current-buf m)
+          lines (ed-inlay-lines m))
+      (ed-inlay-request-at (assoc m
+                             :inlay-hints-at [(buffer-file buffer) (buffer-rope buffer) lines])
+        (ed-current-index m)
+        (:conn (ed-lsp-for m :inlayHintProvider))
+        lines))))
+
+(defn ed-inlay-request-at (m index connection lines)
+  "Ask `connection` for the inlay hints of pool buffer `index`'s `lines` (`[first last]`),
+quietly; the answer folds onto that buffer ([[ed-apply-inlay-hints]]), whichever pane shows
+it — the idle beat asks for the current one, a server's refresh for each on screen."
+  (let (buffer (ed-buf-at m index)
+        file (buffer-file buffer)
+        ;; `:inlay-asked`, per file: the ask the answer must be — one asked while the server
+        ;; was still loading that lands after a newer one is dropped, not painted over it
+        token (ref))
+    (ed-lsp-ask-server-at (map/assoc-in m [:inlay-asked file] token)
+      index
+      connection
+      (lsp-inlay-hints)
+      (merge {:uri (lsp-protocol/lsp-path->uri file) :lang (lsp/lsp-language-id file)}
+        (inlay-range (buffer-rope buffer) lines))
+      {:at [file (buffer-rope buffer) lines] :token token}
+      :quiet)))
+
+(defn inlay-range (rope lines)
+  "The range an inlay-hint request for `lines` (`[first last]`, a pane's top and its rows) asks
+about in `rope`: `{:lines [first last]}`, cut to the text's lines, with `:end-units` — the last
+line's length in UTF-16 units — when the range reaches the text's last line, so it never ends
+at a position past the text (rust-analyzer answers that with `Invalid offset` and no hints).
+
+    (lsp-commands/inlay-range (text/from-string \"ab\\ncd\") [0 48])   ;=> {:lines [0 1] :end-units 2}
+    (lsp-commands/inlay-range (text/from-string \"a\\nb\\nc\\n\") [0 0])   ;=> {:lines [0 0] :end-units nil}"
+  (let (final (math/max 0 (dec (text/line-count rope)))
+        first-line (math/min final (math/max 0 (first lines)))
+        last-line (math/min final (math/max first-line (second lines))))
+    {:lines [first-line last-line]
+     :end-units (when (= last-line final)
+                  (lsp-protocol/lsp-column->units rope
+                    last-line
+                    (string/length (wrap/rope-line-text rope last-line))))}))
 
 (defn ed-inlay-annotations (rope hints)
   "The server's `hints` (`lsp-protocol/lsp-inlay-hint-list`) as inline annotations over
@@ -747,22 +779,45 @@ lookup is — the answer folds in [[ed-apply-inlay-hints]]."
              :text (:text hint)}))))))
 
 (defn ed-apply-inlay-hints (m at hints)
-  "Fold an inlay-hint answer asked `at` (`[file rope lines]`) into the model: the current
-buffer's `:lsp-inlay` annotations replaced by `hints` — only while it is still that file,
-at that text, with its hints on. An answer about text that has moved since is dropped (the
-next idle beat asks again), as an answer for a buffer switched away from is."
-  (let (buffer (ed-current-buf m)
-        [file rope _lines] at)
-    (if (and (= (buffer-file buffer) file)
-          (= (buffer-rope buffer) rope)
-          (ed-inlay-hints-on? m buffer))
-      (ed-set-buf m
-        (inlinetext/set-annotations buffer *inlay-owner* (ed-inlay-annotations rope hints)))
-      m)))
+  "Fold an inlay-hint answer asked `at` (`[file rope lines]`) into the model: the `:lsp-inlay`
+annotations of the buffer visiting that file replaced by `hints` — only while it is still at
+that text, with its hints on. An answer about text that has moved since is dropped (the next
+idle beat asks again), as one for a file no longer open is."
+  (let ([file rope _lines] at
+        index (when (string? file) (ed-buffer-index-by-file m file)))
+    (if (nil? index)
+      m
+      (let (buffer (ed-buf-at m index))
+        (if (and (= (buffer-rope buffer) rope) (ed-inlay-hints-on? m buffer))
+          (ed-set-buf-at m
+            index
+            (inlinetext/set-annotations buffer *inlay-owner* (ed-inlay-annotations rope hints)))
+          m)))))
+
+(defn ed-ev-inlay-refresh (m input text-rows columns rows)
+  "A server asking for its inlay hints again (`[:lsp-refresh-inlay-hints connection]`,
+`workspace/inlayHint/refresh` — rust-analyzer once the crate has loaded): each buffer of its
+on screen with hints on is asked for the lines its pane shows, and the idle beat's stamp is
+forgotten, so the current one is asked again however it moves."
+  (let (connection (nth input 1 nil)
+        forgotten (dissoc m :inlay-hints-at))
+    (fold (ed-lsp-shown forgotten connection)
+      forgotten
+      (fn (acc [index top])
+        (let (buffer (ed-buf-at acc index)
+              entry (lsp/lsp-entry-for acc (buffer-file buffer) :inlayHintProvider))
+          (if (and (ed-inlay-hints-on? acc buffer)
+                (= (:conn entry) connection)
+                (lsp/lsp-capable? (:caps entry) :inlayHintProvider))
+            (ed-inlay-request-at acc index connection [top (+ top (or (:view-rows acc) 50))])
+            acc))))))
 
 (impl LspRequest
   lsp-requests/lsp-inlay-hints
-  (lsp-request-fold (pending m payload) (ed-apply-inlay-hints m (:at pending) payload)))
+  (lsp-request-fold (pending m payload)
+    (if (= (:token pending) (map/get-in m [:inlay-asked (first (:at pending))]))
+      (ed-apply-inlay-hints m (:at pending) payload)
+      m)))
 
 (defcommand cmd-lsp-inlay-hints-mode
   (m key)
@@ -811,6 +866,7 @@ hints shown go at once; on, the next idle beat asks for the lines on screen."
 ;; …and the inlay hints for the lines on screen, after the signature (50): the same settled
 ;; text, asked once it has stopped moving
 (register-event-handler :lsp-inlay-hints 'lsp-commands/ed-ev-lsp-reply)
+(register-event-handler :lsp-refresh-inlay-hints 'lsp-commands/ed-ev-inlay-refresh)
 (register-idle-job :lsp-inlay-hints
   {:order 55
    :run 'lsp-commands/ed-launch-inlay-hints

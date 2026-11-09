@@ -35,7 +35,7 @@ server's own object, which `codeLens/resolve` hands back.
         command (:command lens))
     {:line (or (:line start) 0)
      :units (or (:character start) 0)
-     :title (when (map? command) (:title command))
+     :title (when (and (map? command) (string? (:title command))) (string/trim (:title command)))
      :command (when (map? command) (:command command))
      :arguments (if (map? command) (or (:arguments command) []) [])
      :raw lens}))
@@ -163,15 +163,29 @@ and the text moved since the last ask. The idle job's `:stale?`."
 (defn ed-lens-request (m)
   "Ask the current buffer's server for its code lenses, quietly; the text they are about is
 the buffer as it is now, kept on the lookup as `:seen`."
-  (let (buffer (ed-current-buf m)
+  (ed-lens-request-at m (ed-current-index m)))
+
+(defn ed-lens-request-at (m index)
+  "[[ed-lens-request]] for pool buffer `index`, whichever pane shows it — what a server's
+refresh asks for each buffer of its on screen. Nothing for a buffer no live server lenses."
+  (let (buffer (ed-buf-at m index)
         file (buffer-file buffer)
-        entry (lens-entry m file))
-    (ed-lsp-ask-server (map/assoc-in m [:lsp-lenses file :requested] (buffer-rope buffer))
-      (:conn entry)
-      (lsp-code-lens)
-      {:uri (lsp-protocol/lsp-path->uri file) :lang (lsp/lsp-language-id file)}
-      {:path file :seen buffer}
-      :quiet)))
+        entry (when (string? file) (lens-entry m file)))
+    (if (nil? entry)
+      m
+      ;; `:asked`: the ask the answer must be — an older one landing later is dropped
+      (let (token (ref))
+        (ed-lsp-ask-server-at (map/assoc-in (map/assoc-in m
+                                              [:lsp-lenses file :requested]
+                                              (buffer-rope buffer))
+                                [:lsp-lenses file :asked]
+                                token)
+          index
+          (:conn entry)
+          (lsp-code-lens)
+          {:uri (lsp-protocol/lsp-path->uri file) :lang (lsp/lsp-language-id file)}
+          {:path file :seen buffer :token token}
+          :quiet)))))
 
 (defn ed-launch-lens (m)
   "The idle beat's code lenses: ask when [[ed-lens-due?]]. Never in a headless run."
@@ -217,10 +231,13 @@ it resolves them (`codeLensProvider.resolveProvider`) — at most `*resolve-max*
 (defn ed-lens-fold (pending m payload)
   "A code-lens answer landing: anchored on the text it was about (`:seen`), carried to the text
 now, its rows stamped, and the lenses without a command sent to be resolved. Dropped for a
-closed file or with lenses off."
+closed file, with lenses off, or for an ask a newer one has replaced."
   (let (path (:path pending)
         index (when path (ed-buffer-index-by-file m path)))
-    (if (or (nil? payload) (nil? index) (not (lens-on? m)))
+    (if (or (nil? payload)
+          (nil? index)
+          (not (lens-on? m))
+          (not (= (:token pending) (map/get-in m [:lsp-lenses path :asked]))))
       m
       (let (seen (:seen pending)
             anchored (anchor-lenses payload (buffer-rope seen))
@@ -280,17 +297,146 @@ lens is still from the same answer (`:generation`) — and the rows restamped."
                       (assoc store :lenses [] :requested nil)
                       (assoc store :lenses carried)))))))))))
 
-(defn- ed-lens-run (m lens)
-  "Run `lens`'s command on the server that sent it (`workspace/executeCommand`) — the path a
-code action's command takes; the edits it makes arrive as the server's `workspace/applyEdit`."
-  (let (file (buffer-file (ed-current-buf m))
-        store (map/get-in m [:lsp-lenses file]))
-    (ed-lsp-ask-server m
-      (:conn store)
-      (lsp-execute-command)
-      {:command (:command lens) :arguments (:arguments lens)}
-      nil
-      (str (:title lens) "…"))))
+;; ---- running a lens: the server's command, or the client's ------------------------------
+;; A lens's command is one of two things. A SERVER command — one the server lists in
+;; `executeCommandProvider.commands` — is sent back to it (`workspace/executeCommand`), and the
+;; edits it makes come as `workspace/applyEdit`. A CLIENT command is the server asking the
+;; editor to do something only an editor can: rust-analyzer's `▶ Run` is
+;; `rust-analyzer.runSingle` with a cargo invocation as its argument, its `3 implementations`
+;; is `rust-analyzer.showReferences` with the locations. Those are mapped to what bedit
+;; already does (`*client-commands*`); any other is said, never sent to a server that would
+;; refuse it, and never swallowed.
+
+(defn runnable-command (runnable)
+  "`[command-line directory]` for a rust-analyzer `Runnable` (the argument of
+`rust-analyzer.runSingle`): a `cargo` runnable as `cargo ARGS -- EXECUTABLE-ARGS` (its
+`overrideCargo` for `cargo`, its `environment` as assignments in front) in its `cwd` (else
+its `workspaceRoot`); a `shell` runnable as its program and arguments. Nil for anything else.
+
+    (lsp-lens/runnable-command {:kind \"cargo\" :args {:cargoArgs [\"test\" \"--package\" \"x\"] :executableArgs [\"t::a\" \"--exact\"] :cwd \"/p\"}})   ;=> [\"cargo test --package x -- t::a --exact\" \"/p\"]"
+  (let (kind (when (map? runnable) (:kind runnable))
+        arguments (or (when (map? runnable) (:args runnable)) {})
+        words (fn (values)
+                (into [] (map (seq/filter (or values []) string?) os/shell-quote)))
+        environment (into []
+                      (seq/keep (%map-pairs (or (:environment arguments) {}))
+                        (fn ([name value])
+                          (when (string? value)
+                            (str (->string name)
+                              "="
+                              (os/shell-quote value))))))
+        directory (or (:cwd arguments) (:workspaceRoot arguments)))
+    (cond
+      (= kind "cargo")
+        (let (program (os/shell-quote (or (:overrideCargo arguments) "cargo"))
+              executable (words (:executableArgs arguments)))
+          [(string/join (append environment
+                          [program]
+                          (words (:cargoArgs arguments))
+                          (words (:cargoExtraArgs arguments))
+                          (if (empty? executable) [] (into ["--"] executable)))
+             " ")
+            directory])
+      (and (= kind "shell") (string? (:program arguments)))
+        [(string/join (append environment
+                        [(os/shell-quote (:program arguments))]
+                        (words (:args arguments)))
+           " ")
+          directory]
+      else nil)))
+
+(defn ed-lens-run-runnable (m lens)
+  "`rust-analyzer.runSingle` (▶ Run, ▶ Run Test): the lens's runnable run as its cargo command in
+*compilation* ([[runnable-command]], `compile/compile-run`), or said when it is not one."
+  (let (found (runnable-command (first (:arguments lens))))
+    (if (nil? found)
+      (message m (str "lsp: " (:command lens) " gave nothing bedit knows how to run"))
+      (compile/compile-run m (first found) (second found)))))
+
+(defn- ed-lens-show-locations (m locations)
+  ;; one location is a jump, several a picker (M-, returns from either)
+  (cond
+    (empty? locations) (message m "lsp: no locations")
+    (= 1 (count locations)) (lsp-commands/ed-lsp-goto-loc m (first locations))
+    else (lsp-commands/ed-lsp-locations-prompt m "Locations: " locations)))
+
+(defn ed-lens-show-references (m lens)
+  "`editor.action.showReferences` and rust-analyzer's `showReferences` (`[uri position
+locations]`, a `N references` or `N implementations` lens): one location jumped to, several
+in a picker."
+  (ed-lens-show-locations m (lsp-protocol/lsp-locations (nth (:arguments lens) 2 []))))
+
+(defn ed-lens-goto-location (m lens)
+  "rust-analyzer's `gotoLocation` (`[location]`): jumped to."
+  (ed-lens-show-locations m (lsp-protocol/lsp-locations (first (:arguments lens)))))
+
+(defn ed-lens-no-debugger (m lens)
+  "rust-analyzer's `debugSingle`: bedit has no debugger to hand it, which is said."
+  (message m (str "lsp: bedit has no debugger for " (:command lens) " — ▶ Run runs it")))
+
+(def *client-commands*
+  ;; command name -> what bedit does for it, `(m lens) -> m`. Extend live for another server.
+  {"rust-analyzer.runSingle" 'lsp-lens/ed-lens-run-runnable
+   "rust-analyzer.debugSingle" 'lsp-lens/ed-lens-no-debugger
+   "rust-analyzer.showReferences" 'lsp-lens/ed-lens-show-references
+   "rust-analyzer.gotoLocation" 'lsp-lens/ed-lens-goto-location
+   "editor.action.showReferences" 'lsp-lens/ed-lens-show-references})
+
+(defn server-command? (caps command)
+  "Whether `command` is one the server with `caps` runs (`executeCommandProvider.commands`).
+
+    (lsp-lens/server-command? {:executeCommandProvider {:commands [\"a\"]}} \"a\")   ;=> true"
+  (includes? (or (map/get-in caps [:executeCommandProvider :commands]) []) command))
+
+;; check-allow: a client command's handler is resolved late, so its result is unknown to the
+;; checker; every `*client-commands*` handler answers a model, as the fallback `m` is one
+(sig ed-lens-run (model map -> model))
+(check-allow :trusted
+  (defn ed-lens-run (m lens)
+    "Run `lens`'s command: a server command on the server that sent it
+(`workspace/executeCommand` — the path a code action's command takes; the edits it makes
+arrive as the server's `workspace/applyEdit`), a client command through `*client-commands*`,
+and any other said."
+    (let (file (buffer-file (ed-current-buf m))
+          store (map/get-in m [:lsp-lenses file])
+          command (:command lens)
+          caps (map/get-in m [:lsp-servers (:conn store) :caps])
+          client (get *client-commands* command))
+      (cond
+        (not (string? command)) (message m "lsp: that lens has no command yet")
+        (server-command? caps command)
+          (ed-lsp-ask-server m
+            (:conn store)
+            (lsp-execute-command)
+            {:command command :arguments (:arguments lens)}
+            nil
+            (str (:title lens) "…"))
+        client (ed-call-hook client m m lens)
+        else (message m (str "lsp: " command " is a client command bedit does not run"))))))
+
+(defn lens-at-cell (lenses rope line cell)
+  "The shown lens of `lenses` on 0-based `line` whose title is painted at `cell` of its row
+([[lens-rows]]: the line's indentation, then the titles joined ` | `) — the one left of a
+separator, the first for a cell in the indentation, the last past the end; nil with none.
+
+    (:title (lsp-lens/lens-at-cell [{:offset 0 :title \"Run\"} {:offset 0 :title \"Debug\"}] (text/from-string \"fn\") 0 7))   ;=> \"Debug\""
+  (let (here (lenses-on-line lenses rope line))
+    (when (not (empty? here))
+      (letrec (pick (fn (left at)
+                      (let (end (+ at (string/display-width (:title (first left))) 3))
+                        (if (or (empty? (rest left)) (< cell end))
+                          (first left)
+                          (pick (rest left) end)))))
+        (pick here (string/display-width (indentation rope line)))))))
+
+(defn lens-click (m index line text cell)
+  "A click on a lens row (`model/register-inlay-click`): the lens under the pointer run, as
+M-x lsp-code-lens-run runs point's. `index` is the pool buffer — the current one, its pane
+selected by the press; `text` the row as painted, `cell` the column clicked in it."
+  (let (buffer (ed-buf-at m index)
+        store (map/get-in m [:lsp-lenses (buffer-file buffer)])
+        lens (when store (lens-at-cell (:lenses store) (buffer-rope buffer) line cell)))
+    (if (nil? lens) m (ed-lens-run m lens))))
 
 (defcommand cmd-lsp-code-lens-run
   (m key)
@@ -343,8 +489,33 @@ the lines they are about. Off by default; init.blsp's `:lsp-code-lens true` star
     (message (assoc (ed-lens-clear m) :lsp-code-lens false) "lsp code lenses off")
     (message (assoc m :lsp-code-lens true :lsp-lenses {}) "lsp code lenses on")))
 
+(defn ed-ev-lens-refresh (m input text-rows columns rows)
+  "A server asking for its code lenses again (`[:lsp-refresh-code-lens connection]`,
+`workspace/codeLens/refresh`): every file it lenses is due again, and each buffer of its on
+screen is asked now."
+  (let (connection (nth input 1 nil)
+        stores (or (:lsp-lenses m) {})
+        forgotten (assoc m
+                    :lsp-lenses
+                      (fold (%map-pairs stores)
+                        stores
+                        (fn (acc [path store])
+                          (if (= (:conn store) connection)
+                            (assoc acc path (dissoc store :requested))
+                            acc)))))
+    (if (not (lens-on? forgotten))
+      forgotten
+      (fold (ed-lsp-shown forgotten connection)
+        forgotten
+        (fn (acc [index _top])
+          (let (entry (lens-entry acc (buffer-file (ed-buf-at acc index))))
+            (if (= (:conn entry) connection) (ed-lens-request-at acc index) acc)))))))
+
 ;; ---- registration -------------------------------------------------------------------
 (register-event-handler :lsp-code-lens 'lsp-commands/ed-ev-lsp-reply)
+(register-event-handler :lsp-refresh-code-lens 'lsp-lens/ed-ev-lens-refresh)
+;; a click on a lens's row runs that lens
+(register-inlay-click *inlay-owner* 'lsp-lens/lens-click)
 (register-event-handler :lsp-code-lens-resolve 'lsp-commands/ed-ev-lsp-reply)
 ;; after the text push (30), the signature (50) and semantic tokens (55)
 (register-idle-job :lsp-code-lens
