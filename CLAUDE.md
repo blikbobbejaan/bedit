@@ -982,6 +982,9 @@ src/lsp-protocol.blsp       the protocol, pure: what each answer means, position
                             REFRESH request (`workspace/semanticTokens|inlayHint|codeLens/refresh`,
                             `*lsp-refresh-requests*`) is answered null and queued on `:refreshes`,
                             which the connection sends the editor as `[:lsp-refresh-… conn]`
+                            A ContentModified / ServerCancelled answer to what the idle beat asks by
+                            itself (semantic tokens, lenses, inlay hints) comes back `:lsp-retry`
+                            (`lsp-retry?`), and the fold makes it due again rather than empty
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
                             hover, rename, format, imenu, INLAY HINTS (the lines on screen on the idle beat, as
                             `inlinetext` annotations owned by `:lsp-inlay`; opt-in per mode by
