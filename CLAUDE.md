@@ -130,11 +130,19 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             `:save-all` for a save that lands after the questions), who SHOWS a
                             directory, a file that is not text and a new frame
                             (`register-presenter`: dired, hexl, frames), what an event marks
-                            before the timers (`register-input-step`: the web mirror) and what
-                            runs once its edits reach the buffer processes
-                            (`register-tail-step`: collab), a paste a program takes whole
+                            before the timers (`register-input-step`: the web mirror), what
+                            runs at an event's tail (`register-tail-step`: hosted's propagate,
+                            then collab; `:recover` rows on a thrown command's recovery too),
+                            once a turn COMMITS (`register-commit-step`: syntaxtree's handle
+                            release), an input that changes nothing (`register-inert-input`:
+                            hosted's own echo), who a client is (`register-identity-step`:
+                            collab's name), faces a producer stamped on its text
+                            (`register-text-faces`: ansicolor), a paste a program takes whole
                             (`register-paste-taker`) and a key kept out of a macro
-                            (`register-macro-guard`: both passwd). The core names no feature: a
+                            (`register-macro-guard`: both passwd). A buffer process's
+                            `[:buffer-updated …]` is hosted's handler, replaced by collab's
+                            when collab loads; a process down goes to every down handler
+                            (hosted and collab recover their slots). The core names no feature: a
                             module registers its rows when it loads, each row CLAIMED for the
                             file that registered it (`ownership/claim!`), so a package's rows
                             go back with the package. Also the OUTPUT CAP
