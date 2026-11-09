@@ -1,0 +1,324 @@
+;; tools/ci/ssh-real.blsp — bedit's `/ssh:` editing against a REAL sshd.
+;;
+;;     nest run tools/ci/ssh-real.blsp
+;;
+;; CI's ssh check (tools/ci/ssh-real.sh sets the stage and runs it). The unit tests
+;; (tests/sshedit_test.blsp) stand a shell script in for ssh; this drives the real code —
+;; `sshremote`, `sshedit`, `remotejob`, dired's handler path — through the system `ssh` binary
+;; against an sshd on localhost, the editor's model folded headless (every ssh job runs inline,
+;; so each check sees its answer at once).
+;;
+;; The stage is the environment's:
+;;
+;;   BEDIT_SSH_KEY_HOST       an ssh host alias that logs in with a key (the runner user)
+;;   BEDIT_SSH_HOP_TARGET     an alias whose direct route is refused (`ProxyCommand /bin/false`),
+;;                            reachable only through the key host as a jump host
+;;   BEDIT_SSH_PW_HOST        an alias that takes a password only (PubkeyAuthentication no)
+;;   BEDIT_SSH_PASSWORD       that password
+;;   BEDIT_SSH_PW_FILE        a file in the password user's home, as a path on the host
+;;   BEDIT_SSH_UNKNOWN_HOST   an alias whose host key is in no known_hosts file
+;;   BEDIT_SSH_OTHER_USER     another user whose home holds BEDIT_SSH_OTHER_FILE (a name)
+;;   BEDIT_SSH_CTL            a command: `stop` kills sshd and every session, `start` brings
+;;                            it back — the dropped connection
+;;   BEDIT_SSH_PROGRAM        the ssh run (default `ssh`, reading ~/.ssh/config)
+;;
+;; The remote host is this machine, so the files it edits are local paths the driver checks
+;; on disk. Exit 1 when any check failed.
+(require-one 'project)
+(require-one 'main)
+
+(defmodule ssh-real
+  "The real-sshd driver's checks (above)."
+  (:use sshremote) ; *program* / *control-dir* — the real ssh, and short socket paths
+  (:use config-paths)) ; *config-base* — the editor's state, never the user's
+
+(def- *failures* (%table))
+
+(defn- check (label ok)
+  (do
+    (io/puts (str (if ok "  ok    " "  FAIL  ") label))
+    (when (not ok) (%table-put *failures* :n (inc (%table-get *failures* :n 0))))
+    ok))
+
+(defn- say (& parts) (io/puts (apply str "ssh-real: " parts)))
+
+(defn- read-text (path)
+  ;; the file at `path` as text, nil when it is not there
+  (check-allow :discarded-catch (try (file/slurp path) (catch _ nil))))
+
+(defn- env! (name)
+  (let (value (os/env name))
+    (if (or (nil? value) (= value ""))
+      (do (io/puts (str "ssh-real: " name " is not set") :to *err*) (system/halt 2))
+      value)))
+
+(def- key-host (env! "BEDIT_SSH_KEY_HOST"))
+(def- hop-target (env! "BEDIT_SSH_HOP_TARGET"))
+;; the password login, when the stage has one (a root sshd: tools/ci/ssh-real.sh's `ci` mode)
+(def- pw-host (os/env "BEDIT_SSH_PW_HOST"))
+(def- password (or (os/env "BEDIT_SSH_PASSWORD") ""))
+(def- pw-file (or (os/env "BEDIT_SSH_PW_FILE") ""))
+(def- unknown-host (env! "BEDIT_SSH_UNKNOWN_HOST"))
+(def- other-user (env! "BEDIT_SSH_OTHER_USER"))
+(def- other-file (env! "BEDIT_SSH_OTHER_FILE"))
+(def- sshd-ctl (env! "BEDIT_SSH_CTL"))
+
+;; the files edited, a scratch directory the runner user owns
+(def- work (str (path/temp "bedit-ssh-real-")))
+;; the editor's own state (sidecars, the askpass helper's folder) — never the user's
+(def- config-base (str (path/temp "bedit-ssh-real-config-")))
+;; the shared connections' sockets: a short path, a Unix socket's is limited
+(def- control (str "/tmp/bedit-ssh-real-" (rand/token 4)))
+
+(defn- remote (host path) (str "/ssh:" host ":" path))
+
+(defn- fresh () (model/ed-init (editor/buffer/make-buffer "")))
+
+(defn- key (m k) (input/ed-update m k 100 30))
+
+(defn- press-keys (m ks) (fold ks m key))
+
+(defn- type-text (m text) (press-keys m (string/->list text)))
+
+(defn- current (m) (model/ed-current-buf m))
+
+(defn- echo (m) (or (:echo m) ""))
+
+(defn- said (label m) (say label ": " (echo m)))
+
+(defn- save (m) (file-save/ed-save-buf-at m (model/ed-current-index m)))
+
+(defn- dired-at (m name)
+  ;; the listing `m` shows with point on entry `name`
+  (let (index (index-of (or (:dired-names (current m)) []) name))
+    (model/ed-apply m (fn (buffer) (pool/ed-goto-line buffer (+ index 2))))))
+
+(defn- answer (m typed)
+  ;; the open prompt's text replaced by `typed`, and RET
+  (key (type-text (press-keys m [:ctrl-a :ctrl-k]) typed) :enter))
+
+(defn- stage-files ()
+  (let (dir (path/join work "files"))
+    (do
+      (file/mkdir dir)
+      (file/spit (path/join dir "notes.txt") "first line\n")
+      (os/cmd "chmod" ["640" (path/join dir "notes.txt")])
+      (file/spit-bytes (path/join dir "blob.bin") (bytes 0 1 2 0 255 254 10 0))
+      (file/spit (path/join dir "big.txt") (string/repeat "0123456789\n" 500))
+      (file/mkdir (path/join dir "tree"))
+      (file/mkdir (path/join dir "tree" "sub"))
+      (file/spit (path/join dir "tree" "a.txt") "alpha\n")
+      (file/spit (path/join dir "it's a $file.txt") "quoted\n")
+      dir)))
+
+;; ---- the checks ----------------------------------------------------------------------
+
+(defn- check-open-edit-save (dir)
+  (let (file (path/join dir "notes.txt")
+        mode-before (:mode (file/stat file))
+        opened (pool/ed-find-file (fresh) (remote key-host file))
+        _ (said "open" opened)
+        b (current opened))
+    (do
+      (check "a remote file opens through the real ssh, visiting its TRAMP path"
+        (and (= true (:ssh b))
+          (= (editor/buffer/buffer-file b) (remote key-host file))
+          (= (editor/buffer/buffer-text b) "first line\n")))
+      (let (edited (type-text opened "# ")
+            saved (save edited)
+            _ (said "save" saved))
+        (do
+          (check "C-x C-s writes it back, and the buffer is saved"
+            (and (= (read-text file) "# first line\n")
+              (not (editor/buffer/buffer-modified? (current saved)))))
+          (check "the write kept the file's mode (atomic: staged, checked, renamed)"
+            (= (:mode (file/stat file)) mode-before))
+          (check "no staging file is left beside it"
+            (empty? (seq/filter (file/ls dir) (fn (name) (string/starts-with? name ".bedit-write")))))
+          ;; a write large enough to cross in many lines, its size and SHA-256 checked there
+          (let (text (string/repeat "the quick brown fox jumps over the lazy dog ünïcödé\n" 4000)
+                _big (save (model/ed-apply saved
+                            (fn (buffer)
+                              (editor/buffer/replace-region buffer
+                                0
+                                (editor/buffer/buffer-length buffer)
+                                text)))))
+            (check "a 200 KB write arrives byte for byte" (= (read-text file) text)))
+          (do
+            (file/spit file "changed on the host\n")
+            (let (reverted (lifecycle/cmd-revert-buffer saved nil))
+              (do
+                (said "revert" reverted)
+                (check "M-x revert-buffer reads it again"
+                  (= (editor/buffer/buffer-text (current reverted)) "changed on the host\n")))))))
+      (let (quoted (pool/ed-find-file (fresh) (remote key-host (path/join dir "it's a $file.txt"))))
+        (check "a name full of shell metacharacters is one argument there"
+          (= (editor/buffer/buffer-text (current quoted)) "quoted\n"))))))
+
+(defn- check-binary-and-large (dir)
+  (let (binary (pool/ed-find-file (fresh) (remote key-host (path/join dir "blob.bin")))
+        asked (pool/ed-find-file (assoc (fresh) :large-file-warning-threshold 1000)
+                (remote key-host (path/join dir "big.txt")))
+        taken (key asked "y"))
+    (do
+      (said "binary" binary)
+      (check "a binary opens as the read-only hex view" (includes? (echo binary) "as hex"))
+      (said "large" asked)
+      (check "a large file is asked about before its bytes cross" (includes? (echo asked) "is large"))
+      (check "y reads it"
+        (= (editor/buffer/buffer-text (current taken)) (string/repeat "0123456789\n" 500))))))
+
+(defn- check-prompt-listing (dir)
+  (let (text (str (remote key-host dir) "/")
+        candidates (mincomplete/ed-remote-candidates-fetched text [] 50))
+    (check "the find-file prompt lists the remote directory"
+      (and (includes? candidates (str text "notes.txt")) (includes? candidates (str text "tree/"))))))
+
+(defn- check-dired (dir)
+  (let (tree (path/join dir "tree")
+        listed (pool/ed-find-file (fresh) (remote key-host tree))
+        _ (said "dired" listed)
+        b (current listed)
+        visited (key (dired-at listed "a.txt") :enter)
+        _made (answer (key listed "+") "made")
+        relisted (dired/ed-show-dired (fresh) (remote key-host tree))
+        moved (answer (key (dired-at relisted "a.txt") "R") "b.txt")
+        _ (said "rename" moved)
+        copied (answer (key (dired-at moved "b.txt") "C") "sub")
+        _ (said "copy" copied)
+        copy-landed (read-text (path/join tree "sub" "b.txt"))
+        again (answer (key (dired-at copied "b.txt") "C") "sub")
+        _ (said "copy again" again)
+        asked (key (dired-at copied "sub") "D")
+        deleted (key asked "y")
+        _ (said "delete" deleted))
+    (do
+      (check "a remote directory opens in dired, listed over ssh"
+        (and (= (editor/layers/buffer-type-for b) :dired)
+          (includes? (or (:dired-names b) []) "a.txt")
+          (contains? (or (:dired-dirs b) #{}) "sub")))
+      (check "RET in it visits the file over ssh"
+        (= (editor/buffer/buffer-text (current visited)) "alpha\n"))
+      (check "+ makes a directory on the host" (file/dir? (path/join tree "made")))
+      (check "R moves an entry on the host"
+        (and (file/exists? (path/join tree "b.txt")) (not (file/exists? (path/join tree "a.txt")))))
+      (check "C copies into a directory there"
+        (= copy-landed "alpha\n"))
+      (check "and never over an entry already there" (includes? (echo again) "exists"))
+      (check "D deletes a directory there, for good, after saying so"
+        (and (includes? (echo asked) "no trash") (not (file/exists? (path/join tree "sub"))))))))
+
+(defn- check-other-home ()
+  (let (opened (pool/ed-find-file (fresh) (remote key-host (str "~" other-user "/" other-file))))
+    (do
+      (said "~user" opened)
+      (check "`~user/…` is another user's home there"
+        (and (= true (:ssh (current opened)))
+          (not (string/blank? (editor/buffer/buffer-text (current opened))))
+          (string/starts-with? (sshpath/path-of (editor/buffer/buffer-file (current opened))) "/"))))))
+
+(defn- check-multi-hop (dir)
+  (let (file (path/join dir "notes.txt")
+        direct (pool/ed-find-file (fresh) (remote hop-target file))
+        hopped (pool/ed-find-file (fresh) (str "/ssh:" key-host "|ssh:" hop-target ":" file)))
+    (do
+      (said "direct to the hop target" direct)
+      (check "the hop target is not reachable directly" (not (= true (:ssh (current direct)))))
+      (said "multi-hop" hopped)
+      (check "a multi-hop path reaches it through the jump host"
+        (and (= true (:ssh (current hopped)))
+          (= (editor/buffer/buffer-text (current hopped)) (read-text file))))
+      (let (edited (type-text hopped "hop ")
+            _saved (save edited))
+        (check "and saves through it" (string/starts-with? (or (read-text file) "") "hop "))))))
+
+(defn- check-unknown-host-key (dir)
+  (let (m (pool/ed-find-file (fresh) (remote unknown-host (path/join dir "notes.txt"))))
+    (do
+      (said "unknown host key" m)
+      (check "a host key that is not known is refused and said"
+        (and (includes? (echo m) "host key")
+          (not (any? (:buffers m) (fn (buffer) (= true (:ssh buffer)))))
+          (not (any? (:buffers m) :ssh-loading)))))))
+
+(defn- check-password ()
+  (let (asked (pool/ed-find-file (fresh) (remote pw-host pw-file)))
+    (do
+      (said "password host" asked)
+      (check "a host that takes only a password asks for it, masked"
+        (= true (map/get-in asked [:minibuffer :masked])))
+      (let (wrong (key (type-text asked "not-the-password") :enter))
+        (do
+          (said "wrong password" wrong)
+          (check "a wrong password is said, nothing opens"
+            (and (includes? (echo wrong) "refused the password")
+              (not (any? (:buffers wrong) :ssh-loading))))))
+      (let (again (pool/ed-find-file (fresh) (remote pw-host pw-file))
+            typed (key (type-text again password) :enter))
+        (do
+          (said "password" typed)
+          (check "the right password opens it through SSH_ASKPASS"
+            (and (= true (:ssh (current typed))) (not (string/blank? (editor/buffer/buffer-text (current typed))))))
+          (check "and the password is kept nowhere on the model"
+            (not (includes? (pr-str (dissoc typed :buffers)) password)))
+          (let (saved (save (type-text typed "pw ")))
+            (do
+              (said "save over the password connection" saved)
+              (check "the connection it opened serves the save"
+                (not (editor/buffer/buffer-modified? (current saved)))))))))))
+
+(defn- ctl (verb)
+  (let (result (os/cmd sshd-ctl [verb]))
+    (say "sshd " verb ": exit " (:exit result) " " (string/trim (str (:stdout result) (:stderr result))))))
+
+(defn- check-dropped (dir)
+  (let (file (path/join dir "drop.txt")
+        _ (file/spit file "before\n")
+        opened (pool/ed-find-file (fresh) (remote key-host file))
+        edited (type-text opened "x")
+        _ (ctl "stop")
+        failed (save edited))
+    (do
+      (said "save with sshd gone" failed)
+      (check "a dropped connection is said"
+        (or (includes? (echo failed) "failed or dropped") (includes? (echo failed) "did not answer")))
+      (check "and the buffer stays modified, the file as it was"
+        (and (editor/buffer/buffer-modified? (current failed)) (= (read-text file) "before\n")))
+      (ctl "start")
+      (let (saved (save failed))
+        (do
+          (said "save with sshd back" saved)
+          (check "once the host is back, the save lands"
+            (and (= (read-text file) "xbefore\n") (not (editor/buffer/buffer-modified? (current saved))))))))))
+
+;; ---- the run ---------------------------------------------------------------------------
+
+(defn- run ()
+  (do
+    (file/mkdir work)
+    (file/mkdir config-base)
+    (file/mkdir-private control)
+    (let (dir (stage-files))
+      (binding (*config-base* config-base
+                *control-dir* control
+                *program* (or (os/env "BEDIT_SSH_PROGRAM") "ssh"))
+        (do
+          (say "ssh is " *program* "; the files are in " dir)
+          (check-open-edit-save dir)
+          (check-binary-and-large dir)
+          (check-prompt-listing dir)
+          (check-dired dir)
+          (check-other-home)
+          (check-multi-hop dir)
+          (check-unknown-host-key dir)
+          (if (string/blank? (or pw-host ""))
+            (say "SKIPPED the password login: the stage has none (an sshd not run as root)")
+            (check-password))
+          (check-dropped dir))))
+    (os/cmd "rm" ["-rf" work config-base control])
+    (let (failures (%table-get *failures* :n 0))
+      (if (= failures 0)
+        (say "all checks passed")
+        (do (say failures " check(s) FAILED") (system/halt 1))))))
+
+(run)
