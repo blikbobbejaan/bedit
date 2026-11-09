@@ -671,7 +671,7 @@ src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string
                             (brood ADR-589, Emacs's adaptive fill): the first line keeps its
                             prefix, the rest the paragraph's continuation — a list item HANGS under
                             its text, a comment / quote keeps its marker — the MODE's markers
-                            (`fill-markers`: its comment tokens, a C block comment's ` * `; so
+                            (`stringstate/fill-markers`, which the `:adaptive` wrap prefix shares: its comment tokens, a C block comment's ` * `; so
                             `#include` is code). The paragraph is
                             narrowed to point's comment, list item, or (in code) a string that
                             can span lines — its text only, the code around it untouched
@@ -1094,7 +1094,7 @@ src/wrap.blsp              where a line falls on screen rows: the pure break rul
                             else; `line-row-entries` is a line's rows off the visible table. A
                             row's `display` is `{:prefix :inline}`: the WRAP PREFIX (Emacs
                             `wrap-prefix` / adaptive-wrap — a continuation row starts under its
-                            line's indent, `:indent`, or fill prefix, `:adaptive`; the init file's
+                            line's indent, `:indent`, or fill prefix under the mode's markers, `:adaptive`; the init file's
                             `:wrap-prefix` per mode, `scroll/ed-wrap-prefix-style`; dropped past
                             half the row) and the row's INLINE annotations (`inlinetext`), both of
                             which the breaks leave room for
