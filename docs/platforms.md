@@ -56,7 +56,10 @@ promise by GitHub, so a change on their side shows up here as "the editor opened
    it. That is the window's real keyboard path, the frontend's key translation included. It
    is TRIED and reported, not required, on both: a hosted macOS runner may refuse it
    (Accessibility permission for `osascript`, error 1002) and Windows's foreground lock may
-   keep the window from taking the keys. The log says which (`OS input: NOT proven …`).
+   keep the window from taking the keys. The log says which (`OS input: NOT proven …`). (Until
+   2026-11-09 the driver waited for the OS-typed word at the START of the file, though the keys
+   land at point, after the loop phase's word; with that fixed, both runners' OS typing was
+   seen arriving on the first run — a candidate for `require` once it holds.)
 
 The step has a timeout (the driver kills the editor past `REAL_WINDOW_TIMEOUT_MS`, the step's
 `timeout-minutes` backs it), and the pictures (`before.png`, `after.png`, `os-input.png`,
