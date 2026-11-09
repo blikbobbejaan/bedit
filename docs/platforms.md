@@ -64,11 +64,17 @@ The step has a timeout (the driver kills the editor past `REAL_WINDOW_TIMEOUT_MS
 (`editor.log`) are uploaded as the `real-window-<os>` artifact whether it passed or not.
 
 Linux gets the same check in a job of its own, `real-window-linux`, twice: under a private
-Xvfb, where the OS input (xdotool's XTEST) is tried and reported — not yet required: its keys did
-not reach the window in CI's first run, with no window manager to give it the focus — and under
-a headless Weston (`weston --backend=headless`), where only the loop input runs (no input tool
-reaches a headless Weston), so winit's Wayland backend opens, paints and saves too. Locally:
-`tools/ci/real-window.sh nest /tmp/rw x11` (needs `xvfb-run`; opens nothing on your screen).
+Xvfb, where the OS input is REQUIRED — xdotool gives the window the input focus
+(XSetInputFocus, which needs no window manager), puts the pointer over it, and types through
+XTEST to whatever has the focus, as a real keyboard does. Each xdotool call is its own command:
+in one chained call (`search … type …`) `type` and `key` default to the window `search` found
+and send XSendEvent events, which are synthetic and which winit, reading keys through XInput2,
+never sees — CI's first runs typed with exit 0 and the file never changed. The log says which
+window had the focus before and after the keys. And under a headless Weston
+(`weston --backend=headless`), where only the loop input runs (no input tool reaches a headless
+Weston), so winit's Wayland backend opens, paints and saves too. Locally:
+`tools/ci/real-window.sh nest /tmp/rw x11` (needs `xvfb-run` and `xdotool`; opens nothing on
+your screen).
 
 What it does not prove: what the compositor does with the frame after the window presents
 it (the capture is the app's own rasterisation — ADR-609's limit), a GPU window (CI builds
@@ -106,7 +112,7 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; `recover_test` reads the sidecar's ACL back with `icacls`) |
 | terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
 | a real window: opens on the desktop, paints (captured, not blank), typed keys reach the loop, C-x C-s writes the file | ✅ `real-window.sh` | ✅ `real-window.sh` (Linux too: Xvfb and headless Weston) |
-| the OS keyboard reaching that window | tried each run (System Events), reported, not required | tried each run (SendKeys), reported, not required (Linux too, xdotool under Xvfb, until its keys are seen arriving) |
+| the OS keyboard reaching that window | tried each run (System Events), reported, not required | tried each run (SendKeys), reported, not required; Linux: required, xdotool (XTEST) under Xvfb |
 | font discovery, file watching (auto-revert) | not run — headless | not run — headless |
 
 ## Fixed on the way
