@@ -43,8 +43,13 @@ nothing is painted. Each chunk's tabs are expanded at its column (`string/expand
 and it advances `x` by its cell width, so a wide glyph or a tab pushes what follows."
   (if (or (empty? chunks) (>= x limit))
     (reverse acc)
-    (let ([s f] (first chunks)
-          expanded (string/expand-tabs s col)
+    (let (chunk (first chunks)
+          s (first chunk)
+          f (second chunk)
+          ;; a VIRTUAL chunk (inline text, `ed-splice-inline`) is not the line's: its tabs are
+          ;; not the line's to expand and it moves no tab stop after it
+          virtual? (= (nth chunk 2 nil) :virtual)
+          expanded (if virtual? s (string/expand-tabs s col))
           ;; ONE width per chunk where there were three. The expansion occupies exactly
           ;; `(string/display-width s col)` cells (std's guarantee), so its width is also the
           ;; line-column advance; and only a chunk that overruns the limit needs the clip,
@@ -56,7 +61,7 @@ and it advances `x` by its cell width, so a wide glyph or a tab pushes what foll
           cells (if (<= full-cells room) full-cells (string/display-width shown)))
       (ed-chunks->ops-impl row
         (+ x cells)
-        (+ col full-cells)
+        (if virtual? col (+ col full-cells))
         limit
         (rest chunks)
         (cons (if (nil? f) (text row x shown) (text row x shown f)) acc)))))
@@ -68,6 +73,48 @@ and it advances `x` by its cell width, so a wide glyph or a tab pushes what foll
 `col` is the line column the first chunk starts at (0 unless the view is h-scrolled) and
 `limit` the screen column to clip at."
   (ed-chunks->ops-impl row x col limit chunks '()))
+
+(sig ed-splice-inline-step (list list int list -> any))
+(defn- ed-splice-inline-step (chunks inline at acc)
+  "Tail-recursive: `acc` (reversed) plus `chunks`, the first starting at char `at` of the
+row's text, with each of `inline` (`[index text face]`, ascending by index) inserted as a
+virtual chunk before the char at its index — splitting the chunk it falls inside."
+  (cond
+    (empty? inline) (append (reverse acc) chunks)
+    (empty? chunks)
+    ;; past the row's last char: what is anchored at its end, in order
+      (append (reverse acc)
+        (map inline (fn (annotation) [(second annotation) (nth annotation 2) :virtual])))
+    else
+      (let (annotation (first inline)
+            anchor (first annotation)
+            index (if (int? anchor) anchor at)
+            chunk (first chunks)
+            s (first chunk)
+            n (string/length s))
+        (cond
+          (<= index at)
+            (ed-splice-inline-step chunks
+              (rest inline)
+              at
+              (cons [(second annotation) (nth annotation 2) :virtual] acc))
+          (>= index (+ at n)) (ed-splice-inline-step (rest chunks) inline (+ at n) (cons chunk acc))
+          else
+            (let (cut (- index at))
+              (ed-splice-inline-step (cons [(string/substring s cut n) (second chunk)]
+                                       (rest chunks))
+                inline
+                index
+                (cons [(string/substring s 0 cut) (second chunk)] acc)))))))
+
+(defn ed-splice-inline (chunks inline)
+  "`[substring face]` `chunks` tiling a row's text with its INLINE annotations spliced in —
+`inline` is `[index text face]`, `index` the char of the row's text the annotation is painted
+before (its length: after the last), ascending — each a VIRTUAL chunk `[text face :virtual]`
+that `ed-chunks->ops` paints without moving the line's tab stops. `chunks` itself for none.
+
+    (spanpaint/ed-splice-inline [[\"f(1)\" nil]] [[2 \"x: \" :dim]])   ;=> ([\"f(\" nil] [\"x: \" :dim :virtual] [\"1)\" nil])"
+  (if (empty? inline) chunks (ed-splice-inline-step (seq chunks) (seq inline) 0 '())))
 
 ;; ---- overrides: the bracket pair at point, grouped by line -----------------------
 
@@ -209,6 +256,55 @@ forty thousand faces) does not walk that history every frame to reach its first 
     (reverse acc)
     (ed-span-take spans n (inc i) hi (cons (nth spans i) acc))))
 
+(defn- ed-span-start-seek (spans n at)
+  "The first of the `n` ascending `spans` that starts at or after offset `at`, by bisection."
+  (letrec (go (fn (lo hi)
+                (if (>= lo hi)
+                  lo
+                  (let (mid (math/quot (+ lo hi) 2))
+                    (if (< (first (nth spans mid)) at) (go (inc mid) hi) (go lo mid))))))
+    (go 0 n)))
+
+(defn ed-spans-window (rope spans top last-line)
+  "`spans` cut to the lines `top`..`last-line`: every span that reaches into them and no
+other, in the same shape (`ed-span-sources` and `ed-span-layers` cut part by part), so
+`ed-spans-by-line` answers the same for those lines. Two bisections and a copy of what is
+shown.
+
+What a memo keyed on the spans must be handed. A `defmemo`'s store is a global, and `def`
+deep-copies what it stores, so a remembered band is never the same cell as the caller's:
+each lookup compares it element by element and each miss copies it. A buffer's
+`:face-spans` cover its whole text — a 150,000-line *git-revision*'s are 270,000 spans — and
+a frame must cost what it shows, not the buffer.
+
+    (spanpaint/ed-spans-window (text/from-string \"ab\\ncd\\nef\") [[0 1 :a] [3 4 :b] [6 7 :c]] 1 1)   ;=> [[3 4 :b]]"
+  (cond
+    (or (nil? spans) (empty? spans)) spans
+    ;; a recursion as deep as the layers, which is two or three
+    (and (map? spans) (contains? spans :span-under))
+      (assoc spans
+        :span-over
+          (check-allow :non-tail-recursion
+            (ed-spans-window rope (:span-over spans) top last-line))
+        :span-under
+          (check-allow :non-tail-recursion
+            (ed-spans-window rope (:span-under spans) top last-line)))
+    (map? spans)
+      (assoc spans
+        :span-sources
+          (into []
+            (map (:span-sources spans)
+              (fn (source) (ed-spans-window rope source top last-line)))))
+    else
+      (let (v (if (vector? spans) spans (into [] spans))
+            n (count v)
+            lines (text/line-count rope)
+            from-line (math/min (math/max 0 top) (dec lines))
+            to-line (math/min (math/max from-line last-line) (dec lines))
+            from (ed-span-seek v n (text/line->char rope from-line))
+            to (ed-span-start-seek v n (inc (textpos/ed-line-end rope to-line))))
+        (if (and (= from 0) (= to n)) v (seq/subvec v from (math/max from to))))))
+
 (defn ed-spans-by-line (buf spans top last-line)
   "The lexer `spans` (ascending, non-overlapping, absolute offsets) grouped by the line each
 covers — `{line -> (span …)}` over `top`..`last-line`; `{}` when there are none. One co-walk
@@ -224,11 +320,11 @@ of the lines and the band."
     "`ed-spans-by-line` over `rope`, remembered for the last eight panes' arguments.
 
 Memoised because it is asked EVERY frame and its answer only changes when the band, the text
-or the viewport does: the band is the `:span-cache` entry's own vector (the same heap cell
-while it covers the viewport) and the rope is a handle, so a blink, a hover or a motion that
-does not scroll hits on a few `=` that answer at once. Measured: 270 µs of a 1.8 ms
-all-hit frame on src/view.blsp. A hit also hands every row the SAME span lists as last
-turn, so the row memo's `=` on them (`ed-visible-lines`) stops walking a fresh copy.
+or the viewport does: the rope is a handle, compared at once, and the spans are what
+`ed-spans-window` cut to the rows shown — the store is a deep copy, so a key is compared
+element by element and must be the size of the window, never of the buffer. Measured: 270 µs
+of a 1.8 ms all-hit frame on src/view.blsp. A hit also hands every row the SAME span lists
+as last turn, so the row memo's `=` on them (`ed-visible-lines`) stops walking a fresh copy.
 
 A line's end is `ed-line-end`, not the length of the line's text:
 that read allocated every visible line as a string just to measure it.
@@ -360,11 +456,17 @@ earlier source's spans first, which keeps them ascending."
 scrollback) — the two as `ed-span-sources`, never joined — and over the faces its producer
 stamped on its text (its `:ansi` text property — a build's ANSI colours as SGR attributes, resolved
 through the theme's ANSI palette as they are painted) when it has those.
-Those belong to the text (brood ADR-579), so they are where it is after any edit."
+Those belong to the text (brood ADR-579), so they are where it is after any edit.
+
+A language server's SEMANTIC TOKENS (`:semantic-spans`, stamped and carried by `lsp-semantic`)
+lie over all of that: where the server says what a name is, its face wins; everywhere else the
+mode's colouring shows, as eglot lays its semantic faces over font-lock."
   (let (history (:history-spans buf)
         output (ansicolor/colour-spans buf)
-        own (if (or (nil? history) (empty? history)) spans (ed-span-sources [history spans])))
-    (if (empty? output) own (ed-span-layers own output (ansi-palette)))))
+        semantic (:semantic-spans buf)
+        own (if (or (nil? history) (empty? history)) spans (ed-span-sources [history spans]))
+        coloured (if (empty? output) own (ed-span-layers own output (ansi-palette))))
+    (if (or (nil? semantic) (empty? semantic)) coloured (ed-span-layers semantic coloured))))
 
 ;; ---- diagnostics: the checker's findings as underline overrides -------------------
 
@@ -413,7 +515,12 @@ region then overlays. (The hl-line current-line highlight is NOT a char range �
 full-width `rect` band painted by `panebody/ed-hl-line-band`, so it covers the whole line, not just
 its text.)"
   (let (region-b (buffer-region-bounds buf)
-        region (when region-b (list [(first region-b) (second region-b) face-region]))
+        ;; a rectangle region (C-x SPC, C-M-drag) tints its block on each line, not the span
+        region (cond
+                 (nil? region-b) nil
+                 (bufferops/rectangle-mark-active? buf)
+                   (map (bufferops/rectangle-ranges buf) (fn ([from to]) [from to face-region]))
+                 else (list [(first region-b) (second region-b) face-region]))
         overlays (if selected?
                    (map (or (:overlays m) '()) (fn (o) [(:start o) (:end o) (:face o)]))
                    '()))

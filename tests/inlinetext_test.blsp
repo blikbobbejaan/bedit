@@ -1,0 +1,117 @@
+;; Inline annotations (src/inlinetext.blsp): virtual text shown AT a position inside a line —
+;; an LSP inlay hint's `x: ` — that takes screen cells but is never buffer text. The store and
+;; its markers, then the geometry every row↔column question reads through `wrap/row-cell` /
+;; `wrap/row-column`: the row table, the caret, a click, C-n's goal column, a wrapped line's
+;; breaks, the painted row and a copy.
+(defmodule inlinetext-test
+  (:use model)
+  (:use input)
+  (:use view)
+  (:use panes)
+  (:use window-commands)
+  (:use killing)
+  (:use wrap)
+  (:use editor/buffer)
+  (:use test))
+
+(defn m-of (text) (ed-init (make-buffer text)))
+(defn cur (m) (ed-current-buf m))
+(defn annotate (m annotations)
+  "`m` with the current buffer carrying `annotations` under owner `:test`."
+  (ed-set-buf m (inlinetext/set-annotations (cur m) :test annotations)))
+(defn cursor-op (ops) (seq/find ops (fn (op) (and (vector? op) (= (first op) :cursor)))))
+(defn rows-of (m)
+  (let (pane (first (:panes (ed-body-layout m 40 6)))) (ed-pane-rows pane (cur m))))
+(defn press-at (m row column)
+  "`m` after a left click at screen cell `[row column]` of a 40×6 window."
+  (ed-update m [:mouse :press :left row column [] 1] 40 6))
+
+(describe "the store: owner-keyed, anchored on markers"
+  (test "an owner's set replaces its own and leaves another's"
+    (let (buf (inlinetext/set-annotations (make-buffer "foo(1, 2)")
+                :a [{:at 7 :text "y: "} {:at 4 :text "x: "}])
+          both (inlinetext/set-annotations buf :b [{:at 9 :text " -> int"}])
+          replaced (inlinetext/set-annotations both :a [{:at 4 :text "first: "}]))
+      (assert= (into [] (map (inlinetext/annotations buf) :at)) [4 7])
+      (assert= (count (inlinetext/annotations both)) 3)
+      (assert= (into [] (map (inlinetext/annotations replaced) :text)) ["first: " " -> int"])
+      (assert= (into [] (map (inlinetext/annotations (inlinetext/clear replaced :a)) :owner)) [:b])
+      (assert= (inlinetext/annotations (inlinetext/set-annotations replaced :b []))
+        [{:at 4 :text "first: " :face nil :owner :a}])))
+  (test "edits carry the anchors as markers"
+    (let (buf (inlinetext/set-annotations (make-buffer "foo(1)") :a [{:at 4 :text "x: "}]))
+      ;; text inserted before the anchor moves it
+      (assert= (:at (first (inlinetext/annotations (insert (goto-char buf 0) "ab")))) 6)
+      ;; text typed AT it stays after it, where the caret is painted
+      (assert= (:at (first (inlinetext/annotations (insert (goto-char buf 4) "z")))) 4)
+      ;; a deletion around it collapses it to where the deletion was
+      (assert= (:at (first (inlinetext/annotations (delete-region (goto-char (set-mark (goto-char buf
+                                                                                         2))
+                                                                    5)))))
+        2)))
+  (test "line-annotations index them by line with their widths"
+    (let (buf (inlinetext/set-annotations (make-buffer "a\nfoo(1)") :a [{:at 6 :text "x: "}]))
+      (assert= (inlinetext/line-annotations buf) {1 [[4 3 "x: " nil]]}))))
+
+(describe "inline text takes cells, never chars"
+  (def call "foo(1, 2)")
+  (defn hinted ()
+    (annotate (m-of call) [{:at 4 :text "x: "} {:at 7 :text "y: "}]))
+  (test "the row entry carries the annotations, and the buffer becomes row-wise"
+    (let (row (first (rows-of (hinted))))
+      (assert= (row-inline row) [[4 3 "x: " nil] [7 3 "y: " nil]])))
+  (test "row-cell counts the annotations at or before a column; row-column inverts it"
+    (let (rope (buffer-rope (cur (hinted)))
+          row (first (rows-of (hinted))))
+      (assert= (row-cell rope row 3) 3) ; before the first
+      (assert= (row-cell rope row 4) 7) ; the `1`, past `x: `
+      (assert= (row-cell rope row 7) 13) ; the `2`, past both
+      ;; a cell on an annotation is its anchor
+      (assert= (row-column rope row 4) 4)
+      (assert= (row-column rope row 6) 4)
+      (assert= (row-column rope row 7) 4)
+      (assert= (row-column rope row 8) 5)))
+  (test "the caret at an anchor sits past the annotation — point is never inside one"
+    (let (m (hinted)
+          at (fn (point) (cursor-op (ed-view (ed-set-buf m (goto-char (cur m) point)) 40 6)))
+          gutter (- (nth (at 0) 2) 0))
+      (assert= (- (nth (at 3) 2) gutter) 3)
+      (assert= (- (nth (at 4) 2) gutter) 7)
+      ;; C-f from before the anchor steps one char, over the annotation's cells
+      (assert= (buffer-point (cur (ed-update (ed-set-buf m (goto-char (cur m) 3)) :ctrl-f 40 6))) 4)))
+  (test "a click on an annotation lands on its anchor"
+    (let (m (hinted)
+          gutter (nth (cursor-op (ed-view m 40 6)) 2))
+      (assert= (buffer-point (cur (press-at m 0 (+ gutter 5)))) 4)
+      (assert= (buffer-point (cur (press-at m 0 (+ gutter 7)))) 4)
+      (assert= (buffer-point (cur (press-at m 0 (+ gutter 8)))) 5)))
+  (test "the annotation is painted between the chars, in its own op"
+    (let (texts (map (seq/filter (ed-view (hinted) 40 6)
+                       (fn (op) (and (vector? op) (= (first op) :text) (= (nth op 1) 0))))
+                  (fn (op) [(nth op 2) (nth op 3)]))
+          gutter (nth (cursor-op (ed-view (hinted) 40 6)) 2))
+      (is (includes? texts [(+ gutter 4) "x: "]))
+      (is (includes? texts [(+ gutter 10) "y: "]))))
+  (test "copying the line copies the buffer's text, never the annotations"
+    (let (m (hinted)
+          selected (ed-set-buf m (goto-char (set-mark (goto-char (cur m) 0)) (string/length call)))
+          copied (cmd-copy-region selected nil))
+      (assert= (first (:kill-ring copied)) call)))
+  (test "C-n keeps the SCREEN column across an annotated line"
+    ;; line 0 has `x: ` before col 4; from col 8 of line 1 (cell 8) C-p lands under cell 8 of
+    ;; line 0, which is char 5 (`,`): 4 chars, 3 cells of annotation, then char 4 (`1`) at 7
+    (let (m (annotate (m-of "foo(1, 2)\nabcdefghijkl") [{:at 4 :text "x: "}])
+          m (assoc (ed-set-buf m (goto-char (cur m) 18)) :view-cols 35)
+          up (ed-update m :ctrl-p 40 6))
+      (assert= (buffer-point (cur up)) 5))))
+
+(describe "a wrapped line leaves room for its inline text"
+  (test "the row breaks earlier by the annotation's cells"
+    (let (text "aaaa bbbb cccc dddd eeee ffff gggg hhhh"
+          plain (cmd-visual-line-mode (m-of text) nil)
+          hinted (annotate plain [{:at 0 :text "<<<<<<<<<<: "}])
+          first-end (fn (m) (nth (first (rows-of m)) 2)))
+      (is (< (first-end hinted) (first-end plain)))
+      ;; the row count the scroll clamp walks agrees with the table
+      (assert= (wrap/line-rows (cur hinted) 0 35 (scroll/ed-row-extras (cur hinted)))
+        (count (rows-of hinted))))))

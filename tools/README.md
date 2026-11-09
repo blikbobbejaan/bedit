@@ -145,6 +145,13 @@ geometry (`cell`, `grid`, `origin`). `--zoom PX SCALE` also writes `<out>-zoom.p
 bottom `PX` pixels enlarged `SCALE` times by repeating pixels, for counting a few of them (the
 header line's edge, and the echo area's against the bottom inset — brood ADR-610).
 
+`ci/real-window.blsp` is its sibling for a REAL window: the same child runtime and throwaway
+home, but no `BROOD_GUI_HEADLESS` — the window opens on whatever display there is, gets keys
+(to the loop by its registered name, then through the OS's own input), saves, and is captured
+and checked. CI runs it on every OS through `ci/real-window.sh` (docs/platforms.md); locally,
+`tools/ci/real-window.sh nest /tmp/rw x11` runs it inside a private Xvfb, so nothing opens on
+your screen.
+
 Open the PNG with anything that shows images — an agent's file reader does. For an assertion
 rather than a look, write a test over `gui/render-frame` instead (`tests/window_paint_test.blsp`).
 

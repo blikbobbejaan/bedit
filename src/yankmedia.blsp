@@ -1,0 +1,117 @@
+(defmodule yankmedia
+  "M-x yank-media (Emacs 29's `yank-media`): an IMAGE on the OS clipboard put into the buffer
+the way its mode says. A mode declares a handler as its `:yank-media` facet, a
+`(model image) -> model` symbol, `image` being brood's `os/clipboard-image` answer
+`{:png bytes :width :height}`; Markdown and Org save the PNG beside the file — the name asked
+in the minibuffer, `image-<timestamp>.png` in the buffer's directory by default — and insert a
+link to it (`![](name.png)`, `[[file:name.png]]`).
+
+Reading an image waits on the app that owns the clipboard while it serialises the picture
+(brood ADR-536), so it is read OFF the loop, in a task on `:yank-media-proc` (inline when
+there is no loop, a test), as the PRIMARY selection is (`clipboard/ed-primary-ask`); C-g
+cancels it. A served session's clipboard is the client's, and the link carries no image: it
+says so. A buffer whose mode has no handler says so before reading anything; a clipboard with
+no image says so after."
+  (:use editor/buffer :only [insert]) ; the link at point
+  (:use minibuffer :only [ed-mb-edit]) ; the name prompt
+  (:use model) ; message / ed-current-buf / ed-set-buf / ed-mode-service / register-task-reply
+  (:use interactive)) ; defcommand — M-x yank-media
+
+(defdyn *image-reader* os/clipboard-image)
+;; What reads the clipboard's image (`{:png :width :height}` or nil); a test binds a stand-in.
+
+(defdyn *image-writer* file/spit-bytes)
+;; What writes the PNG's bytes to a path; a test binds a stand-in that records the write.
+
+(defn- read-image ()
+  ;; the clipboard's image, nil when it holds none, `:clipboard-unread` when the read failed
+  (let (reader *image-reader*)
+    (try
+      (reader)
+      (catch failure
+        (do
+          (log/warn (str "yank-media: clipboard read failed: " (error-message failure)))
+          :clipboard-unread)))))
+
+(defn- handler-of (m)
+  ;; the current buffer's mode's `:yank-media` handler, a function, or nil
+  (let (handler (ed-mode-service (ed-current-buf m) :yank-media)) (when (fn? handler) handler)))
+
+(defn image-landed (m image)
+  "The clipboard read's answer folded in: the current buffer's handler run on `image`, or
+what stopped it said — no image, a read that failed, a buffer whose mode has no handler."
+  (let (landed (dissoc m :yank-media-proc)
+        handler (handler-of landed))
+    (cond
+      (= image :clipboard-unread) (message landed "yank-media: the clipboard could not be read")
+      (not (map? image)) (message landed "yank-media: no image on the clipboard")
+      (nil? handler) (message landed "yank-media: no media handler in this buffer's mode")
+      else (handler landed image))))
+
+(register-task-reply :yank-media-proc
+  'yankmedia/image-landed
+  :clipboard-unread "reading the clipboard image"
+  {:cancel-on-quit? true})
+
+(defcommand cmd-yank-media
+  (m key)
+  "Yank the image on the clipboard into this buffer as its mode puts one (Emacs
+`yank-media`): in Markdown and Org, saved as a PNG beside the file — the name asked, a
+timestamped one by default — and linked at point. A mode with no media handler, or a
+clipboard with no image, is said."
+  (cond
+    (nil? (handler-of m)) (message m "yank-media: no media handler in this buffer's mode")
+    (:client-clipboard m)
+      (message m "yank-media: the clipboard is the client's, and its image does not cross the link")
+    (not (:os-clipboard m)) (message m "yank-media: no clipboard to read")
+    (:yank-media-proc m) m
+    (ed-headless?) (image-landed m (read-image))
+    else
+      (assoc m
+        :yank-media-proc
+          (task/task (fn () (read-image))
+            {:timeout clipboard/*clipboard-read-timeout-ms*}))))
+
+;; ---- the Markdown and Org handlers: a PNG beside the file, and a link -----------------
+
+(defn default-image-name (ms)
+  "The name an image yanked at epoch milliseconds `ms` is offered under.
+
+    (yankmedia/default-image-name 0)   ;=> \"image-19700101-000000.png\""
+  (str "image-" (datetime/format (datetime/epoch-ms-> ms) "%Y%m%d-%H%M%S") ".png"))
+
+(defn- save-and-link (m image link-of name)
+  ;; write `image`'s PNG as `name` (relative to the buffer's directory) and insert the link
+  ;; `link-of` makes of the name as typed
+  (let (directory (ed-buffer-dir (ed-current-buf m))
+        typed (string/trim name)
+        path (if (path/absolute? typed) typed (path/join directory typed))
+        writer *image-writer*)
+    (cond
+      (string/blank? typed) (message m "yank-media: the image needs a name")
+      (file/exists? path) (message m (str "yank-media: " path " already exists"))
+      else
+        (try
+          (do
+            (writer path (:png image))
+            (message (ed-set-buf m (insert (ed-current-buf m) (link-of typed)))
+              (str "yank-media: saved " path " (" (:width image) "×" (:height image) ")")))
+          (catch failure
+            (message m (str "yank-media: could not write " path ": " (error-message failure))))))))
+
+(defn yank-image-linked (m image link-of)
+  "Ask for the name to save `image` (a clipboard image) under, beside the buffer's file, then
+save it and insert `(link-of name)` at point: what a mode's `:yank-media` handler that keeps
+images as files calls."
+  (assoc m
+    :minibuffer
+      {:edit (ed-mb-edit "Save image as: " (default-image-name (os/now)))
+       :on-complete (fn (prompted name) (save-and-link prompted image link-of name))}))
+
+(defn markdown-yank-media (m image)
+  "markdown-mode's `:yank-media`: the image saved beside the file, `![](name.png)` at point."
+  (yank-image-linked m image (fn (name) (str "![](" name ")"))))
+
+(defn org-yank-media (m image)
+  "org-mode's `:yank-media`: the image saved beside the file, `[[file:name.png]]` at point."
+  (yank-image-linked m image (fn (name) (str "[[file:" name "]]"))))

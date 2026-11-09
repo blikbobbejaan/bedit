@@ -214,6 +214,35 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
                             and SIGHUP / SIGTERM auto-save every unsaved buffer before the
                             terminal is restored (`main/terminal-hangup`). Named to dodge std's `sudo`
+src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in ONE place, pure: `parse`,
+                            `spec`, `canonical` (a buffer's key), `dirname`, `remote-start` (a `/ssh:`
+                            typed over a path), and `remote?` — what every local tool asks before it
+                            touches a path. `~` / a relative path is the REMOTE home's. filename,
+                            sidecar, mincomplete and the handler all read it
+src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*program*`, a test's
+                            stand-in runs the scripts locally) with one SHARED connection per host
+                            (ControlMaster, the socket in `state/ssh/`, owner-only, ControlPersist
+                            5 min), BatchMode always — a failure classified (`classify`: host key
+                            never accepted, auth, connection dropped). Each operation is a POSIX sh
+                            script on ssh's stdin (`/bin/sh -s` is all the login shell parses; args
+                            `os/shell-quote`d): a read through base64 (bytes, a size limit asked
+                            first), an atomic write (staged beside the file with its mode, size +
+                            SHA-256 checked, renamed), `ls -1pa` for the prompt (kept 10 s, a
+                            table). A password opens the connection once (`connect-with-password`:
+                            SSH_ASKPASS helper reading ssh's own stdin, refusing yes/no questions)
+src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/ssh:`), the second file
+                            handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
+                            /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
+                            the spec, `:ssh` its mark, carried by `hosted-meta`), so no local tool
+                            takes it for a file here. Every ssh call a task (`:ssh-proc`, one at a
+                            time, C-g stops it): `Loading…` at once, a save stays modified until it
+                            lands (`file-save/ed-save-prepare` / `ed-save-landed`), a dropped
+                            connection said. A password the host wants is read masked
+                            (`passwd/ed-read-passwd`) and used once. charset as any file (binary →
+                            hex, large → asked); a directory opens the find-file prompt in it (no
+                            remote dired). Its sidecar is private (`sidecar/private-spec`); auto-revert,
+                            diff-hl, LSP, the formatter, editorconfig, dir-locals, compile, M-! and the
+                            project walk skip it (`sshpath/remote?`). The mode line says `@host`
 src/bugreport.blsp          M-x report-bug (Emacs's report-emacs-bug): every error the editor CATCHES
                             (a command, a render error frame, a fontify, a loop the supervisor
                             restarted) reaches its error sink (`model/register-error-sink`),
@@ -402,7 +431,8 @@ src/scrollbar.blsp          the overlay scrollbar: the thumb as render ops, the 
 src/mouse.blsp              `[:mouse …]` folded into the model: a click, a drag selection, the
                             scrollbar's thumb, a divider's resize, the wheel on the pane under the
                             pointer. A middle click places point (`ed-mouse-set-point`) and commands
-                            yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`)
+                            yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`).
+                            A C-M-drag selects a rectangle (`:rectangle?` on the `:text-drag`)
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
                             feature: a pane body's layers share ONE geometry map, the mode
                             line's feature chips come from the statusbar registry, and what
@@ -469,11 +499,18 @@ src/tabbar.blsp             TABS (Emacs tab-bar-mode, C-x t …): each tab a win
                             `hittest/ed-tab-bar-click`; lastsession saves the tabs. Per frame
 src/whitespace.blsp         trailing whitespace and tabs as highlight ranges (Emacs whitespace-mode,
                             `:show-whitespace`, per mode through `scroll/ed-mode-setting`)
+src/fillindicator.blsp      the fill-column rule (Emacs display-fill-column-indicator-mode,
+                            `:fill-column-indicator` per mode, M-x display-fill-column-indicator-mode
+                            per buffer): `│` at `conventions/fill-column` on each row that leaves
+                            it empty, a `:with-text` pane layer; hscroll moves it, a wrapped row is
+                            measured from its start, a clipped (truncated) row gets none
 src/glyphless.blsp          the invisible format characters SHOWN (Emacs glyphless-char-display):
                             brood lays a zero width space, a BOM mid-text, a tag character out as
                             its `<200b>` escape (ADR-556, bound by `conventions/with-cell-layout`
                             from `:glyphless-chars`); this module gives the escape its face, and a
-                            bidi control (Trojan Source) a hazard face. The minibuffer shows them too
+                            bidi control (Trojan Source) a hazard face. The minibuffer shows them too.
+                            A no-break space (U+00A0, U+202F) is underlined in the escape colour
+                            (Emacs nobreak-char-display, `:nobreak-char-display`, on by default)
 src/rainbow.blsp             a tree-sitter buffer's brackets coloured by depth (Emacs rainbow-delimiters,
                             `:rainbow-delimiters`): delimiter tokens of the held parse, the window's top
                             depth from the tree; the Lisp modes colour theirs in their own lexer
@@ -564,7 +601,9 @@ src/killing.blsp            the kills and yanks (coalescing, M-y, C-u N C-y), za
                             middle click's PRIMARY yank
 src/editing.blsp            open-line, transposes (negative arguments drag backward), duplicate /
                             join, case, read-only toggle, undo / redo
-src/region.blsp             the mark commands, narrowing, `ed-active-region`
+src/region.blsp             the mark commands, narrowing, `ed-active-region`, rectangle-mark-mode (C-x SPC:
+                            `:rectangle-mark` on the buffer, painted as a block, C-w / M-w / C-y act
+                            on it through `killing`; dropped by a post-step once the mark goes)
 src/search-commands.blsp    the entry points of isearch, occur, the fuzzy line search and the
                             query-replace prompts (the loops are isearch's and query-replace's)
                             Other features' commands live with them (dired, help, vim, registers,
@@ -574,6 +613,11 @@ src/comment.blsp            M-; comment-dwim (Emacs newcomment): the mode's `:co
                             or a block-only language's `:comment-block` pair round each line
 src/kmacro.blsp             C-x ( · C-x ) · C-x e, the keyboard-macro commands (Emacs kmacro);
                             the recording and the replay are `input`'s
+src/yankmedia.blsp          M-x yank-media (Emacs 29's): the clipboard's IMAGE (`os/clipboard-image`,
+                            read off the loop on `:yank-media-proc`, C-g cancels) handed to the mode's
+                            `:yank-media` facet; Markdown and Org save the PNG beside the file (name
+                            asked, `image-<timestamp>.png` by default) and insert `![](name)` /
+                            `[[file:name]]`. No handler, no image, a served session: said
 src/browse-kill-ring.blsp   M-x browse-kill-ring: *Kill Ring*, newest first, RET inserts the
                             entry where it was opened from (the ring is `clipboard`'s)
 src/window-commands.blsp    the window commands: tiled splits, windmove and Emacs's
@@ -808,7 +852,14 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             recorded `:fingerprint`), moving one back to its pin, and a
                             live swap — drop a new .so in and reload, no restart. An install or
                             reload retypes every open line-lexer stand-in as its parsed mode
-                            (`model/ed-grammars-arrived`)
+                            (`model/ed-grammars-arrived`). A grammar is native code, so brood
+                            VETS a library in a child before its first load and refuses one that
+                            crashed or hung there, or that crashed bedit (brood ADR-660): an
+                            install vets with the grammar's own test corpus off the loop
+                            (`*grammar-vetter*`) and says a quarantine; the list shows one
+                            (QUARANTINED, why) without loading it; its language stands in with
+                            its line lexer, as a missing grammar's does (`model/grammar-loadable?`,
+                            `missing-note`)
 src/grammarcheck.blsp       does the installed grammar still have every node kind and field a
                             mode names? Each `deflanguage` registers the names its face table,
                             indent spec, injections and definitions use (std's
@@ -894,7 +945,9 @@ src/lsp-protocol.blsp       the protocol, pure: what each answer means, position
                             document sync, what each request puts on the wire, and the connection
                             as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
-                            hover, rename, format, imenu, and `publishDiagnostics` folded into
+                            hover, rename, format, imenu, INLAY HINTS (the lines on screen on the idle beat, as
+                            `inlinetext` annotations owned by `:lsp-inlay`; opt-in per mode by
+                            `:lsp-inlay-hints`, M-x lsp-inlay-hints-mode per buffer), and `publishDiagnostics` folded into
                             the model's diagnostics, so every language gets the underline / ⚠ note
                             / gutter mark the Brood checker used to have to itself. Answers
                             server->client requests too (`client/registerCapability` — a server
@@ -921,6 +974,25 @@ src/lsp-servers.blsp        the servers as the model holds them: where each star
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
                             lsp-commands can register fold impls while lsp stays deferred
+src/lsp-semantic.blsp       LSP SEMANTIC TOKENS (`semanticTokens/full`, `/full/delta`): the integer
+                            array decoded against the server's legend, a delta applied, each token
+                            type + modifiers a `:syntax/*` face (`:syntax/variable` is its own; a
+                            definition `:syntax/definition`; strings / comments / numbers left to
+                            the mode), stamped on the pool buffer as `:semantic-spans`, which
+                            `spanpaint/ed-buffer-spans` lays OVER the mode's colouring. Asked on the
+                            idle beat when the text moved (order 55); carried through the splice
+                            log by a post-step (order 45) until the next answer, never dropped on a
+                            keystroke. `:lsp-semantic-tokens` (default on where offered), M-x
+                            lsp-semantic-tokens-mode. Its request kinds and their `LspRequest` impls
+                            (all four halves) live here, not in lsp-requests / lsp-protocol
+src/lsp-lens.blsp           LSP CODE LENS (`codeLens`, `codeLens/resolve`): each lens a dim INLAY
+                            row above its line (`wrap/inlay-lines`, owner `:lsp-code-lens`), titles
+                            joined ` | `, indented as the line; anchored by a char offset carried
+                            through the splice log (post-step order 46), asked on the idle beat
+                            (order 60), unresolved ones resolved. M-x lsp-code-lens-run runs point's
+                            line's lens through `workspace/executeCommand` (a code action's path:
+                            its edits come back as `workspace/applyEdit`). `:lsp-code-lens`
+                            (default off), M-x lsp-code-lens-mode
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/filename.blsp           a typed path read the Emacs way (`substitute-in-file-name`, which is
                             std's `path/substitute` — this is the prompt's layer over it): the prompt
@@ -1011,7 +1083,30 @@ src/wrap.blsp              where a line falls on screen rows: the pure break rul
                             rides the row) — per line, by `line-policy`. The row↔line owner
                             (panes), the view and the scroll clamp all read it; point past a
                             cut scrolls that one line sideways (`follow-point`, Emacs's
-                            current-line auto-hscroll), a click on `…` goes to the line's end
+                            current-line auto-hscroll), a click on `…` goes to the line's end.
+                            THE ROW GEOMETRY HELPER: `row-cell` (a char column of a row's line →
+                            the cell it is painted at) and `row-column` (a cell → the char under
+                            it; `clicked` makes a cut row's ellipsis the line's end), over a ROW
+                            ENTRY — the table's `[line from to inlay clip display]`, or an
+                            unwrapped pane's `[line hscroll nil nil]`. The caret, a click / drag /
+                            hover, C-n's goal column, C-v, the wheel, avy, the region's end band,
+                            the notes and a remote caret all convert through these two and nothing
+                            else; `line-row-entries` is a line's rows off the visible table. A
+                            row's `display` is `{:prefix :inline}`: the WRAP PREFIX (Emacs
+                            `wrap-prefix` / adaptive-wrap — a continuation row starts under its
+                            line's indent, `:indent`, or fill prefix, `:adaptive`; the init file's
+                            `:wrap-prefix` per mode, `scroll/ed-wrap-prefix-style`; dropped past
+                            half the row) and the row's INLINE annotations (`inlinetext`), both of
+                            which the breaks leave room for
+src/inlinetext.blsp         INLINE ANNOTATIONS (Emacs's `before-string` overlay, what an LSP
+                            inlay hint is): `{:at :text :face}` virtual text shown AT a position
+                            inside a line, owner-keyed (`set-annotations buf owner [...]`,
+                            `clear`), each anchor a buffer MARKER so edits carry it (left gravity:
+                            text typed at it lands after it, where the caret is painted). Never
+                            buffer text: it takes cells in the row table (`scroll/ed-row-extras`
+                            `:inline`, so the buffer lays out row-wise), point cannot be inside
+                            it, a click on it is its anchor, a copy never includes it; painted as
+                            VIRTUAL chunks (`spanpaint/ed-splice-inline`) in the hint voice
 src/folds.blsp              outline FOLDING in an editable buffer (org's TAB): a fold is a
                             marker on its heading, the mode's `:fold-extent` says what it
                             covers, and the row table gives the hidden lines no rows — so the
@@ -1424,6 +1519,12 @@ tools/screenshot.blsp       a PNG of what the REAL editor paints, no display: `m
 tools/ci/platform-smoke.sh  CI's macOS / Windows run (`platform-smoke` in ci.yml): nest check, the
                             boot check and the test files where the OS shows through — what each
                             OS proves is docs/platforms.md
+tools/ci/real-window.sh     CI's REAL-window check (macOS, Windows, Linux under Xvfb and a headless
+                            Weston): `main` on a file in a window on a real display (no
+                            BROOD_GUI_HEADLESS), typed into — through the loop, and the OS's own
+                            input (xdotool / SendKeys / System Events) — saved with C-x C-s, the
+                            file read back, the window captured and checked not blank; the PNGs
+                            are a workflow artifact. The driver is `real-window.blsp`
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")

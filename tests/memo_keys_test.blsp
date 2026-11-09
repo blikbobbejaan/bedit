@@ -1,0 +1,119 @@
+;; tests/memo_keys_test.blsp — a frame over a huge buffer remembers nothing the size of it.
+;;
+;; A `defmemo` (std/memo) keeps its store in a global, and `def` deep-copies what it stores:
+;; the remembered key is never the same cell as the caller's argument, so every lookup
+;; compares it element by element and every miss copies it whole. Only a rope (a handle) is
+;; compared at once. A memo keyed on a BUFFER, or on its whole `:face-spans` or `:line-kinds`,
+;; therefore costs the buffer's size on every frame — a 150,000-line *git-revision* beside the
+;; selected pane cost 4.6 s a frame (`view/ed-resting-point-cell` was keyed on the pane and
+;; the buffer), which is what timed CI's shallow clone out. A frame must cost what it shows.
+;;
+;; Measured without a clock: after rendering a split over a 20,000-line buffer whose faces
+;; and line kinds cover every line, no memo store in bedit (a global `bedit/…-recent`, the
+;; store `defmemo` defines and the hand-kept ones share the name) holds a key anywhere near
+;; that size. A key carrying the buffer, its spans or its kinds is 20,000 nodes at least.
+(defmodule memo-keys-test
+  (:use test)
+  (:use model)
+  (:use input)
+  (:use pool)
+  (:use view)
+  (:use editor/buffer))
+
+(def- *lines* 20000)
+
+(defn- press (m keys) (fold keys m (fn (acc k) (ed-update acc k 80 24))))
+
+(defn- huge-buffer ()
+  "A `*lines*`-line buffer coloured and kinded on every line, as a section buffer is: its
+`:face-spans` one span a line, its `:line-kinds` one kind a line (so its long lines go
+through the row table), every line marked added in the change gutter (a new file's diff-hl
+bars), point near the end."
+  (let (text (string/join (map (range *lines*) (fn (i) (str "line " i " of the huge buffer"))) "\n")
+        buf (annotate (make-buffer text "*huge*")
+              :vcs-line-status (into {} (map (range *lines*) (fn (line) [line :added]))))
+        rope (buffer-rope buf))
+    (assoc (goto-char buf (text/line->char rope (- *lines* 10)))
+      :face-spans
+        (into []
+          (map (range *lines*)
+            (fn (line)
+              (let (bol (text/line->char rope line)) [bol (+ bol 4) {:bold true}]))))
+      :line-kinds (into [] (map (range *lines*) (fn (_) :section-body))))))
+
+(defn- size-of (v cap)
+  "The nodes in `v` — every element of a vector, list or set, every value of a map or
+record — counting no further than `cap`. A rope is one node: it is a handle."
+  (cond
+    (<= cap 0) 0
+    (or (map? v) (record? v))
+      (fold (vals v) 1 (fn (n x) (if (> n cap) n (+ n (size-of x (- cap n))))))
+    (or (vector? v) (list? v) (set? v))
+      (fold v 1 (fn (n x) (if (> n cap) n (+ n (size-of x (- cap n))))))
+    else 1))
+
+(defn- memo-stores ()
+  "`[name store]` for every memo store bedit keeps: the globals named `bedit/…-recent` holding
+`[key value]` entries."
+  (seq/keep (reflect/global-names)
+    (fn (name)
+      (let (spelled (str name))
+        (when (and (string/starts-with? spelled "bedit/") (string/ends-with? spelled "-recent"))
+          (let (store (reflect/eval name))
+            (when (and (list? store)
+                    (every? store (fn (entry) (and (vector? entry) (= (count entry) 2)))))
+              [name store])))))))
+
+(defn- oversized-keys (limit)
+  "`[name key-size]` for every remembered key over `limit` nodes."
+  (mapcat (memo-stores)
+    (fn ([name store])
+      (seq/keep store
+        (fn (entry)
+          (let (size (size-of (first entry) (inc limit))) (when (> size limit) [name size])))))))
+
+(describe "a frame over a huge buffer keeps no memo keyed on its size"
+  (test "the huge buffer beside the selected pane, then selected: every memo key is visible-sized"
+    (let (m (ed-open-buffer (press (ed-init (huge-buffer)) [:ctrl-x "3"])
+              (make-buffer "small" "small"))
+          limit (math/quot *lines* 4))
+      ;; the huge buffer is in the pane NOT selected: its caret is the resting one
+      (assert= (buffer-name (ed-current-buf m)) "small")
+      (ed-view m 80 24)
+      (ed-view m 80 24)
+      (assert= (oversized-keys limit) '())
+      ;; and selected, scrolled near its end: the body, the row table and the caret
+      (let (selected (press m [:ctrl-x "o"]))
+        (assert= (buffer-name (ed-current-buf selected)) "*huge*")
+        (ed-view selected 80 24)
+        (ed-view selected 80 24)
+        (assert= (oversized-keys limit) '())))))
+
+(describe "what the memos are handed instead: the window of it"
+  (test "the spans cut to some lines paint those lines as the whole band does, in every shape"
+    (let (buf (make-buffer (string/join (map (range 100) (fn (i) (str "row " i))) "\n"))
+          rope (buffer-rope buf)
+          per-line (into []
+                     (map (range 100)
+                       (fn (line)
+                         (let (bol (text/line->char rope line)) [bol (+ bol 3) {:bold true}]))))
+          ;; one span reaching from line 48 into line 51: it shows on the lines it covers
+          straddling [[(text/line->char rope 48) (+ 2 (text/line->char rope 51)) {:italic true}]]
+          shapes [per-line
+                   (spanpaint/ed-span-sources [(seq/subvec per-line 0 50) (seq/subvec per-line 50)])
+                   (spanpaint/ed-span-layers straddling per-line)])
+      (doseq (spans shapes)
+        (assert= (spanpaint/ed-spans-by-line buf (spanpaint/ed-spans-window rope spans 50 60) 50 60)
+          (spanpaint/ed-spans-by-line buf spans 50 60)))
+      ;; and the window is the lines', not the band's
+      (is (<= (count (spanpaint/ed-spans-window rope per-line 50 60)) 11))
+      (assert= (spanpaint/ed-spans-window rope straddling 50 50) straddling)))
+  (test "a line's kind is read through a cut of the kinds that starts at :kinds-from"
+    (let (extras {:long-lines {:policy :scroll
+                               :kinds [:heading nil]
+                               :kinds-from 5
+                               :kind-policies {:heading :truncate}}})
+      (assert= (wrap/line-policy extras 5) :truncate)
+      (assert= (wrap/line-policy extras 6) :scroll)
+      ;; a line before the cut has no kind in it, never another line's
+      (assert= (wrap/line-policy extras 0) :scroll))))

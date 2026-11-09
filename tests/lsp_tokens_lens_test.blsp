@@ -1,0 +1,311 @@
+;; LSP semantic tokens (src/lsp-semantic.blsp) and code lenses (src/lsp-lens.blsp): the pure
+;; halves — the integer array, deltas, the legend and faces, spans carried through edits, lens
+;; parsing and placement — and a round trip through a stand-in connection that answers each
+;; request with the kind's own shaping of a canned server result, as a real connection does.
+
+(defmodule lsp-tokens-lens-test
+  (:use test)
+  (:use-internals lsp-semantic)
+  (:use-internals lsp-lens)
+  (:use lsp-requests)
+  (:use lsp-servers) ; ed-lsp-attach — a server filed without spawning one
+  (:use model) ; ed-init / ed-set-buf / ed-current-buf
+  (:use editor/buffer)) ; make-buffer / insert / goto-char
+
+;; ---- the integer array --------------------------------------------------------------
+(describe "lsp semantic tokens: decoding"
+  (test "relative lines and columns become absolute"
+    (assert= (decode-tokens [0 4 3 1 0 1 2 5 0 2 0 6 1 2 0])
+      [[0 4 3 1 0] [1 2 5 0 2] [1 8 1 2 0]]))
+  (test "a partial trailing group and an empty array decode to what is whole"
+    (assert= (decode-tokens [0 1 2 0 0 3 4]) [[0 1 2 0 0]])
+    (assert= (decode-tokens []) [])
+    (assert= (decode-tokens nil) []))
+  (test "a delta's edits splice the previous array, in start order"
+    (assert= (apply-delta [1 2 3 4 5] [{:start 1 :deleteCount 2 :data [9]}]) [1 9 4 5])
+    (assert= (apply-delta [1 2 3 4 5]
+               [{:start 4 :deleteCount 1} {:start 0 :deleteCount 0 :data [7 7]}])
+      [7 7 1 2 3 4])
+    (assert= (apply-delta [1 2] [{:start 2 :deleteCount 0 :data [3 4 5]}]) [1 2 3 4 5])
+    (assert= (apply-delta [1 2] []) [1 2]))
+  (test "a modifier bit set reads through the legend"
+    (assert= (modifier-names 5 ["declaration" "definition" "readonly"]) #{"declaration" "readonly"})
+    (assert= (modifier-names 0 ["declaration"]) #{})
+    ;; a bit past the legend names nothing
+    (assert= (modifier-names 8 ["declaration"]) #{})))
+
+(describe "lsp semantic tokens: faces"
+  (test "a token type maps to the editor's syntax face"
+    (assert= (token-face "function" #{}) :syntax/function)
+    (assert= (token-face "method" #{}) :syntax/function)
+    (assert= (token-face "macro" #{}) :syntax/function)
+    (assert= (token-face "parameter" #{}) :syntax/variable)
+    (assert= (token-face "variable" #{}) :syntax/variable)
+    (assert= (token-face "type" #{}) :syntax/special)
+    (assert= (token-face "namespace" #{}) :syntax/special)
+    (assert= (token-face "keyword" #{}) :syntax/keyword)
+    (assert= (token-face "enumMember" #{}) :syntax/constant))
+  (test "a definition and a readonly variable take their own face"
+    (assert= (token-face "function" #{"declaration"}) :syntax/definition)
+    (assert= (token-face "struct" #{"definition"}) :syntax/definition)
+    (assert= (token-face "variable" #{"readonly"}) :syntax/constant)
+    ;; a parameter is not a definition of a function, whatever its modifiers
+    (assert= (token-face "parameter" #{"declaration"}) :syntax/variable))
+  (test "the lexical kinds and unknown types are left to the mode"
+    (is (nil? (token-face "string" #{})))
+    (is (nil? (token-face "comment" #{})))
+    (is (nil? (token-face "number" #{})))
+    (is (nil? (token-face "somethingNew" #{})))
+    (is (nil? (token-face nil #{}))))
+  (test "the client advertises the types and modifiers it maps"
+    (assert= (:tokenTypes client-capabilities) *token-types*)
+    (is (includes? *token-types* "parameter"))
+    (assert= (map/get-in client-capabilities [:requests :full :delta]) true)))
+
+(def- legend
+  {:tokenTypes ["function" "variable" "string"] :tokenModifiers ["declaration" "readonly"]})
+
+(describe "lsp semantic tokens: spans of the text"
+  (test "tokens become char spans, a faceless one left out"
+    (let (rope (text/from-string "fn main() {\n  let x = \"s\";\n}\n"))
+      (assert= (token-spans (decode-tokens [0 3 4 0 1 1 6 1 1 0 0 4 3 2 0]) legend rope)
+        [[3 7 :syntax/definition] [18 19 :syntax/variable]])))
+  (test "a column past an emoji is read in UTF-16 units"
+    ;; `😀` is two units: `x` starts at unit 3, char 2
+    (let (rope (text/from-string "a😀x"))
+      (assert= (token-spans [[0 3 1 1 0]] legend rope) [[2 3 :syntax/variable]])))
+  (test "a token past the text or past its line's end is cut or dropped"
+    (let (rope (text/from-string "ab\ncd"))
+      (assert= (token-spans [[0 1 9 1 0] [5 0 1 1 0]] legend rope) [[1 2 :syntax/variable]]))))
+
+;; ---- carrying spans through edits --------------------------------------------------
+(describe "lsp semantic tokens: spans follow the text"
+  (test "an insertion before a span moves it; inside a name it stretches"
+    (assert= (shift-spans [[0 3 :a] [4 7 :b] [8 9 :c]] [5 5 "xy"]) [[0 3 :a] [4 9 :b] [10 11 :c]])
+    (assert= (shift-spans [[4 7 :b]] [0 0 "zz"]) [[6 9 :b]])
+    ;; typed right at the end of a name: the name does not grow
+    (assert= (shift-spans [[4 7 :b]] [7 7 "q"]) [[4 7 :b]])
+    ;; right at its start: it moves
+    (assert= (shift-spans [[4 7 :b]] [4 4 "q"]) [[5 8 :b]]))
+  (test "a space typed inside a name, or an edit across it, drops it"
+    (assert= (shift-spans [[4 7 :b] [9 10 :c]] [5 5 " "]) [[10 11 :c]])
+    (assert= (shift-spans [[0 3 :a] [4 7 :b]] [2 5 "zz"]) []))
+  (test "a deletion takes what it covers and leaves a name's tail"
+    (assert= (shift-spans [[0 3 :a] [4 7 :b]] [2 5 ""]) [[2 4 :b]])
+    (assert= (shift-spans [[0 3 :a] [4 7 :b]] [0 3 ""]) [[1 4 :b]]))
+  (test "spans are carried from the buffer they were computed on to the buffer now"
+    (let (seen (make-buffer "let x = 1")
+          now (insert (goto-char seen 0) "// ")
+          gone (make-buffer "other"))
+      (assert= (carry-spans [[4 5 :v]] seen now) [[7 8 :v]])
+      (assert= (carry-spans [[4 5 :v]] seen seen) [[4 5 :v]])
+      ;; a buffer the log cannot reach: nil, for the caller to drop them
+      (is (nil? (carry-spans [[4 5 :v]] seen gone))))))
+
+(describe "lsp semantic tokens: painted over the mode's colours"
+  (test "the semantic layer wins where it colours, the mode shows elsewhere"
+    (let (buf (assoc (make-buffer "foo bar") :semantic-spans [[4 7 :syntax/variable]])
+          spans (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword] [4 7 :syntax/special]]))
+      (assert= (view/ed-face-at spans 1) :syntax/keyword)
+      (assert= (view/ed-face-at spans 5) :syntax/variable)
+      (assert= (into [] (get (spanpaint/ed-spans-by-line-at (buffer-rope buf) spans 0 0) 0))
+        [[0 3 :syntax/keyword] [4 7 :syntax/variable]])))
+  (test "a buffer with no semantic spans paints exactly the mode's"
+    (let (buf (make-buffer "foo"))
+      (assert= (spanpaint/ed-buffer-spans buf [[0 3 :syntax/keyword]]) [[0 3 :syntax/keyword]]))))
+
+;; ---- code lenses: parsing and placement ----------------------------------------------
+(describe "lsp code lens: parsing and placement"
+  (test "a lens reads its start, title and command; an unresolved one has none"
+    (let (lenses (parse-lenses [{:range {:start {:line 2 :character 4}}
+                                 :command {:title "3 references" :command "refs" :arguments [1]}}
+                                 {:range {:start {:line 5 :character 0}} :data {:id 9}}]))
+      (assert= (count lenses) 2)
+      (assert= (map/select-keys (first lenses) [:line :units :title :command :arguments])
+        {:line 2 :units 4 :title "3 references" :command "refs" :arguments [1]})
+      (is (nil? (:command (second lenses))))
+      (assert= (:raw (second lenses)) {:range {:start {:line 5 :character 0}} :data {:id 9}})
+      (is (shown? (first lenses)))
+      (refute (shown? (second lenses)))))
+  (test "a null answer is no lenses"
+    (assert= (parse-lenses nil) [])
+    (assert= (parse-lenses {:not "a list"}) []))
+  (test "a lens is anchored at its offset; one past the text is dropped"
+    (let (rope (text/from-string "a\n  fn x\n"))
+      (assert= (map (anchor-lenses (parse-lenses [{:range {:start {:line 1 :character 2}}}
+                                                   {:range {:start {:line 9 :character 0}}}])
+                      rope)
+                 :offset)
+        '(4))))
+  (test "one row above each line, titles joined, indented as the line"
+    (let (rope (text/from-string "a\n  fn x\nb\n"))
+      (assert= (lens-rows [{:offset 4 :title "Run"}
+                            {:offset 5 :title "Debug"}
+                            {:offset 9 :title "1 ref"}
+                            {:offset 0 :title nil}]
+                 rope)
+        [{:line 1 :text "  Run | Debug"} {:line 2 :text "1 ref"}])))
+  (test "lens anchors follow edits; the lenses on a line are found by them"
+    (let (seen (make-buffer "a\nfn x\n")
+          now (insert (goto-char seen 0) "z\n")
+          carried (carry-lenses [{:offset 2 :title "Run" :command "run"}] seen now))
+      (assert= (map carried :offset) '(4))
+      (assert= (lens-rows carried (buffer-rope now)) [{:line 2 :text "Run"}])
+      (assert= (count (lenses-on-line carried (buffer-rope now) 2)) 1)
+      (assert= (count (lenses-on-line carried (buffer-rope now) 1)) 0))))
+
+;; ---- the wire: what goes out, what comes back ------------------------------------------
+(describe "lsp semantic tokens and code lens: on the wire"
+  (test "each kind names its method and builds its params"
+    (assert= (lsp-request-method (lsp-semantic-tokens)) "textDocument/semanticTokens/full")
+    (assert= (lsp-request-method (lsp-semantic-tokens-delta))
+      "textDocument/semanticTokens/full/delta")
+    (assert= (lsp-request-params (lsp-semantic-tokens-delta)
+               {:uri "file:///a.rs" :previous-result-id "4"})
+      {:textDocument {:uri "file:///a.rs"} :previousResultId "4"})
+    (assert= (lsp-request-method (lsp-code-lens)) "textDocument/codeLens")
+    (assert= (lsp-request-params (lsp-code-lens-resolve) {:lens {:data 1}}) {:data 1}))
+  (test "a server's response is shaped for the waiter by the connection"
+    (let (state {:proc :fake
+                 :buf ""
+                 :next-id 3
+                 :pending {2 [:me :corr (lsp-semantic-tokens)]}
+                 :opened {}
+                 :version 1}
+          response (jsonrpc/frame (json/encode {:jsonrpc "2.0"
+                                                :id 2
+                                                :result {:resultId "7" :data [0 1 2 0 0]}}))
+          [_ replies] (lsp-protocol/lsp-ingest state response))
+      (assert= replies
+        (list [:me [:lsp-semantic-tokens :corr {:result-id "7" :data [0 1 2 0 0] :edits nil}]]))))
+  (test "the request asks for no text: the document is synced before it"
+    (let ([_ frames] (lsp-protocol/lsp-issue {:proc :fake
+                                              :buf ""
+                                              :next-id 1
+                                              :pending {}
+                                              :opened {}
+                                              :version 1}
+                       :corr :me
+                       (lsp-code-lens)
+                       {:uri "file:///a.rs" :lang "rust"}))
+      (assert= (count frames) 1)
+      (is (includes? (first frames) "textDocument/codeLens")))))
+
+;; ---- a round trip through a stand-in connection ----------------------------------------
+(defn- stand-in (results)
+  "A connection answering each ask with the next of `results` (raw server results), shaped by
+the asked kind's own `lsp-request-shape`, and telling the test what it was asked. Syncs are
+taken and ignored."
+  (let (test-pid (self))
+    (spawn (fn ()
+             (letrec (go (fn (left)
+                           (receive
+                             ([:ask kind corr reply-to request] (do
+                                                                  (send test-pid
+                                                                    [:asked [kind request]])
+                                                                  (let ([tag value] (lsp-request-shape kind
+                                                                                      (first left)))
+                                                                    (send reply-to [tag corr value]))
+                                                                  (go (rest left))))
+                             ([:sync _uri _lang _sync] (go left))
+                             (after 3000 :done))))
+               (go results))))))
+
+(defn- asked ()
+  (receive ([:asked question] question) (after 2000 nil)))
+
+(defn- deliver (m)
+  "`m` after the next reply lands, folded as the loop folds it."
+  (receive
+    ((and reply [_tag _corr _value]) (lsp-commands/ed-ev-lsp-reply m reply nil 80 24))
+    (after 2000 m)))
+
+(defn- serving (m conn caps)
+  (let (file (buffer-file (ed-current-buf m)))
+    (ed-lsp-attach m
+      {:spec "rust-analyzer" :roots [(path/dirname (or file "/tmp/x"))] :conn conn :caps caps})))
+
+(describe "lsp semantic tokens: a round trip"
+  (test "asked when the text moved, folded onto the buffer, carried, then asked as a delta"
+    (let (conn (stand-in [{:resultId "1" :data [0 3 4 0 1 0 9 1 1 0]}
+                           {:resultId "2"
+                            :edits [{:start 1 :deleteCount 1 :data [5]}
+                                     {:start 6 :deleteCount 1 :data [12]}]}])
+          caps {:semanticTokensProvider {:legend {:tokenTypes ["function" "variable"]
+                                                  :tokenModifiers ["declaration"]}
+                                         :full {:delta true}}}
+          m (serving (ed-init (make-buffer "fn main() { x; y }" "s.rs" "/tmp/sem.rs")) conn caps)
+          _ (is (ed-semantic-due? m))
+          asking (ed-semantic-request m)
+          _ (refute (ed-semantic-due? asking))
+          [kind _] (asked)
+          _ (assert= kind (lsp-semantic-tokens))
+          landed (deliver asking))
+      (assert= (:semantic-spans (ed-current-buf landed))
+        [[3 7 :syntax/definition] [12 13 :syntax/variable]])
+      ;; typed at the start: the post-step carries the spans with the text
+      (let (typed (semantic-follow (ed-set-buf landed
+                                     (insert (goto-char (ed-current-buf landed) 0) "  "))))
+        (assert= (:semantic-spans (ed-current-buf typed))
+          [[5 9 :syntax/definition] [14 15 :syntax/variable]])
+        (is (ed-semantic-due? typed))
+        ;; the second ask is a delta against the first answer
+        (let (again (ed-semantic-request typed)
+              [kind request] (asked)
+              _ (assert= kind (lsp-semantic-tokens-delta))
+              _ (assert= (:previous-result-id request) "1")
+              updated (deliver again))
+          (assert= (map/get-in updated [:lsp-semantic "/tmp/sem.rs" :data]) [0 5 4 0 1 0 12 1 1 0])
+          (assert= (:semantic-spans (ed-current-buf updated))
+            [[5 9 :syntax/definition] [17 18 :syntax/variable]])))))
+  (test "a server that offers none is never asked, and the mode toggles it off"
+    (let (m (serving (ed-init (make-buffer "x" "s.rs" "/tmp/sem2.rs")) (self) {}))
+      (refute (ed-semantic-due? m))
+      (let (off (cmd-lsp-semantic-tokens-mode (assoc m :lsp-semantic-tokens true) nil))
+        (refute (semantic-on? off))
+        (assert= (:lsp-semantic off) {})))))
+
+(describe "lsp code lens: a round trip"
+  (test "lenses are asked, resolved, shown above their line, and run"
+    (let (conn (stand-in [[{:range {:start {:line 1 :character 2}} :data {:id 1}}]
+                           {:range {:start {:line 1 :character 2}}
+                            :command {:title "Run test" :command "run.test" :arguments [7]}}
+                           nil])
+          caps {:codeLensProvider {:resolveProvider true}}
+          m (assoc (serving (ed-init (make-buffer "a\n  fn t() {}\n" "s.rs" "/tmp/lens.rs"))
+                     conn caps)
+              :lsp-code-lens true)
+          _ (is (ed-lens-due? m))
+          asking (ed-lens-request m)
+          [kind _] (asked)
+          _ (assert= kind (lsp-code-lens))
+          listed (deliver asking)
+          ;; unresolved: no row yet, and the resolve is out
+          _ (assert= (wrap/inlay-lines (ed-current-buf listed)) {})
+          [resolve-kind resolve-request] (asked)
+          _ (assert= resolve-kind (lsp-code-lens-resolve))
+          _ (assert= (:lens resolve-request) {:range {:start {:line 1 :character 2}} :data {:id 1}})
+          resolved (deliver listed))
+      (assert= (wrap/inlay-lines (ed-current-buf resolved)) {1 ["  Run test"]})
+      ;; typing a line above carries the row down with its line
+      (let (typed (lens-follow (ed-set-buf resolved
+                                 (insert (goto-char (ed-current-buf resolved) 0) "new\n"))))
+        (assert= (wrap/inlay-lines (ed-current-buf typed)) {2 ["  Run test"]})
+        ;; point on the lens's line: M-x lsp-code-lens-run sends its command
+        (let (on-line (ed-set-buf typed (goto-char (ed-current-buf typed) 8))
+              _ (cmd-lsp-code-lens-run on-line nil)
+              [run-kind run-request] (asked))
+          (assert= run-kind (lsp-execute-command))
+          (assert= run-request {:command "run.test" :arguments [7]})
+          ;; its answer (`null`) taken, so nothing is left in this process's mailbox
+          (deliver on-line)))))
+  (test "off by default, and the run command says so"
+    (let (m (serving (ed-init (make-buffer "x" "s.rs" "/tmp/lens2.rs"))
+              (self)
+              {:codeLensProvider {}}))
+      (refute (lens-on? m))
+      (refute (ed-lens-due? m))
+      (is (includes? (:echo (cmd-lsp-code-lens-run m nil)) "off"))))
+  (test "no lens on point's line is said"
+    (let (m (assoc (ed-init (make-buffer "x" "s.rs" "/tmp/lens3.rs")) :lsp-code-lens true))
+      (is (includes? (:echo (cmd-lsp-code-lens-run m nil)) "no code lens")))))

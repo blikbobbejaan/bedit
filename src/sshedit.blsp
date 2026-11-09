@@ -1,0 +1,504 @@
+(defmodule sshedit
+  "Editing a file on ANOTHER MACHINE that has no bedit — Emacs's TRAMP `/ssh:` method — over the
+system `ssh` (`sshremote`, the transport; `sshpath`, the path syntax).
+
+  - `C-x C-f /ssh:host:/etc/nginx.conf` opens the file ([[ed-ssh-find-file]]); also
+    `/ssh:user@host#port:path`, and `~` (or a relative path) on the remote is its home. The
+    buffer VISITS the TRAMP path: its `buffer-file` is `/ssh:host:/etc/nginx.conf`, so no
+    local tool takes it for a file here, and C-x C-f from it starts in the remote directory.
+  - The buffer remembers it is remote (`:ssh`, the file handler's mark): C-x C-s writes it
+    back through ssh, atomically, keeping the file's mode ([[ed-ssh-save]]); M-x revert-buffer
+    and C-x RET r read it again; C-x C-w to an `/ssh:` path makes a buffer remote. The mode line
+    says `@host` ([[ssh-segment]]).
+  - The file goes through `charset` as any file does: a binary opens as the read-only hex
+    view, a file past `:large-file-warning-threshold` is asked about first — before its bytes
+    cross the network.
+  - Every ssh call runs OFF the loop, one at a time (`:ssh-proc`; another waits its turn on
+    `:ssh-waiting`): an open shows `Loading…` at once, a save leaves the buffer modified until
+    its write lands, C-g stops either, C-x C-c asks about one still running and saves remote
+    files after its questions. A connection that drops is said, and a save's buffer stays
+    modified.
+  - ssh runs with `BatchMode=yes`, on the user's own `~/.ssh/config` and agent, through ONE
+    shared connection per host (`sshremote`'s ControlMaster). When the host refuses every key
+    but takes a password, the password is read MASKED (`passwd/ed-read-passwd`) and used once,
+    to open that connection (`sshremote/connect-with-password`) — kept nowhere. A host key
+    that is not known, or changed, is never accepted: it is said, with how to check it.
+  - The auto-save sidecar is PRIVATE (`sidecar/ed-auto-save-path`: the editor's state folder,
+    named for the TRAMP path) — never written on the remote host, never beside a local path of
+    the same name. Auto-revert, diff-hl, LSP, the formatter, compile and the project walk leave
+    a remote buffer alone (each asks `sshpath/remote?`).
+
+Remote DIRED is not here: C-x C-f or C-x d on a remote directory opens the find-file prompt
+in it, which lists its entries (Tab completes them, `sshremote`'s listing)."
+  (:use statusbar :only []) ; its chip registers at load, after statusbar is there
+  (:use sshpath :only []) ; the path syntax, loaded with the handler (called qualified)
+  (:use sshremote :only []) ; the transport, loaded with the handler (called qualified)
+  (:use editor/buffer) ; buffer-file / buffer-text / replace-region / goto-char
+  (:use editor/buffer-file) ; buffer-from-file
+  (:use model) ; message / ed-buf-at / ed-current-buf / the registries
+  (:use pool) ; ed-open-buffer / ed-kill-buffer-at / file-loading-buffer / ed-find-file-prompt
+  (:use file-save) ; ed-save-buf-at / ed-save-prepare / ed-save-landed
+  (:use passwd) ; ed-read-passwd — the masked read
+  (:use sidecar) ; ed-auto-save-path — the private sidecar
+  (:use autorevert) ; ed-revert-at
+  (:use theme)) ; *blue*
+
+;; ---- one ssh job at a time, off the loop ----------------------------------------------
+;; An open, a save or a revert is a JOB: run in a task (`:ssh-proc`, its job on `:ssh-job`),
+;; folded back by [[ed-apply-ssh]]. One at a time — a second waits on `:ssh-waiting` and is
+;; never dropped. A job whose host wants a password comes back asking ([[ssh-ask]]) and runs
+;; again with it; the password lives in the task's closure for that one run.
+
+(def *ssh-timeout-ms* 150000)
+;; How long one job's task may run before it is killed and the job said to have failed: past
+;; ssh's own operation timeout, so ssh's word on what went wrong is the one said.
+
+(defdyn *large-default* (* 10 1000 1000))
+;; The size past which a remote file is asked about before it is read, when the model names no
+;; `:large-file-warning-threshold`.
+
+(defn ssh-work (job password)
+  "What ssh `job` does, in its task: with `password`, open the shared connection with it first
+(`sshremote/connect-with-password`), then the job's operation — `sshremote/read-file` for an
+open or a revert (nothing past `:limit` bytes but the size), `sshremote/write-file` for a save.
+Answers that call's answer, `{:failed …}` when ssh itself failed (`:after-password` set when a
+password was just tried)."
+  (let (parts (:parts job)
+        connected (if (nil? password) true (sshremote/connect-with-password parts password)))
+    (cond
+      (map? connected) (assoc connected :after-password true)
+      (= (:kind job) :save) (sshremote/write-file parts (:path parts) (:content job))
+      else (sshremote/read-file parts (:path parts) (if (:force job) 0 (or (:limit job) 0))))))
+
+(defn- job-doing (job)
+  (str (case (:kind job) :open "opening " :revert "reverting " "saving ") (:spec job)))
+
+(defn- same-job? (a b)
+  (= (map/select-keys a [:kind :spec]) (map/select-keys b [:kind :spec])))
+
+(defn- ssh-wait (m step job note)
+  "`job` queued (`:ssh-waiting`) to `step` — `:launch` it, or `:ask` for its password — once the
+running ssh job is done and the prompt is free ([[ed-ssh-run-waiting]]); `note` said. A job
+already waiting is not added again."
+  (let (waiting (or (:ssh-waiting m) []))
+    (message (if (any? waiting (fn (entry) (same-job? (:job entry) job)))
+               m
+               (assoc m :ssh-waiting (conj waiting {:step step :job job})))
+      note)))
+
+(defn- ssh-launch (m job password)
+  "Run `job` off the loop with `password` (nil: none). Headless — the tests — it runs inline.
+While another job runs it waits its turn ([[ssh-wait]])."
+  (cond
+    (:ssh-proc m)
+      (ssh-wait m :launch job (str (job-doing job) " waits for the ssh command running"))
+    (ed-headless?) (ed-apply-ssh (assoc m :ssh-job job) (ssh-work job password))
+    else
+      (assoc (message m (str (job-doing job) "… (C-g stops)"))
+        :ssh-proc (task/task (fn () (ssh-work job password)) {:timeout *ssh-timeout-ms*})
+        :ssh-job job)))
+
+(defn- index-where (m pred)
+  (let (index (seq/index-where (:buffers m) pred)) (if (< index 0) nil index)))
+
+(defn- placeholder-index (m spec)
+  ;; the `Loading…` buffer an open of `spec` shows until its text lands, or nil
+  (index-where m (fn (buffer) (= (:ssh-loading buffer) spec))))
+
+(defn- drop-placeholder (m spec)
+  (let (index (placeholder-index m spec)) (if (nil? index) m (ed-kill-buffer-at m index))))
+
+(defn ssh-buffer-index (m spec)
+  "The pool index of the buffer visiting the remote file `spec` (a canonical ssh path), or nil."
+  (index-where m (fn (buffer) (and (= true (:ssh buffer)) (= (buffer-file buffer) spec)))))
+
+(defn- ssh-abandon (m job)
+  "`job` given up — its password prompt cancelled, its task stopped or failed: an open's
+`Loading…` buffer goes; a save's buffer stays as it was, modified."
+  (if (= (:kind job) :open) (drop-placeholder m (:spec job)) m))
+
+(defn- ssh-failed (m job reason)
+  (message (ssh-abandon m job) (str reason (or (:abandon-note job) ""))))
+
+(defn- password-prompt (job)
+  (str "Password for " (sshpath/host-label (:parts job)) " (or a key's passphrase): "))
+
+(defn- ssh-ask (m job)
+  "The masked prompt for the password `job`'s host wants; RET runs the job again with it, C-g
+gives it up. Only when the prompt is free and no ssh job runs — else it waits on the queue."
+  (cond
+    (not (ed-prompt-free? m))
+      (ssh-wait m :ask job "ssh needs a password — asked when this prompt closes")
+    (:ssh-proc m)
+      (ssh-wait m
+        :ask job
+        (str "ssh needs a password for "
+          (job-doing job)
+          " — asked when the running ssh command is done"))
+    else
+      (map/assoc-in (ed-read-passwd m
+                      (password-prompt job)
+                      (fn (mm password) (ssh-launch mm job password)))
+        [:minibuffer :on-abort]
+        (fn (mm) (ssh-abandon mm job)))))
+
+(defn ed-ssh-run-waiting (m)
+  "A post-step: the first job on the ssh queue taken up once no ssh job runs — launched, or its
+password asked for once the prompt is free too. An open whose `Loading…` buffer was killed
+meanwhile is dropped, wanting nothing."
+  (let (waiting (or (:ssh-waiting m) []))
+    (if (or (empty? waiting) (:ssh-proc m))
+      m
+      (let (entry (first waiting)
+            job (:job entry)
+            rest-m (if (= 1 (count waiting))
+                     (dissoc m :ssh-waiting)
+                     (assoc m :ssh-waiting (vec (rest waiting)))))
+        (cond
+          (and (= (:kind job) :open) (nil? (placeholder-index m (:spec job))))
+            (ed-ssh-run-waiting rest-m)
+          (= (:step entry) :launch) (ed-ssh-run-waiting (ssh-launch rest-m job nil))
+          (ed-prompt-free? m) (ssh-ask rest-m job)
+          else m)))))
+
+(register-post-step :ssh-ask {:order 81 :run 'sshedit/ed-ssh-run-waiting})
+
+;; ---- opening --------------------------------------------------------------------------
+
+(defn- unique-name (m spec)
+  ;; the buffer's name: the file's, or with its host when another buffer has that name
+  (let (parts (sshpath/parse spec)
+        base (path/basename (:path parts))
+        taken? (fn (name) (not (nil? (ed-buffer-index-by-name m name)))))
+    (cond
+      (not (taken? base)) base
+      (not (taken? (str base "<" (:host parts) ">"))) (str base "<" (:host parts) ">")
+      else
+        (str base "<" (sshpath/host-label parts) ":" (sshpath/path-of (sshpath/dirname spec)) ">"))))
+
+(defn ssh-buffer (spec text &optional (mtime nil))
+  "A buffer visiting the remote file `spec`: `text` its contents as read through ssh — nil for
+a file that does not exist yet — `:ssh` set, so a save writes it through ssh, and the file's
+modification time on the host (seconds) as `:remote-mtime`.
+
+    (:ssh (sshedit/ssh-buffer \"/ssh:h:/etc/hosts\" \"127.0.0.1 localhost\\n\"))   ;=> true"
+  (assoc (if (nil? text)
+           (make-buffer "" (path/basename (or (sshpath/path-of spec) spec)) spec)
+           (buffer-from-file spec text))
+    :ssh true
+    :remote-mtime mtime))
+
+(defn loading-buffer (spec)
+  "The buffer an open of the remote file `spec` shows until its text lands: `Loading…`,
+read-only, with no file of its own; `:ssh-loading` names the path.
+
+    (:ssh-loading (sshedit/loading-buffer \"/ssh:h:/etc/hosts\"))   ;=> \"/ssh:h:/etc/hosts\""
+  (file-loading-buffer spec
+    (str (path/basename (or (sshpath/path-of spec) spec)) " <ssh: loading>")
+    :ssh-loading))
+
+(defn remote-recovery-note (spec mtime)
+  "What opening the remote file `spec` (modified on the host at `mtime`, seconds) should say
+when its private sidecar is newer — unsaved text a session left — or nil."
+  (let (sidecar-mtime (file/mtime (ed-auto-save-path spec)))
+    (when (and (int? sidecar-mtime) (or (nil? mtime) (> sidecar-mtime (* 1000 mtime))))
+      (str (path/basename (sshpath/path-of spec))
+        " has unsaved auto-save data — M-x recover-this-file to restore it"))))
+
+(defn- then-of (job) (or (:then job) identity))
+
+(defn- ssh-opened (m job resolved read)
+  "An open's answer landed: the file `read` (`{:kind :new}` or `{:kind :file :bytes :mtime}`)
+in a remote buffer visiting `resolved`, shown where the `Loading…` one was, which goes. A
+binary opens as the read-only hex view. Then the job's continuation."
+  (let (bytes (:bytes read)
+        decoded (if (nil? bytes) {:text nil} (charset/detect bytes)))
+    (if (nil? decoded)
+      ((then-of job) (message (hexl/ed-open-binary (drop-placeholder m (:spec job))
+                                resolved nil bytes)
+                       (str "opened " resolved " as hex — not text, so read-only")))
+      (let (buffer (assoc (charset/with-coding (ssh-buffer resolved (:text decoded) (:mtime read))
+                            (:coding decoded))
+                     :name (unique-name m resolved))
+            opened (drop-placeholder (ed-open-buffer m buffer) (:spec job))
+            shown (let (index (ssh-buffer-index opened resolved))
+                    (if (nil? index) opened (ed-select opened index))))
+        ((then-of job) (message shown
+                         (or (remote-recovery-note resolved (:mtime read))
+                           (str (if (nil? bytes) "new file " "opened ")
+                             resolved
+                             (if (:coding decoded)
+                               (str " as " (charset/label (:coding decoded)))
+                               "")))))))))
+
+(defn- ssh-open-answer (m job answer)
+  "Fold an open's `answer` (`sshremote/parse-read`'s): a file or a new one opens
+([[ssh-opened]]) — or the buffer already visiting it under another spelling (`~`) is selected;
+a large file is asked about first; a directory opens the find-file prompt in it, which lists
+it."
+  (let (resolved (or (sshpath/canonical (sshpath/with-path (:spec job) (:path answer))) (:spec job))
+        existing (ssh-buffer-index m resolved))
+    (cond
+      existing ((then-of job) (ed-select (drop-placeholder m (:spec job)) existing))
+      (= (:kind answer) :large)
+        (ed-confirm m
+          (str "File "
+            (path/basename (:path answer))
+            " is large ("
+            (humanize/byte-size (:size answer))
+            "), really open it over ssh? (y or n)")
+          (fn (mm) (ssh-launch mm (assoc job :force true) nil))
+          "not opened")
+      (= (:kind answer) :dir)
+        (assoc (message (drop-placeholder m (:spec job))
+                 (str resolved " is a directory — no remote dired yet; its entries are listed here"))
+          :minibuffer
+            (ed-find-file-prompt (if (string/ends-with? resolved "/") resolved (str resolved "/"))
+              []))
+      else (ssh-opened m job resolved answer))))
+
+;; check-allow: `then` is the caller's continuation (recover-session's), whose result the
+;; checker cannot see; every caller hands one that answers a model
+(check-allow :trusted
+  (defn ed-ssh-find-file (m spec &optional (then identity))
+    "Open the TRAMP ssh path `spec` (`/ssh:host:/etc/hosts`) OFF the loop — a `Loading…` buffer
+shown at once, the file when ssh answers, a password asked for first when the host wants one —
+then `(then m)` with it open. A buffer already visiting it is selected; a path that is not one
+is said."
+    (let (canonical (sshpath/canonical spec)
+          open-index (when canonical (ssh-buffer-index m canonical))
+          loading-index (when canonical (placeholder-index m canonical)))
+      (cond
+        (nil? canonical)
+          (message m (str "not an ssh path: " spec " (/ssh:[user@]host[#port]:path)"))
+        (includes? canonical "\n") (message m "ssh: a path with a line break in it is not opened")
+        (int? open-index) (then (ed-select m open-index))
+        (int? loading-index) (ed-select m loading-index)
+        else
+          (ssh-launch (ed-open-buffer m (loading-buffer canonical))
+            {:kind :open
+             :spec canonical
+             :parts (sshpath/parse canonical)
+             :limit (or (:large-file-warning-threshold m) *large-default*)
+             :then then}
+            nil)))))
+(sig ed-ssh-find-file (model string &optional any -> model))
+
+;; ---- saving ---------------------------------------------------------------------------
+
+(defn- ssh-saved (m job answer)
+  "A save's write landed: its buffer marked saved as of the text written
+(`file-save/ed-save-landed` — still modified if edited meanwhile), the host's new time kept, the
+directory's listing forgotten (a new file is in it now), then the continuation."
+  (let (index (ssh-buffer-index m (:spec job))
+        host (sshpath/host-label (:parts job))
+        _ (sshremote/forget-listing (sshpath/dirname (:spec job)))
+        saved (if (nil? index)
+                (message m (str "saved " (:spec job)))
+                (let (landed (ed-save-landed m index (:rope job) (str " on " host)))
+                  (ed-set-buf-at landed
+                    index
+                    (assoc (ed-buf-at landed index) :remote-mtime (:mtime answer))))))
+    ((then-of job) saved)))
+
+;; check-allow: `then` is a continuation (the quit's, C-x s's), whose result the checker cannot
+;; see; every caller hands one that answers a model
+(check-allow :trusted
+  (defn ed-ssh-save (m i &optional (then nil) (abandon-note nil))
+    "Save pool buffer `i`, a remote buffer, through ssh OFF the loop — a password asked for first
+when the host wants one. The buffer is made what its `.editorconfig` asks and its text taken now
+(`file-save/ed-save-prepare`); it stays modified until the write lands, and a write that fails —
+the connection dropped, the file not writable — leaves it so and says why. `then` runs once the
+write has landed; `abandon-note` follows the reason when it does not."
+    (let (buffer (ed-buf-at m i))
+      (cond
+        (:ssh-loading buffer) (message m "still loading — nothing to save yet")
+        (:ssh-proc m)
+          (message m
+            (str "ssh: another ssh command is still running — save when it is done"
+              (or abandon-note "")))
+        else
+          (let ([prepared-model prepared] (ed-save-prepare m i)
+                content (charset/file-content prepared))
+            (if (failure? content)
+              (message prepared-model (str (error-message content) (or abandon-note "")))
+              (ssh-launch prepared-model
+                {:kind :save
+                 :spec (buffer-file prepared)
+                 :parts (sshpath/parse (buffer-file prepared))
+                 :content content
+                 :rope (buffer-rope prepared)
+                 :then then
+                 :abandon-note abandon-note}
+                nil)))))))
+(sig ed-ssh-save (model int &optional any any -> model))
+
+;; check-allow: as above — `then` is the caller's
+(check-allow :trusted
+  (defn ed-ssh-save-all (m specs then &optional (abandon-note nil))
+    "Save every remote buffer in `specs` in turn — one ssh job at a time, each asking for a
+password when its host wants one — then `(then m)`. One that fails stops the run there, saying
+why with `abandon-note`: what C-x C-c and C-x s do with the remote buffers they were told to
+save."
+    (if (empty? specs)
+      (then m)
+      (let (index (ssh-buffer-index m (first specs)))
+        (if (nil? index)
+          (ed-ssh-save-all m (rest specs) then abandon-note)
+          (ed-ssh-save m
+            index
+            (fn (mm) (ed-ssh-save-all mm (rest specs) then abandon-note))
+            abandon-note))))))
+(sig ed-ssh-save-all (model seqable any &optional any -> model))
+
+;; ---- reverting ------------------------------------------------------------------------
+
+(defn- ssh-reverted (m job answer)
+  "A revert's answer landed: the buffer holds the remote file as it is, in the job's `:coding`,
+one undoable edit — or the hex view for `:hex`. A file that is gone, or not in that coding, is
+said and the buffer left as it was."
+  (let (i (ssh-buffer-index m (:spec job))
+        coding (:coding job)
+        bytes (:bytes answer)
+        text (when (and (bytes? bytes) (not (= coding :hex)))
+               (charset/decode bytes (or coding :utf-8))))
+    (cond
+      (nil? i) m
+      (not (bytes? bytes)) (ssh-failed m job (str (:spec job) " is gone, or not a file"))
+      (= coding :hex) (ed-show-as-hex m i bytes)
+      (nil? text) (message m (str (:spec job) " is not " (charset/label coding)))
+      else
+        (let (reverted (ed-revert-at (ed-set-buf-at m
+                                       i
+                                       (charset/with-coding (ed-buf-at m i) coding))
+                         i text))
+          (message (ed-set-buf-at reverted
+                     i
+                     (assoc (ed-buf-at reverted i) :remote-mtime (:mtime answer)))
+            (str "reverted " (:spec job)))))))
+
+(defn ed-ssh-revert (m i coding)
+  "Read pool buffer `i`, a remote buffer, again through ssh OFF the loop: the file in `coding`
+(nil for the one it has, `:hex` for the hex view) replaces its text, one undoable edit. What
+M-x revert-buffer and C-x RET r do for a remote file."
+  (let (buffer (ed-buf-at m i))
+    (ssh-launch m
+      {:kind :revert
+       :spec (buffer-file buffer)
+       :parts (sshpath/parse (buffer-file buffer))
+       :force true
+       :coding (or coding (:coding buffer))}
+      nil)))
+
+;; ---- the job's fold, its C-g, its exit question ---------------------------------------
+
+(defn ed-apply-ssh (m answer)
+  "Fold a finished ssh job's `answer` ([[ssh-work]]; nil when its task failed or timed out):
+ask for the password its host wants, open the file, mark the save landed — or say why not."
+  (let (job (:ssh-job m)
+        m1 (dissoc m :ssh-proc :ssh-job)
+        failed (when (map? answer) (:failed answer)))
+    (cond
+      (nil? job) m1
+      ;; the `Loading…` buffer was killed while ssh ran: the open is cancelled
+      (and (= (:kind job) :open) (nil? (placeholder-index m1 (:spec job))))
+        (message m1 (str "opening " (:spec job) " cancelled"))
+      (nil? answer) (ssh-failed m1 job (str "ssh: " (job-doing job) " failed or timed out"))
+      (and failed (= (:error failed) :auth) (:after-password answer))
+        (ssh-failed m1 job (str "ssh: " (sshpath/host-label (:parts job)) " refused the password"))
+      (and failed (= (:error failed) :auth) (:password? failed)) (ssh-ask m1 job)
+      failed (ssh-failed m1 job (:reason failed))
+      (failure? answer) (ssh-failed m1 job (str "ssh: " (error-message answer)))
+      (= (:kind job) :open) (ssh-open-answer m1 job answer)
+      (= (:kind job) :revert) (ssh-reverted m1 job answer)
+      else (ssh-saved m1 job answer))))
+
+(defn ed-ssh-quit (m)
+  "C-g's clean-up for an ssh job (its task already killed): an open's `Loading…` buffer goes, a
+save's buffer stays modified, and C-g says what stopped."
+  (let (job (:ssh-job m))
+    (if (nil? job)
+      m
+      (ed-quit-note (ssh-abandon (dissoc m :ssh-job) job)
+        (str (job-doing job) " stopped" (or (:abandon-note job) ""))))))
+
+(defn ed-ssh-live (m)
+  "The ssh jobs C-x C-c would stop (`model/register-exit-query`): the one running, and those
+waiting their turn."
+  (into (if (:ssh-proc m) [(str "ssh: " (job-doing (or (:ssh-job m) {})))] [])
+    (map (or (:ssh-waiting m) []) (fn (entry) (str "ssh: " (job-doing (:job entry)) " (waiting)")))))
+
+(register-task-reply :ssh-proc
+  'sshedit/ed-apply-ssh
+  nil
+  "ssh"
+  {:cancel-on-quit? true :on-quit 'sshedit/ed-ssh-quit})
+(register-exit-query :ssh 'sshedit/ed-ssh-live)
+
+;; ---- the file handler -----------------------------------------------------------------
+
+(sig ed-ssh-write-file (model string -> model))
+(defn ed-ssh-write-file (m spec)
+  "C-x C-w to a TRAMP ssh path: the current buffer becomes a remote buffer visiting that file
+and is saved through ssh."
+  (let (canonical (sshpath/canonical spec))
+    (if (or (nil? canonical) (= (sshpath/path-of canonical) "~"))
+      (message m (str "write failed: not an ssh file path: " spec " (/ssh:host:PATH)"))
+      (let (old (ed-current-buf m)
+            old-key (hosted/hosted-key old)
+            retargeted (assoc (dissoc (ed-buffer-unhandled old) :dir)
+                         :file canonical
+                         :dir (sshpath/dirname canonical)
+                         :ssh true
+                         :name (unique-name m canonical))
+            index (ed-current-index m)
+            rekeyed (hosted/hosted-rekey-slot (dissoc (ed-set-buf m retargeted) :status)
+                      index old-key))
+        (do (ed-forget-auto-save old) (ed-save-buf-at rekeyed index))))))
+
+(defn ssh-later-entry (buffer)
+  "What a quit keeps of remote `buffer` to save it after the questions: its path, for
+[[ed-ssh-save-all]]."
+  (buffer-file buffer))
+
+(register-file-handler :ssh
+  {:order 15
+   :prefix "/ssh:"
+   :mark :ssh
+   :buffer-keys [:ssh :remote-mtime]
+   :find-file 'sshedit/ed-ssh-find-file
+   :write-file 'sshedit/ed-ssh-write-file
+   :save 'sshedit/ed-ssh-save
+   :revert 'sshedit/ed-ssh-revert
+   :later-entry 'sshedit/ssh-later-entry
+   :save-all 'sshedit/ed-ssh-save-all})
+
+;; ---- a kill ---------------------------------------------------------------------------
+
+(defn ed-ssh-cancel-killed (m killed)
+  "`m` with the open behind a killed `Loading…` buffer cancelled: its task stopped, so no
+buffer appears after all. Any other kill leaves it as it is."
+  (let (loading (when (:ssh-proc m) (:ssh-loading (ed-buf-at m killed))))
+    (if (and loading (= loading (:spec (:ssh-job m))))
+      (do (task/cancel (:ssh-proc m)) (dissoc m :ssh-proc :ssh-job))
+      m)))
+
+(register-slot-keeper :ssh-open {:order 27 :drop 'sshedit/ed-ssh-cancel-killed})
+
+;; ---- the mode line --------------------------------------------------------------------
+
+(defn ssh-segment (m pane buffer)
+  "The `@host` chip on a remote buffer's mode line — Emacs shows the TRAMP prefix there — as a
+reminder that the file is on another machine; nil on any other buffer."
+  (when (= true (:ssh buffer))
+    (let (parts (sshpath/parse (buffer-file buffer)))
+      (when parts
+        (statusbar/seg :ssh
+          (str "@" (sshpath/host-label parts))
+          {:sep "  —  "
+           :face {:fg *blue* :bold true}
+           :tooltip (fn (_mm)
+                      [(str "editing " (:path parts) " on " (sshpath/host-label parts))
+                        "C-x C-s writes it back through ssh"])})))))
+
+(statusbar/register-modeline-segment :ssh 31 'sshedit/ssh-segment)

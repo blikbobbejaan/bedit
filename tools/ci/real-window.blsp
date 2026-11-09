@@ -1,0 +1,312 @@
+;; tools/ci/real-window.blsp — the REAL editor in a REAL window, typed into, saved and looked at.
+;;
+;;     nest run tools/ci/real-window.blsp -- OUT-DIR [--os-input require|try|off]
+;;
+;; CI's real-window check (tools/ci/real-window.sh runs it; docs/platforms.md says what it
+;; proves on each OS). Unlike tools/screenshot.blsp it runs with NO `BROOD_GUI_HEADLESS`: the
+;; editor opens a window on the desktop the runner has (macOS's logged-in session, Windows's
+;; interactive desktop, Linux's Xvfb or a headless Weston), through `main` — its startup, init
+;; file, fonts, timers, lifeline supervisor and loop, the editor `nest run FILE` runs.
+;;
+;; The editor runs in a CHILD runtime with a throwaway HOME / USERPROFILE / XDG dirs, on a file
+;; in that home holding `first line`. The child:
+;;
+;; 1. waits for the window (`gui/windows`) and the loop (`:editor`), and for the picture to
+;;    settle; writes it to OUT-DIR/before.png (`gui/capture` of the live window, painted by the
+;;    window's own renderer, brood ADR-609) and checks it is not blank: more than the
+;;    background in the first text row;
+;; 2. LOOP INPUT: sends the typed keys to the editor's loop as the window delivers them (a
+;;    string per character, then `:ctrl-x :ctrl-s`), waits for the file on disk to start with
+;;    the typed text, then captures OUT-DIR/after.png and checks the first text row's pixels
+;;    CHANGED — the typing was painted;
+;; 3. OS INPUT (`--os-input require` or `try`): types a second word and C-x C-s through the
+;;    OS's own input — `xdotool` (XTEST) on X11, `WScript.Shell.SendKeys` on Windows, System
+;;    Events' `keystroke` on macOS — and waits for the file to have it too, then captures
+;;    OUT-DIR/os-input.png. That is the window's real keyboard path, the frontend's key
+;;    translation included. `try` reports a failure and still passes (an input tool the
+;;    runner does not permit, macOS's Accessibility prompt); `require` fails on it.
+;;
+;; Every wait has a deadline, and the parent has one over the whole run (REAL_WINDOW_TIMEOUT_MS,
+;; default 300000): past it the child is killed, so a hung window cannot hold a runner. On a
+;; failure the child writes what the window shows to OUT-DIR/failure.png when it can, and exits
+;; 1; the editor's output is the child's, passed through (the shell script keeps it in
+;; OUT-DIR/editor.log). The saved file is copied to OUT-DIR/saved.txt.
+(require-one 'project)
+
+(def *child?* (= (os/env "BEDIT_REAL_WINDOW_CHILD") "1"))
+
+(def *args* (let (all (system/argv) at (index-of all "--")) (if (>= at 0) (vec (drop all (inc at))) [])))
+
+(def *file-name* "bedit-window-check.txt") ; in the window's title, which the OS input tools find it by
+
+(def *first-line* "first line")
+
+(def *loop-typed* "loop-input ")
+
+(def *os-typed* "os-input ")
+
+(defn- usage ()
+  (io/puts "usage: nest run tools/ci/real-window.blsp -- OUT-DIR [--os-input require|try|off]" :to *err*)
+  (system/halt 2))
+
+(defn- options (arguments)
+  "The command line as a map: `:out` (the directory the pictures go to), `:os-input` (`require`
+`try` or `off`, the default) and, in the child, `:file`."
+  (letrec (walk (fn (remaining accumulated)
+                  (cond
+                    (empty? remaining) accumulated
+                    (= (first remaining) "--os-input")
+                    (walk (drop remaining 2) (assoc accumulated :os-input (nth remaining 1)))
+                    (= (first remaining) "--file")
+                    (walk (drop remaining 2) (assoc accumulated :file (nth remaining 1)))
+                    else (walk (rest remaining) (assoc accumulated :out (first remaining))))))
+    (walk arguments {:os-input "off"})))
+
+(def *options* (options *args*))
+
+(when (or (nil? (:out *options*)) (not (contains? #{"require" "try" "off"} (:os-input *options*))))
+  (usage))
+
+(defn- nap (ms) (receive (:never nil) (after ms nil)))
+
+(defn- say (& parts) (io/puts (apply str "real-window: " parts)))
+
+;; ---- the parent: a throwaway home, then the editor in a child runtime, under a deadline ----
+
+(defn- timeout-ms ()
+  (let (given (os/env "REAL_WINDOW_TIMEOUT_MS")
+        number (when given (string/->number given)))
+    (if (int? number) number 300000)))
+
+(defn- run-child ()
+  "Start this script again as the child, in a throwaway home with the file to edit, pass its
+output through, and exit with its code — or kill it and exit 1 past the deadline."
+  (let (out (path/absolute (:out *options*))
+        _ (file/mkdir out)
+        home (str (path/temp "bedit-real-window-"))
+        config (path/join home ".config")
+        work (path/join home "work")
+        _ (file/mkdir (path/join config "bedit"))
+        _ (file/mkdir work)
+        file (path/join work *file-name*)
+        _ (file/spit file (str *first-line* "\n"))
+        root (or (project/find-root (file/cwd)) (file/cwd))
+        script (path/join root "tools" "ci" "real-window.blsp")
+        child (os/spawn (os/exe-path)
+                ["run" script "--" out "--os-input" (:os-input *options*) "--file" file]
+                {:cwd root
+                 :env {"BEDIT_REAL_WINDOW_CHILD" "1"
+                       ;; the point of the run: a window on the desktop, never one painted offscreen
+                       "BROOD_GUI_HEADLESS" nil
+                       "HOME" home
+                       "USERPROFILE" home
+                       "XDG_CONFIG_HOME" config
+                       "XDG_STATE_HOME" (path/join home ".local" "state")
+                       "XDG_DATA_HOME" (path/join home ".local" "share")
+                       ;; brood's own caches (the std image) are the caller's: a fresh one
+                       ;; rebuilds the image and holds nothing of the user's
+                       "XDG_CACHE_HOME" (or (os/env "XDG_CACHE_HOME") (path/join (or (path/home) (path/temp-root)) ".cache"))}})
+        deadline (+ (os/now) (timeout-ms)))
+    (letrec (pump (fn ()
+                    (receive
+                      ([:proc ^child data] (do (io/write data) (pump)))
+                      ([:proc-err ^child data] (do (io/write data :to *err*) (pump)))
+                      ([:proc-closed ^child code] code)
+                      (after (let (now (os/now)) (if (> deadline now) (- deadline now) 0))
+                        (do
+                          (io/puts (str "real-window: FAIL: the run took longer than " (timeout-ms)
+                                     " ms (REAL_WINDOW_TIMEOUT_MS); the editor was killed")
+                            :to *err*)
+                          (os/close child)
+                          1)))))
+      (let (code (pump))
+        (do
+          (when (file/exists? file) (file/cp file (path/join out "saved.txt")))
+          ;; a file still held open (Windows) must not turn a pass into a crash
+          (try (file/rmdir home) (catch e (io/puts (str "real-window: the throwaway home stays: " e) :to *err*)))
+          (system/halt (or code 1)))))))
+
+;; ---- reading a picture ----------------------------------------------------------------
+
+(defn- first-row-band (image)
+  "`[top bottom]`, the pixel rows of the window's first text row (`:row-tops`, ADR-610), or
+the top tenth of the picture when the capture carries no row map."
+  (let (tops (:row-tops image))
+    (if (and tops (>= (count tops) 2))
+      [(nth tops 0) (nth tops 1)]
+      [0 (math/max 1 (math/quot (:height image) 10))])))
+
+(defn- band-pixels (image band)
+  "Every pixel of the rows `band` (`[top bottom]`), left to right, top to bottom."
+  (let ([top bottom] band
+        width (:width image))
+    (for (y (range top bottom) x (range 0 width)) (gui/pixel image x y))))
+
+(defn- ink-count (image band)
+  "How many pixels of `band` are not its background — the band's most common colour."
+  (let (pixels (band-pixels image band)
+        background (first (reduce (seq/frequencies pixels)
+                            nil
+                            (fn (best pair) (if (or (nil? best) (> (second pair) (second best))) pair best)))))
+    (count (seq/filter pixels (fn (pixel) (not (= pixel background)))))))
+
+(defn- changed-count (before after band)
+  "How many pixels of `band` differ between two pictures of the same size."
+  (count (seq/filter (seq/zip (band-pixels before band) (band-pixels after band))
+           (fn (pair) (not (= (first pair) (second pair)))))))
+
+(defn- colour-count (image)
+  "How many distinct colours a sparse grid over the whole picture finds (every 7th pixel)."
+  (count (into #{}
+           (for (y (range 0 (:height image) 7) x (range 0 (:width image) 7)) (gui/pixel image x y)))))
+
+;; ---- the child: the real editor, driven -----------------------------------------------
+
+(defn- await-value (probe deadline)
+  "The first non-nil answer of `(probe)`, asked every 100 ms until `deadline` (os/now ms); nil
+past it."
+  (let (value (probe))
+    (cond
+      (not (nil? value)) value
+      (> (os/now) deadline) nil
+      else (do (nap 100) (await-value probe deadline)))))
+
+(defn- settled (window previous since deadline)
+  "The window's picture once two captures 400 ms apart agree and two seconds have passed
+since `since` — or the last capture at `deadline`."
+  (do
+    (nap 400)
+    (let (image (gui/capture window)
+          now (os/now))
+      (if (or (> now deadline)
+            (and previous (> (- now since) 2000) (= (:rgba image) (:rgba previous))))
+        image
+        (settled window image since deadline)))))
+
+(defn- write-picture (image out name)
+  (let (target (path/join out name))
+    (do
+      (gui/write-png image target)
+      (say "wrote " target " (" (:width image) "x" (:height image) ")")
+      target)))
+
+(defn- fail (window out & parts)
+  "Say why the run failed, write what the window shows to failure.png when there is one, and
+exit 1."
+  (do
+    (io/puts (apply str "real-window: FAIL: " parts) :to *err*)
+    (when window
+      (try (write-picture (gui/capture window) out "failure.png")
+        (catch e (io/puts (str "real-window: no failure picture: " e) :to *err*))))
+    (system/halt 1)))
+
+(defn- file-starts-with? (file prefix)
+  (and (file/exists? file) (string/starts-with? (file/slurp file) prefix)))
+
+(defn- await-file (file prefix ms)
+  "Whether `file` comes to start with `prefix` within `ms`."
+  (not (nil? (await-value (fn () (when (file-starts-with? file prefix) true)) (+ (os/now) ms)))))
+
+(defn- os-input-command (text)
+  "`[program arguments]` that type `text` then C-x C-s into the focused bedit window through
+this OS's own input, or a string saying why there is none."
+  (case (os/type)
+    :linux
+      (cond
+        (nil? (os/env "DISPLAY")) "no X display (OS input is X11's XTEST, through xdotool)"
+        (nil? (os/which "xdotool")) "xdotool is not installed"
+        else ["xdotool"
+               ["search" "--sync" "--name" *file-name* "windowfocus" "--sync" "%1" "sleep" "0.3" "type"
+                 "--delay" "60" text "key" "--delay" "120" "ctrl+x" "ctrl+s"
+                 ;; said in the log: which window had the focus the keys went to
+                 "getwindowfocus" "getwindowname"]])
+    :windows
+      ["powershell"
+        ["-NoProfile" "-NonInteractive" "-Command"
+          (str "$shell = New-Object -ComObject WScript.Shell; "
+            "if (-not $shell.AppActivate('" *file-name* "')) { Write-Error 'AppActivate found no bedit window'; exit 1 }; "
+            "Start-Sleep -Milliseconds 400; $shell.SendKeys('" text "'); Start-Sleep -Milliseconds 300; "
+            "$shell.SendKeys('^x'); Start-Sleep -Milliseconds 200; $shell.SendKeys('^s')")]]
+    :macos
+      ["osascript"
+        ["-e" "delay 0.4"
+          "-e" (str "tell application \"System Events\" to keystroke \"" text "\"")
+          "-e" "delay 0.3"
+          "-e" "tell application \"System Events\" to keystroke \"x\" using control down"
+          "-e" "delay 0.2"
+          "-e" "tell application \"System Events\" to keystroke \"s\" using control down"]]
+    "no OS input tool for this OS"))
+
+(defn- os-input-phase (window out file previous)
+  "Type through the OS's input and save; nil when it reached the file, else why not."
+  (let (command (os-input-command *os-typed*))
+    (if (string? command)
+      command
+      (do
+        (try (gui/focus window) (catch e (say "gui/focus: " e)))
+        (nap 500)
+        (let ([program arguments] command
+              result (os/cmd program arguments {:timeout-ms 60000})
+              expected (str *os-typed* previous))
+          (do
+            (when (not (= "" (:stdout result))) (say program ": " (:stdout result)))
+            (when (not (= "" (:stderr result))) (say program " (stderr): " (:stderr result)))
+            (cond
+              (not (= 0 (:exit result))) (str program " exited " (:exit result))
+              (not (await-file file expected 30000))
+                (str "the file never started with " (pr-str expected) " after " program
+                  " typed it (it holds " (pr-str (when (file/exists? file) (file/slurp file))) ")")
+              else (do (write-picture (settled window nil (os/now) (+ (os/now) 20000)) out "os-input.png") nil))))))))
+
+(defn- drive ()
+  (let ({:keys [file out]} *options*
+        mode (:os-input *options*))
+    (do
+      (when (gui/headless?)
+        (fail nil out "the runtime is headless (BROOD_GUI_HEADLESS set, or a build without the gui): this check needs a real window"))
+      (say "OS " (os/type) ", file " file)
+      (reflect/eval `(def config/*window-options* ~(assoc config/*window-options* :width 1000 :height 600)))
+      (spawn (main/main file))
+      (let (window (await-value (fn () (first (gui/windows))) (+ (os/now) 180000)))
+        (do
+          (when (nil? window) (fail nil out "the editor opened no window in 180 s"))
+          (say "window " window " is open")
+          (when (nil? (await-value (fn () (proc/whereis :editor)) (+ (os/now) 60000)))
+            (fail window out "the editor's loop never registered as :editor"))
+          (let (before (settled window nil (os/now) (+ (os/now) 30000))
+                band (first-row-band before)
+                ink (ink-count before band)
+                colours (colour-count before))
+            (do
+              (write-picture before out "before.png")
+              (say "first text row: pixel rows " band ", " ink " pixels of ink; " colours " colours")
+              (when (or (< ink 20) (< colours 3))
+                (fail window out "the window is blank: " ink " ink pixels in the first text row, "
+                  colours " colours"))
+              ;; the loop's input: what the window delivers, a string per character, then C-x C-s
+              (doseq (character (string/->graphemes *loop-typed*)) (send :editor (str character)))
+              (send :editor :ctrl-x)
+              (send :editor :ctrl-s)
+              (when (not (await-file file (str *loop-typed* *first-line*) 30000))
+                (fail window out "C-x C-s did not write the typed text: the file holds "
+                  (pr-str (file/slurp file))))
+              (say "saved: " (pr-str (file/slurp file)))
+              (let (after (settled window before (os/now) (+ (os/now) 20000))
+                    changed (changed-count before after band))
+                (do
+                  (write-picture after out "after.png")
+                  (say changed " pixels of the first text row changed with the typing")
+                  (when (< changed 20)
+                    (fail window out "the typing was saved but not painted: " changed
+                      " pixels of the first text row changed"))))
+              (if (= mode "off")
+                (say "OS input: off")
+                (let (problem (os-input-phase window out file (str *loop-typed* *first-line*)))
+                  (cond
+                    (nil? problem) (say "OS input: typed and saved through the OS's own input")
+                    (= mode "require") (fail window out "OS input: " problem)
+                    else (say "OS input: NOT proven (--os-input try): " problem))))
+              (say "PASS")
+              (system/halt 0))))))))
+
+(if *child?* (drive) (run-child))

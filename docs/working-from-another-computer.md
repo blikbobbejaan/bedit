@@ -143,6 +143,47 @@ bedit --attach ed@HOST:7457 --cookie-file ~/.config/bedit/state/ed.cookie
 - Verified over a real TCP link (loopback: two runtimes, full presence + edit fan-out);
   cross-machine is the same code path — try it from the second machine.
 
+## Editing a file on a machine that has no bedit (`/ssh:`)
+
+The serve/attach modes need bedit on both ends. To edit a file on a server that has only
+`sshd` and a POSIX `sh`, visit it by its TRAMP path, as in Emacs:
+
+```
+C-x C-f /ssh:web1:/etc/nginx/nginx.conf
+C-x C-f /ssh:deploy@web1#2222:~/app/.env      # a user, a port; ~ is the REMOTE home
+C-x C-f /ssh:[fe80::1]:/etc/hosts             # an IPv6 host in brackets
+```
+
+- **What it runs.** The system `ssh`, with your `~/.ssh/config` (host aliases, `ProxyJump`,
+  `IdentityFile`) and your agent. Every operation shares one connection per host (OpenSSH's
+  `ControlMaster`; the socket is under `~/.config/bedit/state/ssh/`, owner-only, and lives
+  five minutes past the last use). Nothing is installed on the host: each operation is a short
+  `/bin/sh` script sent on ssh's standard input, so the account's login shell (bash, zsh,
+  fish) never parses a path, and a file name with spaces, quotes or `$` is safe.
+- **Opening.** A `Loading…` buffer appears at once and the file replaces it when ssh answers;
+  C-g stops it. The bytes come through `base64`, so the file's coding is detected as any
+  file's is: a binary opens as the read-only hex view, and a file past
+  `:large-file-warning-threshold` is asked about before it is sent. A directory opens the
+  find-file prompt in it, and Tab completes its entries (listed over ssh, kept 10 s). There is
+  no remote dired yet.
+- **Saving.** C-x C-s writes the file back atomically — staged in the file's directory with
+  the file's mode, checked by size and SHA-256, then renamed over it — and the buffer stays
+  modified until the write has landed. A connection that drops is said in the echo area and
+  the buffer stays modified; C-x C-s again once it is back. C-x C-c asks about remote files as
+  about any, and saves them after its questions. M-x revert-buffer and C-x RET r read the file
+  again; C-x C-w to an `/ssh:` path moves a buffer there. The mode line shows `@host`.
+- **Passwords and host keys.** ssh runs in batch mode, so it never waits on a prompt. A host
+  that refuses every key but takes a password gets one asked for, masked, in the minibuffer;
+  it opens the shared connection (through an `SSH_ASKPASS` helper reading it from ssh's own
+  input — never the environment or a file) and is kept nowhere. A host key that is not yet
+  known, or has CHANGED, is never accepted: bedit says so, and you check it with `ssh host` in
+  a terminal.
+- **What stays local.** The auto-save sidecar is private, under
+  `~/.config/bedit/state/auto-save/`, named for the TRAMP path (M-x recover-session lists it).
+  Auto-revert, the diff-hl gutter, language servers, the formatter, `.editorconfig`,
+  `.bedit-locals.blsp`, `M-x compile`, `M-!` and the project commands leave a remote buffer
+  alone: they would run here, on a path that exists only there.
+
 ## Collaboration status (what's built vs runnable)
 
 | Capability | State |
