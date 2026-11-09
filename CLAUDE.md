@@ -211,8 +211,8 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             through sudo in place (`file-save/ed-save-prepare` / `ed-save-landed`), the mode line says
                             `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
                             handed to sudo once and kept nowhere — sudo's own timestamp serves the
-                            next save. Every sudo call is a task (`:sudo-proc`, one at a time, C-g
-                            stops it): an open shows `Loading…` at once, a save stays modified
+                            next save. Every sudo call is a task on `remotejob`'s queue (`:sudo-proc`,
+                            one at a time, C-g stops it): an open shows `Loading…` at once, a save stays modified
                             until its write lands (`file-save/ed-save-prepare` / `ed-save-landed`), and
                             C-x C-c / C-x s save root files after their questions and go on when
                             the last lands. A file is read as BYTES (`sudo/read-bytes`) and goes through
@@ -222,11 +222,22 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
                             and SIGHUP / SIGTERM auto-save every unsaved buffer before the
                             terminal is restored (`main/terminal-hangup`). Named to dodge std's `sudo`
+src/remotejob.blsp          the ONE queue a file reached another way runs on, shared by sudoedit and
+                            sshedit (each hands it a spec map: its model keys, its work, its fold):
+                            a job (open / save / revert / listing) is a task, one at a time per
+                            method, a second waiting its turn and never dropped; `Loading…` killed
+                            cancels an open; a password asked for masked only when the prompt is
+                            free (`ask`, `run-waiting`); C-g (`quit`), C-x C-c (`live`), the common
+                            head of a landed job's fold (`landed`), and a save / save-all that keep
+                            the buffer modified until the write lands (`save`, `save-all`)
 src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in ONE place, pure: `parse`,
-                            `spec`, `canonical` (a buffer's key), `dirname`, `remote-start` (a `/ssh:`
-                            typed over a path), and `remote?` — what every local tool asks before it
-                            touches a path. `~` / a relative path is the REMOTE home's. filename,
-                            sidecar, mincomplete and the handler all read it
+                            `spec`, `canonical` (a buffer's key), `dirname`, `join`, `remote-start` (a
+                            `/ssh:` typed over a path), and `remote?` — what every local tool asks
+                            before it touches a path. `~` / a relative path is the REMOTE home's,
+                            `~other/…` another user's (kept as typed, resolved there); a route
+                            through jump hosts is TRAMP's multi-hop (`/ssh:bastion|ssh:host:/x`,
+                            `:hops` on the parts, `route-label`, `prefix`; `same-connection?`).
+                            filename, sidecar, mincomplete, dired and the handler all read it
 src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*program*`, a test's
                             stand-in runs the scripts locally) with one SHARED connection per host
                             (ControlMaster, the socket in `state/ssh/`, owner-only, ControlPersist
@@ -236,19 +247,31 @@ src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*pro
                             `os/shell-quote`d): a read through base64 (bytes, a size limit asked
                             first), an atomic write (staged beside the file with its mode, size +
                             SHA-256 checked, renamed), `ls -1pa` for the prompt (kept 10 s, a
-                            table). A password opens the connection once (`connect-with-password`:
-                            SSH_ASKPASS helper reading ssh's own stdin, refusing yes/no questions)
+                            table), `stat` rows for dired (`list-entries`, GNU or BSD) and its
+                            mkdir / mv / cp -pR / rm -rf (`make-directory`, `transfer`, `delete-path`:
+                            never over an entry already there). `~user` resolved by the remote
+                            shell, the name checked first. Jump hosts become a nested
+                            `ProxyCommand` of `ssh -W` (`proxy-command`; batch mode for every hop —
+                            ssh's `-J` passes no options on), run by `/bin/sh` (`SHELL`). A password
+                            opens the connection once (`connect-with-password`: SSH_ASKPASS helper
+                            reading ssh's own stdin, refusing yes/no questions)
 src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/ssh:`), the second file
                             handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
                             /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
                             the spec, `:ssh` its mark, carried by `hosted-meta`), so no local tool
-                            takes it for a file here. Every ssh call a task (`:ssh-proc`, one at a
-                            time, C-g stops it): `Loading…` at once, a save stays modified until it
-                            lands (`file-save/ed-save-prepare` / `ed-save-landed`), a dropped
-                            connection said. A password the host wants is read masked
-                            (`passwd/ed-read-passwd`) and used once. charset as any file (binary →
-                            hex, large → asked); a directory opens the find-file prompt in it (no
-                            remote dired). Its sidecar is private (`sidecar/private-spec`); auto-revert,
+                            takes it for a file here. Every ssh call a task on `remotejob`'s queue
+                            (`:ssh-proc`, one at a time, C-g stops it): `Loading…` at once, a save
+                            stays modified until it lands (`file-save/ed-save-prepare` /
+                            `ed-save-landed`), a dropped connection said. A password the host wants is
+                            read masked (`passwd/ed-read-passwd`) and used once. charset as any file
+                            (binary → hex, large → asked); a directory opens in DIRED (the handler's
+                            `:dired`, `ed-ssh-dired`: listed off the loop, then
+                            `dired/ed-dired-show-entries`), whose `+` `R` `C` `D` `x` go through the
+                            handler's file operations (`:make-directory`, `:rename-file`,
+                            `:copy-file`, `:delete-file`, `:expand-file-name`, `:parent-directory`,
+                            Emacs's file-name-handler-alist — dired names no handler). CI's
+                            `ssh-real` job drives all of it against a real sshd
+                            (tools/ci/ssh-real.sh). Its sidecar is private (`sidecar/private-spec`); auto-revert,
                             diff-hl, LSP, the formatter, editorconfig, dir-locals, compile, M-! and the
                             project walk skip it (`sshpath/remote?`). The mode line says `@host`
 src/bugreport.blsp          M-x report-bug (Emacs's report-emacs-bug): every error the editor CATCHES
@@ -1533,6 +1556,14 @@ tools/ci/real-window.sh     CI's REAL-window check (macOS, Windows, Linux under 
                             input (xdotool / SendKeys / System Events) — saved with C-x C-s, the
                             file read back, the window captured and checked not blank; the PNGs
                             are a workflow artifact. The driver is `real-window.blsp`
+tools/ci/ssh-real.sh        CI's REAL-sshd check (`ssh-real` in ci.yml): OpenSSH's server on
+                            localhost (a throwaway host key and config, root through sudo so it can
+                            check a password, a throwaway password user), host aliases for a key
+                            login, a jump-host-only target and an unknown host key; the driver
+                            (`ssh-real.blsp`) runs `/ssh:` open / save / revert / hex / large /
+                            prompt listing / dired ops / `~user` / multi-hop / password / a dropped
+                            connection through the real ssh. `local` mode runs sshd as you (no
+                            sudo, no password check) for a quick look on a desktop
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")

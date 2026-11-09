@@ -96,6 +96,33 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
     (assert= (sshpath/dirname "/ssh:web1:/etc/hosts") "/ssh:web1:/etc")
     (assert= (sshpath/dirname "/ssh:web1:/etc") "/ssh:web1:/")
     (assert= (sshpath/dirname "/ssh:web1:~/a") "/ssh:web1:~"))
+  (test "goes through jump hosts, TRAMP's multi-hop"
+    (let (parts (sshpath/parse "/ssh:me@bastion#2222|ssh:gate|ssh:you@web1:/etc/hosts"))
+      (do
+        (assert= (:hops parts)
+          [{:user "me" :host "bastion" :port 2222} {:user nil :host "gate" :port nil}])
+        (assert= (:host parts) "web1")
+        (assert= (:user parts) "you")
+        (assert= (:path parts) "/etc/hosts")
+        (assert= (sshpath/spec parts) "/ssh:me@bastion#2222|ssh:gate|ssh:you@web1:/etc/hosts")))
+    (assert= (:path (sshpath/parse "/ssh:h:/tmp/a|ssh:b")) "/tmp/a|ssh:b")
+    (assert= (sshpath/canonical "/ssh:j|ssh:h:/etc/../x") "/ssh:j|ssh:h:/x")
+    (assert= (sshpath/dirname "/ssh:j|ssh:h:/etc/x") "/ssh:j|ssh:h:/etc")
+    (assert= (sshpath/prefix (sshpath/parse "/ssh:j|ssh:h:/x")) "/ssh:j|ssh:h:")
+    (each ["/ssh:j|scp:h:/x" "/ssh:-j|ssh:h:/x" "/ssh:j%h|ssh:h:/x" "/ssh:j|ssh:" "/ssh:j|ssh:h"]
+      (fn (spec) (is (nil? (sshpath/parse spec))))))
+  (test "another user's home stays as typed"
+    (assert= (sshpath/canonical "/ssh:h:~www/site/") "/ssh:h:~www/site")
+    (assert= (sshpath/dirname "/ssh:h:~www/site") "/ssh:h:~www")
+    (assert= (sshpath/dirname "/ssh:h:~www") "/ssh:h:~www"))
+  (test "a name is joined in a remote directory, and two paths know their connection"
+    (assert= (sshpath/join "/ssh:h:/etc" "hosts") "/ssh:h:/etc/hosts")
+    (assert= (sshpath/join "/ssh:h:/" "etc") "/ssh:h:/etc")
+    (assert= (sshpath/join "/ssh:h:/etc" "../srv") "/ssh:h:/srv")
+    (assert= (sshpath/join "/ssh:h:/etc" "/srv/a") "/ssh:h:/srv/a")
+    (assert= (sshpath/join "/ssh:h:/etc" "~/a") "/ssh:h:~/a")
+    (is (sshpath/same-connection? "/ssh:me@h:/a" "/ssh:me@h:~/b"))
+    (is (not (sshpath/same-connection? "/ssh:h:/a" "/ssh:j|ssh:h:/a"))))
   (test "is found where it was typed over a local path"
     (assert= (sshpath/remote-start "/ssh:h:/x") 0)
     (assert= (sshpath/remote-start "~/src//ssh:h:/x") 6)
@@ -135,6 +162,23 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
       (do
         (is (includes? argv "BatchMode=no"))
         (is (includes? argv "NumberOfPasswordPrompts=1")))))
+  (test "a route through jump hosts is a ProxyCommand, each hop in batch mode"
+    (binding (*program* "ssh")
+      (let (argv (sshremote/ssh-argv (sshpath/parse "/ssh:me@bastion#2222|ssh:gate|ssh:web1:/x")
+                   "/bin/sh -s")
+            proxy (seq/find argv (fn (a) (string/starts-with? a "ProxyCommand="))))
+        (do
+          (assert= (last-three argv) ["--" "web1" "/bin/sh -s"])
+          ;; the last hop carries the connection, `%h`/`%p` this ssh's own
+          (is (string/ends-with? proxy "-W '[%h]:%p' -- gate"))
+          (is (includes? proxy "BatchMode=yes"))
+          ;; the hop before it, nested: its `%` doubled so the outer ssh hands it on
+          (is (includes? proxy "ProxyCommand="))
+          (is (includes? proxy "[%%h]:%%p"))
+          (is (includes? proxy "-p 2222 -l me"))))))
+  (test "a direct path has no ProxyCommand of bedit's"
+    (is (not (any? (sshremote/ssh-argv {:host "h"} "true")
+               (fn (a) (string/starts-with? a "ProxyCommand="))))))
   (test "a too long state folder puts the sockets in the runtime dir"
     (binding (*config-base* (str "/tmp/" (string/repeat "x" 90)))
       (is (not (string/starts-with? (sshremote/control-dir) "/tmp/xxxx"))))))
@@ -296,11 +340,12 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                      (file/spit-bytes path (bytes 0 1 2 0 255))
                      (let (m (ed-find-file (ed-init (make-buffer "")) (remote path)))
                        (is (includes? (:echo m) "as hex"))))))))
-  (test "a directory opens the find-file prompt in it"
+  (test "a directory opens in dired, listed over ssh"
     (with-stub (fn (dir)
                  (let (m (ed-find-file (ed-init (make-buffer "")) (remote dir)))
                    (do
-                     (assert= (map/get-in m [:minibuffer :edit :text]) (str (remote dir) "/"))
+                     (assert= (editor/layers/buffer-type-for (ed-current-buf m)) :dired)
+                     (assert= (buffer-name (ed-current-buf m)) (remote dir))
                      (is (not (any? (:buffers m) :ssh-loading))))))))
   (test "a large file is asked about before its bytes cross"
     (with-stub (fn (dir)
@@ -471,3 +516,139 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                              [(str text "alpha.txt")])))))))))
   (test "a local path never asks the network"
     (is (not (mincomplete/remote-listing-wanted? "/tmp/" nil)))))
+
+;; ---- another user's home, a route through jump hosts ---------------------------------
+
+(describe "another user's home on the remote"
+  (test "`~USER/…` is resolved by the remote shell"
+    (with-stub (fn (_dir)
+                 (let (user (os/user-name)
+                       home (string/trim (:stdout (os/cmd "sh" ["-c" (str "eval echo ~" user)])))
+                       read (sshremote/read-file {:host "web1"} (str "~" user)))
+                   (do
+                     (assert= (:kind read) :dir)
+                     (assert= (:path read) home))))))
+  (test "a user there is not, or a name that is not one, is said"
+    (with-stub (fn (_dir)
+                 (do
+                   (is (includes? (error-message (sshremote/read-file {:host "web1"}
+                                                   "~nosuchuser4711/x"))
+                         "no such user"))
+                   (is (includes? (error-message (sshremote/read-file {:host "web1"} "~a;b/x"))
+                         "not a user's home")))))))
+
+(describe "a route through jump hosts"
+  (test "reaches the host through them, the hop given to ssh as a ProxyCommand"
+    (with-stub (fn (dir)
+                 (let (path (path/join dir "far.txt"))
+                   (do
+                     (file/spit path "far\n")
+                     (let (m (ed-find-file (ed-init (make-buffer ""))
+                               (str "/ssh:bastion|ssh:web1:" path))
+                           b (ed-current-buf m))
+                       (do
+                         (assert= (buffer-text b) "far\n")
+                         (assert= (buffer-file b) (str "/ssh:bastion|ssh:web1:" path))
+                         (is (includes? (file/slurp (path/join dir "last-args")) "ProxyCommand="))
+                         (is (includes? (file/slurp (path/join dir "last-args")) "-- bastion"))))))))))
+
+;; ---- dired over ssh ------------------------------------------------------------------
+
+(defn- dired-at (m name)
+  ;; the remote listing `m` shows with point on entry `name`
+  (let (index (index-of (:dired-names (ed-current-buf m)) name))
+    (ed-apply m (fn (buffer) (ed-goto-line buffer (+ index 2))))))
+
+(defn- press-keys (m keys) (fold keys m (fn (acc key) (ed-update acc key 80 24))))
+
+(defn- answer (m typed)
+  ;; the open prompt's text replaced by `typed`, and RET
+  (press-keys (type-text (press-keys m [:ctrl-a :ctrl-k]) typed) [:enter]))
+
+(defn- remote-fixture (dir)
+  (do
+    (file/mkdir (path/join dir "tree"))
+    (file/mkdir (path/join dir "tree" "sub"))
+    (file/spit (path/join dir "tree" "a.txt") "alpha\n")
+    (path/join dir "tree")))
+
+(describe "a remote directory in dired"
+  (test "is listed over ssh: its entries, which are directories, `ls -l` rows"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       m (dired/ed-show-dired (ed-init (make-buffer "")) (remote tree))
+                       b (ed-current-buf m))
+                   (do
+                     (assert= (buffer-name b) (remote tree))
+                     (assert= (:dired-dir b) (remote tree))
+                     (assert= (vec (take (:dired-names b) 2)) ["." ".."])
+                     (is (includes? (:dired-names b) "a.txt"))
+                     (is (contains? (:dired-dirs b) "sub"))
+                     (is (not (contains? (:dired-dirs b) "a.txt")))
+                     (is (includes? (buffer-text b) "\n -rw"))
+                     (is (includes? (buffer-text b) "\n drwx")))))))
+  (test "RET visits a file over ssh and enters a directory; ^ goes up"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       m (dired/ed-show-dired (ed-init (make-buffer "")) (remote tree))
+                       visited (ed-update (dired-at m "a.txt") :enter 80 24)
+                       entered (ed-update (dired-at m "sub") :enter 80 24)
+                       up (ed-update entered "^" 80 24))
+                   (do
+                     (assert= (buffer-file (ed-current-buf visited))
+                       (remote (path/join tree "a.txt")))
+                     (assert= (buffer-text (ed-current-buf visited)) "alpha\n")
+                     (assert= (:dired-dir (ed-current-buf entered)) (remote (path/join tree "sub")))
+                     (assert= (:dired-dir (ed-current-buf up)) (remote tree)))))))
+  (test "g lists it again, + makes a directory there"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       m (dired/ed-show-dired (ed-init (make-buffer "")) (remote tree))
+                       _ (file/spit (path/join tree "late.txt") "")
+                       refreshed (ed-update m "g" 80 24)
+                       made (answer (ed-update refreshed "+" 80 24) "fresh"))
+                   (do
+                     (is (includes? (:dired-names (ed-current-buf refreshed)) "late.txt"))
+                     (is (file/dir? (path/join tree "fresh")))
+                     (is (includes? (:dired-names (ed-current-buf made)) "fresh")))))))
+  (test "R moves an entry on the host, and a buffer visiting it follows"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       listed (dired/ed-show-dired (ed-find-file (ed-init (make-buffer ""))
+                                                     (remote (path/join tree "a.txt")))
+                                (remote tree))
+                       moved (answer (ed-update (dired-at listed "a.txt") "R" 80 24) "b.txt"))
+                   (do
+                     (is (file/exists? (path/join tree "b.txt")))
+                     (is (not (file/exists? (path/join tree "a.txt"))))
+                     (is (includes? (:dired-names (ed-current-buf moved)) "b.txt"))
+                     (is (any? (:buffers moved)
+                           (fn (b) (= (buffer-file b) (remote (path/join tree "b.txt")))))))))))
+  (test "C copies into a directory, and never over an entry already there"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       m (dired/ed-show-dired (ed-init (make-buffer "")) (remote tree))
+                       copied (answer (ed-update (dired-at m "a.txt") "C" 80 24) "sub")
+                       again (answer (ed-update (dired-at copied "a.txt") "C" 80 24) "sub"))
+                   (do
+                     (assert= (file/slurp (path/join tree "sub" "a.txt")) "alpha\n")
+                     (is (file/exists? (path/join tree "a.txt")))
+                     (is (includes? (:echo again) "exists")))))))
+  (test "D deletes for good after a question that says there is no trash"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       m (dired/ed-show-dired (ed-init (make-buffer "")) (remote tree))
+                       asked (ed-update (dired-at m "sub") "D" 80 24)
+                       done (ed-update asked "y" 80 24))
+                   (do
+                     (is (includes? (:echo asked) "no trash"))
+                     (is (not (file/exists? (path/join tree "sub"))))
+                     (is (not (includes? (:dired-names (ed-current-buf done)) "sub"))))))))
+  (test "a host that refuses the listing is said, and no listing is shown"
+    (with-stub (fn (dir)
+                 (do
+                   (file/spit (path/join dir "down") "")
+                   (let (m (dired/ed-show-dired (ed-init (make-buffer "")) (remote dir)))
+                     (do
+                       (is (includes? (:echo m) "failed or dropped"))
+                       (is (not (= (editor/layers/buffer-type-for (ed-current-buf m)) :dired))))))))))

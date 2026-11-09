@@ -140,8 +140,69 @@ folders and files mixed, as `ls -al` lists them. Robust to an unreadable `dir` (
 `.`/`..`)."
   (let (names (try (file/ls dir) (catch _e '()))
         entries (map names (fn (name) {:name name :stat (file/stat (path/join dir name))})))
-    (into [{:name "." :stat (file/stat dir)} {:name ".." :stat (file/stat (path/dirname dir))}]
-      (dired-sort-entries entries (dired-sort-of switches)))))
+    (dired-order-entries (into [{:name "." :stat (file/stat dir)}
+                                 {:name ".." :stat (file/stat (path/dirname dir))}]
+                           entries)
+      switches)))
+
+(defn dired-order-entries (entries switches)
+  "`entries` (`{:name :stat}`, `.` and `..` among them or not) in display order: `.` then `..`
+(a stat-less row when one is missing), then the rest in the order `switches` ask for
+([[dired-sort-of]]). A local listing and one a file handler brought (another machine's) are
+ordered alike.
+
+    (map (dired/dired-order-entries [{:name \"b\"} {:name \"..\"} {:name \"a\"}] \"-al\") :name)   ;=> (\".\" \"..\" \"a\" \"b\")"
+  (let (named (fn (name)
+                (or (seq/find entries (fn (entry) (= (:name entry) name))) {:name name :stat nil})))
+    (into [(named ".") (named "..")]
+      (dired-sort-entries (seq/reject entries (fn (entry) (contains? #{"." ".."} (:name entry))))
+        (dired-sort-of switches)))))
+
+;; ---- a directory a file handler reaches (another machine's, `/ssh:…`) -------------------
+;; Emacs's dired works on a TRAMP directory because every file operation it makes goes through
+;; `file-name-handler-alist`. Here the same: a directory a file handler claims
+;; (`model/ed-path-handler`) is listed by its `:dired`, its paths joined by its
+;; `:expand-file-name` / `:parent-directory`, and its entries made, moved, copied and deleted by
+;; its `:make-directory` / `:rename-file` / `:copy-file` / `:delete-file` — called off the loop,
+;; since each may wait on the network. Dired names no handler.
+
+(defn- dired-handler (dir)
+  ;; the file handler claiming `dir` that lists directories (`:dired`), or nil: a directory of
+  ;; this machine
+  (let (handler (when (string? dir) (ed-path-handler dir)))
+    (when (and handler (get handler :dired)) handler)))
+
+(defn- dired-handled? (m)
+  ;; whether the selected listing is one a file handler brought
+  (not (nil? (dired-handler (ed-dired-state m :dired-dir)))))
+
+(defn dired-join (dir name)
+  "The path of `name` read in the listed directory `dir`: `path/join`, or the claiming file
+handler's `:expand-file-name` (an ssh directory's own spelling).
+
+    (dired/dired-join \"/srv\" \"a\")   ;=> \"/srv/a\""
+  (let (handler (dired-handler dir))
+    (if handler
+      (ed-handler-call handler :expand-file-name (path/join dir name) dir name)
+      (path/join dir name))))
+
+(defn dired-parent (dir)
+  "The directory holding `dir`: `path/dirname`, or the claiming file handler's
+`:parent-directory`.
+
+    (dired/dired-parent \"/srv/a\")   ;=> \"/srv\""
+  (let (handler (dired-handler dir))
+    (if handler
+      (ed-handler-call handler :parent-directory (path/dirname dir) dir)
+      (path/dirname dir))))
+
+(defn- dired-handler-op (dir operation & arguments)
+  ;; `operation` of the handler claiming `dir`, called with `arguments` (off the loop); raises
+  ;; when the handler has none
+  (let (handler (dired-handler dir))
+    (if (and handler (get handler operation))
+      (apply ed-handler-call handler operation nil arguments)
+      (error (str "dired: " operation " is not supported there")))))
 
 (defn- ed-stat-field-str (stat key fallback)
   "Stat field `key` of `stat` as a string, or `fallback` when the stat or field is missing."
@@ -226,35 +287,44 @@ buffer's NAME (the directory), not the selection, since a prompt's answer can ar
 the user moved on."
   (ed-update-named m dir (fn (buffer) (assoc buffer :dired-marks '() :dired-flags '()))))
 
-(defn ed-show-dired (m dir &optional (line nil))
-  "Build/refresh the read-only dired listing for `dir` in the selected pane (the buffer
+;; check-allow: a handler's `:dired` is resolved late (`model/ed-handler-call`); every one
+;; answers a model, as the local listing does
+(sig ed-show-dired (model string &optional any -> model))
+(check-allow :trusted
+  (defn ed-show-dired (m dir &optional (line nil))
+    "Build/refresh the read-only dired listing for `dir` in the selected pane (the buffer
 is named by the absolute directory path, so revisiting reuses it), recording its
 `:dired-dir`/`:dired-names` on that buffer ([[ed-dired-state]]), and put point on (1-based)
 `line` — default the first entry. The listing's marks and flags carry over from the buffer
 it replaces, so they survive a refresh and a revisit, and an entry no longer listed drops out.
 
-A directory on another machine (`/ssh:…`) has no dired yet: the find-file prompt opens in it
-instead, listing its entries over ssh (`sshedit`)."
-  (if (sshpath/remote? dir)
-    (ed-show-remote-dir m dir)
-    (ed-show-local-dired m dir line)))
+A directory a file handler claims — another machine's (`/ssh:…`) — is listed by that handler's
+`:dired` (off the loop: `sshedit` lists it over ssh), which shows it here when the listing lands
+([[ed-dired-show-entries]])."
+    (let (handler (dired-handler dir))
+      (if handler
+        (ed-handler-call handler :dired m m dir line)
+        ;; no `./` in the listing's title
+        (let (dir (path/normalize (path/absolute dir)))
+          (ed-dired-render m dir (ed-dired-list dir (ed-dired-switches m dir)) line))))))
 
-(defn- ed-show-remote-dir (m dir)
-  ;; [[ed-show-dired]] on a remote directory: the find-file prompt in it, which lists it
-  (let (canonical (or (sshpath/canonical dir) dir))
-    (assoc (message m
-             (str canonical
-               " is on another machine — no remote dired yet; its entries are listed here"))
-      :minibuffer
-        (ed-find-file-prompt (if (string/ends-with? canonical "/") canonical (str canonical "/"))
-          []))))
+(defn ed-dired-show-entries (m dir entries &optional (line nil))
+  "Show `dir`'s listing in dired from `entries` (`{:name :stat}` each, the stat in `file/stat`'s
+shape) a file handler brought — another machine's directory, listed over ssh — ordered as a
+local one is ([[dired-order-entries]]), its marks kept, point on (1-based) `line`. The entries
+that are directories are kept on the buffer (`:dired-dirs`): RET cannot ask the disk."
+  (let (ordered (dired-order-entries entries (ed-dired-switches m dir))
+        shown (ed-dired-render m dir ordered line))
+    (ed-set-buf shown
+      (assoc (ed-current-buf shown)
+        :dired-dirs
+          (into #{}
+            (map (seq/filter ordered (fn (entry) (map/get-in entry [:stat :dir?]))) :name))))))
 
-(defn- ed-show-local-dired (m dir line)
-  ;; [[ed-show-dired]] on a directory of this machine
-  (let (dir (path/normalize (path/absolute dir)) ; no `./` in the listing's title
-        previous-index (ed-buffer-index-by-name m dir)
+(defn- ed-dired-render (m dir entries line)
+  ;; `dir`'s listing of `entries` (in display order) shown, its marks and flags carried over
+  (let (previous-index (ed-buffer-index-by-name m dir)
         previous (if (nil? previous-index) {} (nth (:buffers m) previous-index))
-        entries (ed-dired-list dir (ed-dired-switches m dir))
         names (into [] (map entries :name))
         listed (into #{} names)
         still-listed (fn (key)
@@ -459,8 +529,8 @@ entry; a dired buffer jumps to its parent, point on the directory just left."
                     (= here (ed-default-dir m))
                     (= (editor/layers/buffer-type-for buffer) :dired))
         dir (cond
-              in-dired? (path/dirname here)
-              file (path/dirname file)
+              in-dired? (dired-parent here)
+              file (dired-parent file)
               else (ed-default-dir m))
         target (cond
                  in-dired? (path/basename here)
@@ -485,8 +555,8 @@ up — opening dired on the chosen directory."
           (if (string/blank? typed)
             (message mm "(no directory)")
             ;; a directory → browse it; a FILE (or a path inside one) → browse its directory
-            (let (dir (if (or (sshpath/remote? typed) (file/dir? typed)) typed (path/dirname typed)))
-              (if (or (sshpath/remote? dir) (file/dir? dir))
+            (let (dir (if (or (dired-handler typed) (file/dir? typed)) typed (path/dirname typed)))
+              (if (or (dired-handler dir) (file/dir? dir))
                 (ed-show-dired mm dir)
                 (message mm (str "no such directory: " dir)))))))))
 
@@ -524,15 +594,18 @@ is the one the current buffer is in (`ed-project-root`), not where the editor la
     (cond
       (nil? name) (message m "not on an entry")
       (= name ".") (ed-show-dired m dir (inc (buffer-current-line (ed-current-buf m))))
-      (= name "..") (ed-show-dired m (path/dirname dir))
+      (= name "..") (ed-show-dired m (dired-parent dir))
       else
-        (let (path (path/join dir name))
-          (if (file/dir? path) (ed-show-dired m path) (ed-visit-file m path))))))
+        (let (path (dired-join dir name)
+              dir? (if (dired-handled? m)
+                     (contains? (or (ed-dired-state m :dired-dirs) #{}) name)
+                     (file/dir? path)))
+          (if dir? (ed-show-dired m path) (ed-visit-file m path))))))
 
 (defcommand cmd-dired-up
   (m key)
   "Go to the parent directory (^)."
-  (ed-show-dired m (path/dirname (ed-dired-state m :dired-dir))))
+  (ed-show-dired m (dired-parent (ed-dired-state m :dired-dir))))
 
 (defcommand cmd-dired-refresh
   (m key)
@@ -718,12 +791,20 @@ message on blank input)."
 
 (defcommand cmd-dired-create-dir
   (m key)
-  "Create a new subdirectory (+)."
+  "Create a new subdirectory (+). In a directory a file handler brings (another machine's) it
+is made through the handler, off the loop."
   (ed-dired-prompt m
     "Create directory: "
     ""
     (fn (mm dir typed)
-      (ed-dired-op mm dir "mkdir" (fn () (file/mkdir (path/join dir typed)))))))
+      (if (dired-handler dir)
+        (ed-dired-launch mm
+          (str "making " typed)
+          (fn ()
+            (dired-run-each [typed]
+              (fn (name) (dired-handler-op dir :make-directory (dired-join dir name)))))
+          (fn (landed report) (ed-dired-report (ed-dired-refresh landed dir) "Made" report)))
+        (ed-dired-op mm dir "mkdir" (fn () (file/mkdir (path/join dir typed))))))))
 
 ;; ---- running an operation: R, C, D and x over the marked entries -------------------
 ;; Emacs's dired acts on the MARKED entries when any are marked, else on the one at point.
@@ -741,14 +822,15 @@ point — none on `.`, `..` or the header."
       (into []
         (seq/filter (or (ed-dired-state m :dired-names) []) (fn (name) (contains? marks name)))))))
 
-(defn- dired-run-each (items act)
+(defn- dired-run-each (items act &optional (keep nil))
   "`act` (`item -> any`) run on each of `items`, a failure caught and kept rather than
-stopping the rest: `{:done items :failed [[item reason]]}`."
+stopping the rest: `{:done items :failed [[item reason]]}`. With `keep` (`(item result) ->
+item`), what is kept of each item done says what its act answered (where a move went)."
   (fold items
     {:done [] :failed []}
     (fn (acc item)
       (try
-        (do (act item) (update acc :done conj item))
+        (let (result (act item)) (update acc :done conj (if keep (keep item result) item)))
         (catch e (update acc :failed conj [item (error-message e)]))))))
 
 (defn- dired-entries-phrase (done)
@@ -836,12 +918,23 @@ a directory (Emacs's dired), keeping the name."
 
 (defn- dired-transfer-one (kind move)
   "Rename or copy (`kind`) one `move` (`{:name :source :target}`): a whole directory, across
-filesystems too. A directory already at the target is never replaced."
-  (if (file/dir? (:target move))
-    (error (str (:target move) " is a directory, not replaced"))
-    (if (= kind :rename)
-      (file/move (:source move) (:target move))
-      (file/copy-tree (:source move) (:target move)))))
+filesystems too. A directory already at the target is never replaced. A move a file handler
+makes (`:handled`, another machine's) goes through its `:rename-file` / `:copy-file`, which go
+into a directory there themselves and answer where the entry went."
+  (cond
+    (:handled move)
+      (dired-handler-op (:source move)
+        (if (= kind :rename) :rename-file :copy-file)
+        (:source move)
+        (:target move)
+        (= true (:into? move)))
+    (file/dir? (:target move)) (error (str (:target move) " is a directory, not replaced"))
+    (= kind :rename) (do (file/move (:source move) (:target move)) nil)
+    else (do (file/copy-tree (:source move) (:target move)) nil)))
+
+(defn- dired-moved-to (move result)
+  ;; `move` once done: its target where the handler said it went
+  (if (string? result) (assoc move :target result) move))
 
 (defn- ed-dired-transfer-run (m dir kind moves)
   "Rename or copy (`kind`) every one of `moves` from `dir`, then: a buffer visiting a renamed
@@ -850,7 +943,7 @@ are unmarked, and the listing is read again."
   (let (words (dired-transfer-words kind))
     (ed-dired-launch m
       (str (:running words) " " (dired-entries-phrase (map moves :name)))
-      (fn () (dired-run-each moves (fn (move) (dired-transfer-one kind move))))
+      (fn () (dired-run-each moves (fn (move) (dired-transfer-one kind move)) dired-moved-to))
       (fn (mm report)
         (let (done (:done report)
               followed (if (= kind :rename)
@@ -867,11 +960,14 @@ are unmarked, and the listing is read again."
 (defn- ed-dired-transfer-ask (m dir kind moves)
   "Rename or copy `moves`, asking first about each target that exists — `y`, `n`, `!` for it and
 every one after, `q` to stop asking (Emacs's dired-do-copy) — and refusing one onto itself or
-into itself."
+into itself. A file handler's moves (another machine's) are not asked about: the disk there
+cannot be asked from the loop, so its operations never replace an entry already there and say
+so for each one."
   (let (word (:word (dired-transfer-words kind))
         usable (seq/reject moves (fn (move) (dired-inside? (:source move) (:target move))))
-        clashes (seq/filter usable (fn (move) (file/exists? (:target move))))
-        fresh (seq/reject usable (fn (move) (file/exists? (:target move)))))
+        exists? (fn (move) (and (not (:handled move)) (file/exists? (:target move))))
+        clashes (seq/filter usable exists?)
+        fresh (seq/reject usable exists?))
     (cond
       (empty? usable)
         (let (move (first moves))
@@ -908,16 +1004,32 @@ into the directory typed."
           (str (:prompt words) " " (first names) " to: "))
         (if many? "" (first names))
         (fn (mm dir typed)
-          (if (and many? (not (file/dir? (path/join dir typed))))
-            (message mm (str (:word words) ": " typed " is not a directory"))
-            (ed-dired-transfer-ask mm
-              dir
-              kind
-              (map names
-                (fn (name)
-                  {:name name
-                   :source (path/join dir name)
-                   :target (ed-dired-target dir name typed)})))))))))
+          (let (handled? (not (nil? (dired-handler dir))))
+            (cond
+              ;; another machine's: its own operation goes into a directory, and refuses a
+              ;; target that is not one when it must be
+              handled?
+                (ed-dired-transfer-ask mm
+                  dir
+                  kind
+                  (map names
+                    (fn (name)
+                      {:name name
+                       :source (dired-join dir name)
+                       :target (dired-join dir typed)
+                       :into? many?
+                       :handled true})))
+              (and many? (not (file/dir? (path/join dir typed))))
+                (message mm (str (:word words) ": " typed " is not a directory"))
+              else
+                (ed-dired-transfer-ask mm
+                  dir
+                  kind
+                  (map names
+                    (fn (name)
+                      {:name name
+                       :source (path/join dir name)
+                       :target (ed-dired-target dir name typed)}))))))))))
 
 (defcommand cmd-dired-rename
   (m key)
@@ -946,25 +1058,36 @@ directory when the answer names one; an existing file is asked about before it i
 (defn dired-delete-question (entries what how)
   "The y/n question before deleting `entries` (`{:label :dir? :files}` each: a name, a
 directory's with its slash, and how many files deleting it takes) — `what` names a group of
-them (`marked`, `flagged`); `how` is `:trash`, `:delete`, or `:no-trash` (deleting for good
-because there is no trash to move to).
+them (`marked`, `flagged`); `how` is `:trash`, `:delete`, `:no-trash` (deleting for good
+because there is no trash to move to), or `:remote` (for good, on another machine, whose files
+were not counted).
 
     (dired/dired-delete-question [{:label \"a.txt\" :dir? false :files 1}] \"marked\" :trash)   ;=> \"Move a.txt to the trash? (y/n)\"
     (dired/dired-delete-question [{:label \"sub/\" :dir? true :files 214}] \"marked\" :delete)   ;=> \"Delete sub/ and its 214 files for good? (y/n)\"
-    (dired/dired-delete-question [{:label \"a\" :dir? false :files 1} {:label \"b/\" :dir? true :files 3}] \"flagged\" :delete)   ;=> \"Delete 2 flagged (4 files in all) for good? (y/n)\""
+    (dired/dired-delete-question [{:label \"a\" :dir? false :files 1} {:label \"b/\" :dir? true :files 3}] \"flagged\" :delete)   ;=> \"Delete 2 flagged (4 files in all) for good? (y/n)\"
+    (dired/dired-delete-question [{:label \"sub/\" :dir? true}] \"marked\" :remote)   ;=> \"Delete sub/ and everything in it for good? The other machine has no trash. (y/n)\""
   (let (single? (= (count entries) 1)
         any-dir? (any? entries :dir?)
-        files (fold entries 0 (fn (total entry) (+ total (:files entry))))
+        files (fold entries 0 (fn (total entry) (+ total (or (:files entry) 1))))
         named (if single? (:label (first entries)) (str (count entries) " " what)))
-    (if (= how :trash)
-      (str "Move " named " to the trash? (y/n)")
-      (str (if (= how :no-trash) "No trash here — delete " "Delete ")
-        named
-        (cond
-          (not any-dir?) ""
-          single? (str " and its " (ed-count-noun files "file"))
-          else (str " (" (ed-count-noun files "file") " in all)"))
-        " for good? (y/n)"))))
+    (cond
+      (= how :trash) (str "Move " named " to the trash? (y/n)")
+      (= how :remote)
+        (str "Delete "
+          named
+          (cond
+            (not any-dir?) ""
+            single? " and everything in it"
+            else " (directories with everything in them)")
+          " for good? The other machine has no trash. (y/n)")
+      else
+        (str (if (= how :no-trash) "No trash here — delete " "Delete ")
+          named
+          (cond
+            (not any-dir?) ""
+            single? (str " and its " (ed-count-noun files "file"))
+            else (str " (" (ed-count-noun files "file") " in all)"))
+          " for good? (y/n)"))))
 
 (defn- dired-delete-entry (dir name count?)
   "The question's view of entry `name` under `dir`: its label, whether it is a directory, and —
@@ -985,11 +1108,13 @@ deleted file as unsaved, saying so ([[ed-dired-orphans]])."
     (fn ()
       (dired-run-each names
         (fn (name)
-          (let (path (path/join dir name))
-            (if location
-              (let (trashed (file/trash path))
-                (when (failure? trashed) (error (error-message trashed))))
-              (fileops/remove-path path))))))
+          (let (path (dired-join dir name))
+            (cond
+              (dired-handler dir) (dired-handler-op dir :delete-file path)
+              location
+                (let (trashed (file/trash path))
+                  (when (failure? trashed) (error (error-message trashed))))
+              else (fileops/remove-path path))))))
     (fn (mm report)
       (ed-dired-orphans (ed-dired-report (ed-dired-refresh (ed-dired-unmark-done mm
                                                              dir
@@ -997,7 +1122,7 @@ deleted file as unsaved, saying so ([[ed-dired-orphans]])."
                                            dir)
                           (if location "Trashed" "Deleted")
                           report)
-        (map (:done report) (fn (name) (path/join dir name)))
+        (map (:done report) (fn (name) (dired-join dir name)))
         (not (nil? location))))))
 
 (defn dired-orphans-note (files trashed?)
@@ -1028,7 +1153,24 @@ surprise, and the echo area saying so — the report stays in *Messages*."
 (defn- ed-dired-delete-asking (m dir names what)
   "Ask before deleting `names` under `dir` (`what` they are: `marked`, `flagged`), then do it:
 to the trash when that is wanted and there is one, else for good. A delete for good counts the
-files it takes first, off the loop like the delete — a large tree's walk is no quicker."
+files it takes first, off the loop like the delete — a large tree's walk is no quicker. A
+directory another machine's (a file handler's) is deleted for good, uncounted: there is no
+trash there, and its listing says which entries are directories."
+  (if (dired-handler dir)
+    (let (dirs (or (ed-dired-state m :dired-dirs) #{}))
+      (ed-dired-unless-busy m
+        (fn ()
+          (ed-confirm m
+            (dired-delete-question (map names
+                                     (fn (name)
+                                       (let (dir? (contains? dirs name))
+                                         {:label (if dir? (str name "/") name) :dir? dir?})))
+              what :remote)
+            (fn (sure) (ed-dired-delete-now sure dir names nil))))))
+    (ed-dired-delete-local-asking m dir names what)))
+
+(defn- ed-dired-delete-local-asking (m dir names what)
+  ;; [[ed-dired-delete-asking]] for a directory of this machine
   (let (wanted? (ed-dired-trash-wanted? m)
         location (when wanted?
                    (let (found (file/trash-location)) (when (not (failure? found)) found)))

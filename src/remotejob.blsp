@@ -1,0 +1,246 @@
+(defmodule remotejob
+  "A file reached ANOTHER WAY — as root through `sudo` (`sudoedit`), on another machine through
+`ssh` (`sshedit`) — is read and written by a program that may wait on the disk, on PAM, on the
+network, on a password. The editor's loop never waits with it: each open, save, revert or
+listing is a JOB run in a task, ONE at a time per method, folded back when it lands. This is
+that queue, once, for both methods; each module hands it a SPEC (a map) saying what its jobs
+do and where they live on the model:
+
+  - `:name`      the method as it is said (`ssh`, `sudo`).
+  - `:prefix`    what goes before a failure's reason (`ssh: `).
+  - `:proc` `:job` `:waiting`   the model keys of the running task, its job, the queue.
+  - `:loading`   the buffer key a `Loading…` placeholder is marked with, naming its file.
+  - `:target`    the job key naming the file (`:spec`, `:path`); `:same` the job keys two
+                 jobs that are one share (a job waiting is not queued twice).
+  - `:work`      `(job password) -> answer`, run IN the task (password nil: none).
+  - `:fold`      `(model answer) -> model`, the module's fold of a finished job.
+  - `:timeout-ms`  how long a task may run before it is killed and said to have failed.
+  - `:doing`     `(job) -> text`, what a job is doing (`opening /etc/hosts as root`).
+  - `:prompt`    `(job) -> text`, the masked password prompt's question.
+
+What the queue promises, for every method alike:
+
+  - A job launched while another runs WAITS its turn on the queue — never refused and lost —
+    and a post-step ([[run-waiting]]) takes the next one up once the slot is free.
+  - An open shows a `Loading…` buffer at once (the module makes it); killing it cancels the
+    open, and an open whose placeholder went while it waited is dropped wanting nothing.
+  - A job whose program wants a password comes back asking ([[ask]]): the masked prompt
+    (`passwd/ed-read-passwd`), only when the prompt is free and no job runs — over an open
+    minibuffer it would take that read's keys — and the job runs again with it. The password
+    lives in the task's closure for that one run, never on the model.
+  - C-g stops a job in flight ([[quit]]): an open's placeholder goes, a save's buffer stays
+    modified. C-x C-c names the jobs running and waiting ([[live]]).
+  - A save takes the buffer's text when it is asked for (`file-save/ed-save-prepare`) and the
+    buffer stays modified until the write lands; C-x C-c and C-x s save every buffer of the
+    method in turn after their questions ([[save-all]]), one that fails stopping the run.
+
+Headless — a test — a job runs inline, so a test sees its answer at once."
+  (:use model) ; message / ed-buf-at / ed-headless? / ed-prompt-free? / ed-quit-note
+  (:use pool) ; ed-kill-buffer-at
+  (:use file-save) ; ed-save-prepare
+  (:use passwd)) ; ed-read-passwd — the masked read
+
+(defn then-of (job)
+  "The continuation a job runs on the model once it has landed: its `:then`, else nothing."
+  (or (:then job) identity))
+
+(defn doing (spec job)
+  "What `job` is doing, as `spec`'s method says it (`opening /etc/hosts as root`)."
+  ((:doing spec) job))
+
+(defn wait (spec m step job note)
+  "`job` put on `spec`'s queue to `step` — `:launch` it, or `:ask` for its password — once the
+job running has finished and the prompt is free ([[run-waiting]]), and `note` said. A job is
+never dropped for the slot being taken: it waits its turn, its `Loading…` buffer kept. Queued
+once: a job already waiting is not added again."
+  (let (waiting (or (get m (:waiting spec)) [])
+        same? (fn (entry)
+                (= (map/select-keys (:job entry) (:same spec)) (map/select-keys job (:same spec)))))
+    (message (if (any? waiting same?)
+               m
+               (assoc m (:waiting spec) (conj waiting {:step step :job job})))
+      note)))
+
+(defn launch (spec m job password)
+  "Run `job` off the loop with `password` (nil: none). Headless — the tests — it runs inline.
+While another job of the method runs it WAITS its turn on the queue ([[wait]]) — never refused
+and lost: a password typed for it is not kept, so the program is asked again when its turn
+comes, and the prompt opens again only if it still wants one."
+  (cond
+    (get m (:proc spec))
+      (wait spec
+        m
+        :launch job
+        (str (doing spec job) " waits for the " (:name spec) " command running"))
+    (ed-headless?) ((:fold spec) (assoc m (:job spec) job) ((:work spec) job password))
+    else
+      (assoc (message m (str (doing spec job) "… (C-g stops)"))
+        (:proc spec) (task/task (fn () ((:work spec) job password)) {:timeout (:timeout-ms spec)})
+        (:job spec) job)))
+
+(defn- index-where (m pred)
+  ;; the pool index of the first buffer `pred` holds for, or nil
+  (let (index (seq/index-where (:buffers m) pred)) (if (< index 0) nil index)))
+
+(defn placeholder-index (spec m target)
+  "The pool index of the `Loading…` buffer an open of `target` shows until its text lands, or
+nil."
+  (index-where m (fn (buffer) (= (get buffer (:loading spec)) target))))
+
+(defn drop-placeholder (spec m target)
+  "`m` without the `Loading…` buffer of an open of `target`, when there is one."
+  (let (index (placeholder-index spec m target)) (if (nil? index) m (ed-kill-buffer-at m index))))
+
+(defn abandon (spec m job)
+  "`job` given up — its password prompt cancelled, its task stopped or failed: an open's
+`Loading…` buffer goes; a save's buffer stays as it was, modified."
+  (if (= (:kind job) :open) (drop-placeholder spec m (get job (:target spec))) m))
+
+(defn failed (spec m job reason)
+  "`job` given up for `reason`, said with the method's prefix and the job's own note (` — quit
+canceled`)."
+  (message (abandon spec m job) (str (:prefix spec) reason (or (:abandon-note job) ""))))
+
+(defn ask (spec m job)
+  "The masked prompt for the password `job` needs; RET runs it again with it, C-g gives it up.
+Only when the prompt is free (`model/ed-prompt-free?`) and no job of the method is running:
+over an open minibuffer — a C-x b half typed — it would take that read's keys, and RET would
+send them as a failed attempt that pam_faillock (or the host's sshd) counts; while another job
+runs, the RET would find the slot taken. Otherwise the job WAITS on the queue ([[wait]]) and
+[[run-waiting]] opens the prompt once both are free."
+  (cond
+    (not (ed-prompt-free? m))
+      (wait spec m :ask job (str (:name spec) " needs a password — asked when this prompt closes"))
+    (get m (:proc spec))
+      (wait spec
+        m
+        :ask job
+        (str (:name spec)
+          " needs a password for "
+          (doing spec job)
+          " — asked when the running "
+          (:name spec)
+          " command is done"))
+    else
+      (map/assoc-in (ed-read-passwd m
+                      ((:prompt spec) job)
+                      (fn (mm password) (launch spec mm job password)))
+        [:minibuffer :on-abort]
+        (fn (mm) (abandon spec mm job)))))
+
+(defn run-waiting (spec m)
+  "A post-step's body: the first job on `spec`'s queue ([[wait]]) taken up once no job of the
+method runs — launched, or its password asked for once the prompt is free too. An open whose
+`Loading…` buffer was killed meanwhile is dropped from the queue, wanting nothing."
+  (let (waiting (or (get m (:waiting spec)) []))
+    (if (or (empty? waiting) (get m (:proc spec)))
+      m
+      (let (entry (first waiting)
+            job (:job entry)
+            rest-m (if (= 1 (count waiting))
+                     (dissoc m (:waiting spec))
+                     (assoc m (:waiting spec) (vec (rest waiting)))))
+        (cond
+          (and (= (:kind job) :open) (nil? (placeholder-index spec m (get job (:target spec)))))
+            (run-waiting spec rest-m)
+          ;; launched: headless it ran inline, so the next may follow at once
+          (= (:step entry) :launch) (run-waiting spec (launch spec rest-m job nil))
+          (ed-prompt-free? m) (ask spec rest-m job)
+          else m)))))
+
+;; check-allow: `on-answer` is the method's own fold, whose result the checker cannot see;
+;; every caller hands one that answers a model
+(check-allow :trusted
+  (defn landed (spec m answer on-answer)
+    "The head of a finished job's fold, the same for every method: the job taken off the model,
+an open whose `Loading…` buffer was killed while it ran said cancelled, a task that failed or
+timed out (`answer` nil) said — else `(on-answer m job answer)`, the method's own reading of
+it."
+    (let (job (get m (:job spec))
+          m1 (dissoc m (:proc spec) (:job spec)))
+      (cond
+        (nil? job) m1
+        (and (= (:kind job) :open) (nil? (placeholder-index spec m1 (get job (:target spec)))))
+          (message m1 (str (doing spec job) " cancelled"))
+        (nil? answer) (failed spec m1 job (str (doing spec job) " failed or timed out"))
+        else (on-answer m1 job answer)))))
+
+(defn quit (spec m)
+  "C-g's clean-up for a job of `spec`'s method (its task already killed): an open's `Loading…`
+buffer goes, a save's buffer stays modified, and C-g says what stopped."
+  (let (job (get m (:job spec)))
+    (if (nil? job)
+      m
+      (ed-quit-note (abandon spec (dissoc m (:job spec)) job)
+        (str (doing spec job) " stopped" (or (:abandon-note job) ""))))))
+
+(defn live (spec m)
+  "The jobs of `spec`'s method C-x C-c would stop (`model/register-exit-query`): the one
+running, and those waiting their turn ([[wait]])."
+  (let (said (fn (job) (str (:name spec) ": " (doing spec job))))
+    (into (if (get m (:proc spec)) [(said (or (get m (:job spec)) {}))] [])
+      (map (or (get m (:waiting spec)) []) (fn (entry) (str (said (:job entry)) " (waiting)"))))))
+
+(defn cancel-killed (spec m killed)
+  "`m` with the open behind a killed `Loading…` buffer (pool index `killed`) cancelled: its
+task stopped, so no buffer appears after all. Any other kill leaves it as it is."
+  (let (loading (when (get m (:proc spec)) (get (ed-buf-at m killed) (:loading spec))))
+    (if (and loading (= loading (get (get m (:job spec)) (:target spec))))
+      (do (task/cancel (get m (:proc spec))) (dissoc m (:proc spec) (:job spec)))
+      m)))
+
+;; check-allow: `job-fields` is the method's, `then` the caller's continuation; every caller
+;; hands ones the checker cannot see through
+(check-allow :trusted
+  (defn save (spec m i then abandon-note job-fields)
+    "Save pool buffer `i`, a buffer of `spec`'s method, OFF the loop — a password asked for first
+when the program wants one. The buffer is made what its `.editorconfig` asks and its text taken
+now (`file-save/ed-save-prepare`); it stays modified until the write lands, and a write that
+fails leaves it so and says why. The job is `{:kind :save :content :rope :then :abandon-note}`
+and what `(job-fields prepared original)` adds (the file it goes to). `then` runs on the model
+once the write has landed; `abandon-note` follows the reason when it does not
+(` — quit canceled`)."
+    (let (buffer (ed-buf-at m i))
+      (cond
+        (get buffer (:loading spec)) (message m "still loading — nothing to save yet")
+        ;; the run stops here, as one whose save failed does: said WITH the caller's note, so a
+        ;; C-x C-c that cannot go on does not end silently
+        (get m (:proc spec))
+          (message m
+            (str (:name spec)
+              ": another "
+              (:name spec)
+              " command is still running — save when it is done"
+              (or abandon-note "")))
+        else
+          (let ([prepared-model prepared] (ed-save-prepare m i)
+                content (charset/file-content prepared))
+            (if (failure? content)
+              (message prepared-model (str (error-message content) (or abandon-note "")))
+              (launch spec
+                prepared-model
+                (merge {:kind :save
+                        :content content
+                        :rope (editor/buffer/buffer-rope prepared)
+                        :then then
+                        :abandon-note abandon-note}
+                  (job-fields prepared buffer))
+                nil)))))))
+
+;; check-allow: `entry-index` and `save-one` are the method's, `then` the caller's
+(check-allow :trusted
+  (defn save-all (m entries then abandon-note entry-index save-one)
+    "Save the buffer each of `entries` names (`(entry-index m entry)`, nil when it is gone) in
+turn with `(save-one m index then note)` — one job at a time, each asking for a password when
+it wants one — then `(then m)`. One that fails, or whose prompt or task is cancelled, stops the
+run there, saying why with `abandon-note`: what C-x C-c and C-x s do with the buffers of a
+method they were told to save."
+    (if (empty? entries)
+      (then m)
+      (let (index (entry-index m (first entries)))
+        (if (nil? index)
+          (save-all m (rest entries) then abandon-note entry-index save-one)
+          (save-one m
+            index
+            (fn (mm) (save-all mm (rest entries) then abandon-note entry-index save-one))
+            abandon-note))))))
