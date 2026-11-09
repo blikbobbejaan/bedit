@@ -1,0 +1,333 @@
+(defmodule lsp-rust
+  "bedit's newer LSP features against a REAL rust-analyzer, through a real `ui-run` loop.
+
+Inlay hints, semantic tokens and code lenses had only ever met stand-in connections that
+answer with canned results. This opens tools/ci/fixtures/lens-fixture (copied to a temporary
+folder) with the editor's own loop over a scripted frontend — the idle beat's autostart, the
+real connection process, rust-analyzer's own answers — and asserts what lands on the model:
+
+- inlay hints arrive as INLINE annotations at the right places: `: i32` after `total`, `left:`
+  and `right:` before the two arguments of `add(1, 2)`;
+- semantic tokens decode to faces on the right ranges (`add`'s definition, its call, the
+  parameter `left`), and after an edit the next answer is a DELTA, applied, colouring the new
+  line's variable;
+- code lenses show above the right lines (▶ Run over `main`, ▶ Run Test over the test, `1
+  implementation` over the struct — which rust-analyzer sends unresolved, so it proves
+  `codeLens/resolve`), and move with the text;
+- rust-analyzer's refresh requests (`workspace/inlayHint|codeLens/refresh`) reach the editor (the
+  semantic tokens refresh is not offered: rust-analyzer would then never answer with a delta);
+- a lens CLICK (a real `[:mouse …]` press on the lens row) runs its command: ▶ Run is
+  `rust-analyzer.runSingle`, run as a cargo command in *compilation*; `1 implementation` is
+  `rust-analyzer.showReferences`, which jumps to the impl.
+
+    tools/ci/lsp-rust.sh NEST      (CI: .github/workflows/ci.yml, `lsp-rust-analyzer`)
+    nest run tools/ci/lsp-rust.blsp
+
+Needs `rust-analyzer` and `cargo` on PATH; says so and passes when rust-analyzer is not, like a
+missing grammar. `LSP_RUST_DEADLINE_MS` bounds the whole run (default 300000)."
+  (:use-internals bedit/input))
+
+(require-one 'project)
+(project/load-config)
+(let (root (project/find-root (file/cwd)))
+  (when root (project/setup root) (project/load-sources root)))
+
+(def *cols* 120)
+(def *rows* 50)
+
+(def *deadline-ms*
+  (let (given (os/env "LSP_RUST_DEADLINE_MS")
+        parsed (when given (string/->number given)))
+    (if (int? parsed) parsed 300000)))
+
+;; A model cannot cross a process boundary (it holds ropes), so the assertions run INSIDE the
+;; loop's update fn and only the tally comes back out (`tools/drive-async.blsp`).
+(def *failures* (%table))
+
+(defn check (what ok)
+  (do
+    (io/puts (str (if ok "  ok  " "  FAIL ") what))
+    (when (not ok) (%table-put *failures* :n (inc (%table-get *failures* :n 0))))
+    ok))
+
+(defn note (what) (io/puts (str "  ..  " what)))
+
+;; The display's `:poll`: whatever is in the mailbox (a server's reply or request, the
+;; compile's output), or nil when the wait runs out — which is what lets the idle beat fire,
+;; and the idle beat is what starts the server and asks it.
+(defn poll (ms) (receive (msg msg) (after (math/max 1 ms) nil)))
+
+;; ---- what the model holds ---------------------------------------------------------------
+
+(defn- current (m) (model/ed-current-buf m))
+
+(defn- text-of (m) (editor/buffer/buffer-text (current m)))
+
+(defn- offset-of (m needle)
+  ;; the char offset of the first `needle` in the current buffer's text, or nil
+  (let (at (index-of (text-of m) needle)) (when (>= at 0) at)))
+
+(defn- line-start (m line)
+  (text/line->char (editor/buffer/buffer-rope (current m)) line))
+
+(defn- line-of (m needle)
+  ;; the 0-based line of the first `needle`
+  (let (at (offset-of m needle))
+    (when at (text/char->line (editor/buffer/buffer-rope (current m)) at))))
+
+(defn- hints (m)
+  ;; the rust-analyzer inlay hints on the buffer: `[{:at :text :owner}]`
+  (seq/filter (inlinetext/annotations (current m)) (fn (hint) (= (:owner hint) :lsp-inlay))))
+
+(defn- hint-at? (m offset needle)
+  ;; an inlay hint anchored at `offset` whose text holds `needle`
+  (and (int? offset)
+    (any? (hints m) (fn (hint) (and (= (:at hint) offset) (includes? (:text hint) needle))))))
+
+(defn hints-ok? (m)
+  "`: i32` right after `total`, `left:` / `right:` right before `1` / `2` in `add(1, 2)`."
+  (let (call (offset-of m "add(1, 2)")
+        total (offset-of m "total = add"))
+    (and call
+      total
+      (hint-at? m (+ total 5) "i32")
+      (hint-at? m (+ call 4) "left")
+      (hint-at? m (+ call 7) "right"))))
+
+(defn- spans (m) (or (:semantic-spans (current m)) []))
+
+(defn- span? (m from to face)
+  (any? (spans m) (fn (span) (= span [from to face]))))
+
+(defn tokens-ok? (m)
+  "`add`'s definition, the call `add(1, 2)` and the parameter `left` each coloured as what they
+are, on exactly their own chars."
+  (let (definition (offset-of m "add(left")
+        call (offset-of m "add(1, 2)")
+        parameter (offset-of m "left: i32"))
+    (and definition
+      call
+      parameter
+      (span? m definition (+ definition 3) :syntax/definition)
+      (span? m call (+ call 3) :syntax/function)
+      (span? m parameter (+ parameter 4) :syntax/variable))))
+
+(defn- lens-rows (m) (wrap/inlay-lines (current m)))
+
+(defn- lens-row-has? (m line needle)
+  (and (int? line) (any? (get (lens-rows m) line []) (fn (row) (includes? row needle)))))
+
+(defn lenses-ok? (m)
+  "▶ Run over `fn main`, ▶ Run Test over `fn adds`, `1 implementation` (resolved) over the struct."
+  (and (lens-row-has? m (line-of m "fn main") "Run")
+    (lens-row-has? m (line-of m "fn adds") "Run")
+    (lens-row-has? m (line-of m "struct Counter") "implementation")))
+
+(defn- store (m) (get (or (:lsp-semantic m) {}) (editor/buffer/buffer-file (current m))))
+
+(defn delta-ok? (m)
+  "After the edit: the last answer was a delta, and the new line's variable is coloured."
+  (let (extra (offset-of m "extra = total"))
+    (and extra (= true (:delta? (store m))) (span? m extra (+ extra 5) :syntax/variable))))
+
+;; ---- the lens click, through the mouse --------------------------------------------------
+
+(defn- screen-row-of-lens (m line)
+  "The absolute screen row of the lens row above buffer `line` in the selected pane, or nil."
+  (let (layout (panes/ed-body-layout m *cols* *rows*)
+        pane (seq/find (:panes layout) (fn (pane) (:selected pane)))
+        buffer (current m)
+        [_x y _w _h] (:rect pane))
+    (when pane
+      (seq/find (range y (+ y (panes/ed-pane-vrows pane buffer)))
+        (fn (row) (= (first (or (panes/ed-pane-inlay-row pane buffer row) [])) line))))))
+
+(defn- click-lens (m line)
+  "`m` after a left press and release on the lens row above `line`, at its first title's cell."
+  (let (row (screen-row-of-lens m line)
+        layout (panes/ed-body-layout m *cols* *rows*)
+        pane (seq/find (:panes layout) (fn (pane) (:selected pane)))
+        [x _y _w _h] (:rect pane)
+        column (+ x (panes/ed-pane-gutter-width (current m) pane) 6))
+    (if (nil? row)
+      (do (check (str "the lens row above line " line " is on screen") false) m)
+      (input/ed-update (input/ed-update m [:mouse :press :left row column [] 1] *cols* *rows*)
+        [:mouse :release :left row column [] 1]
+        *cols*
+        *rows*))))
+
+;; ---- the phases -------------------------------------------------------------------------
+;; The phase rides on the model (`:drive-phase`); `:drive-refreshes` counts the refresh
+;; requests that arrived (the update sees every input).
+
+(defn- compilation (m)
+  (let (index (model/ed-buffer-index-by-name m "*compilation*"))
+    (if index (editor/buffer/buffer-text (model/ed-buf-at m index)) "")))
+
+(defn- advance (m phase t0)
+  (cond
+    (= phase :features)
+      (if (and (hints-ok? m) (tokens-ok? m) (lenses-ok? m))
+        (do
+          (check "inlay hints: `: i32` after `total`, `left:` / `right:` before the arguments" true)
+          (check "semantic tokens: add's definition, its call and `left` coloured on their chars"
+            true)
+          (check "code lenses: Run over main and the test, 1 implementation (resolved) over the struct"
+            true)
+          (note (str "features in after " (- (os/now) t0) " ms"))
+          ;; a line pasted into main, through the loop's own input (a bracketed paste), so the
+          ;; idle beat is armed as a keystroke arms it: the next semantic tokens answer is a delta
+          (let (at (line-start m (inc (line-of m "let total"))))
+            (assoc (input/ed-update (model/ed-set-buf m (editor/buffer/goto-char (current m) at))
+                     [:paste "    let extra = total + 1;\n"]
+                     *cols*
+                     *rows*)
+              :drive-phase :delta)))
+        m)
+    (= phase :delta)
+      (let (extra (offset-of m "extra = total")
+            settled (and extra
+                      (span? m extra (+ extra 5) :syntax/variable)
+                      (hint-at? m (+ extra 5) "i32"))
+            result-id (:result-id (store m)))
+        (cond
+          (and settled (delta-ok? m))
+            (do
+              (check "after an edit: semantic tokens came as a delta, applied, the new variable coloured"
+                true)
+              (check "after an edit: the new line has its inlay hint" true)
+              (check "after an edit: the test's lens row moved down with its line"
+                (lens-row-has? m (line-of m "fn adds") "Run"))
+              (note (str "edits until a delta answered: " (or (:drive-edits m) 1)))
+              (assoc (click-lens m (line-of m "fn main")) :drive-phase :run))
+          ;; the answer to the edit was a whole set — what a server sends when the result id
+          ;; asked against is not the one it kept (an ask overtaken while it was loading): one
+          ;; more edit, a comment line, whose answer is asked against this one
+          (and settled
+            (< (or (:drive-edits m) 1) 5)
+            (not (= result-id (:drive-retried-at m))))
+            (assoc (input/ed-update (model/ed-set-buf m
+                                      (editor/buffer/goto-char (current m)
+                                        (line-start m (line-of m "let extra"))))
+                     [:paste "    // again\n"]
+                     *cols*
+                     *rows*)
+              :drive-edits (inc (or (:drive-edits m) 1))
+              :drive-retried-at result-id)
+          else m))
+    (= phase :run)
+      (let (output (compilation m))
+        (if (includes? output "Compilation")
+          (do
+            (check "a click on ▶ Run ran `cargo run` (rust-analyzer.runSingle) in *compilation*"
+              (includes? output "cargo run"))
+            (check "…and the program ran: it printed its total"
+              (includes? output "total 3 bumped 3"))
+            (check "…and finished" (includes? output "Compilation finished"))
+            ;; back to the source, then the struct's implementations lens
+            (let (back (pool/ed-find-file m (:drive-file m)))
+              (assoc (click-lens back (line-of back "struct Counter")) :drive-phase :impl)))
+          m))
+    (= phase :impl)
+      (let (buffer (current m)
+            line (editor/buffer/buffer-current-line buffer))
+        (if (= line (line-of m "impl Counter"))
+          (do
+            (check "a click on `1 implementation` (rust-analyzer.showReferences) jumped to the impl"
+              true)
+            (check "rust-analyzer asked the editor to refresh, and was heard"
+              (> (or (:drive-refreshes m) 0) 0))
+            (note (str "refresh requests heard: " (or (:drive-refreshes m) 0)))
+            (doseq (entry (vals (or (:lsp-servers m) {}))) (lsp/lsp-shutdown (:conn entry)))
+            (assoc m :done true :drive-phase :finished))
+          m))
+    else m))
+
+(defn- report-stuck (m phase)
+  (do
+    (check (str "everything arrived before the deadline (stuck at " phase ")") false)
+    (note (str "inlay hints: " (pr-str (map (hints m) (fn (hint) [(:at hint) (:text hint)])))))
+    (note (str "semantic spans: " (count (spans m)) " " (pr-str (take (spans m) 12))))
+    (note (str "semantic store: delta? "
+            (:delta? (store m))
+            " result-id "
+            (:result-id (store m))
+            " edits "
+            (or (:drive-edits m) 1)))
+    (note (str "lens rows: " (pr-str (lens-rows m))))
+    (note (str "lens store: "
+            (pr-str (map (map/get-in m [:lsp-lenses (editor/buffer/buffer-file (current m)) :lenses] [])
+                      (fn (lens) [(:line lens) (:title lens) (:command lens)])))))
+    (note (str "servers: "
+            (pr-str (map (vals (or (:lsp-servers m) {}))
+                      (fn (entry) [(:spec entry) (:roots entry) (keys (or (:caps entry) {}))])))))
+    (note (str "refreshes: " (or (:drive-refreshes m) 0)))
+    (note (str "*compilation*: " (compilation m)))
+    (note (str "echo: " (:echo m)))
+    (doseq (name ["*Messages*" "*lsp-log*"])
+      (let (index (model/ed-buffer-index-by-name m name)
+            text (if index (editor/buffer/buffer-text (model/ed-buf-at m index)) ""))
+        (note (str name " (its last 4000 chars):\n"
+                (string/substring text (math/max 0 (- (string/length text) 4000)) (string/length text))))))))
+
+(defn- refresh? (input)
+  (and (vector? input)
+    (includes? [:lsp-refresh-semantic-tokens :lsp-refresh-inlay-hints :lsp-refresh-code-lens]
+      (first input))))
+
+(defn drive (m0 file)
+  (let (t0 (os/now)
+        display {:enter (fn () nil)
+                 :leave (fn () nil)
+                 :size (fn () [*cols* *rows*])
+                 :draw (fn (_frame) nil)
+                 :poll poll}
+        update (fn (m input cols rows)
+                 (let (counted (if (refresh? input)
+                                 (assoc m :drive-refreshes (inc (or (:drive-refreshes m) 0)))
+                                 m)
+                       next (input/ed-update counted input cols rows)
+                       phase (or (:drive-phase next) :features))
+                   (cond
+                     (= phase :finished) next
+                     (> (- (os/now) t0) *deadline-ms*)
+                       (do (report-stuck next phase)
+                         (doseq (entry (vals (or (:lsp-servers next) {})))
+                           (lsp/lsp-shutdown (:conn entry)))
+                         (assoc next :done true :drive-phase :finished))
+                     else (advance next phase t0)))))
+    (editor/ui/ui-run (assoc (pool/ed-find-file m0 file) :drive-file file)
+      view/ed-view
+      update
+      display)))
+
+(if (nil? (os/which "rust-analyzer"))
+  (io/puts "lsp-rust: rust-analyzer is not on PATH — nothing to drive (skipped)")
+  (let (_ (proc/register :editor (self))
+        here (project/find-root (file/cwd))
+        crate (path/join (path/temp "bedit-lsp-rust-") "lens-fixture")
+        _ (file/copy-tree (path/join here "tools/ci/fixtures/lens-fixture") crate)
+        file (path/join crate "src/main.rs")
+        m0 (assoc (model/ed-init (editor/buffer/make-buffer "" "*scratch*"))
+             :recent-files false
+             :lsp-inlay-hints true
+             :lsp-code-lens true
+             :lsp-semantic-tokens true))
+    (do
+      ;; semantic tokens' refresh is not offered here: rust-analyzer, offered it, clears the
+      ;; result it keeps for deltas on every change, so no answer after an edit could be a
+      ;; delta. The refresh check hears the inlay-hint and code-lens refreshes instead.
+      (def lsp-semantic/*refresh-support* false)
+      (check "the async paths are live (`:editor` registered, not headless)"
+        (not (model/ed-headless?)))
+      (io/puts (str "== rust-analyzer on " crate))
+      (drive m0 file)
+      (file/rmdir (path/dirname crate))
+      (io/puts "")
+      (if (= (%table-get *failures* :n 0) 0)
+        (io/puts "inlay hints, semantic tokens and code lenses work against rust-analyzer")
+        ;; an exit code CI reads, not a raise: a script's uncaught error is printed, and the
+        ;; run still ends 0
+        (do
+          (io/puts (str "lsp-rust: " (%table-get *failures* :n 0) " check(s) failed") :to *err*)
+          (system/halt 1))))))

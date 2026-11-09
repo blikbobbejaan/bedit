@@ -25,6 +25,12 @@ use), and the remote half of each operation as a POSIX `sh` script.
   standard input — never the environment, never a file — and refuses every other question
   (a host-key confirmation above all). The connection then serves the operations without it.
 
+- **A route through jump hosts** (`/ssh:bastion|ssh:host:`, `sshpath`'s `:hops`) is a nested
+  `ProxyCommand` of `ssh -W`, every hop in batch mode ([[proxy-command]]).
+- **Dired's side.** A directory listed as `ls -l` facts ([[list-entries]]), and its entries
+  made, moved, copied and deleted on the host ([[make-directory]], [[transfer]],
+  [[delete-path]]) — a move or copy never over an entry already there.
+
 `*program*` names the ssh run — a test binds a stand-in that runs the script locally, so no
 test reaches a network. Pure command construction ([[ssh-argv]], the scripts) is separate
 from the call ([[run]]).")
@@ -68,15 +74,62 @@ from the call ([[run]]).")
 reach one runs commands as you on that host. Its path."
   (let (dir (control-dir)) (do (file/mkdir-private dir) dir)))
 
+(defn- user-port-options (parts)
+  ;; `-p PORT` and `-l USER` for the ones `parts` names
+  (into (if (:port parts) ["-p" (str (:port parts))] [])
+    (if (:user parts) ["-l" (:user parts)] [])))
+
+(defn- escape-percent (text)
+  ;; `text` read back exactly by the ssh that expands `%` escapes in it (a ProxyCommand)
+  (string/replace text "%" "%%"))
+
+(defn jump-argv (hops)
+  "The ssh run that carries a connection through the LAST of the jump hosts `hops` (`-W`, to
+the target host and port as the ssh using it expands `%h` and `%p`), itself reached through
+the ones before it ([[proxy-command]], nested). Always batch mode: a jump host is reached with
+a key or the agent, never a password — no prompt can reach a person from inside another ssh.
+
+    (last (sshremote/jump-argv [{:host \"bastion\"}]))   ;=> \"bastion\""
+  (let (hop (last hops)
+        earlier (vec (take hops (dec (count hops)))))
+    (into []
+      (append [*program*
+                "-o"
+                "BatchMode=yes"
+                "-o"
+                "ControlMaster=no"
+                "-o"
+                (str "ConnectTimeout=" *connect-timeout-seconds*)
+                "-o"
+                (str "ServerAliveInterval=" *alive-interval-seconds*)
+                "-o"
+                "ServerAliveCountMax=2"]
+        (if (empty? earlier)
+          []
+          ["-o" (str "ProxyCommand=" (escape-percent (proxy-command earlier)))])
+        (user-port-options hop)
+        ["-W" "[%h]:%p" "--" (:host hop)]))))
+
+(defn proxy-command (hops)
+  "The `ProxyCommand` that reaches a host through the jump hosts `hops` (TRAMP's multi-hop
+`/ssh:bastion|ssh:host:`): [[jump-argv]] quoted for `/bin/sh`, which ssh runs it with (the
+env names `SHELL`). ssh's own `-J` is not used because it passes none of these options on to
+the jump: a jump host wanting a password would prompt on a terminal, or hang.
+
+    (string/ends-with? (sshremote/proxy-command [{:host \"bastion\" :port 2222}]) \"-p 2222 -W '[%h]:%p' -- bastion\")   ;=> true"
+  (string/join (map (jump-argv hops) os/shell-quote) " "))
+
 (defn ssh-options (parts &optional (batch true))
   "The ssh options every operation on `parts`' host runs with: the shared connection
 (`ControlMaster=auto`, `ControlPath=DIR/%C`, `ControlPersist`), a connect timeout, keep-alives
 that notice a dropped network, no terminal, no escape character — and `BatchMode=yes` unless
-`batch` is false (the one call a password opens, [[connect-with-password]]). The user's own
-`~/.ssh/config` still applies: a `ProxyJump`, an `IdentityFile`, a host alias.
+`batch` is false (the one call a password opens, [[connect-with-password]]). A path through
+jump hosts (`:hops`) reaches the host through them ([[proxy-command]]). The user's own
+`~/.ssh/config` still applies: an `IdentityFile`, a host alias, a `ProxyJump` of its own.
 
     (includes? (sshremote/ssh-options {:host \"h\"}) \"BatchMode=yes\")   ;=> true"
-  (let (dir (control-dir))
+  (let (dir (control-dir)
+        hops (or (:hops parts) []))
     (into []
       (append ["-o"
                 "ControlMaster=auto"
@@ -96,8 +149,8 @@ that notice a dropped network, no terminal, no escape character — and `BatchMo
                 "-e"
                 "none"]
         (if batch [] ["-o" "NumberOfPasswordPrompts=1"])
-        (if (:port parts) ["-p" (str (:port parts))] [])
-        (if (:user parts) ["-l" (:user parts)] [])))))
+        (if (empty? hops) [] ["-o" (str "ProxyCommand=" (proxy-command hops))])
+        (user-port-options parts)))))
 
 (defn ssh-argv (parts remote-command &optional (batch true))
   "The arguments ssh runs `remote-command` (one string, for the login shell) on `parts`' host
@@ -111,22 +164,37 @@ with: [[ssh-options]], `--` (so nothing after it is an option), the host, the co
 ;; standard input. Nothing in it any shell treats specially.
 
 (def- ssh-env
-  ;; ssh's own messages in English, read only to tell what failed
-  {"LC_ALL" "C" "LANG" "C"})
+  ;; ssh's own messages in English, read only to tell what failed; a jump's ProxyCommand run by
+  ;; the POSIX shell it was quoted for, whatever the user's login shell is
+  {"LC_ALL" "C" "LANG" "C" "SHELL" "/bin/sh"})
 
 ;; ---- the remote scripts -----------------------------------------------------------------
 
+(def- home-function
+  ;; `home PATH` sets `$r` to PATH with a leading `~` (the home), `~/…` or `~user[/…]` (another
+  ;; user's home, the name checked before the shell's own tilde expansion reads it) resolved;
+  ;; fails, saying why, for a user with no home there
+  (str "home() {\n"
+    "  case $1 in\n" "    \"~\") r=$HOME ;;\n" "    \"~/\"*) r=$HOME/${1#??} ;;\n"
+    "    \"~\"*) u=${1%%/*}; u=${u#?}; rest=${1#\"~$u\"}\n"
+    "      case $u in \"\"|-*|*[!A-Za-z0-9._-]*) echo \"$1: not a user's home\" >&2; return 1 ;; esac\n"
+    "      eval \"h=~$u\"\n"
+    "      case $h in \"~\"*) echo \"$u: no such user there\" >&2; return 1 ;; esac\n"
+    "      r=$h$rest ;;\n" "    *) r=$1 ;;\n" "  esac\n" "}\n"))
+
 (defn script-with (arguments body)
   "A script running `body` with `arguments` as its `$1`, `$2`, … — each quoted for POSIX sh
-(`os/shell-quote`), so the remote shell reads it back exactly — and the first resolved
-against the remote home when it starts with `~` (as `$p`).
+(`os/shell-quote`), so the remote shell reads it back exactly — and the first resolved as
+`$p` when it starts with `~`: the remote home (`~`, `~/notes`) or another user's
+(`~www/site`). `home ARG` resolves another argument the same way, into `$r`.
 
     (string/starts-with? (sshremote/script-with [\"/a b\" \"it's\"] \"\") \"set -- '/a b' 'it'\")   ;=> true"
   (str "set --"
     (string/join (map arguments (fn (argument) (str " " (os/shell-quote argument)))) "")
     "\n"
-    "p=$1\n"
-    "case $p in \"~\") p=$HOME ;; \"~/\"*) p=$HOME/${p#??} ;; esac\n"
+    home-function
+    "home \"$1\" || exit 4\n"
+    "p=$r\n"
     body))
 
 (def- mtime-line
@@ -217,6 +285,71 @@ count and SHA-256 sent with them.
     (includes? (sshremote/list-script \"~/src\") \"ls -1pa\")   ;=> true"
   (script-with [path] list-body))
 
+(def- entries-body
+  ;; the resolved directory, then one line per entry — `.` and `..` first — as GNU or BSD
+  ;; `stat` gives it, links followed where they lead somewhere: the mode in hex, the link count,
+  ;; owner, group, size, mtime (seconds), then `d` / `-` (a directory, followed) and `l` for a
+  ;; link, and the name. A name with a line break in it is left out (it cannot be one line).
+  (str "cd -- \"$p\" 2>/dev/null || { echo \"$p: cannot list\" >&2; exit 4; }\n"
+    "pwd\n"
+    "if stat -c %f . >/dev/null 2>&1; then flag=-c; form='%f %h %U %G %s %Y'; else flag=-f; form='%Xp %l %Su %Sg %z %m'; fi\n"
+    "nl='\n'\n" "entry() {\n" "  case $1 in *\"$nl\"*) return 0 ;; esac\n"
+    "  s=$(stat -L $flag \"$form\" -- \"$1\" 2>/dev/null || stat $flag \"$form\" -- \"$1\" 2>/dev/null) || return 0\n"
+    "  t=-; [ -d \"$1\" ] && t=d; [ -L \"$1\" ] && t=${t}l\n"
+    "  printf '%s %s %s\\n' \"$s\" \"$t\" \"$1\"\n" "}\n" "entry .; entry ..\n"
+    "for n in .* *; do\n" "  case $n in .|..) continue ;; esac\n"
+    "  if [ -e \"$n\" ] || [ -L \"$n\" ]; then entry \"$n\"; fi\n" "done\n"))
+
+(defn entries-script (path)
+  "The script that lists the remote directory `path` the way dired shows one, an `ls -l` row's
+facts per entry ([[parse-entries]] reads its answer).
+
+    (includes? (sshremote/entries-script \"/srv\") \"entry .; entry ..\")   ;=> true"
+  (script-with [path] entries-body))
+
+(def- mkdir-body
+  "if [ -e \"$p\" ] || [ -L \"$p\" ]; then echo \"$p exists\" >&2; exit 4; fi\nmkdir -- \"$p\" || exit 4\n")
+
+(defn mkdir-script (path)
+  "The script that makes the remote directory `path` (its parent must be there; one already
+there is refused).
+
+    (includes? (sshremote/mkdir-script \"/srv/new\") \"mkdir -- \")   ;=> true"
+  (script-with [path] mkdir-body))
+
+(def- delete-body
+  ;; the whole tree, for good — there is no trash on the other machine; `/`, `.` and `..` refused
+  (str "case $p in \"\"|/|.|..|*/.|*/..) echo \"$p: not deleted\" >&2; exit 4 ;; esac\n"
+    "if [ ! -e \"$p\" ] && [ ! -L \"$p\" ]; then echo \"$p: no such file\" >&2; exit 4; fi\n"
+    "rm -rf -- \"$p\" || exit 4\n"
+    "if [ -e \"$p\" ] || [ -L \"$p\" ]; then echo \"$p: could not be deleted\" >&2; exit 4; fi\n"))
+
+(defn delete-script (path)
+  "The script that deletes the remote file or directory `path` — a directory with everything in
+it — for good: the other machine has no trash this can reach.
+
+    (includes? (sshremote/delete-script \"/srv/old\") \"rm -rf -- \")   ;=> true"
+  (script-with [path] delete-body))
+
+(def- transfer-body
+  ;; `$2` the target (resolved as `$1` is), `$3` 1 when it must be a directory, `$4` `mv` or
+  ;; `cp`. Into a directory keeps the name; a target already there is never replaced. Answers
+  ;; where the entry went.
+  (str "home \"$2\" || exit 4\n"
+    "to=$r\n" "if [ -d \"$to\" ]; then to=${to%/}/$(basename -- \"$p\")\n"
+    "elif [ \"$3\" = 1 ]; then echo \"$2: not a directory\" >&2; exit 4; fi\n"
+    "if [ -e \"$to\" ] || [ -L \"$to\" ]; then echo \"$to exists — not replaced\" >&2; exit 4; fi\n"
+    "if [ \"$4\" = mv ]; then mv -- \"$p\" \"$to\" || exit 4; else cp -pR -- \"$p\" \"$to\" || exit 4; fi\n"
+    "printf '%s\\n' \"$to\"\n"))
+
+(defn transfer-script (op from to into?)
+  "The script that moves (`op` `:move`) or copies (`:copy`) the remote `from` to `to` on the same
+host — INTO `to` when it is a directory, keeping the name, which it must be when `into?` — and
+never over an entry already there. Answers where it went ([[transfer]]).
+
+    (includes? (sshremote/transfer-script :copy \"/a\" \"/b\" false) \"set -- /a /b 0 cp\")   ;=> true"
+  (script-with [from to (if into? "1" "0") (if (= op :move) "mv" "cp")] transfer-body))
+
 ;; ---- reading the answers ----------------------------------------------------------------
 
 (defn- lines-of (text)
@@ -234,21 +367,21 @@ or a failure when the answer does not read.
         kind (first lines)
         path (second lines))
     (cond
-      (or (nil? path) (= path "")) (failure (str "ssh: an answer that does not read: " stdout))
+      (or (nil? path) (= path "")) (failure (str "an answer that does not read: " stdout))
       (= kind "dir") {:kind :dir :path path}
       (= kind "new") {:kind :new :path path}
       (or (= kind "file") (= kind "large"))
         (let (mtime (string/->number (or (nth lines 2 nil) ""))
               size (string/->number (or (nth lines 3 nil) "")))
           (if (or (not (int? mtime)) (not (int? size)))
-            (failure (str "ssh: an answer that does not read: " kind))
+            (failure (str "an answer that does not read: " kind))
             (if (= kind "large")
               {:kind :large :path path :mtime mtime :size size}
               (let (bytes (encoding/base64-decode-bytes (string/join (drop lines 4) "")))
                 (if (failure? bytes)
-                  (failure "ssh: the file's bytes arrived damaged")
+                  (failure "the file bytes arrived damaged")
                   {:kind :file :path path :mtime mtime :size size :bytes bytes})))))
-      else (failure (str "ssh: an answer that does not read: " kind)))))
+      else (failure (str "an answer that does not read: " kind)))))
 
 (defn parse-write (stdout)
   "The new modification time (seconds) a write script answered, or nil when it said none.
@@ -266,6 +399,41 @@ directory's ending in `/`, `.` and `..` left out.
     {:dir (first lines)
      :names (vec (sort (seq/reject (rest lines) (fn (line) (or (= line "./") (= line "../"))))))}))
 
+(def- entry-pattern
+  "^([0-9A-Fa-f]+) ([0-9]+) (\\S+) (\\S+) ([0-9]+) ([0-9]+) ([-dl]+) (.*)$")
+
+(defn parse-entry (line)
+  "One entry of an [[entries-script]] answer as dired lists it, `{:name :stat}` — the stat in
+`file/stat`'s shape (`:dir?` followed, `:symlink?`, `:mode` the permission bits, `:nlink`,
+`:owner`, `:group`, `:size`, `:mtime` in ms, `:exec?`) — or nil when the line does not read.
+
+    (:stat (sshremote/parse-entry \"41ed 2 me staff 4096 10 d .\"))   ;=> {:dir? true :symlink? false :mode 493 :nlink 2 :owner \"me\" :group \"staff\" :size 4096 :mtime 10000 :exec? true}"
+  (when-let (found (regex/find entry-pattern line))
+    (let (field (fn (index) (:text (nth (:groups found) index)))
+          number (fn (index radix)
+                   (let (read (string/->number (field index) radix)) (if (int? read) read 0)))
+          mode (math/mod (number 0 16) 4096)
+          flags (field 6))
+      {:name (field 7)
+       :stat {:dir? (includes? flags "d")
+              :symlink? (includes? flags "l")
+              :mode mode
+              :nlink (number 1 10)
+              :owner (field 2)
+              :group (field 3)
+              :size (number 4 10)
+              :mtime (* 1000 (number 5 10))
+              :exec? (>= (math/mod (math/quot mode 64) 2) 1)}})))
+
+(defn parse-entries (stdout)
+  "What an [[entries-script]] answered: `{:dir resolved :entries [{:name :stat} …]}`, `.` and
+`..` among them, a line that does not read left out.
+
+    (:dir (sshremote/parse-entries \"/srv\\n41ed 2 me me 4096 10 d .\\n\"))   ;=> \"/srv\""
+  (let (lines (seq/reject (lines-of stdout) (fn (line) (= line ""))))
+    {:dir (first lines)
+     :entries (vec (seq/reject (map (rest lines) parse-entry) nil?))}))
+
 ;; ---- what failed --------------------------------------------------------------------------
 
 (defn- methods-of (stderr)
@@ -278,33 +446,33 @@ directory's ending in `/`, `.` and `..` left out.
 exit is read by the caller), else `{:error kind :reason text}` — `:host-key` (the host's key is
 not known, or changed: never accepted here), `:auth` (no key or agent worked; `:password?`
 when the host would take a password), `:connection` (the host could not be reached, or the
-connection dropped), `:timeout`. ssh's own failures exit 255.
+connection dropped), `:timeout`. ssh's own failures exit 255. A reason names the host, not the
+method: the caller says `ssh: ` before it.
 
     (:error (sshremote/classify {:exit 255 :stderr \"Host key verification failed.\\n\"} {:host \"h\"}))   ;=> :host-key"
-  (let (stderr (or (:stderr result) "")
+  (let (stderr (string/replace (or (:stderr result) "") "\r" "")
         said (string/trim stderr)
-        who (sshpath/host-label parts))
+        who (sshpath/host-label parts)
+        hops? (not (empty? (or (:hops parts) []))))
     (cond
-      (:timed-out result) {:error :timeout :reason (str "ssh: " who " did not answer in time")}
+      (:timed-out result) {:error :timeout :reason (str who " did not answer in time")}
       (not (= 255 (:exit result))) nil
       (includes? stderr "Host key verification failed")
         {:error :host-key
-         :reason (str "ssh: "
-                   who "'s host key is not known, or has CHANGED — check it with `ssh " who
-                   "` in a terminal; bedit never accepts a host key for you")}
+         :reason (str (sshpath/route-label parts)
+                   (if hops?
+                     ": a host key on the way is not known, or has CHANGED — check each host with ssh"
+                     (str "'s host key is not known, or has CHANGED — check it with `ssh " who "`"))
+                   " in a terminal; bedit never accepts a host key for you")}
       (includes? stderr "Permission denied")
         (let (methods (methods-of stderr))
           {:error :auth
            :password? (or (includes? methods "password") (includes? methods "keyboard-interactive"))
-           :reason (str "ssh: "
-                     who
-                     " refused every key and the agent ("
-                     (string/join methods ",")
-                     ")")})
+           :reason (str who " refused every key and the agent (" (string/join methods ",") ")")})
       else
         {:error :connection
-         :reason (str "ssh: the connection to "
-                   who
+         :reason (str "the connection to "
+                   (sshpath/route-label parts)
                    " failed or dropped"
                    (if (= said "") "" (str ": " said)))})))
 
@@ -360,6 +528,39 @@ failed — a connection that dropped mid-write leaves the file as it was. Blocks
       (:failed result) {:failed (:failed result)}
       (= 0 (:exit result)) (parse-list (:stdout result))
       else (script-failure result))))
+
+(defn list-entries (parts path)
+  "List the remote directory `path` on `parts`' host as dired shows it: [[parse-entries]]'s
+answer, a failure carrying the remote reason, or `{:failed …}`. Blocks."
+  (let (result (run parts (entries-script path)))
+    (cond
+      (:failed result) {:failed (:failed result)}
+      (= 0 (:exit result)) (parse-entries (:stdout result))
+      else (script-failure result))))
+
+(defn- run-op (parts script)
+  ;; a script run for its effect: its standard output, else a failure saying why (ssh's own
+  ;; failure classified)
+  (let (result (run parts script))
+    (cond
+      (:failed result) (failure (str "ssh: " (:reason (:failed result))))
+      (= 0 (:exit result)) (:stdout result)
+      else (script-failure result))))
+
+(defn make-directory (parts path)
+  "Make the remote directory `path` on `parts`' host: true, or a failure saying why. Blocks."
+  (let (done (run-op parts (mkdir-script path))) (if (failure? done) done true)))
+
+(defn delete-path (parts path)
+  "Delete the remote `path` on `parts`' host for good, a directory with everything in it: true,
+or a failure saying why. Blocks."
+  (let (done (run-op parts (delete-script path))) (if (failure? done) done true)))
+
+(defn transfer (parts op from to into?)
+  "Move (`op` `:move`) or copy (`:copy`) the remote `from` to `to` on `parts`' host
+([[transfer-script]]): the remote path it went to, or a failure saying why. Blocks."
+  (let (done (run-op parts (transfer-script op from to into?)))
+    (if (failure? done) done (string/trim done))))
 
 ;; ---- a password, once ---------------------------------------------------------------------
 

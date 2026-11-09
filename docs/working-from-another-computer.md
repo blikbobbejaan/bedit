@@ -151,7 +151,10 @@ The serve/attach modes need bedit on both ends. To edit a file on a server that 
 ```
 C-x C-f /ssh:web1:/etc/nginx/nginx.conf
 C-x C-f /ssh:deploy@web1#2222:~/app/.env      # a user, a port; ~ is the REMOTE home
+C-x C-f /ssh:web1:~www/site/index.html        # another user's home there
 C-x C-f /ssh:[fe80::1]:/etc/hosts             # an IPv6 host in brackets
+C-x C-f /ssh:bastion|ssh:db1:/etc/my.cnf      # through a jump host (TRAMP's multi-hop)
+C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
 ```
 
 - **What it runs.** The system `ssh`, with your `~/.ssh/config` (host aliases, `ProxyJump`,
@@ -160,12 +163,26 @@ C-x C-f /ssh:[fe80::1]:/etc/hosts             # an IPv6 host in brackets
   five minutes past the last use). Nothing is installed on the host: each operation is a short
   `/bin/sh` script sent on ssh's standard input, so the account's login shell (bash, zsh,
   fish) never parses a path, and a file name with spaces, quotes or `$` is safe.
+- **Jump hosts.** `/ssh:bastion|ssh:db1:PATH` reaches db1 through bastion (any number of
+  hops, each `[user@]host[#port]`): bedit hands ssh a `ProxyCommand` that runs `ssh -W` to
+  each hop in turn, in batch mode like everything else — so a jump host is reached with a key
+  or your agent, never a password. (ssh's own `-J` passes none of bedit's options on to the
+  jump, so a hop wanting a password would prompt on a terminal.) A `ProxyJump` in your
+  `~/.ssh/config` keeps working as it always does.
 - **Opening.** A `Loading…` buffer appears at once and the file replaces it when ssh answers;
   C-g stops it. The bytes come through `base64`, so the file's coding is detected as any
   file's is: a binary opens as the read-only hex view, and a file past
-  `:large-file-warning-threshold` is asked about before it is sent. A directory opens the
-  find-file prompt in it, and Tab completes its entries (listed over ssh, kept 10 s). There is
-  no remote dired yet.
+  `:large-file-warning-threshold` is asked about before it is sent. In the find-file prompt,
+  Tab completes a remote directory's entries (listed over ssh, kept 10 s).
+- **Directories.** A remote directory opens in dired, listed over ssh with the same `ls -l`
+  columns and sorting (`s`) as a local one. RET visits a file or enters a directory, `^` goes
+  up, `g` lists it again; `+` makes a directory, `R` moves and `C` copies (marked entries or
+  the one at point, a directory with everything in it) within that host, and `D` / `x` delete
+  — for good, after a question that says so: there is no trash on the other machine. A move
+  or copy never replaces an entry already there (it is reported, not asked about: the far
+  disk cannot be asked from the editor's loop), and it stays on the one host. Each operation
+  runs off the loop; a buffer visiting a moved file follows it, one visiting a deleted file
+  is kept and marked modified.
 - **Saving.** C-x C-s writes the file back atomically — staged in the file's directory with
   the file's mode, checked by size and SHA-256, then renamed over it — and the buffer stays
   modified until the write has landed. A connection that drops is said in the echo area and
@@ -175,14 +192,21 @@ C-x C-f /ssh:[fe80::1]:/etc/hosts             # an IPv6 host in brackets
 - **Passwords and host keys.** ssh runs in batch mode, so it never waits on a prompt. A host
   that refuses every key but takes a password gets one asked for, masked, in the minibuffer;
   it opens the shared connection (through an `SSH_ASKPASS` helper reading it from ssh's own
-  input — never the environment or a file) and is kept nowhere. A host key that is not yet
-  known, or has CHANGED, is never accepted: bedit says so, and you check it with `ssh host` in
-  a terminal.
+  input — never the environment or a file; OpenSSH 8.4 or newer) and is kept nowhere. A host
+  key that is not yet known, or has CHANGED, is never accepted: bedit says so, and you check
+  it with `ssh host` in a terminal.
 - **What stays local.** The auto-save sidecar is private, under
   `~/.config/bedit/state/auto-save/`, named for the TRAMP path (M-x recover-session lists it).
   Auto-revert, the diff-hl gutter, language servers, the formatter, `.editorconfig`,
   `.bedit-locals.blsp`, `M-x compile`, `M-!` and the project commands leave a remote buffer
   alone: they would run here, on a path that exists only there.
+- **Proven against a real sshd.** CI's `ssh-real` job (tools/ci/ssh-real.sh) runs OpenSSH's
+  server on localhost and drives all of the above through the real `ssh`: key and password
+  logins, a jump host, an unknown host key, dired's operations, and sshd killed mid-session.
+- **Not there yet.** A password for a jump host; a file moved or copied from one host to
+  another, or between a host and this machine; replacing an existing entry from dired (asked
+  about locally, refused remotely); C-x C-j from a remote file lands on the listing's first
+  entry rather than the file; and hops other than `ssh:` (TRAMP's `sudo:` as the last hop).
 
 ## Collaboration status (what's built vs runnable)
 

@@ -1,15 +1,21 @@
 (defmodule sshpath
   "The TRAMP `/ssh:` path — a file on another machine, reached through `ssh` (`sshedit`):
 `/ssh:host:/etc/nginx.conf`, `/ssh:user@host:path`, `/ssh:user@host#2222:path`, an IPv6
-host in brackets (`/ssh:[::1]:/etc/hosts`). Read and spelled in ONE place, so the prompt
-(`filename`), the sidecars (`sidecar`), the completion (`mincomplete`) and the handler agree
-on what a path names. Pure: no process, no disk.
+host in brackets (`/ssh:[::1]:/etc/hosts`), and a MULTI-HOP path through jump hosts in
+TRAMP's syntax (`/ssh:bastion|ssh:me@web1:/etc/hosts`: web1 reached through bastion, as
+ssh's ProxyJump does). Read and spelled in ONE place, so the prompt (`filename`), the sidecars
+(`sidecar`), the completion (`mincomplete`), dired and the handler agree on what a path names.
+Pure: no process, no disk.
 
-The path after the host is the REMOTE machine's: `~` is the remote home, a relative path is
-under it (`/ssh:host:notes` is `/ssh:host:~/notes`), and an empty one is the home itself.
-The remote shell resolves `~` when the file is read ([[canonical]] keeps it as typed).")
+The path after the host is the REMOTE machine's: `~` is the remote home, `~other` another
+user's, a relative path is under the home (`/ssh:host:notes` is `/ssh:host:~/notes`), and an
+empty one is the home itself. The remote shell resolves `~` when the file is read
+([[canonical]] keeps it as typed).")
 
 (def *prefix* "/ssh:")
+
+(def- hop-separator "|ssh:")
+;; what ends a jump host in a multi-hop path and starts the next one (TRAMP's `|`)
 
 (defn remote? (path)
   "Whether `path` names a file on another machine through ssh: a string that starts with
@@ -22,67 +28,96 @@ compile, the project walk).
   (and (string? path) (string/starts-with? path *prefix*)))
 
 (defn- bad-name? (name)
-  ;; a user or host that could be read as an option by ssh, or that holds a blank
-  (or (not (string? name)) (string/starts-with? name "-") (not (nil? (regex/find "\\s" name)))))
+  ;; a user or host ssh would take for an option, or that holds a blank, a `%` (ssh's own
+  ;; escapes, in a jump's command) or a `|` (the hop separator)
+  (or (not (string? name))
+    (string/starts-with? name "-")
+    (not (nil? (regex/find "[\\s%|]" name)))))
 
-(defn- split-user (rest)
-  ;; `[user host-and-path]`: the user when an `@` comes before the first `:`
-  (let (at (index-of rest "@")
-        colon (index-of rest ":"))
-    (if (and (> at 0) (or (< colon 0) (< at colon)))
-      [(string/substring rest 0 at) (string/substring rest (inc at) (string/length rest))]
-      [nil rest])))
+(defn- first-of (text needles)
+  ;; the lowest index in `text` of any of `needles`, or -1
+  (let (found (seq/filter (map needles (fn (needle) (index-of text needle)))
+                (fn (index) (>= index 0))))
+    (if (empty? found) -1 (apply math/min found))))
+
+(defn- split-user (text)
+  ;; `[user rest]`: the user when an `@` comes before the host's end (`:`, `|`, `[`)
+  (let (at (index-of text "@")
+        end (first-of text [":" "|" "["]))
+    (if (and (> at 0) (or (< end 0) (< at end)))
+      [(string/substring text 0 at) (string/substring text (inc at) (string/length text))]
+      [nil text])))
 
 (defn- split-host (text)
-  ;; `[host after]` — a bracketed IPv6 host up to its `]`, else up to the first `:` or `#`;
-  ;; nil when a bracket never closes
+  ;; `[host after]` — a bracketed IPv6 host up to its `]`, else up to the first `:`, `#` or
+  ;; `|`; nil when a bracket never closes or nothing ends the host
   (if (string/starts-with? text "[")
     (let (close (index-of text "]"))
       (when (> close 0)
         [(string/substring text 1 close) (string/substring text (inc close) (string/length text))]))
-    (let (end (first (sort (seq/filter [(index-of text ":") (index-of text "#")]
-                             (fn (index) (>= index 0))))))
-      (when (int? end)
+    (let (end (first-of text [":" "#" "|"]))
+      (when (>= end 0)
         [(string/substring text 0 end) (string/substring text end (string/length text))]))))
 
 (defn- split-port (after)
-  ;; `[port path]` from what follows the host: `#2222:path` or `:path`; nil when malformed
-  (cond
-    (string/starts-with? after ":") [nil (string/substring after 1 (string/length after))]
-    (string/starts-with? after "#")
-      (let (colon (index-of after ":")
-            digits (when (> colon 1) (string/substring after 1 colon))
-            port (when (and digits (regex/matches? "[0-9]+" digits)) (string/->number digits)))
-        (when (and (int? port) (> port 0) (< port 65536))
-          [port (string/substring after (inc colon) (string/length after))]))
-    else nil))
+  ;; `[port rest]` from what follows the host: `#2222` up to the next `:` or `|`, or no port;
+  ;; nil when malformed. `rest` starts with the `:` or `|` that ends the host.
+  (if (string/starts-with? after "#")
+    (let (end (first-of after [":" "|"])
+          digits (when (> end 1) (string/substring after 1 end))
+          port (when (and digits (regex/matches? "[0-9]+" digits)) (string/->number digits)))
+      (when (and (int? port) (> port 0) (< port 65536))
+        [port (string/substring after end (string/length after))]))
+    [nil after]))
+
+(defn- read-host (text)
+  ;; `[{:user :host :port} rest]` for the `[user@]host[#port]` at the start of `text`, `rest`
+  ;; starting with the `:` or `|` after it; nil when it does not read or names a bad one
+  (let ([user after-user] (split-user text)
+        host-split (split-host after-user)
+        host (when host-split (first host-split))
+        port-split (when host-split (split-port (second host-split))))
+    (when (and port-split
+            (string? host)
+            (not (string/blank? host))
+            (not (bad-name? host))
+            (or (nil? user) (and (not (string/blank? user)) (not (bad-name? user)))))
+      [{:user user :host host :port (first port-split)} (second port-split)])))
 
 (defn parse (spec)
   "The parts of the TRAMP ssh path `spec` as `{:user :host :port :path}` — `:user` and `:port`
-nil when it names none — or nil when `spec` is not one: no `/ssh:` prefix, no host, no `:`
-after it, a port that is not a number, or a user or host that starts with `-` or holds a
-blank (which ssh would take for an option).
+nil when it names none, and `:hops` (each `{:user :host :port}`, the first connected to first)
+when it goes through jump hosts — or nil when `spec` is not one: no `/ssh:` prefix, no host,
+no `:` after it, a port that is not a number, a hop that is not `ssh:`, or a user or host that
+starts with `-` or holds a blank, `%` or `|` (which ssh would take for an option or an escape).
 
     (sshpath/parse \"/ssh:web1:/etc/hosts\")   ;=> {:user nil :host \"web1\" :port nil :path \"/etc/hosts\"}
     (sshpath/parse \"/ssh:me@web1#2222:notes\")   ;=> {:user \"me\" :host \"web1\" :port 2222 :path \"notes\"}
     (:host (sshpath/parse \"/ssh:[::1]:/x\"))   ;=> \"::1\"
+    (:hops (sshpath/parse \"/ssh:bastion|ssh:web1:/x\"))   ;=> [{:user nil :host \"bastion\" :port nil}]
     (sshpath/parse \"/ssh:-oProxyCommand=x:/etc\")   ;=> nil
     (sshpath/parse \"/etc/hosts\")   ;=> nil"
   (when (remote? spec)
-    (let ([user rest] (split-user (string/substring spec 5 (string/length spec)))
-          host-split (split-host rest)
-          host (when host-split (first host-split))
-          port-split (when host-split (split-port (second host-split))))
-      (when (and port-split
-              (string? host)
-              (not (string/blank? host))
-              (not (bad-name? host))
-              (or (nil? user) (and (not (string/blank? user)) (not (bad-name? user)))))
-        {:user user :host host :port (first port-split) :path (second port-split)}))))
+    (letrec (walk (fn (text hops)
+                    (when-let (read (read-host text))
+                      (let ([host rest] read)
+                        (cond
+                          (string/starts-with? rest ":")
+                            (let (parts (assoc host
+                                          :path (string/substring rest 1 (string/length rest))))
+                              (if (empty? hops) parts (assoc parts :hops hops)))
+                          (string/starts-with? rest hop-separator)
+                            (walk (string/substring rest
+                                    (string/length hop-separator)
+                                    (string/length rest))
+                              (conj hops host))
+                          else nil)))))
+      (walk (string/substring spec (string/length *prefix*) (string/length spec)) []))))
 (sig parse (any -> (or nil map)))
 
 (defn host-label (parts)
-  "Who `parts` connects to, as a person reads it: `user@host#port`, the parts it names.
+  "Who `parts` connects to at the end of its route, as a person reads it: `user@host#port`, the
+parts it names (the whole route is [[route-label]]'s).
 
     (sshpath/host-label {:user \"me\" :host \"web1\" :port 2222})   ;=> \"me@web1#2222\"
     (sshpath/host-label {:host \"web1\"})   ;=> \"web1\""
@@ -90,27 +125,50 @@ blank (which ssh would take for an option).
     (if (includes? (:host parts) ":") (str "[" (:host parts) "]") (:host parts))
     (if (:port parts) (str "#" (:port parts)) "")))
 
+(defn route-label (parts)
+  "The whole route to `parts`' host as a TRAMP path spells it: each jump host, then the host,
+`|ssh:` between them.
+
+    (sshpath/route-label {:host \"web1\" :hops [{:host \"bastion\"}]})   ;=> \"bastion|ssh:web1\"
+    (sshpath/route-label {:host \"web1\"})   ;=> \"web1\""
+  (str (string/join (map (or (:hops parts) []) (fn (hop) (str (host-label hop) hop-separator))) "")
+    (host-label parts)))
+
+(defn prefix (parts)
+  "Everything a TRAMP path for `parts` spells before its remote path: `/ssh:`, the route, `:`.
+
+    (sshpath/prefix {:host \"web1\" :hops [{:host \"bastion\"}]})   ;=> \"/ssh:bastion|ssh:web1:\""
+  (str *prefix* (route-label parts) ":"))
+
 (defn spec (parts)
   "The TRAMP path `parts` spell — [[parse]] read back.
 
     (sshpath/spec {:host \"web1\" :path \"/etc/hosts\"})   ;=> \"/ssh:web1:/etc/hosts\"
     (sshpath/spec {:user \"me\" :host \"::1\" :port 22 :path \"~\"})   ;=> \"/ssh:me@[::1]#22:~\""
-  (str *prefix* (host-label parts) ":" (:path parts)))
+  (str (prefix parts) (:path parts)))
+
+(defn- home-form? (path)
+  ;; `~`, `~/…`, `~user` or `~user/…`: a path from a home the remote shell resolves
+  (string/starts-with? path "~"))
 
 (defn remote-path (path)
   "The remote path `path` (what follows the host) in its one spelling: `.` and `..`
 collapsed, a trailing `/` dropped, a relative path under the home (`~/…`), an empty one the
-home (`~`).
+home (`~`). Another user's home (`~other/…`) stays as typed, and so does a path from a home
+with a `..` in it: where a home is, and so what is above it, only the host knows.
 
     (sshpath/remote-path \"/etc/../srv/a/\")   ;=> \"/srv/a\"
     (sshpath/remote-path \"notes\")   ;=> \"~/notes\"
+    (sshpath/remote-path \"~other/x/\")   ;=> \"~other/x\"
+    (sshpath/remote-path \"~/../srv\")   ;=> \"~/../srv\"
     (sshpath/remote-path \"\")   ;=> \"~\"
     (sshpath/remote-path \"/\")   ;=> \"/\""
   (let (rooted (cond
                  (or (= path "") (= path "~") (= path "~/")) "~"
-                 (or (string/starts-with? path "/") (string/starts-with? path "~/")) path
+                 (or (string/starts-with? path "/") (home-form? path)) path
                  else (str "~/" path))
-        normal (path/normalize rooted))
+        climbs? (and (home-form? rooted) (includes? (string/split rooted "/") ".."))
+        normal (if climbs? rooted (path/normalize rooted)))
     (cond
       (= normal ".") "~"
       (and (> (string/length normal) 1) (string/ends-with? normal "/"))
@@ -123,13 +181,14 @@ not one — what a buffer visiting it is keyed by, so `/ssh:h:/etc/./hosts` and
 `/ssh:h:/etc/hosts` are one buffer.
 
     (sshpath/canonical \"/ssh:h:/etc/./hosts\")   ;=> \"/ssh:h:/etc/hosts\"
-    (sshpath/canonical \"/ssh:h:\")   ;=> \"/ssh:h:~\""
+    (sshpath/canonical \"/ssh:h:\")   ;=> \"/ssh:h:~\"
+    (sshpath/canonical \"/ssh:j|ssh:h:x\")   ;=> \"/ssh:j|ssh:h:~/x\""
   (when-let (parts (parse text))
     (spec (assoc parts :path (remote-path (:path parts))))))
 
 (defn with-path (spec-text path)
-  "The ssh path `spec-text` with its remote path replaced by `path` — the same host, user and
-port.
+  "The ssh path `spec-text` with its remote path replaced by `path` — the same route, host,
+user and port.
 
     (sshpath/with-path \"/ssh:me@h:/etc/hosts\" \"/srv\")   ;=> \"/ssh:me@h:/srv\""
   (when-let (parts (parse spec-text)) (spec (assoc parts :path path))))
@@ -140,29 +199,57 @@ port.
     (sshpath/path-of \"/ssh:h:/etc/hosts\")   ;=> \"/etc/hosts\""
   (:path (parse spec-text)))
 
+(defn- parent-path (path)
+  ;; the directory holding remote `path` (in [[remote-path]]'s spelling); a home and the root
+  ;; are their own parents, since the remote shell has not resolved the home yet
+  (if (or (= path "/") (and (home-form? path) (not (includes? path "/"))))
+    path
+    (let (slash (string/last-index-of path "/"))
+      (cond
+        (= slash 0) "/"
+        (> slash 0) (string/substring path 0 slash)
+        else "~"))))
+
 (defn dirname (spec-text)
   "The directory holding the file the ssh path `spec-text` names, as an ssh path.
 
     (sshpath/dirname \"/ssh:h:/etc/hosts\")   ;=> \"/ssh:h:/etc\"
     (sshpath/dirname \"/ssh:h:~/notes\")   ;=> \"/ssh:h:~\"
+    (sshpath/dirname \"/ssh:h:~other/notes\")   ;=> \"/ssh:h:~other\"
     (sshpath/dirname \"/ssh:h:/etc\")   ;=> \"/ssh:h:/\""
   (when-let (parts (parse spec-text))
-    (let (path (remote-path (:path parts))
-          parent (cond
-                   (or (= path "/") (= path "~")) path
-                   else
-                     (let (slash (string/last-index-of path "/"))
-                       (cond
-                         (= slash 0) "/"
-                         (> slash 0) (string/substring path 0 slash)
-                         else "~"))))
-      (spec (assoc parts :path parent)))))
+    (spec (assoc parts :path (parent-path (remote-path (:path parts)))))))
+
+(defn join (dir-spec name)
+  "The ssh path of `name` read in the remote directory `dir-spec`, in its one spelling
+([[canonical]]): an absolute or `~` name on the same host, a relative one under the directory.
+A whole `/ssh:` path is itself.
+
+    (sshpath/join \"/ssh:h:/etc\" \"hosts\")   ;=> \"/ssh:h:/etc/hosts\"
+    (sshpath/join \"/ssh:h:/etc\" \"../srv\")   ;=> \"/ssh:h:/srv\"
+    (sshpath/join \"/ssh:h:/etc\" \"/srv/a\")   ;=> \"/ssh:h:/srv/a\""
+  (cond
+    (remote? name) (canonical name)
+    (or (string/starts-with? name "/") (home-form? name)) (canonical (with-path dir-spec name))
+    else
+      (let (dir (or (path-of dir-spec) "~"))
+        (canonical (with-path dir-spec (str dir (if (string/ends-with? dir "/") "" "/") name))))))
 
 (defn connection (parts)
-  "What two paths share when one ssh connection serves both: `[user host port]`.
+  "What two paths share when one ssh connection serves both: `[hops user host port]`.
 
-    (sshpath/connection (sshpath/parse \"/ssh:me@h:/a\"))   ;=> [\"me\" \"h\" nil]"
-  [(:user parts) (:host parts) (:port parts)])
+    (sshpath/connection (sshpath/parse \"/ssh:me@h:/a\"))   ;=> [[] \"me\" \"h\" nil]"
+  [(or (:hops parts) []) (:user parts) (:host parts) (:port parts)])
+
+(defn same-connection? (a b)
+  "Whether the ssh paths `a` and `b` are reached through one connection — one route to one host
+as one user.
+
+    (sshpath/same-connection? \"/ssh:h:/a\" \"/ssh:h:~/b\")   ;=> true
+    (sshpath/same-connection? \"/ssh:h:/a\" \"/ssh:g:/a\")   ;=> false"
+  (let (parts-a (parse a)
+        parts-b (parse b))
+    (and (not (nil? parts-a)) (not (nil? parts-b)) (= (connection parts-a) (connection parts-b)))))
 
 (defn remote-start (text)
   "Where the ssh path in typed `text` starts — 0 when `text` is one, the index of a `/ssh:`

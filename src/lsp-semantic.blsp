@@ -288,6 +288,13 @@ between them (`buffer-splices-since`) — or nil when the buffer's log cannot sa
   (lsp-request-shape (_ result) [:lsp-semantic-tokens (shape-tokens result)])
   (lsp-request-fold (pending m payload) (ed-semantic-fold pending m payload)))
 
+(def *refresh-support*
+  ;; whether `initialize` tells a server this client takes `workspace/semanticTokens/refresh`.
+  ;; A cost to know of: rust-analyzer, told yes, drops the result it keeps for deltas on every
+  ;; change (it clears its cache as it sends the refresh), so an answer after an edit is a whole
+  ;; set, never a delta. tools/ci/lsp-rust.blsp turns it off to see a delta apply.
+  true)
+
 (def client-capabilities
   ;; what `initialize` tells a server this client takes (`lsp/lsp-init-params`)
   {:requests {:full {:delta true} :range false}
@@ -322,6 +329,9 @@ would not happen."
     (and (semantic-on? m)
       (string? file)
       (not (= (buffer-rope buffer) (map/get-in m [:lsp-semantic file :requested])))
+      ;; one ask at a time: two in flight are two deltas against one answer, and the server,
+      ;; which keeps only its newest, answers the second whole
+      (not (ed-lsp-in-flight? m (map/get-in m [:lsp-semantic file :asked])))
       (not (nil? (semantic-entry m file))))))
 
 (defn ed-semantic-request (m)
@@ -329,7 +339,12 @@ would not happen."
 when the server offers deltas and that answer came from it, else the whole set. Quiet: the
 reader did not ask. The text the answer is about is the buffer as it is now (the ask pushes
 it first, `lsp-servers/ed-lsp-ask-server`), kept on the lookup as `:seen`."
-  (let (buffer (ed-current-buf m)
+  (ed-semantic-request-at m (ed-current-index m)))
+
+(defn ed-semantic-request-at (m index)
+  "[[ed-semantic-request]] for pool buffer `index`, whichever pane shows it — what a server's
+refresh asks for each buffer of its on screen. Nothing for a buffer no live server colours."
+  (let (buffer (ed-buf-at m index)
         file (buffer-file buffer)
         entry (semantic-entry m file)
         provider (map/get-in entry [:caps :semanticTokensProvider])
@@ -340,16 +355,25 @@ it first, `lsp-servers/ed-lsp-ask-server`), kept on the lookup as `:seen`."
                  (vector? (:data store)))
         request (assoc {:uri (lsp-protocol/lsp-path->uri file) :lang (lsp/lsp-language-id file)}
                   :previous-result-id (when delta? (:result-id store)))
-        marked (map/assoc-in m [:lsp-semantic file :requested] (buffer-rope buffer)))
-    (ed-lsp-ask-server marked
-      (:conn entry)
-      (if delta? (lsp-semantic-tokens-delta) (lsp-semantic-tokens))
-      request
-      {:path file
-       :seen buffer
-       :legend (:legend provider)
-       :previous-id (when delta? (:result-id store))}
-      :quiet)))
+        token (ref)
+        ;; the ask this answer must be: an older one landing after it (asked while the server
+        ;; was still loading, say) is dropped rather than painted over the newer
+        marked (map/assoc-in (map/assoc-in m [:lsp-semantic file :requested] (buffer-rope buffer))
+                 [:lsp-semantic file :asked]
+                 token))
+    (if (or (nil? entry) (not (string? file)))
+      m
+      (ed-lsp-ask-server-at marked
+        index
+        (:conn entry)
+        (if delta? (lsp-semantic-tokens-delta) (lsp-semantic-tokens))
+        request
+        {:path file
+         :seen buffer
+         :legend (:legend provider)
+         :previous-id (when delta? (:result-id store))
+         :token token}
+        :quiet))))
 
 (defn ed-launch-semantic (m)
   "The idle beat's semantic tokens: ask when [[ed-semantic-due?]]. Never in a headless run,
@@ -366,13 +390,16 @@ becomes the stamped buffer, so the next carry starts from it."
   "A semantic-tokens answer landing: the array rebuilt (a delta applied to the last one, when
 it is the answer the delta was asked against), decoded against the legend the request carried,
 turned into spans of the text it was about (`:seen`) and carried to the text now. Dropped for a
-closed file or with the feature off; a delta against an answer no longer kept forgets the
-result id, so the next ask is a whole one."
+closed file, with the feature off, or for an ask a newer one has replaced; a delta against an
+answer no longer kept forgets the result id, so the next ask is a whole one."
   (let (path (:path pending)
         store (or (map/get-in m [:lsp-semantic path]) {})
         index (when path (ed-buffer-index-by-file m path)))
     (cond
       (or (nil? payload) (nil? index) (not (semantic-on? m))) m
+      (not (= (:token pending) (:asked store))) m
+      ;; the server said ask again (`lsp-protocol/lsp-retry?`): due on the next beat
+      (= payload :lsp-retry) (map/assoc-in m [:lsp-semantic path :requested] nil)
       else
         (let (data (cond
                      (not (nil? (:edits payload)))
@@ -391,6 +418,9 @@ result id, so the next ask is a whole one."
                 (assoc store
                   :spans (or carried [])
                   :data data
+                  ;; whether this array was rebuilt from a delta — what *lsp-log* and a
+                  ;; driver read to tell the two answers apart
+                  :delta? (not (nil? (:edits payload)))
                   :result-id (:result-id payload)
                   :conn (:conn pending)
                   ;; spans the log could not carry are wrong: asked again on the next beat
@@ -442,8 +472,40 @@ On by default where the server offers it; init.blsp's `:lsp-semantic-tokens fals
     (message (assoc (ed-semantic-clear m) :lsp-semantic-tokens false) "lsp semantic tokens off")
     (message (assoc m :lsp-semantic-tokens true :lsp-semantic {}) "lsp semantic tokens on")))
 
+(defn ed-ev-semantic-refresh (m input text-rows columns rows)
+  "A server asking for its semantic tokens again (`[:lsp-refresh-semantic-tokens connection]`,
+`workspace/semanticTokens/refresh` — the project finished loading, a dependency changed):
+every file it colours is due again, and each buffer of its on screen is asked now — as a delta
+against the last answer when there is one, as VS Code asks: the server keeps that answer and
+sends what changed since (rust-analyzer refreshes after most edits, so forgetting it would make
+every answer a whole one)."
+  (let (connection (nth input 1 nil)
+        stores (or (:lsp-semantic m) {})
+        forgotten (assoc m
+                    :lsp-semantic
+                      (fold (%map-pairs stores)
+                        stores
+                        (fn (acc [path store])
+                          (if (= (:conn store) connection)
+                            (assoc acc path (dissoc store :requested))
+                            acc)))))
+    (if (not (semantic-on? forgotten))
+      forgotten
+      (fold (ed-lsp-shown forgotten connection)
+        forgotten
+        (fn (acc [index _top])
+          (let (entry (semantic-entry acc (buffer-file (ed-buf-at acc index))))
+            (cond
+              (not (= (:conn entry) connection)) acc
+              ;; an ask already out: this file is due again once it lands (`:requested` forgotten)
+              (ed-lsp-in-flight? acc
+                (map/get-in acc [:lsp-semantic (buffer-file (ed-buf-at acc index)) :asked]))
+                acc
+              else (ed-semantic-request-at acc index))))))))
+
 ;; ---- registration -------------------------------------------------------------------
 (register-event-handler :lsp-semantic-tokens 'lsp-commands/ed-ev-lsp-reply)
+(register-event-handler :lsp-refresh-semantic-tokens 'lsp-semantic/ed-ev-semantic-refresh)
 ;; after the text push (30) and the signature (50)
 (register-idle-job :lsp-semantic-tokens
   {:order 55

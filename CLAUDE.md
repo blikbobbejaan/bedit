@@ -130,11 +130,21 @@ src/model.blsp              the ui-run model: buffer pool, panes, *Messages*,
                             `:save-all` for a save that lands after the questions), who SHOWS a
                             directory, a file that is not text and a new frame
                             (`register-presenter`: dired, hexl, frames), what an event marks
-                            before the timers (`register-input-step`: the web mirror) and what
-                            runs once its edits reach the buffer processes
-                            (`register-tail-step`: collab), a paste a program takes whole
+                            before the timers (`register-input-step`: the web mirror), what
+                            runs at an event's tail (`register-tail-step`: hosted's propagate,
+                            then collab; `:recover` rows on a thrown command's recovery too),
+                            once a turn COMMITS (`register-commit-step`: syntaxtree's handle
+                            release), an input that changes nothing (`register-inert-input`:
+                            hosted's own echo), who a client is (`register-identity-step`:
+                            collab's name), faces a producer stamped on its text
+                            (`register-text-faces`: ansicolor), a paste a program takes whole
                             (`register-paste-taker`) and a key kept out of a macro
-                            (`register-macro-guard`: both passwd). The core names no feature: a
+                            (`register-macro-guard`: both passwd), what a click on an INLAY
+                            row does, by the row's owner (`register-inlay-click`: a code lens
+                            runs). A buffer process's
+                            `[:buffer-updated …]` is hosted's handler, replaced by collab's
+                            when collab loads; a process down goes to every down handler
+                            (hosted and collab recover their slots). The core names no feature: a
                             module registers its rows when it loads, each row CLAIMED for the
                             file that registered it (`ownership/claim!`), so a package's rows
                             go back with the package. Also the OUTPUT CAP
@@ -203,8 +213,8 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             through sudo in place (`file-save/ed-save-prepare` / `ed-save-landed`), the mode line says
                             `# root`. A password sudo wants is read masked (`passwd/ed-read-passwd`),
                             handed to sudo once and kept nowhere — sudo's own timestamp serves the
-                            next save. Every sudo call is a task (`:sudo-proc`, one at a time, C-g
-                            stops it): an open shows `Loading…` at once, a save stays modified
+                            next save. Every sudo call is a task on `remotejob`'s queue (`:sudo-proc`,
+                            one at a time, C-g stops it): an open shows `Loading…` at once, a save stays modified
                             until its write lands (`file-save/ed-save-prepare` / `ed-save-landed`), and
                             C-x C-c / C-x s save root files after their questions and go on when
                             the last lands. A file is read as BYTES (`sudo/read-bytes`) and goes through
@@ -214,11 +224,22 @@ src/sudoedit.blsp           editing a file as ROOT (Emacs's TRAMP `/sudo::` and 
                             Under -nw, C-z suspends (`frames/cmd-suspend-frame`, `term/suspend`)
                             and SIGHUP / SIGTERM auto-save every unsaved buffer before the
                             terminal is restored (`main/terminal-hangup`). Named to dodge std's `sudo`
+src/remotejob.blsp          the ONE queue a file reached another way runs on, shared by sudoedit and
+                            sshedit (each hands it a spec map: its model keys, its work, its fold):
+                            a job (open / save / revert / listing) is a task, one at a time per
+                            method, a second waiting its turn and never dropped; `Loading…` killed
+                            cancels an open; a password asked for masked only when the prompt is
+                            free (`ask`, `run-waiting`); C-g (`quit`), C-x C-c (`live`), the common
+                            head of a landed job's fold (`landed`), and a save / save-all that keep
+                            the buffer modified until the write lands (`save`, `save-all`)
 src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in ONE place, pure: `parse`,
-                            `spec`, `canonical` (a buffer's key), `dirname`, `remote-start` (a `/ssh:`
-                            typed over a path), and `remote?` — what every local tool asks before it
-                            touches a path. `~` / a relative path is the REMOTE home's. filename,
-                            sidecar, mincomplete and the handler all read it
+                            `spec`, `canonical` (a buffer's key), `dirname`, `join`, `remote-start` (a
+                            `/ssh:` typed over a path), and `remote?` — what every local tool asks
+                            before it touches a path. `~` / a relative path is the REMOTE home's,
+                            `~other/…` another user's (kept as typed, resolved there); a route
+                            through jump hosts is TRAMP's multi-hop (`/ssh:bastion|ssh:host:/x`,
+                            `:hops` on the parts, `route-label`, `prefix`; `same-connection?`).
+                            filename, sidecar, mincomplete, dired and the handler all read it
 src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*program*`, a test's
                             stand-in runs the scripts locally) with one SHARED connection per host
                             (ControlMaster, the socket in `state/ssh/`, owner-only, ControlPersist
@@ -228,19 +249,31 @@ src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*pro
                             `os/shell-quote`d): a read through base64 (bytes, a size limit asked
                             first), an atomic write (staged beside the file with its mode, size +
                             SHA-256 checked, renamed), `ls -1pa` for the prompt (kept 10 s, a
-                            table). A password opens the connection once (`connect-with-password`:
-                            SSH_ASKPASS helper reading ssh's own stdin, refusing yes/no questions)
+                            table), `stat` rows for dired (`list-entries`, GNU or BSD) and its
+                            mkdir / mv / cp -pR / rm -rf (`make-directory`, `transfer`, `delete-path`:
+                            never over an entry already there). `~user` resolved by the remote
+                            shell, the name checked first. Jump hosts become a nested
+                            `ProxyCommand` of `ssh -W` (`proxy-command`; batch mode for every hop —
+                            ssh's `-J` passes no options on), run by `/bin/sh` (`SHELL`). A password
+                            opens the connection once (`connect-with-password`: SSH_ASKPASS helper
+                            reading ssh's own stdin, refusing yes/no questions)
 src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/ssh:`), the second file
                             handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
                             /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
                             the spec, `:ssh` its mark, carried by `hosted-meta`), so no local tool
-                            takes it for a file here. Every ssh call a task (`:ssh-proc`, one at a
-                            time, C-g stops it): `Loading…` at once, a save stays modified until it
-                            lands (`file-save/ed-save-prepare` / `ed-save-landed`), a dropped
-                            connection said. A password the host wants is read masked
-                            (`passwd/ed-read-passwd`) and used once. charset as any file (binary →
-                            hex, large → asked); a directory opens the find-file prompt in it (no
-                            remote dired). Its sidecar is private (`sidecar/private-spec`); auto-revert,
+                            takes it for a file here. Every ssh call a task on `remotejob`'s queue
+                            (`:ssh-proc`, one at a time, C-g stops it): `Loading…` at once, a save
+                            stays modified until it lands (`file-save/ed-save-prepare` /
+                            `ed-save-landed`), a dropped connection said. A password the host wants is
+                            read masked (`passwd/ed-read-passwd`) and used once. charset as any file
+                            (binary → hex, large → asked); a directory opens in DIRED (the handler's
+                            `:dired`, `ed-ssh-dired`: listed off the loop, then
+                            `dired/ed-dired-show-entries`), whose `+` `R` `C` `D` `x` go through the
+                            handler's file operations (`:make-directory`, `:rename-file`,
+                            `:copy-file`, `:delete-file`, `:expand-file-name`, `:parent-directory`,
+                            Emacs's file-name-handler-alist — dired names no handler). CI's
+                            `ssh-real` job drives all of it against a real sshd
+                            (tools/ci/ssh-real.sh). Its sidecar is private (`sidecar/private-spec`); auto-revert,
                             diff-hl, LSP, the formatter, editorconfig, dir-locals, compile, M-! and the
                             project walk skip it (`sshpath/remote?`). The mode line says `@host`
 src/bugreport.blsp          M-x report-bug (Emacs's report-emacs-bug): every error the editor CATCHES
@@ -432,7 +465,9 @@ src/mouse.blsp              `[:mouse …]` folded into the model: a click, a dra
                             scrollbar's thumb, a divider's resize, the wheel on the pane under the
                             pointer. A middle click places point (`ed-mouse-set-point`) and commands
                             yanks PRIMARY there, read off the loop (Emacs `mouse-yank-primary`).
-                            A C-M-drag selects a rectangle (`:rectangle?` on the `:text-drag`)
+                            A C-M-drag selects a rectangle (`:rectangle?` on the `:text-drag`).
+                            A press on an INLAY row (`panes/ed-pane-inlay-row`) goes to its
+                            owner's `model/register-inlay-click` (a code lens runs), else to its line
 src/view.blsp               pure view: model -> render frame (editor/display ops). Names no
                             feature: a pane body's layers share ONE geometry map, the mode
                             line's feature chips come from the statusbar registry, and what
@@ -671,7 +706,7 @@ src/fill.blsp               M-q and auto-fill over std's `string/fill` / `string
                             (brood ADR-589, Emacs's adaptive fill): the first line keeps its
                             prefix, the rest the paragraph's continuation — a list item HANGS under
                             its text, a comment / quote keeps its marker — the MODE's markers
-                            (`fill-markers`: its comment tokens, a C block comment's ` * `; so
+                            (`stringstate/fill-markers`, which the `:adaptive` wrap prefix shares: its comment tokens, a C block comment's ` * `; so
                             `#include` is code). The paragraph is
                             narrowed to point's comment, list item, or (in code) a string that
                             can span lines — its text only, the code around it untouched
@@ -943,15 +978,25 @@ src/snippet.blsp            SNIPPETS (Emacs's yasnippet / tempel): templates in 
                             expansion is one undo step
 src/lsp-protocol.blsp       the protocol, pure: what each answer means, positions in UTF-16 units, the
                             document sync, what each request puts on the wire, and the connection
-                            as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server
+                            as a state machine (`lsp-ingest`, `lsp-issue`). No process, no server. A server's
+                            REFRESH request (`workspace/semanticTokens|inlayHint|codeLens/refresh`,
+                            `*lsp-refresh-requests*`) is answered null and queued on `:refreshes`,
+                            which the connection sends the editor as `[:lsp-refresh-… conn]`
+                            A ContentModified / ServerCancelled answer to what the idle beat asks by
+                            itself (semantic tokens, lenses, inlay hints) comes back `:lsp-retry`
+                            (`lsp-retry?`), and the fold makes it due again rather than empty
 src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, goto-def/references,
                             hover, rename, format, imenu, INLAY HINTS (the lines on screen on the idle beat, as
                             `inlinetext` annotations owned by `:lsp-inlay`; opt-in per mode by
-                            `:lsp-inlay-hints`, M-x lsp-inlay-hints-mode per buffer), and `publishDiagnostics` folded into
+                            `:lsp-inlay-hints`, M-x lsp-inlay-hints-mode per buffer; the range cut to the text, `inlay-range`,
+                            since rust-analyzer answers a position past it with no hints), and `publishDiagnostics` folded into
                             the model's diagnostics, so every language gets the underline / ⚠ note
                             / gutter mark the Brood checker used to have to itself. Answers
                             server->client requests too (`client/registerCapability` — a server
-                            BLOCKS on that reply) and starts the server IN the project root, which
+                            BLOCKS on that reply), advertises `refreshSupport` for semantic tokens,
+                            inlay hints and lenses and the client commands it runs
+                            (`experimental.commands`, `lsp-lens/*client-commands*` — rust-analyzer
+                            sends no lens without them), and starts the server IN the project root, which
                             is how one that builds the project finds it. Elixir is Expert
                             (expert-lsp.org), which narrates its own startup — forwarded to
                             *Messages*, because it answers nothing until its engine is up.
@@ -969,7 +1014,9 @@ src/lsp.blsp                LSP client (proc-spawn + JSON-RPC) — completion, g
                             lists them
 src/lsp-servers.blsp        the servers as the model holds them: where each starts, which projects
                             share one, filing them under `:lsp-servers`, a server dying or merged,
-                            the document push, what they published, asking one. lsp-commands is the
+                            the document push, what they published, asking one — about any pool
+                            buffer (`ed-lsp-ask-server-at`, `ed-lsp-push-text-at`), and which of a
+                            server's buffers are on screen (`ed-lsp-shown`, what a refresh re-asks). lsp-commands is the
                             commands and the folds of their answers
 src/lsp-requests.blsp       the LSP request-kind records + `LspRequest` ability — the shape/fold vocabulary
                             shared by lsp (connection side) and lsp-commands (model side); eager-loaded so
@@ -983,16 +1030,23 @@ src/lsp-semantic.blsp       LSP SEMANTIC TOKENS (`semanticTokens/full`, `/full/d
                             idle beat when the text moved (order 55); carried through the splice
                             log by a post-step (order 45) until the next answer, never dropped on a
                             keystroke. `:lsp-semantic-tokens` (default on where offered), M-x
-                            lsp-semantic-tokens-mode. Its request kinds and their `LspRequest` impls
+                            lsp-semantic-tokens-mode. A server's refresh asks each of its buffers on
+                            screen again (a delta against the last answer, as VS Code asks). Its request kinds and their `LspRequest` impls
                             (all four halves) live here, not in lsp-requests / lsp-protocol
 src/lsp-lens.blsp           LSP CODE LENS (`codeLens`, `codeLens/resolve`): each lens a dim INLAY
                             row above its line (`wrap/inlay-lines`, owner `:lsp-code-lens`), titles
                             joined ` | `, indented as the line; anchored by a char offset carried
                             through the splice log (post-step order 46), asked on the idle beat
-                            (order 60), unresolved ones resolved. M-x lsp-code-lens-run runs point's
-                            line's lens through `workspace/executeCommand` (a code action's path:
-                            its edits come back as `workspace/applyEdit`). `:lsp-code-lens`
-                            (default off), M-x lsp-code-lens-mode
+                            (order 60), unresolved ones resolved, asked again on the server's refresh.
+                            A CLICK on a lens row (`model/register-inlay-click`) or M-x
+                            lsp-code-lens-run runs the lens: a SERVER command (one it lists in
+                            `executeCommandProvider`) through `workspace/executeCommand` (a code
+                            action's path: its edits come back as `workspace/applyEdit`), a CLIENT
+                            command through `*client-commands*` — rust-analyzer's `runSingle` as
+                            its cargo command in *compilation* (`runnable-command`,
+                            `compile/compile-run`), `showReferences` / `gotoLocation` a jump or a
+                            picker, `debugSingle` said — and any other said, never sent.
+                            `:lsp-code-lens` (default off), M-x lsp-code-lens-mode
 src/mincomplete.blsp        minibuffer prompt completion (path / name)
 src/filename.blsp           a typed path read the Emacs way (`substitute-in-file-name`, which is
                             std's `path/substitute` — this is the prompt's layer over it): the prompt
@@ -1094,7 +1148,7 @@ src/wrap.blsp              where a line falls on screen rows: the pure break rul
                             else; `line-row-entries` is a line's rows off the visible table. A
                             row's `display` is `{:prefix :inline}`: the WRAP PREFIX (Emacs
                             `wrap-prefix` / adaptive-wrap — a continuation row starts under its
-                            line's indent, `:indent`, or fill prefix, `:adaptive`; the init file's
+                            line's indent, `:indent`, or fill prefix under the mode's markers, `:adaptive`; the init file's
                             `:wrap-prefix` per mode, `scroll/ed-wrap-prefix-style`; dropped past
                             half the row) and the row's INLINE annotations (`inlinetext`), both of
                             which the breaks leave room for
@@ -1525,6 +1579,21 @@ tools/ci/real-window.sh     CI's REAL-window check (macOS, Windows, Linux under 
                             input (xdotool / SendKeys / System Events) — saved with C-x C-s, the
                             file read back, the window captured and checked not blank; the PNGs
                             are a workflow artifact. The driver is `real-window.blsp`
+tools/ci/lsp-rust.sh        CI's REAL language server check (`lsp-rust-analyzer` in ci.yml): the LSP
+                            client against rust-analyzer on tools/ci/fixtures/lens-fixture, through
+                            the editor's own loop headless (`lsp-rust.blsp`) — inlay hints at their
+                            positions, semantic token faces on their ranges and a delta after an
+                            edit, lenses above their lines (resolved, moved with the text), the
+                            refresh requests heard, and a lens CLICK running `cargo run` and
+                            jumping to an impl
+tools/ci/ssh-real.sh        CI's REAL-sshd check (`ssh-real` in ci.yml): OpenSSH's server on
+                            localhost (a throwaway host key and config, root through sudo so it can
+                            check a password, a throwaway password user), host aliases for a key
+                            login, a jump-host-only target and an unknown host key; the driver
+                            (`ssh-real.blsp`) runs `/ssh:` open / save / revert / hex / large /
+                            prompt listing / dired ops / `~user` / multi-hop / password / a dropped
+                            connection through the real ssh. `local` mode runs sshd as you (no
+                            sudo, no password check) for a quick look on a desktop
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")

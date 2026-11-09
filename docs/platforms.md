@@ -56,7 +56,10 @@ promise by GitHub, so a change on their side shows up here as "the editor opened
    it. That is the window's real keyboard path, the frontend's key translation included. It
    is TRIED and reported, not required, on both: a hosted macOS runner may refuse it
    (Accessibility permission for `osascript`, error 1002) and Windows's foreground lock may
-   keep the window from taking the keys. The log says which (`OS input: NOT proven …`).
+   keep the window from taking the keys. The log says which (`OS input: NOT proven …`). (Until
+   2026-11-09 the driver waited for the OS-typed word at the START of the file, though the keys
+   land at point, after the loop phase's word; with that fixed, both runners' OS typing was
+   seen arriving on the first run — a candidate for `require` once it holds.)
 
 The step has a timeout (the driver kills the editor past `REAL_WINDOW_TIMEOUT_MS`, the step's
 `timeout-minutes` backs it), and the pictures (`before.png`, `after.png`, `os-input.png`,
@@ -64,11 +67,17 @@ The step has a timeout (the driver kills the editor past `REAL_WINDOW_TIMEOUT_MS
 (`editor.log`) are uploaded as the `real-window-<os>` artifact whether it passed or not.
 
 Linux gets the same check in a job of its own, `real-window-linux`, twice: under a private
-Xvfb, where the OS input (xdotool's XTEST) is tried and reported — not yet required: its keys did
-not reach the window in CI's first run, with no window manager to give it the focus — and under
-a headless Weston (`weston --backend=headless`), where only the loop input runs (no input tool
-reaches a headless Weston), so winit's Wayland backend opens, paints and saves too. Locally:
-`tools/ci/real-window.sh nest /tmp/rw x11` (needs `xvfb-run`; opens nothing on your screen).
+Xvfb, where the OS input is REQUIRED — xdotool gives the window the input focus
+(XSetInputFocus, which needs no window manager), puts the pointer over it, and types through
+XTEST to whatever has the focus, as a real keyboard does. Each xdotool call is its own command:
+in one chained call (`search … type …`) `type` and `key` default to the window `search` found
+and send XSendEvent events, which are synthetic and which winit, reading keys through XInput2,
+never sees — CI's first runs typed with exit 0 and the file never changed. The log says which
+window had the focus before and after the keys. And under a headless Weston
+(`weston --backend=headless`), where only the loop input runs (no input tool reaches a headless
+Weston), so winit's Wayland backend opens, paints and saves too. Locally:
+`tools/ci/real-window.sh nest /tmp/rw x11` (needs `xvfb-run` and `xdotool`; opens nothing on
+your screen).
 
 What it does not prove: what the compositor does with the frame after the window presents
 it (the capture is the app's own rasterisation — ADR-609's limit), a GPU window (CI builds
@@ -101,12 +110,12 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | clipboard seam | ✅ | ✅ |
 | key mapping (Option-as-Meta, AltGr) | ✅ brood unit tests | ✅ brood unit tests |
 | missing-font warning | ✅ (names Font Book) | ✅ (names the Fonts settings) |
-| a save survives a crash mid-write | ✅ `file/replace`: a synced temp file renamed over the file (brood ADR-621), owner, mode and a symlink kept | ⚠️ a plain write in place (`file/replace` is `fs::write` off Unix: a rename there loses the file's DACL, and `ReplaceFileW` is untried) — see Not fixed |
+| a save survives a crash mid-write | ✅ `file/replace`: a synced temp file renamed over the file (brood ADR-621), owner, mode and a symlink kept | ✅ `file/replace`: a flushed temp file put in the file's place by `ReplaceFileW` (brood ADR-671), its ACL, attributes and creation time kept; a file another program holds open is refused after about a second, said, and left whole (brood's `windows_replace_tests`) |
 | auto-save sidecars: location, recovery | ✅ | ✅ |
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; `recover_test` reads the sidecar's ACL back with `icacls`) |
 | terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
 | a real window: opens on the desktop, paints (captured, not blank), typed keys reach the loop, C-x C-s writes the file | ✅ `real-window.sh` | ✅ `real-window.sh` (Linux too: Xvfb and headless Weston) |
-| the OS keyboard reaching that window | tried each run (System Events), reported, not required | tried each run (SendKeys), reported, not required (Linux too, xdotool under Xvfb, until its keys are seen arriving) |
+| the OS keyboard reaching that window | tried each run (System Events), reported, not required | tried each run (SendKeys), reported, not required; Linux: required, xdotool (XTEST) under Xvfb |
 | font discovery, file watching (auto-revert) | not run — headless | not run — headless |
 
 ## Fixed on the way
@@ -148,14 +157,16 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 - The share name and sudo's prompt read `$USER`, which Windows does not set; they use
   `os/user-name` (`%USERNAME%` there).
 
+- A save on Windows was not atomic: brood's `file/replace`, which every save goes through
+  (`file-save`, `charset/save`, std's `save-buffer`), was a plain write off Unix — truncated,
+  then written — so a crash, a power cut or a full disk between the two left the file empty or
+  cut short. brood now writes a flushed temp file beside it and puts it in the file's place
+  with `ReplaceFileW`, which keeps the file's ACL, attributes and creation time (`MoveFileExW`
+  for a new file; brood ADR-671). A file another program holds open (Excel, a tool that opened
+  it without sharing delete) is waited on for about a second, then the save fails with that
+  reason: the buffer stays modified, the file unchanged. bedit's save path needed no change.
+
 ## Not fixed
-- A save on Windows is not atomic. brood's `file/replace`, which every save goes through
-  (`file-save`, `charset/save`), renames a synced temp file over the file on Unix, but off Unix
-  it is a plain write: the file is truncated, then written (brood ADR-621, Limits). A crash, a
-  power cut or a full disk between the two leaves the file empty or cut short, and the text is
-  then only in the buffer and in its auto-save sidecar if the idle beat wrote one (`#file#`, M-x
-  recover-this-file) — edits made after that sidecar are lost with the editor. A program reading the file while it is
-  written can see half of it. Fixing it is brood's (`ReplaceFileW`, which keeps the DACL).
 - Not run anywhere but Linux: font discovery, file watching, a language server,
   git and mur themselves (their test files are not in the smoke set), and the remote / collab
   node links.

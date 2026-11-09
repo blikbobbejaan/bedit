@@ -388,8 +388,8 @@ decouples the cursor from the shared buffer.
 writes the pane's cursor to the pool too and [[ed-sync-window-point]] does after every
 event. That keeps `ed-current-buf` free and identity-stable across the twenty-odd times a
 turn asks for it: no map built per call, and a `ui-memo` dep or a model cache keyed on the
-buffer is a pointer test. (Not a `defmemo` key: its store is a global, and `def` deep-copies
-what it stores, so a remembered buffer is never this cell and every lookup walks it.)"
+buffer is a pointer test. (Not a `defmemo` key: a hit on this cell is free, but every miss after an edit walks the
+buffer against each remembered one, brood ADR-670.)"
   (if (nil? point)
     buf
     (let (n (buffer-length buf)
@@ -1182,6 +1182,13 @@ notice, and the notes that follow it. With `passing?`, only the steps marked `:p
 ;;                 question has been answered, because it may open a prompt of its own.
 ;;   :save-all     `(model entries then note) -> model`, the entries in turn, then `(then m)`;
 ;;                 one that fails stops the run, saying why with `note`.
+;; and, for a handler whose directories dired lists (Emacs's TRAMP dired):
+;;   :dired        `(model dir line) -> model`, list `dir` and show it
+;;                 (`dired/ed-dired-show-entries`) when the listing lands.
+;;   :expand-file-name `(dir name) -> path`, :parent-directory `(path) -> path`.
+;;   :make-directory `(path)`, :delete-file `(path)`, :rename-file / :copy-file
+;;                 `(from to into?) -> where it went` — called OFF the loop (dired's operations
+;;                 run in a task), each raising with the reason when it fails.
 
 (defn register-file-handler (name handler)
   "Add the file handler `name` (see the comment above), replacing any registered under
@@ -1267,6 +1274,22 @@ loads."
   "The model after the first paste taker that takes `text`, or nil when none does."
   (first (seq/keep (vals (registry/entries :model/paste-takers))
            (fn (taker) (ed-call-hook taker nil m text)))))
+
+;; [[register-inlay-click]]: what a click on an INLAY row does (`wrap/inlay-lines` — a row of
+;; derived text above a line), by the OWNER of the row — a `(m index line text cell) -> model`
+;; symbol: pool buffer `index`, the 0-based line the row sits above, the row's text and the
+;; cell clicked in it. A row whose owner registered none is a click on its line (mouse). An
+;; LSP code lens (lsp-lens) runs the lens clicked.
+(defn register-inlay-click (owner handler)
+  "Make the symbol `handler` what a click on an inlay row of `owner` does, replacing any
+registered for it. Called when its module loads."
+  (ownership/claim! :model/inlay-clicks owner handler))
+
+(defn ed-inlay-click (m owner index line text cell)
+  "The model after `owner`'s inlay-click handler takes a click on its row (see
+[[register-inlay-click]]), or nil when it registered none."
+  (let (handler (registry/lookup :model/inlay-clicks owner))
+    (when handler (ed-call-hook handler nil m index line text cell))))
 
 ;; [[register-macro-guard]]: a key kept out of a keyboard macro being recorded — a
 ;; `(m input) -> bool` symbol, true to keep it out. A password typed into a masked read
@@ -1357,6 +1380,26 @@ under `name`. Called when its module loads."
   "Add the highlight source `name`, `{:rank :run :deps}` (see the comment above), replacing any
 registered under `name`. Called when the source's module loads."
   (ownership/claim! :model/highlight-sources name (assoc source :name name)))
+
+(defn register-text-faces (name row)
+  "Add the text-face source `name`, `{:rank :spans :palette}`: faces a PRODUCER stamped on a
+buffer's text (a build's ANSI colours, its `:ansi` text property — `ansicolor`), painted under
+the mode's own colouring. `:spans` is a `(buffer) -> spans` symbol (ascending, `[from to
+attributes]`; `[]` for none), `:palette` a `() -> palette` symbol the attributes are resolved
+through as they are painted (`spanpaint/ed-span-layers`), so a theme switch recolours them.
+The lowest `:rank` with spans on a buffer is its layer. Called when the source's module loads."
+  (ownership/claim! :model/text-faces name (assoc row :name name)))
+
+(defn ed-text-faces (buf)
+  "`[spans palette]` of the first text-face source ([[register-text-faces]]) with spans on
+`buf`, or nil when none has any."
+  (reduce (registry/ranked :model/text-faces)
+    nil
+    (fn (found [_ row])
+      (if found
+        found
+        (let (spans (reflect/call-if-bound (:spans row) [] buf))
+          (when (and spans (not (empty? spans))) [spans (reflect/call-if-bound (:palette row) nil)]))))))
 
 (defn register-pane-layer (name layer)
   "Add the pane layer `name`, `{:rank :slot :run}` (see the comment above), replacing any
@@ -1464,6 +1507,55 @@ Called when its module loads."
   (fold (registry/ranked :model/tail-steps)
     after
     (fn (acc [_ step]) (ed-call-hook (:run step) acc before acc input))))
+
+(defn ed-run-recover-steps (before after input)
+  "The tail steps marked `:recover true`, in `:order`, over `after`: what still runs when a
+command threw and `input`'s turn is abandoned for `before` with an error echo (`after`). The
+hosted propagate is one — the echo's append to *Messages* must reach that buffer's process."
+  (fold (registry/ranked :model/tail-steps)
+    after
+    (fn (acc [_ step])
+      (if (= true (:recover step)) (ed-call-hook (:run step) acc before acc input) acc))))
+
+;; ---- a turn's last word: steps after it is committed, inputs that change nothing --------
+
+(defn register-commit-step (name step)
+  "Add `step`, `{:order :run}` with `:run` a `(before after) -> model` symbol, run once a turn
+is COMMITTED (`input/ed-update-turn`): after every tail step, and after a thrown command's
+recovery too, outside the turn's guard — what must happen to a turn that stands and never to
+one rolled back (a held tree handle freed once nothing names it: `syntaxtree`). Replaces any
+registered under `name`. Called when its module loads."
+  (ownership/claim! :model/commit-steps name (assoc step :name name :rank (:order step))))
+
+(defn ed-run-commit-steps (before after)
+  "Every registered commit step, in `:order`, over `after`."
+  (fold (registry/ranked :model/commit-steps)
+    after
+    (fn (acc [_ step]) (ed-call-hook (:run step) acc before acc))))
+
+(defn register-identity-step (name step)
+  "Add `step`, a `(model identity) -> model` symbol, run when a client says who it is (its
+attach identity `{:name :guest}`, `events/ed-apply-client-identity`): collab records the
+participant name and announces it on every shared buffer. Called when its module loads."
+  (ownership/claim! :model/identity-steps name step))
+
+(defn ed-run-identity-steps (m identity)
+  "Every registered identity step ([[register-identity-step]]) over `m`."
+  (fold (vals (registry/entries :model/identity-steps))
+    m
+    (fn (acc step) (ed-call-hook step acc acc identity))))
+
+(defn register-inert-input (name test)
+  "Declare inputs that change nothing: `test` is a `(model input) -> bool` symbol, true for an
+input the model already reflects (our own edit echoed back by a hosted buffer's process:
+`hosted`), which the loop then hands back unchanged, drawing nothing. Called when its module
+loads."
+  (ownership/claim! :model/inert-inputs name test))
+
+(defn ed-inert-input? (m input)
+  "True when a registered test ([[register-inert-input]]) says `input` changes nothing in `m`."
+  (any? (vals (registry/entries :model/inert-inputs))
+    (fn (test) (= true (reflect/call-if-bound test false m input)))))
 
 ;; ---- the pool buffer, the panes showing it, their restrictions ------------------
 

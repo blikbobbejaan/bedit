@@ -38,7 +38,8 @@ or its answers name a file this client never opened. On Windows `C:\\x` is
 
 (def *lsp-server-requests-handled*
   ;; Server→client requests this client answers with a plain `null` result — an
-  ;; acknowledgement, which is what the protocol specifies for each. Registration is
+  ;; acknowledgement, which is what the protocol specifies for each. A REFRESH is also acted
+  ;; on (`*lsp-refresh-requests*`): the editor asks again for what it shows. Registration is
   ;; genuinely a no-op here: this client has no dynamic capability table and no file
   ;; watcher, so "registered" and "ignored" are the same state — but SAYING so is not
   ;; optional, because the server is blocked until we do.
@@ -49,6 +50,17 @@ or its answers name a file this client never opened. On Windows `C:\\x` is
     ;; on a token of its own; the token needs no bookkeeping here — every `$/progress` is
     ;; narrated by what it says, whatever token it carries
     "window/workDoneProgress/create"})
+
+(def *lsp-refresh-requests*
+  ;; The server asking the client to ask AGAIN — what it answered before is out of date (a
+  ;; project finished loading, a dependency changed) — and the editor event each becomes. The
+  ;; client advertises `refreshSupport` for each (`lsp/lsp-init-params`), which is what makes
+  ;; a server send them: rust-analyzer's first semantic tokens, inlay hints and lenses come
+  ;; before it has loaded the crate, and without a refresh they stay that thin until the
+  ;; text is edited.
+  {"workspace/semanticTokens/refresh" :lsp-refresh-semantic-tokens
+   "workspace/inlayHint/refresh" :lsp-refresh-inlay-hints
+   "workspace/codeLens/refresh" :lsp-refresh-code-lens})
 
 ;; ---- pure protocol: completion-result shapes --------------------------------
 
@@ -725,12 +737,18 @@ signature, code actions, commands, formatting, rename. Returns `[state' frames]`
 (impl LspRequest
   lsp-requests/lsp-inlay-hints
   ;; the hints for a RANGE of lines — the ones on screen, `:lines [first last]` — so a long
-  ;; file is never asked about whole
+  ;; file is never asked about whole. The range ends at `:end-units` on the last line when the
+  ;; editor gives it (the document's last line: a position past the text is an error to
+  ;; rust-analyzer — `Invalid offset`, and no hints at all), else at the next line's start
   (lsp-request-method (_) "textDocument/inlayHint")
   (lsp-request-params (_ request)
     (let ([first-line last-line] (or (:lines request) [0 0]))
       (assoc (lsp-doc request)
-        :range {:start (lsp-pos first-line 0) :end (lsp-pos (inc last-line) 0)})))
+        :range
+          {:start (lsp-pos first-line 0)
+           :end (if (int? (:end-units request))
+                  (lsp-pos last-line (:end-units request))
+                  (lsp-pos (inc last-line) 0))})))
   (lsp-request-shape (_ result) [:lsp-inlay-hints (lsp-inlay-hint-list result)]))
 (impl LspRequest
   lsp-requests/lsp-code-actions
@@ -971,7 +989,7 @@ is worth in every client."
 (defn- lsp-answer-server (state message)
   "Queue this client's answer to a request the SERVER made, on the state's `:outbox` (the
 shell writes it). `workspace/applyEdit` carries work and is handled; the rest are
-acknowledged; anything else gets MethodNotFound, which is a real answer and unblocks the
+acknowledged — a refresh also queued on `:refreshes`, which the shell hands the editor; anything else gets MethodNotFound, which is a real answer and unblocks the
 server just as well as agreement would."
   (let (id (:id message)
         method (:method message))
@@ -991,8 +1009,34 @@ server just as well as agreement would."
                       (jsonrpc/response id nil)
                       (jsonrpc/error-response id
                         (:method-not-found jsonrpc/*error-codes*)
-                        (str "bedit does not implement " method))))
-          (assoc state :outbox (append (or (:outbox state) []) [frame]))))))
+                        (str "bedit does not implement " method)))
+              answered (assoc state :outbox (append (or (:outbox state) []) [frame]))
+              refresh (get *lsp-refresh-requests* method))
+          ;; a refresh is acknowledged AND handed to the editor, which asks again
+          (if refresh
+            (assoc answered :refreshes (conj (or (:refreshes answered) []) refresh))
+            answered)))))
+
+(def *lsp-retry-codes*
+  ;; LSP's error codes for "the answer would be stale, ask again": ContentModified (the text or
+  ;; the project changed while the server worked — rust-analyzer while it is still loading)
+  ;; and ServerCancelled
+  #{-32801 -32802})
+
+(def *lsp-retried-methods*
+  ;; the requests the idle beat makes by itself, whose folds take `:lsp-retry` and ask again
+  #{"textDocument/semanticTokens/full"
+    "textDocument/semanticTokens/full/delta" "textDocument/codeLens" "textDocument/inlayHint"})
+
+(defn lsp-retry? (kind error)
+  "Whether `error` (a response's error object, or nil) asks for request `kind` (an `LspRequest`
+record) to be made again: a retry code (`*lsp-retry-codes*`) on a request the editor makes by
+itself (`*lsp-retried-methods*`). A lookup the reader asked for gets its empty answer instead.
+
+    (lsp-protocol/lsp-retry? (lsp-requests/lsp-inlay-hints) {:code -32801})   ;=> true"
+  (and (map? error)
+    (contains? *lsp-retry-codes* (:code error))
+    (contains? *lsp-retried-methods* (lsp-request-method kind))))
 
 (defn lsp-dispatch (folded message)
   ;; Fold step: route one decoded message. Three kinds arrive on this stream and they are
@@ -1018,7 +1062,11 @@ server just as well as agreement would."
         (let (reply-to (first entry)
               correlation (second entry)
               kind (nth entry 2)
-              [tag value] (lsp-shape kind (:result message))
+              [tag shaped] (lsp-shape kind (:result message))
+              ;; a server that says ask again (ContentModified, ServerCancelled) for a request
+              ;; the editor re-asks by itself answers `:lsp-retry`, not an empty result that
+              ;; would stand until the text next moved ([[lsp-retry?]])
+              value (if (lsp-retry? kind (:error message)) :lsp-retry shaped)
               ;; an error response still answers its waiter (as an empty result); the
               ;; server's reason goes to the log, not the echo area ([[lsp-error-notice]])
               state (if (:error message)
