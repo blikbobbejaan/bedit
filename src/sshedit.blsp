@@ -41,6 +41,7 @@ system `ssh` (`sshremote`, the transport; `sshpath`, the path syntax).
   (:use sshpath :only []) ; the path syntax, loaded with the handler (called qualified)
   (:use sshremote :only []) ; the transport, loaded with the handler (called qualified)
   (:use remotejob :only []) ; the one-job-at-a-time queue sudoedit shares (called qualified)
+  (:use sshsudo :only []) ; the `|sudo:` hop's root shell, loaded with the transport
   (:use editor/buffer) ; buffer-file / buffer-text / replace-region / goto-char
   (:use editor/buffer-file) ; buffer-from-file
   (:use model) ; message / ed-buf-at / ed-current-buf / the registries
@@ -71,38 +72,45 @@ system `ssh` (`sshremote`, the transport; `sshpath`, the path syntax).
     else (sshremote/read-file parts (:path parts) (if (:force job) 0 (or (:limit job) 0)))))
 
 (defn ssh-work (job password)
-  "What ssh `job` does, in its task: with `password`, open the shared connection with it first
-(`sshremote/connect-with-password`) — to the host, or to the jump host `:password-hop` names —
-then the job's operation: `sshremote/read-file` for an open or a revert (nothing past `:limit`
-bytes but the size), `sshremote/write-file` for a save, `sshremote/list-entries` for a directory
-dired shows. Answers that call's answer, `{:failed …}` when ssh itself failed (`:after-password`
-set when a password was just tried; `:hop` the jump host that failed, when one did —
-`sshremote/blame-route`)."
+  "What ssh `job` does, in its task: with `password`, first open what `:password-for` names with
+it — the host's shared connection (nil, `sshremote/connect-with-password`), a jump host's (its
+index on the route), or the root shell of the path's `|sudo:` hop (`:sudo`,
+`sshremote/sudo-connect`) — then the job's operation: `sshremote/read-file` for an open or a
+revert (nothing past `:limit` bytes but the size), `sshremote/write-file` for a save,
+`sshremote/list-entries` for a directory dired shows. Answers that call's answer, `{:failed …}`
+when ssh (or sudo) failed (`:after-password` set when a password was just tried; `:hop` the jump
+host that failed, when one did — `sshremote/blame-route`)."
   (let (parts (:parts job)
-        hop (:password-hop job)
-        connected (if (nil? password)
-                    true
-                    (sshremote/connect-with-password (if (nil? hop)
-                                                       parts
-                                                       (sshremote/hop-parts parts hop))
-                      password)))
+        target (:password-for job)
+        connected (cond
+                    (nil? password) true
+                    (= target :sudo) (sshremote/sudo-connect parts password)
+                    (int? target)
+                      (sshremote/connect-with-password (sshremote/hop-parts parts target) password)
+                    else (sshremote/connect-with-password parts password)))
     (if (map? connected)
-      (assoc connected :after-password true :hop hop)
+      (assoc connected :after-password true :for target)
       (sshremote/blame-route parts (job-operation job parts)))))
 
 (defn- job-doing (job)
   (str (case (:kind job) :open "opening " :revert "reverting " :list "listing " "saving ")
     (:spec job)))
 
-(defn- who-of (parts hop)
-  ;; who a password or a refusal is about: the host, or jump host `hop` on its route
-  (sshpath/host-label (if (nil? hop) parts (sshremote/hop-parts parts hop))))
+(defn- who-of (parts target)
+  ;; who a password or a refusal is about: the host, jump host `target` on its route, or the
+  ;; sudo there (`:sudo`)
+  (cond
+    (= target :sudo) (str "sudo on " (sshpath/host-label parts))
+    (int? target) (sshpath/host-label (sshremote/hop-parts parts target))
+    else (sshpath/host-label parts)))
 
 (defn- password-prompt (job)
-  (str "Password for "
-    (who-of (:parts job) (:password-hop job))
-    (if (nil? (:password-hop job)) "" " (jump host)")
-    " (or a key's passphrase): "))
+  (let (target (:password-for job)
+        who (who-of (:parts job) target))
+    (cond
+      (= target :sudo) (str "Password for " who " (yours there, as sudo asks): ")
+      (int? target) (str "Password for " who " (jump host) (or a key's passphrase): ")
+      else (str "Password for " who " (or a key's passphrase): "))))
 
 (def- jobs
   ;; the ssh method on `remotejob`'s queue
@@ -445,10 +453,13 @@ whether it would replace an entry. Blocks; raises with the reason when ssh fails
   (let (failed (when (map? answer) (:failed answer)))
     (cond
       (and failed (= (:error failed) :auth) (:after-password answer))
-        (ssh-failed m job (str (who-of (:parts job) (:hop answer)) " refused the password"))
+        (ssh-failed m job (str (who-of (:parts job) (:for answer)) " refused the password"))
       ;; the host, or the jump host on its way that refused (`:hop`), wants a password
       (and failed (= (:error failed) :auth) (:password? failed))
-        (remotejob/ask jobs m (assoc job :password-hop (:hop answer)))
+        (remotejob/ask jobs m (assoc job :password-for (:hop answer)))
+      ;; the path's `|sudo:` hop wants the user's password there
+      (and failed (= (:error failed) :sudo-password))
+        (remotejob/ask jobs m (assoc job :password-for :sudo))
       failed (ssh-failed m job (:reason failed))
       (failure? answer) (ssh-failed m job (error-message answer))
       (= (:kind job) :open) (ssh-open-answer m job answer)
@@ -538,16 +549,23 @@ buffer appears after all. Any other kill leaves it as it is."
 
 (defn ssh-segment (m pane buffer)
   "The `@host` chip on a remote buffer's mode line — Emacs shows the TRAMP prefix there — as a
-reminder that the file is on another machine; nil on any other buffer."
+reminder that the file is on another machine, and `@host # root` (the user) when it is edited
+there through a `|sudo:` hop; nil on any other buffer."
   (when (= true (:ssh buffer))
     (let (parts (sshpath/parse (buffer-file buffer)))
       (when parts
         (statusbar/seg :ssh
-          (str "@" (sshpath/host-label parts))
+          (str "@"
+            (sshpath/host-label parts)
+            (if (:sudo parts) (str " # " (or (:user (:sudo parts)) "root")) ""))
           {:sep "  —  "
            :face {:fg *blue* :bold true}
            :tooltip (fn (_mm)
-                      [(str "editing " (:path parts) " on " (sshpath/route-label parts))
+                      [(str "editing "
+                         (:path parts)
+                         " on "
+                         (sshpath/route-label parts)
+                         (if (:sudo parts) (str " as " (or (:user (:sudo parts)) "root")) ""))
                         "C-x C-s writes it back through ssh"])})))))
 
 (statusbar/register-modeline-segment :ssh 31 'sshedit/ssh-segment)

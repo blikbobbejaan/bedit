@@ -56,7 +56,27 @@
     "  touch \"$mark\"\n"
     "fi\n"
     "HOME=\"$state/home\"; export HOME\n"
+    "PATH=\"$state/bin:$PATH\"; export PATH\n"
     "exec /bin/sh -c \"$*\"\n"))
+
+(defn- sudo-source (state)
+  ;; the `sudo` the stand-in host runs: as the user it was told (written to `sudo-user`), a
+  ;; password (`rootpw`) wanted when `sudopw` is there — asked again once when wrong, as sudo does
+  (str "#!/bin/sh\n"
+    "state="
+    (os/shell-quote state)
+    "\n"
+    "prompt=; user=root\n"
+    "while [ $# -gt 0 ]; do\n"
+    "  case \"$1\" in -S|-n|-k) shift ;; -p) prompt=$2; shift 2 ;; -u) user=$2; shift 2 ;; --) shift; break ;; *) break ;; esac\n"
+    "done\n"
+    "printf '%s\\n' \"$user\" > \"$state/sudo-user\"\n"
+    "if [ -f \"$state/sudopw\" ]; then\n"
+    "  printf '%s' \"$prompt\" >&2\n"
+    "  IFS= read -r typed || exit 1\n"
+    "  if [ \"$typed\" != rootpw ]; then printf 'Sorry, try again.\\n%s' \"$prompt\" >&2; IFS= read -r typed; exit 1; fi\n"
+    "fi\n"
+    "exec \"$@\"\n"))
 
 (defn- with-stub (body)
   "`(body dir)` with ssh stood in for by a script in a fresh temp `dir` (the remote commands
@@ -67,10 +87,14 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
       (file/mkdir (path/join dir "home"))
       (file/spit stub (stub-source dir))
       (os/cmd "chmod" ["+x" stub])
-      (binding (*program* stub
-                *control-dir* (path/join dir "ctl")
-                *config-base* dir)
-        (body dir)))))
+      (file/mkdir (path/join dir "bin"))
+      (file/spit (path/join dir "bin" "sudo") (sudo-source dir))
+      (os/cmd "chmod" ["+x" (path/join dir "bin" "sudo")])
+      (let (result (binding (*program* stub
+                             *control-dir* (path/join dir "ctl")
+                             *config-base* dir)
+                     (body dir)))
+        (do (sshsudo/stop-all dir) result)))))
 
 (defn- type-text (m text)
   (fold (string/->graphemes text) m (fn (acc key) (ed-update acc key 80 24))))
@@ -855,3 +879,103 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
         (assert= (:bytes packed) (string/->bytes "hi"))))
     (is (failure? (sshremote/parse-pack "a\n1\n3\naGk=\n")))
     (is (failure? (sshremote/parse-pack "")))))
+
+(describe "a file edited as root on another machine (`|sudo:`)"
+  (test "is read as a sudo hop on the host before it"
+    (let (parts (sshpath/parse "/ssh:me@web1|sudo::/etc/hosts"))
+      (do
+        (assert= (:sudo parts) {:user nil})
+        (assert= (:host parts) "web1")
+        (assert= (:path parts) "/etc/hosts")
+        (assert= (sshpath/spec parts) "/ssh:me@web1|sudo::/etc/hosts")))
+    (assert= (:sudo (sshpath/parse "/ssh:web1|sudo:www-data@web1:/srv")) {:user "www-data"})
+    (assert= (sshpath/canonical "/ssh:web1|sudo:www@web1:/srv/./a") "/ssh:web1|sudo:www@:/srv/a")
+    (assert= (sshpath/canonical "/ssh:j|ssh:web1|sudo::x") "/ssh:j|ssh:web1|sudo::~/x")
+    (assert= (sshpath/dirname "/ssh:web1|sudo::/etc/hosts") "/ssh:web1|sudo::/etc")
+    (is (not (sshpath/same-connection? "/ssh:web1|sudo::/a" "/ssh:web1:/a")))
+    (each ["/ssh:web1|sudo:other:/x"
+            "/ssh:web1|sudo:a;b@:/x" "/ssh:web1|sudo:-u@:/y" "/ssh:web1|sudo:/x"]
+      (fn (spec) (is (nil? (sshpath/parse spec))))))
+  (test "the remote command is words every login shell reads alike"
+    (assert= (sshsudo/remote-command nil)
+      "sudo -S -p BEDIT-SUDO-PASSWORD -u root /bin/sh -c 'echo BEDIT-SUDO-READY; exec /bin/sh'"))
+  (test "a request's reply is read between its markers"
+    (let (reply (sshsudo/parse-reply (str "noise\nBEDIT-OUT-T 0\n"
+                                       (encoding/base64-encode (str "dir\n/etc\n"))
+                                       "\nBEDIT-ERR-T\n\nBEDIT-END-T\n")
+                  "T"))
+      (do
+        (assert= (:exit reply) 0)
+        (assert= (:stdout reply) "dir\n/etc\n")
+        (assert= (:stderr reply) "")))
+    (is (nil? (sshsudo/parse-reply "BEDIT-OUT-T 0\n" "T"))))
+  (test "opens and saves through a root shell there, sudo asking nothing (NOPASSWD)"
+    (with-stub (fn (dir)
+                 (let (path (path/join dir "hosts"))
+                   (do
+                     (file/spit path "127.0.0.1 localhost\n")
+                     (let (m (ed-find-file (ed-init (make-buffer "")) (str "/ssh:web1|sudo::" path))
+                           b (ed-current-buf m))
+                       (do
+                         (assert= (buffer-text b) "127.0.0.1 localhost\n")
+                         (is (= true (:ssh b)))
+                         (assert= (string/trim (file/slurp (path/join dir "sudo-user"))) "root")
+                         (let (saved (file-save/ed-save-buf-at (ed-update m "#" 80 24)
+                                       (ed-current-index m)))
+                           (do
+                             (assert= (file/slurp path) "#127.0.0.1 localhost\n")
+                             (is (not (buffer-modified? (ed-current-buf saved))))))
+                         (let (segment (sshedit/ssh-segment m nil b))
+                           (is (includes? (pr-str segment) "@web1 # root"))))))))))
+  (test "as another user"
+    (with-stub (fn (dir)
+                 (let (path (path/join dir "site.conf"))
+                   (do
+                     (file/spit path "x\n")
+                     (ed-find-file (ed-init (make-buffer "")) (str "/ssh:web1|sudo:www@:" path))
+                     (assert= (string/trim (file/slurp (path/join dir "sudo-user"))) "www"))))))
+  (test "asks for sudo's password, masked, writes it once, and keeps it nowhere"
+    (with-stub
+      (fn (dir)
+        (let (path (path/join dir "shadow"))
+          (do
+            (file/spit path "secret stuff\n")
+            (file/spit (path/join dir "sudopw") "")
+            (let (asked (ed-find-file (ed-init (make-buffer "")) (str "/ssh:web1|sudo::" path)))
+              (do
+                (is (map/get-in asked [:minibuffer :masked]))
+                (is (includes? (pr-str (:minibuffer asked)) "sudo on web1"))
+                (let (m (ed-update (type-text asked "rootpw") :enter 80 24))
+                  (do
+                    (assert= (buffer-text (ed-current-buf m)) "secret stuff\n")
+                    (is (not (includes? (pr-str (dissoc m :buffers)) "rootpw")))
+                    ;; the root shell stays open: the save asks nothing
+                    (let (saved (file-save/ed-save-buf-at (ed-update m "#" 80 24)
+                                  (ed-current-index m)))
+                      (do
+                        (is (nil? (:minibuffer saved)))
+                        (assert= (file/slurp path) "#secret stuff\n"))))))))))))
+  (test "a wrong password is said, and nothing opens"
+    (with-stub (fn (dir)
+                 (do
+                   (file/spit (path/join dir "sudopw") "")
+                   (let (asked (ed-find-file (ed-init (make-buffer ""))
+                                 (str "/ssh:web1|sudo::" (path/join dir "x")))
+                         m (ed-update (type-text asked "nope") :enter 80 24))
+                     (do
+                       (is (includes? (:echo m) "sudo on web1 refused the password"))
+                       (is (not (any? (:buffers m) :ssh-loading)))))))))
+  (test "dired lists a directory as root there, and a copy reaches it from the plain login"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       etc (path/join dir "etc")
+                       _ (file/mkdir etc)
+                       m (dired/ed-show-dired (ed-init (make-buffer "")) (remote tree))
+                       copied (answer (ed-update (dired-at m "a.txt") "C" 80 24)
+                                (str "/ssh:web1|sudo::" etc)))
+                   (do
+                     (assert= (file/slurp (path/join etc "a.txt")) "alpha\n")
+                     (is (includes? (:echo copied) "Copied"))
+                     (let (listed (dired/ed-show-dired (ed-init (make-buffer ""))
+                                    (str "/ssh:web1|sudo::" etc)))
+                       (is (includes? (:dired-names (ed-current-buf listed)) "a.txt")))))))))

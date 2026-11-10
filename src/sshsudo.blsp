@@ -1,0 +1,285 @@
+(defmodule sshsudo
+  "The `|sudo:` hop of a TRAMP ssh path (`/ssh:web1|sudo::/etc/hosts`): the file edited as ROOT
+(or `|sudo:USER@:` as another user) on the far side. The scripts `sshremote` runs on a host run
+here in a ROOT SHELL that stays open — Emacs's TRAMP keeps one too — because sudo's own
+credential cache cannot serve the next operation: each ssh command is a session of its own, with
+no terminal, so the timestamp a password left is not found again. A password asked for every
+save would be worse than one kept, and none is kept: the shell is.
+
+  - **One session per route and user** ([[session-name]]): a process of the editor's holding an
+    `ssh … sudo -S -p PROMPT -u USER /bin/sh -c 'echo READY; exec /bin/sh'` child, over the
+    host's shared connection (`sshremote`'s ControlMaster, so an ssh password was asked for
+    once already). It ends `*idle-ms*` after its last request, or when the connection drops.
+  - **The password is written once, only when sudo asks.** sudo prompts on standard error with
+    a marker of ours; the session writes the password then, and only then — so a `NOPASSWD`
+    rule, or a cache that still holds, never gets a password line it would run as a command. A
+    second prompt is a wrong password: the session closes before sudo asks a third time, so a
+    host's `pam_faillock` counts one failure. A session started with no password answers
+    `{:failed {:error :sudo-password}}` when sudo wants one, and the editor asks.
+  - **Each request is a script, run exactly as `/bin/sh -s` runs it on a host**: written to a
+    temporary file of root's, run by its own `sh` (so `exit` and `trap` mean what they do there),
+    its output and errors Base64 between markers no output can forge ([[request-text]]), the
+    file removed. The answer is `os/cmd`'s map, so `sshremote` reads it as it reads any.
+
+Blocks the CALLER (a task) for one request; the session's own child is the session's.")
+
+(def *idle-ms* 300000)
+;; How long a root shell outlives its last request — ssh's ControlPersist, for sudo.
+
+(def- prompt-marker "BEDIT-SUDO-PASSWORD")
+;; what sudo is told to prompt with (`-p`), so a prompt is told from anything else it says
+
+(def- ready-marker "BEDIT-SUDO-READY")
+;; what the root shell says first, so the session knows sudo let it in
+
+(defn remote-command (user)
+  "The command the remote LOGIN shell runs to open the root shell for `user` (nil: root): words
+every shell reads alike — the user checked by `sshpath/sudo-user?`, the one quoted part plain.
+
+    (sshsudo/remote-command \"www\")   ;=> \"sudo -S -p BEDIT-SUDO-PASSWORD -u www /bin/sh -c 'echo BEDIT-SUDO-READY; exec /bin/sh'\""
+  (str "sudo -S -p "
+    prompt-marker
+    " -u "
+    (or user "root")
+    " /bin/sh -c 'echo "
+    ready-marker
+    "; exec /bin/sh'"))
+
+(defn session-name (argv)
+  "The name of the session serving the ssh run `argv` — one per route, user and socket folder.
+
+    (keyword? (sshsudo/session-name [\"ssh\" \"h\"]))   ;=> true"
+  (keyword (str "bedit-sudo-" (string/substring (hash/sha256 (pr-str argv)) 0 24))))
+
+(defn request-text (script token)
+  "What the root shell is sent to run `script` (a `/bin/sh -s` script): the script into a
+temporary file through a here-document ended by `token`, run by its own `sh` with nothing on its
+standard input, then its exit status and its output and errors as Base64 between `token`'s
+markers ([[parse-reply]] reads them), the files removed.
+
+    (string/ends-with? (sshsudo/request-text \"true\\n\" \"T\") \"BEDIT-END-T\\n\")   ;=> true"
+  (let (body (if (string/ends-with? script "\n") script (str script "\n")))
+    (str "f=$(mktemp \"${TMPDIR:-/tmp}/.bedit-sudo.XXXXXX\") || f=/dev/null\n"
+      "cat > \"$f\" <<'BEDIT_REQ_" token "'\n" body "BEDIT_REQ_" token "\n"
+      "sh \"$f\" > \"$f.o\" 2> \"$f.e\" < /dev/null; rc=$?\n" "printf 'BEDIT-OUT-" token
+      " %s\\n' \"$rc\"; base64 < \"$f.o\"\n" "printf 'BEDIT-ERR-" token "\\n'; base64 < \"$f.e\"\n"
+      "printf 'BEDIT-END-" token "\\n'; rm -f -- \"$f\" \"$f.o\" \"$f.e\"\n")))
+
+(defn- decoded-text (base64)
+  ;; the text Base64 `base64` spells (a damaged one as it is)
+  (let (bytes (encoding/base64-decode-bytes (string/replace (string/replace base64 "\n" "") "\r" "")))
+    (if (failure? bytes) base64 (string/bytes-> bytes :lossy))))
+
+(defn parse-reply (text token)
+  "`os/cmd`'s map `{:exit :stdout :stderr}` from the root shell's `text` once it holds the reply to
+the request `token` names ([[request-text]]), or nil while it does not yet.
+
+    (:exit (sshsudo/parse-reply \"BEDIT-OUT-T 3\\naGk=\\nBEDIT-ERR-T\\nBEDIT-END-T\\n\" \"T\"))   ;=> 3"
+  (let (out-mark (str "BEDIT-OUT-" token " ")
+        err-mark (str "BEDIT-ERR-" token "\n")
+        end-mark (str "BEDIT-END-" token "\n")
+        out-at (index-of text out-mark)
+        err-at (index-of text err-mark)
+        end-at (index-of text end-mark))
+    (when (and (>= out-at 0) (> err-at out-at) (> end-at err-at))
+      (let (after-out (+ out-at (string/length out-mark))
+            line-end (index-of text "\n" after-out)
+            code (string/->number (string/substring text after-out line-end)))
+        {:exit (if (int? code) code -1)
+         :stdout (decoded-text (string/substring text (inc line-end) err-at))
+         :stderr (decoded-text (string/substring text (+ err-at (string/length err-mark)) end-at))}))))
+
+;; ---- the session ----------------------------------------------------------------------------
+
+(defn- close-child (state)
+  ;; `state` with its child closed and forgotten
+  (do
+    (when (:proc state)
+      (check-allow :discarded-catch (try (os/close (:proc state)) (catch _ nil))))
+    (assoc state :proc nil :stdout "" :stderr "")))
+
+(defn- prompts-in (text)
+  ;; how many times sudo prompted in `text`
+  (dec (count (string/split text prompt-marker))))
+
+(defn- start-failure (state code)
+  ;; why the root shell did not open: ssh's own failure, or sudo's, said
+  (let (classified (sshremote/classify {:exit code :stderr (:stderr state)} (:parts state)))
+    (or classified
+      {:error :sudo
+       :reason (str "sudo on "
+                 (sshpath/host-label (:parts state))
+                 " refused: "
+                 (let (said (string/trim (string/replace (:stderr state) prompt-marker "")))
+                   (if (= said "") (str "exit " code) said)))})))
+
+(defn- await-ready (state password)
+  "`[state answer]` once the root shell `state` is starting answers: `true` when it is open, else
+`{:failed …}` — sudo wanting a password not given (`:sudo-password`), refusing the one given
+(`:auth`, `:sudo`), ssh failing. `password` is written once, at sudo's first prompt."
+  (letrec (wait (fn (state sent?)
+                  (cond
+                    (includes? (:stdout state) ready-marker)
+                      (let (after (index-of (:stdout state)
+                                    "\n"
+                                    (index-of (:stdout state) ready-marker)))
+                        [(assoc state
+                           :stdout
+                             (if (< after 0)
+                               ""
+                               (string/substring (:stdout state)
+                                 (inc after)
+                                 (string/length (:stdout state))))
+                           :stderr "")
+                          true])
+                    (and sent? (> (prompts-in (:stderr state)) 1))
+                      [(close-child state)
+                        {:failed {:error :auth
+                                  :sudo true
+                                  :reason (str "sudo on "
+                                            (sshpath/host-label (:parts state))
+                                            " refused the password")}}]
+                    (and (not sent?) (> (prompts-in (:stderr state)) 0))
+                      (if (nil? password)
+                        [(close-child state) {:failed {:error :sudo-password}}]
+                        (do (os/write (:proc state) (str password "\n")) (wait state true)))
+                    else
+                      (let (proc (:proc state))
+                        (receive
+                          ([:proc ^proc data] (wait (update state :stdout str data) sent?))
+                          ([:proc-err ^proc data] (wait (update state :stderr str data) sent?))
+                          ([:proc-exit ^proc code] [(close-child state)
+                                                     {:failed (start-failure state code)}])
+                          ([:proc-closed ^proc code] [(close-child state)
+                                                       {:failed (start-failure state code)}])
+                          (after (:timeout-ms state)
+                            [(close-child state)
+                              {:failed {:error :timeout
+                                        :reason (str "sudo on "
+                                                  (sshpath/host-label (:parts state))
+                                                  " did not answer in time")}}]))))))
+    (wait state false)))
+
+(defn- ensure-open (state request)
+  "`[state answer]`: the root shell open (started from `request`'s `:argv` / `:env`, with its
+`:password` when sudo asks) — `true` — or why not."
+  (if (:proc state)
+    [state true]
+    (let (proc (check-allow :discarded-catch
+                 (try
+                   (os/spawn (first (:argv request))
+                     (vec (rest (:argv request)))
+                     {:env (:env request)})
+                   (catch e (failure (error-message e))))))
+      (if (failure? proc)
+        [state
+          {:failed {:error :connection
+                    :reason (str "ssh could not be started: " (error-message proc))}}]
+        (await-ready (assoc state
+                       :proc proc
+                       :stdout ""
+                       :stderr ""
+                       :parts (:parts request)
+                       :timeout-ms (:timeout-ms request))
+          (:password request))))))
+
+(defn- run-request (state script timeout-ms)
+  "`[state answer]` for `script` run in the open root shell: `os/cmd`'s map, or `{:failed …}` when
+the shell went away (the connection dropped) or did not answer in time."
+  (let (token (rand/token 8)
+        proc (:proc state)
+        written (check-allow :discarded-catch
+                  (try (do (os/write proc (request-text script token)) true) (catch _ false))))
+    (if (not written)
+      [(close-child state)
+        {:failed {:error :connection
+                  :reason (str "the root shell on " (sshpath/host-label (:parts state)) " is gone")}}]
+      (letrec (wait (fn (text)
+                      (let (reply (parse-reply text token))
+                        (if reply
+                          [(assoc state :stdout "") reply]
+                          (receive
+                            ([:proc ^proc data] (wait (str text data)))
+                            ([:proc-err ^proc _data] (wait text))
+                            ([:proc-exit ^proc _] [(close-child state)
+                                                    {:failed {:error :connection
+                                                              :reason (str "the connection to "
+                                                                        (sshpath/route-label (:parts state))
+                                                                        " dropped")}}])
+                            ([:proc-closed ^proc _] [(close-child state)
+                                                      {:failed {:error :connection
+                                                                :reason (str "the connection to "
+                                                                          (sshpath/route-label (:parts state))
+                                                                          " dropped")}}])
+                            (after timeout-ms
+                              [(close-child state)
+                                {:failed {:error :timeout
+                                          :reason (str "sudo on "
+                                                    (sshpath/host-label (:parts state))
+                                                    " did not answer in time")}}]))))))
+        (wait (:stdout state))))))
+
+(defn session-loop (state)
+  "A root shell's session over `state` `{:proc :stdout :stderr :parts}`:
+
+  [:open request reply ref]   open it (with `request`'s `:password`), answer `[:sudo ref answer]`
+  [:run request reply ref]    run `request`'s `:script` in it (opening it first, no password)
+  [:stop]                     close it and end
+
+and ends by itself `*idle-ms*` after the last request."
+  (receive
+    ([:open request reply ref] (let ([opened answer] (ensure-open state request))
+                                 (do (send reply [:sudo ref answer]) (session-loop opened))))
+    ([:run request reply ref] (let ([opened answer] (ensure-open state request))
+                                (if (= answer true)
+                                  (let ([after-run result] (run-request opened
+                                                             (:script request)
+                                                             (:timeout-ms request)))
+                                    (do (send reply [:sudo ref result]) (session-loop after-run)))
+                                  (do (send reply [:sudo ref answer]) (session-loop opened)))))
+    ([:stop] (do (close-child state) :stopped))
+    ([:proc-closed p _] (session-loop (if (= p (:proc state)) (close-child state) state)))
+    (_ (session-loop state))
+    (after *idle-ms* (do (close-child state) :idle))))
+
+(def- *sessions* (table/new))
+;; the names of the sessions started, so they can all be ended ([[stop-all]])
+
+(defn- ask (request kind &optional (again? true))
+  ;; `request` sent to its session as `kind`, the answer awaited. A session that ended as it was
+  ;; asked (idle, at that moment) is started again once; one that died answers a dropped
+  ;; connection
+  (let (name (session-name (:argv request))
+        pid (spawn name (session-loop {:proc nil :stdout "" :stderr ""}))
+        _ (table/put *sessions* name (pr-str (:argv request)))
+        request-ref (ref)
+        monitor-ref (monitor pid))
+    (do
+      (send pid [kind request (self) request-ref])
+      (receive
+        ([:sudo ^request-ref answer] (do (demonitor monitor-ref) answer))
+        ([:down ^monitor-ref _ reason] (if (and again? (contains? #{:idle :stopped :normal} reason))
+                                         (ask request kind false)
+                                         {:failed {:error :connection
+                                                   :reason (str "the root shell ended: "
+                                                             (pr-str reason))}}))))))
+
+(defn open (request)
+  "Open the root shell `request` names (`{:argv :env :parts :timeout-ms :password}`, the argv
+ssh's for the route with [[remote-command]]) — `true`, or `{:failed …}` — the password written
+once, if sudo asks. Blocks."
+  (ask request :open))
+
+(defn run (request)
+  "Run `request`'s `:script` in its root shell (opened first if it is not: with no password, so
+one sudo wants is answered `{:failed {:error :sudo-password}}`): `os/cmd`'s map, or
+`{:failed …}`. Blocks."
+  (ask request :run))
+
+(defn stop-all (&optional (matching nil))
+  "End every root shell this editor opened — or, given `matching`, those whose ssh run names it
+(a test's socket folder: its clean-up, beside other tests' sessions)."
+  (doseq (entry (table/snapshot *sessions*))
+    (when (or (nil? matching) (includes? (second entry) matching))
+      (let (pid (proc/whereis (first entry)))
+        (do (when pid (send pid [:stop])) (table/delete *sessions* (first entry)))))))

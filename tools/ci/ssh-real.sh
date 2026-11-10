@@ -8,9 +8,10 @@
 #
 #   ci     (the default) sshd runs as ROOT through sudo — the only way it can check a password —
 #          and a throwaway user `bedittest` with a random password is made for the password
-#          login. The aliases go into ~/.ssh/config, which the driver's plain `ssh` reads, as a
-#          user's would. Nothing else of the machine is changed: the system's own sshd, if any,
-#          keeps its port and config.
+#          login (and allowed sudo WITH that password, for the `|sudo:` hop's password; a
+#          root-only file is staged for the runner's own passwordless sudo). The aliases go into
+#          ~/.ssh/config, which the driver's plain `ssh` reads, as a user's would. Nothing else
+#          of the machine is changed: the system's own sshd, if any, keeps its port and config.
 #   local  sshd runs as YOU (no sudo, no new user, ~/.ssh untouched): key logins only, so the
 #          password check is skipped. The aliases go into a config file of the run's own that
 #          a wrapper hands ssh with -F. SSHD names the sshd binary (default /usr/sbin/sshd);
@@ -32,6 +33,8 @@ me="$(id -un)"
 
 stage="$(mktemp -d /tmp/bedit-ssh-stage.XXXXXX)"
 chmod 755 "$stage"
+# the `|sudo:` hop's root-only file (ci mode)
+root_file="$stage/root-only.conf"
 
 case "$mode" in
   ci) as_root=sudo ;;
@@ -109,7 +112,10 @@ chmod 755 "$stage/sshd-ctl"
 
 cleanup() {
   "$stage/sshd-ctl" stop >/dev/null 2>&1 || true
-  if [ "$mode" = ci ]; then sudo userdel -r bedittest >/dev/null 2>&1 || true; fi
+  if [ "$mode" = ci ]; then
+    sudo userdel -r bedittest >/dev/null 2>&1 || true
+    sudo rm -f /etc/sudoers.d/bedittest "$root_file" || true
+  fi
   rm -rf "$stage"
 }
 trap cleanup EXIT
@@ -196,6 +202,15 @@ if [ "$mode" = ci ]; then
   export BEDIT_SSH_PW_FILE=/home/bedittest/pw.txt
   export BEDIT_SSH_OTHER_USER=bedittest
   export BEDIT_SSH_OTHER_FILE=pw.txt
+  # the `|sudo:` hop: a file only root may read, reached through the runner's passwordless
+  # sudo; and the password user may sudo with its password, which sudo -S is handed
+  printf 'root only\n' | sudo tee "$root_file" >/dev/null
+  sudo chown root:root "$root_file"
+  sudo chmod 600 "$root_file"
+  echo "bedittest ALL=(ALL) ALL" | sudo tee /etc/sudoers.d/bedittest >/dev/null
+  sudo chmod 440 /etc/sudoers.d/bedittest
+  export BEDIT_SSH_ROOT_FILE="$root_file"
+  export BEDIT_SSH_SUDO_PASSWORD=1
 else
   aliases >"$stage/ssh_config"
   printf '#!/bin/sh\nexec ssh -F %s "$@"\n' "$stage/ssh_config" >"$stage/ssh"
