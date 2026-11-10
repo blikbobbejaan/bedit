@@ -784,7 +784,8 @@ src/menu.blsp               the right-click context menu's model ops (open / mov
                             close); an item names its command by SYMBOL, resolved when it
                             runs, so a redefined command reaches the menu too
 src/keymaps.blsp            keybinding profiles (emacs / modal vim) as model-scope layers
-src/interactive.blsp        the `defcommand` macro + the M-x command registry
+src/interactive.blsp        the `defcommand` macro + the M-x command registry, command traits, and REPEAT MAPS
+                            (`declare-repeat-map`, Emacs repeat-map: after C-x C-M-+ the keys + / - / 0 repeat)
 src/transient.blsp          TRANSIENT MENUS (magit's `P`): the editor half of
                             `transient-core` (brood ADR-387) — the modal overlay, the
                             minibuffer read behind a `:read` outcome, and the MEMORY (a

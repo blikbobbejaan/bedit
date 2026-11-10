@@ -33,6 +33,19 @@ is the language change that would make doc-view readable; drawing at a higher dp
 **Tests.** tests/docview_test.blsp (11): the rasteriser and pdfinfo are stand-ins
 (`docview/*which*`, `docview/*run*`) that write PNGs whose colour is the page number.
 
+### Zoom every window, and repeat maps
+
+**What shipped.** Emacs 29's `global-text-scale-adjust`: `C-x C-M-+` / `C-x C-M-=` / `C-x C-M--` /
+`C-x C-M-0` and Ctrl+Meta+wheel step the WINDOW's font (`appearance/global-zoom-*`, through
+`apply!` like a preset), every pane and the chrome; `0` goes back to the size before the first
+step (`:global-zoom-base`). A terminal refuses it as it refuses the pane zoom. After the first
+key, `+` / `=` / `-` / `0` repeat — and the per-pane `C-x C-=` family now repeats the same way.
+That came from a general change: `interactive/declare-repeat-map` (Emacs's `repeat-map`
+property), which the repeat overlay in `input` now reads as `:repeat {:keys {key command}}`; the
+`:repeat` trait is its one-key case.
+
+**Tests.** tests/appearance_test.blsp (+5).
+
 ## 2026-09-17
 
 ### the zoom is per pane, and it is a render op — not a font change
