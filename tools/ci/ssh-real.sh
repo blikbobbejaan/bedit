@@ -129,6 +129,8 @@ cleanup() {
   if [ -n "$sudo_placed" ]; then "$as_root" rm -f /usr/local/bin/sudo || true; fi
   "$stage/sshd-ctl" stop >/dev/null 2>&1 || true
   if [ "$mode" = ci ]; then
+    # its ControlPersist connections and sessions hold it: userdel refuses a user with processes
+    "$as_root" pkill -KILL -u bedittest >/dev/null 2>&1 || true
     "$as_root" userdel -r bedittest >/dev/null 2>&1 || true
     "$as_root" rm -f /etc/sudoers.d/bedittest "$root_file" || true
     if [ -n "$doas_conf_made" ]; then "$as_root" rm -f /etc/doas.conf || true; fi
@@ -213,7 +215,9 @@ if [ "$mode" = ci ]; then
   chmod 600 ~/.ssh/config
   # the password login's user, a password nobody else knows, a file in its home
   password="bedit-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
-  sudo useradd -m -s /bin/sh bedittest
+  # a run earlier in this job may have left it (cleanup kills its processes first, but a
+  # straggler can still hold it): reuse it, with this run's password
+  id bedittest >/dev/null 2>&1 || sudo useradd -m -s /bin/sh bedittest
   echo "bedittest:$password" | sudo chpasswd
   sudo chmod 755 /home/bedittest
   echo "the password user's file" | sudo tee /home/bedittest/pw.txt >/dev/null
