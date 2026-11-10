@@ -1616,6 +1616,11 @@ tools/ci/ssh-real.sh        CI's REAL-sshd check (`ssh-real` in ci.yml): OpenSSH
                             prompt listing / dired ops / `~user` / multi-hop / password / a dropped
                             connection through the real ssh. `local` mode runs sshd as you (no
                             sudo, no password check) for a quick look on a desktop
+tools/ci/drive-all.sh       CI's weekly LIVE DRIVERS run (.github/workflows/drive.yml, cron +
+                            workflow_dispatch): every tools/drive-*.blsp, each on its own with a
+                            timeout so one red driver hides none of the rest, the built nest (and
+                            brood-lsp) first on PATH, a scratch XDG home, Elixir installed for
+                            drive-elixir; a log per driver and summary.txt, uploaded on failure
 assets/                     the desktop identity: the icon (SVG) + the .desktop entry the
                             window's `:app-id` is matched against (`make install` places both)
 project.blsp                the nest manifest (:name "bedit")

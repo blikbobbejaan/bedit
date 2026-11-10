@@ -12,6 +12,13 @@ make drive                        # all of them
 nest run tools/drive-mspc.blsp    # or one at a time (from anywhere)
 ```
 
+CI runs every one of them weekly (and on demand: `gh workflow run drive.yml`) on Linux, headless
+— `.github/workflows/drive.yml` over `tools/ci/drive-all.sh NEST OUT [driver …]`, which runs each
+driver on its own with a timeout, so one failure hides none of the rest, and keeps a log per
+driver (uploaded when any failed). A driver that needs a program the runner lacks skips itself
+(`terraform-ls`); the job installs Elixir and builds `brood-lsp` so `drive-elixir` and
+`drive-lsp` run for real.
+
 All of them are Brood. Two shapes, and the difference is where the editor runs:
 
 - **On a pty** (`drive.blsp` is their harness). The editor is a real child process with a
