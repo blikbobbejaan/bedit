@@ -772,9 +772,11 @@ src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (re
                             another coding or the hex view): how a file reads is a guess, and this
                             overrules it either way. A file edited as root reads through sudo
                             (`sudoedit/ed-sudo-revert`, M-x revert-buffer too)
-src/imageview.blsp          an image (PNG, JPEG, GIF, WebP, BMP) opens as a picture: brood's gui/image-thumb
-                            decodes it to fit the pane, painted in half-block cells (window and
-                            terminal alike) over the theme's background; one that does not decode is hex
+src/imageview.blsp          an image (PNG, JPEG, GIF, WebP, BMP) opens as a picture: ONE brood `[:image …]`
+                            op (brood ADR-686) over the pane's text area — a window paints it at full
+                            pixel resolution, a terminal in half-block cells; never enlarged, top-left
+                            (a buffer's `:image-placement` overrides: doc-view fits and centres a page);
+                            one that does not decode is hex
 src/docview.blsp            a PDF opens as its pages (Emacs doc-view, the `:document` presenter): each page
                             drawn OFF the loop (`:docview-proc`) by `pdftoppm`, else `mutool draw`, into
                             a PNG cached under state/cache/docview/, and painted by imageview's layer
