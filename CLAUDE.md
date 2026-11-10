@@ -239,9 +239,10 @@ src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in O
                             `~other/…` another user's (kept as typed, resolved there); a route
                             through jump hosts is TRAMP's multi-hop (`/ssh:bastion|ssh:host:/x`,
                             `:hops` on the parts, `route-label`, `prefix`; `same-connection?`), and
-                            a last `|sudo:` hop edits as root THERE (`/ssh:host|sudo::/etc/x`,
-                            `|sudo:www@:` another user — `:sudo` on the parts, `sudo-user?`, its own
-                            connection). filename, sidecar, mincomplete, dired and the handler all
+                            a last ROOT HOP edits as root THERE — `|sudo:`, `|su:` or `|doas:`
+                            (`/ssh:host|sudo::/etc/x`, `|su:www@:` another user — `:become
+                            {:method :user}` on the parts, `*become-methods*`, `become-user?`, its
+                            own connection). filename, sidecar, mincomplete, dired and the handler all
                             read it
 src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*program*`, a test's
                             stand-in runs the scripts locally) with one SHARED connection per host
@@ -266,18 +267,25 @@ src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*pro
                             (`SHELL`); a route that fails is tried hop by hop (`route-failure`,
                             `blame-route`), naming the hop. A password opens a connection once —
                             the host's or a hop's (`connect-with-password`, `hop-parts`: SSH_ASKPASS
-                            helper reading ssh's own stdin, refusing yes/no questions). A `|sudo:`
-                            path's scripts run in `sshsudo`'s root shell (`run`, `sudo-connect`)
-src/sshsudo.blsp            the `|sudo:` hop's ROOT SHELL, kept open as TRAMP keeps one (sudo's
-                            cache cannot serve the next ssh command: no terminal, a new session
-                            each): a process per route + user holding `ssh … sudo -S -p MARKER -u
-                            USER /bin/sh -c 'echo READY; exec /bin/sh'`, over the host's
-                            ControlMaster, ended 5 min idle or when the link drops. The password is
-                            written once, only at sudo's own prompt (a NOPASSWD rule never gets
-                            it); a second prompt is a wrong one, closed before a third. Each request
-                            a script run by its own `sh` from a temp file, output and errors Base64
-                            between per-request markers (`request-text`, `parse-reply`), answered as
-                            `os/cmd`'s map. `stop-all` (a test passes its socket dir)
+                            helper reading ssh's own stdin, refusing yes/no questions). A root-hop
+                            path's scripts run in `sshsudo`'s root shell (`run`, `become-request`,
+                            `become-connect`; `-tt` for su / doas: `ssh-options`' `tty`)
+src/sshsudo.blsp            the ROOT HOPS' ROOT SHELL (`|sudo:`, `|su:`, `|doas:`), kept open as TRAMP
+                            keeps one (no credential cache can serve the next ssh command: a new
+                            session each). ONE METHOD TABLE (`*methods*`): each method's command,
+                            whether it needs a terminal (su and doas read a password only from
+                            one: ssh `-tt`, the shell then `stty raw -echo`, stderr away so never
+                            interactive), its prompt regex (`prompts-in`) and whose password
+                            (`password-question`, `who`). sudo is told its prompt by
+                            `SUDO_PROMPT`, never `-p` (sudo-rs < 0.2.5 refuses `-p`; its own
+                            `[sudo: authenticate]` is the fallback). A process per route + method +
+                            user over the host's ControlMaster, ended 5 min idle or when the link
+                            drops. The password is written once, only at the method's prompt (a
+                            NOPASSWD / `nopass` rule never gets it); a second prompt, or the method
+                            ending after it, is a wrong one. Each request a script run by its own
+                            `sh` from a temp file, output and errors Base64 between per-request
+                            markers (`request-text`, `parse-reply`), answered as `os/cmd`'s map.
+                            `stop-all` (a test passes its socket dir)
 src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/ssh:`), the second file
                             handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
                             /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
@@ -286,7 +294,7 @@ src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/s
                             (`:ssh-proc`, one at a time, C-g stops it): `Loading…` at once, a save
                             stays modified until it lands (`file-save/ed-save-prepare` /
                             `ed-save-landed`), a dropped connection said. A password the host, a
-                            jump host or the `|sudo:` hop wants is read masked
+                            jump host or the root hop (`|sudo:`, `|su:`, `|doas:`) wants is read masked
                             (`passwd/ed-read-passwd`; the job's `:password-for`) and used once.
                             charset as any file (binary → hex, large → asked); a directory opens in
                             DIRED (the handler's `:dired`, `ed-ssh-dired`: listed off the loop, then
@@ -1665,8 +1673,12 @@ tools/ci/ssh-real.sh        CI's REAL-sshd check (`ssh-real` in ci.yml): OpenSSH
                             (`ssh-real.blsp`) runs `/ssh:` open / save / revert / hex / large /
                             prompt listing / dired ops (replacing asked) / copies to and from this
                             machine and to another host / `~user` / multi-hop / password / a jump
-                            host's password / `|sudo:` with and without sudo's password / a dropped
-                            connection through the real ssh. `local` mode runs sshd as you (no
+                            host's password / `|sudo:` with and without sudo's password / `|su:`
+                            (root given a password for the run) / `|doas:` (a doas.conf of the
+                            run's) / a dropped connection through the real ssh; then the root hops
+                            again with sudo-rs as the host's sudo (`BEDIT_SSH_SUDO`, installed as
+                            /usr/local/bin/sudo for the run; `BEDIT_SSH_ONLY=root`) — Ubuntu's
+                            0.2.2 and the latest. `local` mode runs sshd as you (no
                             sudo, no password check) for a quick look on a desktop
 tools/ci/drive-all.sh       CI's weekly LIVE DRIVERS run (.github/workflows/drive.yml, cron +
                             workflow_dispatch): every tools/drive-*.blsp, each on its own with a

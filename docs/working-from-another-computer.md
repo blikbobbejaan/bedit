@@ -156,6 +156,8 @@ C-x C-f /ssh:[fe80::1]:/etc/hosts             # an IPv6 host in brackets
 C-x C-f /ssh:bastion|ssh:db1:/etc/my.cnf      # through a jump host (TRAMP's multi-hop)
 C-x C-f /ssh:web1|sudo::/etc/hosts           # as root ON web1 (TRAMP's sudo hop)
 C-x C-f /ssh:web1|sudo:www-data@:/srv/x      # as another user there
+C-x C-f /ssh:web1|su::/etc/hosts             # as root through su (root's password)
+C-x C-f /ssh:web1|doas::/etc/hosts           # as root through doas
 C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
 ```
 
@@ -184,7 +186,19 @@ C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
   rule never gets it — and kept nowhere; a wrong one is said, and sudo is not left to count
   more tries. Dired, saving and C-x C-w work as on any remote path; the mode line says
   `@web1 # root`. A `sudo` that insists on a terminal (`requiretty`) is said, not worked
-  around.
+  around. sudo is told its prompt through `SUDO_PROMPT`, never `-p`: sudo-rs (Ubuntu 25.10's
+  `sudo`) took `-p` and `SUDO_PROMPT` only in 0.2.5, and an older one — Ubuntu 24.04's package —
+  refuses the whole command over `-p`; its own `[sudo: authenticate] Password:` is recognised
+  instead.
+- **Through su or doas (`|su:`, `|doas:`).** `/ssh:web1|su::/etc/hosts` and
+  `/ssh:web1|doas::/etc/hosts` (`USER@` before the `:` for another user) keep the same root
+  shell, opened by `su - USER` (asking for THAT user's password — root's) or `doas -u USER`
+  (asking for yours; a `nopass` rule asks nothing). Both read a password only from a terminal,
+  so their ssh asks the host for one (`-tt`), and the root shell turns it raw and silent before
+  the first request, so every byte crosses as sent and nothing echoes back. The password is
+  asked for masked (`Password for su on web1 (theirs, as su asks)`), written once, at the
+  prompt, and kept nowhere; a wrong one is said (su and doas end at once). The mode line says
+  `@web1 # root` as for sudo.
 - **Opening.** A `Loading…` buffer appears at once and the file replaces it when ssh answers;
   C-g stops it. The bytes come through `base64`, so the file's coding is detected as any
   file's is: a binary opens as the read-only hex view, and a file past
@@ -230,12 +244,13 @@ C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
   server on localhost and drives all of the above through the real `ssh`: key and password
   logins, a jump host and one that takes only a password, an unknown host key, dired's
   operations (replacing an entry, copies to and from this machine and to another host through
-  a jump host), a root-only file through `|sudo:` with and without sudo's password, and sshd
-  killed mid-session.
-- **Not there yet.** Hops other than `ssh:` and a last `sudo:` (TRAMP's `su:`, `doas:`, a
-  `sudo:` in the middle of a route); a copy between machines larger than 200 MB (it passes
-  through the editor's memory); and a jump host's password asked for by dired's own
-  operations (the listing before them has always opened the route).
+  a jump host), a root-only file through `|sudo:` with and without sudo's password — then again
+  with Ubuntu's sudo-rs (0.2.2) and the latest sudo-rs as the host's `sudo` — through `|su:`
+  with root's password and `|doas:` with and without one, and sshd killed mid-session.
+- **Not there yet.** A root hop in the middle of a route (`|sudo:` then `|ssh:` on), or one
+  after another; a copy between machines larger than 200 MB (it passes through the editor's
+  memory); and a jump host's password asked for by dired's own operations (the listing before
+  them has always opened the route).
 
 ## Collaboration status (what's built vs runnable)
 

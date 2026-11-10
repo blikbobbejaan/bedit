@@ -35,6 +35,7 @@
     "    -o) case \"$2\" in BatchMode=no) batch=no ;; ProxyCommand=*) proxy=${2#ProxyCommand=} ;; esac; shift 2 ;;\n"
     "    -p|-l|-e) shift 2 ;;\n"
     "    -T) shift ;;\n"
+    "    -tt) touch \"$state/tty-asked\"; shift ;;\n"
     "    --) shift; break ;;\n"
     "    *) break ;;\n"
     "  esac\n"
@@ -61,20 +62,67 @@
 
 (defn- sudo-source (state)
   ;; the `sudo` the stand-in host runs: as the user it was told (written to `sudo-user`), a
-  ;; password (`rootpw`) wanted when `sudopw` is there — asked again once when wrong, as sudo does
+  ;; password (`rootpw`) wanted when `sudopw` is there — asked again once when wrong, as sudo does.
+  ;; `sudo-flavour` holding `rs-old` makes it sudo-rs before 0.2.5 (no `-p`, no SUDO_PROMPT: its
+  ;; own `[sudo: authenticate] Password: `), `rs-new` sudo-rs since (SUDO_PROMPT wrapped in its
+  ;; brackets); else classic sudo (SUDO_PROMPT as it is)
   (str "#!/bin/sh\n"
     "state="
     (os/shell-quote state)
     "\n"
-    "prompt=; user=root\n"
+    "flavour=$(cat \"$state/sudo-flavour\" 2>/dev/null)\n"
+    "case $flavour in\n"
+    "  rs-old) prompt='[sudo: authenticate] Password: ' ;;\n"
+    "  rs-new) prompt=\"[sudo: $SUDO_PROMPT] Password: \" ;;\n"
+    "  *) prompt=${SUDO_PROMPT:-'[sudo] password for me: '} ;;\n"
+    "esac\n"
+    "user=root\n"
     "while [ $# -gt 0 ]; do\n"
-    "  case \"$1\" in -S|-n|-k) shift ;; -p) prompt=$2; shift 2 ;; -u) user=$2; shift 2 ;; --) shift; break ;; *) break ;; esac\n"
+    "  case \"$1\" in -S|-n|-k) shift ;; -u) user=$2; shift 2 ;; --) shift; break ;;\n"
+    "    -p) if [ \"$flavour\" = rs-old ]; then echo 'sudo-rs: invalid option provided' >&2; exit 1; fi; prompt=$2; shift 2 ;;\n"
+    "    *) break ;; esac\n"
     "done\n"
     "printf '%s\\n' \"$user\" > \"$state/sudo-user\"\n"
     "if [ -f \"$state/sudopw\" ]; then\n"
     "  printf '%s' \"$prompt\" >&2\n"
     "  IFS= read -r typed || exit 1\n"
     "  if [ \"$typed\" != rootpw ]; then printf 'Sorry, try again.\\n%s' \"$prompt\" >&2; IFS= read -r typed; exit 1; fi\n"
+    "fi\n"
+    "exec \"$@\"\n"))
+
+(defn- su-source (state)
+  ;; the stand-in host's `su - USER -c SCRIPT`: as the user it was told (written to `su-user`),
+  ;; always asking for that user's password (`rootpw`) on its one stream, as on a terminal, and
+  ;; ending at once when it is wrong, as su does
+  (str "#!/bin/sh\n"
+    "state="
+    (os/shell-quote state)
+    "\n"
+    "[ \"$1\" = - ] && shift\n"
+    "user=$1; shift\n"
+    "[ \"$1\" = -c ] || exit 2\n"
+    "printf '%s\\n' \"$user\" > \"$state/su-user\"\n"
+    "printf 'Password: '\n"
+    "IFS= read -r typed || exit 1\n"
+    "printf '\\n'\n"
+    "if [ \"$typed\" != rootpw ]; then echo 'su: Authentication failure'; exit 1; fi\n"
+    "exec /bin/sh -c \"$2\"\n"))
+
+(defn- doas-source (state)
+  ;; the stand-in host's `doas -u USER COMMAND…`: as the user it was told (written to
+  ;; `doas-user`), asking for YOUR password (`mypw`) when `doaspw` is there (else `nopass`), on
+  ;; its one stream, ending at once when it is wrong, as doas does
+  (str "#!/bin/sh\n"
+    "state="
+    (os/shell-quote state)
+    "\n"
+    "user=root\n"
+    "if [ \"$1\" = -u ]; then user=$2; shift 2; fi\n"
+    "printf '%s\\n' \"$user\" > \"$state/doas-user\"\n"
+    "if [ -f \"$state/doaspw\" ]; then\n"
+    "  printf 'doas (me@web1) password: '\n"
+    "  IFS= read -r typed || exit 1\n"
+    "  if [ \"$typed\" != mypw ]; then echo 'doas: Authentication failed'; exit 1; fi\n"
     "fi\n"
     "exec \"$@\"\n"))
 
@@ -88,8 +136,11 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
       (file/spit stub (stub-source dir))
       (os/cmd "chmod" ["+x" stub])
       (file/mkdir (path/join dir "bin"))
-      (file/spit (path/join dir "bin" "sudo") (sudo-source dir))
-      (os/cmd "chmod" ["+x" (path/join dir "bin" "sudo")])
+      (each [["sudo" (sudo-source dir)] ["su" (su-source dir)] ["doas" (doas-source dir)]]
+        (fn ([program source])
+          (do
+            (file/spit (path/join dir "bin" program) source)
+            (os/cmd "chmod" ["+x" (path/join dir "bin" program)]))))
       (let (result (binding (*program* stub
                              *control-dir* (path/join dir "ctl")
                              *config-base* dir)
@@ -904,11 +955,12 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
   (test "is read as a sudo hop on the host before it"
     (let (parts (sshpath/parse "/ssh:me@web1|sudo::/etc/hosts"))
       (do
-        (assert= (:sudo parts) {:user nil})
+        (assert= (:become parts) {:method :sudo :user nil})
         (assert= (:host parts) "web1")
         (assert= (:path parts) "/etc/hosts")
         (assert= (sshpath/spec parts) "/ssh:me@web1|sudo::/etc/hosts")))
-    (assert= (:sudo (sshpath/parse "/ssh:web1|sudo:www-data@web1:/srv")) {:user "www-data"})
+    (assert= (:become (sshpath/parse "/ssh:web1|sudo:www-data@web1:/srv"))
+      {:method :sudo :user "www-data"})
     (assert= (sshpath/canonical "/ssh:web1|sudo:www@web1:/srv/./a") "/ssh:web1|sudo:www@:/srv/a")
     (assert= (sshpath/canonical "/ssh:j|ssh:web1|sudo::x") "/ssh:j|ssh:web1|sudo::~/x")
     (assert= (sshpath/dirname "/ssh:web1|sudo::/etc/hosts") "/ssh:web1|sudo::/etc")
@@ -916,9 +968,17 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
     (each ["/ssh:web1|sudo:other:/x"
             "/ssh:web1|sudo:a;b@:/x" "/ssh:web1|sudo:-u@:/y" "/ssh:web1|sudo:/x"]
       (fn (spec) (is (nil? (sshpath/parse spec))))))
-  (test "the remote command is words every login shell reads alike"
-    (assert= (sshsudo/remote-command nil)
-      "sudo -S -p BEDIT-SUDO-PASSWORD -u root /bin/sh -c 'echo BEDIT-SUDO-READY; exec /bin/sh'"))
+  (test "the remote command is words every login shell reads alike, the prompt in SUDO_PROMPT"
+    ;; never `-p`: sudo-rs before 0.2.5 refuses the whole command over it
+    (assert= (sshsudo/remote-command {:method :sudo :user nil})
+      "env SUDO_PROMPT=BEDIT-SUDO-PASSWORD sudo -S -u root /bin/sh -c 'echo BEDIT-SUDO-READY; exec /bin/sh'"))
+  (test "sudo's prompt is told apart however it is worded: classic sudo, sudo-rs old and new"
+    (assert= (sshsudo/prompts-in {:method :sudo} "BEDIT-SUDO-PASSWORD") 1)
+    (assert= (sshsudo/prompts-in {:method :sudo} "[sudo: BEDIT-SUDO-PASSWORD] Password: ") 1)
+    (assert= (sshsudo/prompts-in {:method :sudo}
+               "[sudo: authenticate] Password: \nAuthentication failed, try again.\n[sudo: authenticate] Password: ")
+      2)
+    (assert= (sshsudo/prompts-in {:method :sudo} "sudo: a password is required\n") 0))
   (test "a request's reply is read between its markers"
     (let (reply (sshsudo/parse-reply (str "noise\nBEDIT-OUT-T 0\n"
                                        (encoding/base64-encode (str "dir\n/etc\n"))
@@ -999,3 +1059,100 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                      (let (listed (dired/ed-show-dired (ed-init (make-buffer ""))
                                     (str "/ssh:web1|sudo::" etc)))
                        (is (includes? (:dired-names (ed-current-buf listed)) "a.txt")))))))))
+
+(defn- open-with-password (dir spec password)
+  ;; `spec` opened, the masked prompt answered with `password`: `[asked answered]`
+  (let (asked (ed-find-file (ed-init (make-buffer "")) spec))
+    [asked (ed-update (type-text asked password) :enter 80 24)]))
+
+(describe "sudo-rs as the host's sudo"
+  (each [["before 0.2.5 (no -p, no SUDO_PROMPT)" "rs-old"]
+          ["since 0.2.5 (SUDO_PROMPT bracketed)" "rs-new"]]
+    (fn ([label flavour])
+      (test (str "its password prompt is recognised: " label)
+        (with-stub (fn (dir)
+                     (let (path (path/join dir "shadow"))
+                       (do
+                         (file/spit path "secret stuff\n")
+                         (file/spit (path/join dir "sudopw") "")
+                         (file/spit (path/join dir "sudo-flavour") flavour)
+                         (let ([asked m] (open-with-password dir
+                                           (str "/ssh:web1|sudo::" path)
+                                           "rootpw"))
+                           (do
+                             (is (map/get-in asked [:minibuffer :masked]))
+                             (is (includes? (pr-str (:minibuffer asked)) "sudo on web1"))
+                             (assert= (buffer-text (ed-current-buf m)) "secret stuff\n")
+                             (let (saved (file-save/ed-save-buf-at (ed-update m "#" 80 24)
+                                           (ed-current-index m)))
+                               (assert= (file/slurp path) "#secret stuff\n"))))))))))))
+
+(describe "a file edited as root through `|su:` and `|doas:`"
+  (test "the paths read and spell back"
+    (assert= (:become (sshpath/parse "/ssh:me@web1|su::/etc/hosts")) {:method :su :user nil})
+    (assert= (:become (sshpath/parse "/ssh:web1|doas:www@web1:/srv")) {:method :doas :user "www"})
+    (assert= (sshpath/canonical "/ssh:web1|su:root@:/etc/./x") "/ssh:web1|su:root@:/etc/x")
+    (assert= (sshpath/dirname "/ssh:j|ssh:web1|doas::/etc/hosts") "/ssh:j|ssh:web1|doas::/etc")
+    (is (not (sshpath/same-connection? "/ssh:web1|su::/a" "/ssh:web1|sudo::/a")))
+    (each ["/ssh:web1|su:other:/x" "/ssh:web1|doas:a;b@:/x" "/ssh:web1|sux::/x"]
+      (fn (spec) (is (nil? (sshpath/parse spec))))))
+  (test "su and doas run on a terminal, the root shell raw and silent"
+    (is (sshsudo/tty? {:method :su}))
+    (is (sshsudo/tty? {:method :doas}))
+    (is (not (sshsudo/tty? {:method :sudo})))
+    (assert= (sshsudo/remote-command {:method :su :user nil})
+      "env LC_ALL=C su - root -c 'stty raw -echo 2>/dev/null; echo BEDIT-SUDO-READY; exec /bin/sh 2>/dev/null'")
+    (let (argv (sshremote/ssh-argv {:host "h"} "x" true true))
+      (do (is (includes? argv "-tt")) (is (not (includes? argv "-T"))))))
+  (test "su asks for root's password, masked, opens and saves, and the mode line says root"
+    (with-stub (fn (dir)
+                 (let (path (path/join dir "hosts"))
+                   (do
+                     (file/spit path "127.0.0.1 localhost\n")
+                     (let ([asked m] (open-with-password dir (str "/ssh:web1|su::" path) "rootpw"))
+                       (do
+                         (is (map/get-in asked [:minibuffer :masked]))
+                         (is (includes? (pr-str (:minibuffer asked))
+                               "su on web1 (theirs, as su asks)"))
+                         (is (file/exists? (path/join dir "tty-asked")))
+                         (assert= (string/trim (file/slurp (path/join dir "su-user"))) "root")
+                         (assert= (buffer-text (ed-current-buf m)) "127.0.0.1 localhost\n")
+                         (is (not (includes? (pr-str (dissoc m :buffers)) "rootpw")))
+                         (is (includes? (pr-str (sshedit/ssh-segment m nil (ed-current-buf m)))
+                               "@web1 # root"))
+                         (let (saved (file-save/ed-save-buf-at (ed-update m "#" 80 24)
+                                       (ed-current-index m)))
+                           (do
+                             (is (nil? (:minibuffer saved)))
+                             (assert= (file/slurp path) "#127.0.0.1 localhost\n"))))))))))
+  (test "a wrong su password is said — su ends at once — and nothing opens"
+    (with-stub (fn (dir)
+                 (let ([_asked m] (open-with-password dir
+                                    (str "/ssh:web1|su::" (path/join dir "x"))
+                                    "nope"))
+                   (do
+                     (is (includes? (:echo m) "su on web1 refused the password"))
+                     (is (not (any? (:buffers m) :ssh-loading))))))))
+  (test "doas with `nopass` opens as the user named, asking nothing"
+    (with-stub (fn (dir)
+                 (let (path (path/join dir "site.conf"))
+                   (do
+                     (file/spit path "x\n")
+                     (let (m (ed-find-file (ed-init (make-buffer ""))
+                               (str "/ssh:web1|doas:www@:" path)))
+                       (do
+                         (assert= (buffer-text (ed-current-buf m)) "x\n")
+                         (is (nil? (:minibuffer m)))
+                         (assert= (string/trim (file/slurp (path/join dir "doas-user"))) "www"))))))))
+  (test "doas asks for your password, and a wrong one is refused"
+    (with-stub (fn (dir)
+                 (let (path (path/join dir "hosts"))
+                   (do
+                     (file/spit path "doas\n")
+                     (file/spit (path/join dir "doaspw") "")
+                     (let ([_ wrong] (open-with-password dir (str "/ssh:web1|doas::" path) "nope"))
+                       (is (includes? (:echo wrong) "doas on web1 refused the password")))
+                     (let ([asked m] (open-with-password dir (str "/ssh:web1|doas::" path) "mypw"))
+                       (do
+                         (is (includes? (pr-str (:minibuffer asked)) "doas on web1 (yours there"))
+                         (assert= (buffer-text (ed-current-buf m)) "doas\n")))))))))
