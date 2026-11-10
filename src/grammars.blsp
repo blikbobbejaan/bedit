@@ -351,12 +351,10 @@ upgrade path: replace the `.so` and run this, without restarting.
 Safe because the runtime treats a re-load as a swap: it overrides the registration, drops
 the pooled parsers bound to the old library, and clears the cached trees, which were
 shaped by it. Anything that survived would be holding pointers into a library the next
-parse no longer uses. Each reloaded grammar is checked against bedit's tables afresh."
-  (let (loaded (load-user-grammars))
-    (message (ed-grammars-arrived m)
-      (if (empty? loaded)
-        (str "no grammars in " (ts-grammar-dir))
-        (str "reloaded " (string/join (map loaded ->string) ", "))))))
+parse no longer uses. Each library is VETTED first in a child, off the loop (brood ADR-660;
+C-g cancels), a quarantined one said and not loaded; each reloaded grammar is checked against
+bedit's tables afresh, and the open buffers of a language that arrived are retyped."
+  (grammar-reload-start m))
 
 (defn grammar-loaded? (lang)
   "Whether the runtime can parse `lang` right now (loaded or built in)."
@@ -417,6 +415,90 @@ text}`. Runs off the loop — a fetch, a compile and a vetting take seconds."
             (check-allow :discarded-catch
               (try (*grammar-vetter* (get result :ok) lang root) (catch _ nil)))))
       result)))
+
+(defn- checkout-root (lang)
+  ;; where `lang`'s checkout from an install is — the grammar's subdirectory when its source
+  ;; names one — or nil when there is none (a library built by hand)
+  (let (source (grammar-source lang)
+        subdir (when (map? source) (get source :subdir))
+        checkout (path/join (grammar-work-dir) (->string lang))
+        root (if subdir (path/join checkout subdir) checkout))
+    (when (file/dir? root) root)))
+
+(defn- vet-library (vetter lang path)
+  ;; one library vetted in a child, with its checkout's corpus when there is one; nil when no
+  ;; vetting could run — the load then vets the library itself
+  (check-allow :discarded-catch
+    (try (vetter path lang (checkout-root lang)) (catch _ nil))))
+
+(defn- vet-all (vetter files)
+  ;; each `[lang path]` of `files` vetted in turn: `[lang verdict]` pairs
+  (map files (fn ([lang path]) [lang (vet-library vetter lang path)])))
+
+(defn- quarantined? (verdict) (= (get verdict :verdict) :quarantined))
+
+(defn- reload-outcome (pair)
+  ;; one vetted library loaded, unless its vetting quarantined it: `[lang :loaded|:failed|reason]`
+  (let ([lang verdict] pair)
+    (cond
+      (quarantined? verdict) [lang (str "QUARANTINED — " (get verdict :reason "it crashed"))]
+      (ts-load-grammar lang) [lang :loaded]
+      else [lang :failed])))
+
+(defn- grammar-reload-land (m vetted)
+  "Load each grammar of `vetted` (`[lang verdict]` pairs) whose vetting did not quarantine it,
+check them afresh, retype the open buffers when any arrived, and say what happened."
+  (grammarcheck/forget)
+  (let (outcomes (map vetted reload-outcome)
+        names-with (fn (want?)
+                     (into []
+                       (seq/keep outcomes
+                         (fn ([lang outcome]) (when (want? outcome) (->string lang))))))
+        loaded (names-with (fn (outcome) (= outcome :loaded)))
+        failed (names-with (fn (outcome) (= outcome :failed)))
+        quarantined (seq/keep outcomes
+                      (fn ([lang outcome])
+                        (when (string? outcome) (str (->string lang) " " outcome " — not loaded"))))
+        parts (seq/keep [(when (not (empty? loaded)) (str "reloaded " (string/join loaded ", ")))
+                          (when (not (empty? failed))
+                            (str (string/join failed ", ") " did not load — see *Messages*"))
+                          (when (not (empty? quarantined)) (string/join quarantined "; "))]
+                (fn (part) part)))
+    (message (if (empty? loaded) m (ed-grammars-arrived m))
+      (str "grammar-reload: " (string/join parts "; ")))))
+
+(register-task-reply :grammar-reload-proc
+  'grammars/grammar-reload-apply
+  nil
+  "vetting grammars"
+  {:cancel-on-quit? true})
+(defn grammar-reload-apply (m vetted)
+  "The `:grammar-reload-proc` task's reply, folded: each library's `[lang verdict]`, or nil when
+the task errored or timed out — then nothing is loaded, since a load would vet on the loop."
+  (let (cleared (dissoc m :grammar-reload-proc))
+    (if (nil? vetted)
+      (message cleared "grammar-reload: the vetting failed or timed out — nothing reloaded")
+      (grammar-reload-land cleared vetted))))
+
+(defn grammar-reload-start (m)
+  "Re-load every grammar in the user's grammar directory, each library VETTED first in a child
+(brood ADR-660) off the loop — a vetting takes seconds, and a load that finds no verdict would
+start that child on the editor's loop — then loaded when the verdicts land; inline when there is
+no loop to reply to (a test, a batch run). C-g cancels the vetting and loads nothing."
+  (let (files (vec (grammar-files))
+        vetter *grammar-vetter*)
+    (cond
+      (empty? files) (message m (str "no grammars in " (ts-grammar-dir)))
+      (:grammar-reload-proc m) (message m "the grammars are already being vetted")
+      (ed-headless?) (grammar-reload-land m (vet-all vetter files))
+      else
+        (message (assoc m
+                   :grammar-reload-proc
+                     (task (fn () (vet-all vetter files)) {:timeout (* 30000 (count files))}))
+          (str "vetting "
+            (count files)
+            (if (= 1 (count files)) " grammar" " grammars")
+            " before reloading… (C-g cancels)")))))
 
 (defn- install-outcome (lang result)
   ;; one language's install, loaded and checked: the line that says how it went, and whether

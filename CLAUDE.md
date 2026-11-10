@@ -902,7 +902,9 @@ src/grammars.blsp           tree-sitter grammars the runtime was not built with:
                             VETS a library in a child before its first load and refuses one that
                             crashed or hung there, or that crashed bedit (brood ADR-660): an
                             install vets with the grammar's own test corpus off the loop
-                            (`*grammar-vetter*`) and says a quarantine; the list shows one
+                            (`*grammar-vetter*`) and says a quarantine, and so does M-x
+                            grammar-reload (`:grammar-reload-proc`, C-g cancels, a library loaded
+                            only once its verdict lands); the list shows one
                             (QUARANTINED, why) without loading it; its language stands in with
                             its line lexer, as a missing grammar's does (`model/grammar-loadable?`,
                             `missing-note`)
