@@ -196,10 +196,10 @@ handler's `:expand-file-name` (an ssh directory's own spelling).
       (ed-handler-call handler :parent-directory (path/dirname dir) dir)
       (path/dirname dir))))
 
-(defn- dired-handler-op (dir operation & arguments)
-  ;; `operation` of the handler claiming `dir`, called with `arguments` (off the loop); raises
-  ;; when the handler has none
-  (let (handler (dired-handler dir))
+(defn- dired-handler-op (path operation & arguments)
+  ;; `operation` of the handler claiming `path` (a listed directory, or a target typed on
+  ;; another machine), called with `arguments` (off the loop); raises when the handler has none
+  (let (handler (when (string? path) (ed-path-handler path)))
     (if (and handler (get handler operation))
       (apply ed-handler-call handler operation nil arguments)
       (error (str "dired: " operation " is not supported there")))))
@@ -917,15 +917,17 @@ a directory (Emacs's dired), keeping the name."
 (defn- dired-transfer-one (kind move)
   "Rename or copy (`kind`) one `move` (`{:name :source :target}`): a whole directory, across
 filesystems too. A directory already at the target is never replaced. A move a file handler
-makes (`:handled`, another machine's) goes through its `:rename-file` / `:copy-file`, which go
-into a directory there themselves and answer where the entry went."
+makes (`:handled`: from or to another machine) goes through the `:rename-file` / `:copy-file`
+of the handler claiming its source, else its target — told whether it may replace the entry
+there (`:replace`, asked first) — and answers where the entry went."
   (cond
     (:handled move)
-      (dired-handler-op (:source move)
+      (dired-handler-op (if (nil? (ed-path-handler (:source move))) (:target move) (:source move))
         (if (= kind :rename) :rename-file :copy-file)
         (:source move)
         (:target move)
-        (= true (:into? move)))
+        (= true (:into? move))
+        (= true (:replace move)))
     (file/dir? (:target move)) (error (str (:target move) " is a directory, not replaced"))
     (= kind :rename) (do (file/move (:source move) (:target move)) nil)
     else (do (file/copy-tree (:source move) (:target move)) nil)))
@@ -934,10 +936,15 @@ into a directory there themselves and answer where the entry went."
   ;; `move` once done: its target where the handler said it went
   (if (string? result) (assoc move :target result) move))
 
-(defn- ed-dired-transfer-run (m dir kind moves)
+(defn- dired-failed-names (failed)
+  ;; a report's `[move reason]` failures as `[name reason]`
+  (map failed (fn ([move reason]) [(:name move) reason])))
+
+(defn- ed-dired-transfer-run (m dir kind moves prior-failed)
   "Rename or copy (`kind`) every one of `moves` from `dir`, then: a buffer visiting a renamed
 file (or one under a renamed directory) follows it (`pool/ed-file-moved`), the entries done
-are unmarked, and the listing is read again."
+are unmarked, and the listing is read again. `prior-failed` (`[move reason]`) are moves that
+failed before they ran — a target that could not be used — said with the rest."
   (let (words (dired-transfer-words kind))
     (ed-dired-launch m
       (str (:running words) " " (dired-entries-phrase (map moves :name)))
@@ -953,60 +960,112 @@ are unmarked, and the listing is read again."
                              dir)
             (:done words)
             {:done (map done :name)
-             :failed (map (:failed report) (fn ([move reason]) [(:name move) reason]))}))))))
+             :failed (dired-failed-names (into (vec prior-failed) (:failed report)))}))))))
 
-(defn- ed-dired-transfer-ask (m dir kind moves)
-  "Rename or copy `moves`, asking first about each target that exists — `y`, `n`, `!` for it and
-every one after, `q` to stop asking (Emacs's dired-do-copy) — and refusing one onto itself or
-into itself. A file handler's moves (another machine's) are not asked about: the disk there
-cannot be asked from the loop, so its operations never replace an entry already there and say
-so for each one."
+(defn- dired-path-kind (path)
+  ;; what `path` is — `:dir`, `:file` or nil — asked of the file handler claiming it (another
+  ;; machine's: this runs off the loop), else of this machine's disk
+  (cond
+    (not (nil? (ed-path-handler path))) (dired-handler-op path :file-kind path)
+    (file/dir? path) :dir
+    (file/exists? path) :file
+    else nil))
+
+(defn- dired-resolve-move (move)
+  "A `move` that reaches another machine with its target made final, as the disk there says —
+INTO the target when it is a directory, keeping the name (which it must be when `:into?`) — and
+`:exists` set when an entry would be replaced. Raises for a target that cannot be used: a
+directory there is never replaced. Off the loop."
+  (let (kind (dired-path-kind (:target move)))
+    (cond
+      (= kind :dir)
+        (let (inside (dired-join (:target move) (:name move))
+              inside-kind (dired-path-kind inside))
+          (if (= inside-kind :dir)
+            (error (str inside " is a directory, not replaced"))
+            (assoc move :target inside :into? false :exists (= inside-kind :file))))
+      (:into? move) (error (str (:target move) " is not a directory"))
+      else (assoc move :exists (= kind :file)))))
+
+(defn- ed-dired-transfer-choose (m dir kind moves prior-failed)
+  "Rename or copy `moves` (each `:exists` when its target is there), asking first about each
+target that exists — `y`, `n`, `!` for it and every one after, `q` to stop asking (Emacs's
+dired-do-copy); a target said yes to is REPLACED (`:replace`) — and refusing one onto itself or
+into itself. `prior-failed` are moves already refused ([[ed-dired-transfer-run]])."
   (let (word (:word (dired-transfer-words kind))
         usable (seq/reject moves (fn (move) (dired-inside? (:source move) (:target move))))
-        exists? (fn (move) (and (not (:handled move)) (file/exists? (:target move))))
-        clashes (seq/filter usable exists?)
-        fresh (seq/reject usable exists?))
+        clashes (seq/filter usable :exists)
+        fresh (seq/reject usable :exists))
     (cond
-      (empty? usable)
+      (and (empty? usable) (not (empty? moves)))
         (let (move (first moves))
           (message m
             (if (= (path/normalize (:source move)) (path/normalize (:target move)))
               (str word ": " (:target move) " is the file itself")
               (str word ": " (:target move) " is inside " (:name move)))))
-      (empty? clashes) (ed-dired-transfer-run m dir kind fresh)
+      (empty? usable)
+        (ed-dired-report m
+          (:done (dired-transfer-words kind))
+          {:done [] :failed (dired-failed-names prior-failed)})
+      (empty? clashes) (ed-dired-transfer-run m dir kind fresh prior-failed)
       else
         (ed-map-y-or-n (dissoc m :dired-accepted)
           clashes
           (fn (move) (str (:target move) " exists; overwrite it?"))
           (fn (answered move)
-            (assoc answered :dired-accepted (conj (or (:dired-accepted answered) []) move)))
+            (assoc answered
+              :dired-accepted (conj (or (:dired-accepted answered) []) (assoc move :replace true))))
           (fn (answered _accepted)
             (let (chosen (into (into [] fresh) (or (:dired-accepted answered) []))
                   cleared (dissoc answered :dired-accepted))
               (if (empty? chosen)
                 (message cleared (str word " canceled"))
-                (ed-dired-transfer-run cleared dir kind chosen))))))))
+                (ed-dired-transfer-run cleared dir kind chosen prior-failed))))))))
+
+(defn- ed-dired-transfer-ask (m dir kind moves)
+  "Rename or copy `moves`, asking first about each target that exists
+([[ed-dired-transfer-choose]]). One that reaches another machine (`:handled`) asks the disk there
+OFF the loop first — where its target lands, and whether an entry is there
+([[dired-resolve-move]]) — and the question follows when the answers land; this machine's disk
+is asked here."
+  (if (any? moves :handled)
+    (ed-dired-launch m
+      "looking at the targets"
+      (fn () (dired-run-each moves dired-resolve-move (fn (_move resolved) resolved)))
+      (fn (mm report) (ed-dired-transfer-choose mm dir kind (:done report) (:failed report))))
+    (ed-dired-transfer-choose m
+      dir
+      kind
+      (map moves (fn (move) (assoc move :exists (file/exists? (:target move)))))
+      [])))
 
 (defn- ed-dired-transfer (m kind)
   "R or C (`kind`): the marked entries — or the one at point — renamed or copied to where the
 prompt says. One entry goes to the name typed, or into it when it is a directory; several go
-into the directory typed."
+into the directory typed. A listing another machine brought (`/ssh:…`) starts the prompt at the
+entry's whole path, as Emacs does: edited, it stays on that host; another `/ssh:` path is
+another host; a path of this machine's (the line cleared, `/tmp/x` typed) is here. A target
+typed as another machine's path in a local listing goes there."
   (let (names (ed-dired-chosen m)
         words (dired-transfer-words kind)
-        many? (> (count names) 1))
+        many? (> (count names) 1)
+        listed (ed-dired-state m :dired-dir)
+        remote-listing? (not (nil? (dired-handler listed))))
     (if (empty? names)
       (message m (str "not on a " (if (= kind :rename) "renamable" "copyable") " entry"))
       (ed-dired-prompt m
         (if many?
           (str (:prompt words) " " (count names) " marked into: ")
           (str (:prompt words) " " (first names) " to: "))
-        (if many? "" (first names))
+        (cond
+          (not remote-listing?) (if many? "" (first names))
+          many? (if (string/ends-with? listed "/") listed (str listed "/"))
+          else (dired-join listed (first names)))
         (fn (mm dir typed)
-          (let (handled? (not (nil? (dired-handler dir))))
+          (let (expanded (filename/expand typed dir))
             (cond
-              ;; another machine's: its own operation goes into a directory, and refuses a
-              ;; target that is not one when it must be
-              handled?
+              ;; from or to another machine: the target is asked about off the loop
+              (or (not (nil? (dired-handler dir))) (not (nil? (ed-path-handler expanded))))
                 (ed-dired-transfer-ask mm
                   dir
                   kind
@@ -1014,7 +1073,7 @@ into the directory typed."
                     (fn (name)
                       {:name name
                        :source (dired-join dir name)
-                       :target (dired-join dir typed)
+                       :target expanded
                        :into? many?
                        :handled true})))
               (and many? (not (file/dir? (path/join dir typed))))

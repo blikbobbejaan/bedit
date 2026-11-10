@@ -340,24 +340,148 @@ it — for good: the other machine has no trash this can reach.
     (includes? (sshremote/delete-script \"/srv/old\") \"rm -rf -- \")   ;=> true"
   (script-with [path] delete-body))
 
+(def- place-function
+  ;; `place TARGET NAME INTO REPLACE` sets `$to` to where an entry called NAME lands for TARGET:
+  ;; INTO it when it is a directory (keeping NAME), which it must be when INTO is 1. A directory
+  ;; there is never replaced; another entry only when REPLACE is 1. `$d` is its directory.
+  (str "place() {\n"
+    "  home \"$1\" || exit 4\n" "  to=$r\n" "  if [ -d \"$to\" ]; then to=${to%/}/$2\n"
+    "  elif [ \"$3\" = 1 ]; then echo \"$1: not a directory\" >&2; exit 4; fi\n"
+    "  if [ -d \"$to\" ]; then echo \"$to is a directory — not replaced\" >&2; exit 4; fi\n"
+    "  if { [ -e \"$to\" ] || [ -L \"$to\" ]; } && [ \"$4\" != 1 ]; then echo \"$to exists — not replaced\" >&2; exit 4; fi\n"
+    "  d=$(dirname -- \"$to\")\n"
+    "  if [ ! -d \"$d\" ]; then echo \"$d: no such directory\" >&2; exit 4; fi\n" "}\n"))
+
+(def- staging-lines
+  ;; a staging directory beside the target (`$d`), removed on every exit the shell sees
+  (str "stage=$(mktemp -d \"$d/.bedit-copy.XXXXXX\") || { echo \"$d: cannot write there\" >&2; exit 4; }\n"
+    "trap 'rm -rf -- \"$stage\"' EXIT\n" "trap 'exit 4' HUP INT TERM\n"))
+
 (def- transfer-body
   ;; `$2` the target (resolved as `$1` is), `$3` 1 when it must be a directory, `$4` `mv` or
-  ;; `cp`. Into a directory keeps the name; a target already there is never replaced. Answers
-  ;; where the entry went.
-  (str "home \"$2\" || exit 4\n"
-    "to=$r\n" "if [ -d \"$to\" ]; then to=${to%/}/$(basename -- \"$p\")\n"
-    "elif [ \"$3\" = 1 ]; then echo \"$2: not a directory\" >&2; exit 4; fi\n"
-    "if [ -e \"$to\" ] || [ -L \"$to\" ]; then echo \"$to exists — not replaced\" >&2; exit 4; fi\n"
-    "if [ \"$4\" = mv ]; then mv -- \"$p\" \"$to\" || exit 4; else cp -pR -- \"$p\" \"$to\" || exit 4; fi\n"
+  ;; `cp`, `$5` 1 when an entry there (not a directory) may be replaced: by a rename (atomic on
+  ;; one filesystem) for a move, a copy staged beside it and renamed over it for a copy.
+  ;; Answers where the entry went.
+  (str place-function
+    "place \"$2\" \"$(basename -- \"$p\")\" \"$3\" \"$5\"\n"
+    "if [ \"$4\" = mv ]; then mv -f -- \"$p\" \"$to\" || exit 4\n"
+    "elif [ -e \"$to\" ] || [ -L \"$to\" ]; then\n" staging-lines
+    "  cp -pR -- \"$p\" \"$stage/x\" || exit 4\n" "  mv -f -- \"$stage/x\" \"$to\" || exit 4\n"
+    "else cp -pR -- \"$p\" \"$to\" || exit 4; fi\n" "printf '%s\\n' \"$to\"\n"))
+
+(defn transfer-script (op from to into? &optional (replace? false))
+  "The script that moves (`op` `:move`) or copies (`:copy`) the remote `from` to `to` on the same
+host — INTO `to` when it is a directory, keeping the name, which it must be when `into?` — never
+over a directory, and over another entry only when `replace?` (a copy staged beside it, then
+renamed over it). Answers where it went ([[transfer]]).
+
+    (includes? (sshremote/transfer-script :copy \"/a\" \"/b\" false) \"set -- /a /b 0 cp 0\")   ;=> true"
+  (script-with [from to (if into? "1" "0") (if (= op :move) "mv" "cp") (if replace? "1" "0")]
+    transfer-body))
+
+(def- kind-body
+  "if [ -d \"$p\" ]; then echo dir; elif [ -e \"$p\" ] || [ -L \"$p\" ]; then echo file; else echo none; fi\n")
+
+(defn kind-script (path)
+  "The script that says what the remote `path` is: `dir` (a directory, or a link to one), `file`
+(anything else there), `none` ([[file-kind]]).
+
+    (includes? (sshremote/kind-script \"/srv\") \"echo dir\")   ;=> true"
+  (script-with [path] kind-body))
+
+;; ---- a copy between two machines ------------------------------------------------------------
+;; An entry copied or moved between hosts — or between a host and this machine — crosses as a
+;; TAR stream through the editor: packed where it is ([[pack-script]], Base64 on standard
+;; output), checked here (its byte count), and unpacked where it goes ([[unpack-script]]), staged
+;; beside the target, its size, SHA-256 and entry count checked before it is renamed into place.
+;; A move removes the original only once the copy has landed checked.
+
+(def *transfer-max-bytes* (* 200 1000 1000))
+;; The largest archive a copy between machines carries: it passes through the editor's memory.
+
+(def- pack-body
+  ;; `$2` the largest archive sent (0: any). Answers the name, the entry count and the archive's
+  ;; size, then the archive as Base64. tar is told `./NAME`, so no name is read as an option.
+  (str "limit=$2\n"
+    "if [ ! -e \"$p\" ] && [ ! -L \"$p\" ]; then echo \"$p: no such file\" >&2; exit 4; fi\n"
+    "d=$(dirname -- \"$p\"); n=$(basename -- \"$p\")\n"
+    "tmp=$(mktemp \"${TMPDIR:-/tmp}/.bedit-pack.XXXXXX\") || exit 4\n"
+    "trap 'rm -f -- \"$tmp\"' EXIT\n" "trap 'exit 4' HUP INT TERM\n"
+    "(cd -- \"$d\" && COPYFILE_DISABLE=1 tar cf - \"./$n\") > \"$tmp\" || { echo \"$p: could not be packed\" >&2; exit 4; }\n"
+    "c=$(cd -- \"$d\" && find \"./$n\" | wc -l | tr -d ' ')\n" "s=$(wc -c < \"$tmp\" | tr -d ' ')\n"
+    "if [ \"$limit\" -gt 0 ] && [ \"$s\" -gt \"$limit\" ]; then echo \"$p: $s bytes packed, more than $limit cross between machines\" >&2; exit 4; fi\n"
+    "printf '%s\\n%s\\n%s\\n' \"$n\" \"$c\" \"$s\"\n" "base64 < \"$tmp\" || exit 4\n"))
+
+(defn pack-script (path &optional (limit 0))
+  "The script that packs `path` (a directory with everything in it) as a tar archive for a copy
+to another machine ([[parse-pack]] reads its answer): nothing past `limit` bytes (0: any).
+
+    (includes? (sshremote/pack-script \"/srv/a\") \"tar cf - \")   ;=> true"
+  (script-with [path (str limit)] pack-body))
+
+(defn parse-pack (stdout)
+  "What a pack script answered: `{:name :count :bytes}` — the entry's name, how many entries the
+archive holds, the archive — or a failure when it arrived damaged or short.
+
+    (:count (sshremote/parse-pack \"a\\n1\\n2\\naGk=\\n\"))   ;=> 1"
+  (let (lines (lines-of stdout)
+        name (first lines)
+        count-read (string/->number (or (nth lines 1 nil) ""))
+        size (string/->number (or (nth lines 2 nil) ""))
+        bytes (encoding/base64-decode-bytes (string/join (drop lines 3) "")))
+    (cond
+      (or (string/blank? (or name "")) (not (int? count-read)) (not (int? size)))
+        (failure "a packed copy that does not read")
+      (failure? bytes) (failure "the packed copy arrived damaged")
+      (not (= (bytes/length bytes) size))
+        (failure (str (bytes/length bytes) " of " size " bytes of the copy arrived"))
+      else {:name name :count count-read :bytes bytes})))
+
+(def- unpack-body
+  ;; `$2` the entry's name, `$3` INTO, `$4` REPLACE ([[place-function]]), `$5` the entry count,
+  ;; `$6` the archive's size, `$7` its SHA-256; the archive follows as a here-document. Unpacked
+  ;; in a staging directory beside the target, checked, then renamed into place.
+  (str place-function
+    "place \"$1\" \"$2\" \"$3\" \"$4\"\n" "name=$2; count=$5; expected=$6; digest=$7\n"
+    "if printf 'aGk=' | base64 -d >/dev/null 2>&1; then dec='base64 -d'\n"
+    "elif printf 'aGk=' | base64 -D >/dev/null 2>&1; then dec='base64 -D'\n"
+    "else echo 'no base64 on this host to receive the copy' >&2; exit 4; fi\n" staging-lines
+    "$dec > \"$stage/archive.tar\" <<'BEDIT_EOF' || exit 4\n"))
+
+(def- unpack-tail
+  (str "BEDIT_EOF\n"
+    "size=$(wc -c < \"$stage/archive.tar\" | tr -d ' ')\n"
+    "if [ \"$size\" != \"$expected\" ]; then echo \"$size of $expected bytes arrived; nothing was copied\" >&2; exit 4; fi\n"
+    "if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum < \"$stage/archive.tar\" | cut -d' ' -f1)\n"
+    "elif command -v shasum >/dev/null 2>&1; then got=$(shasum -a 256 < \"$stage/archive.tar\" | cut -d' ' -f1)\n"
+    "else got=$digest; fi\n"
+    "if [ \"$got\" != \"$digest\" ]; then echo 'the copy arrived changed; nothing was copied' >&2; exit 4; fi\n"
+    "mkdir -- \"$stage/x\" || exit 4\n"
+    "(cd -- \"$stage/x\" && tar xpof ../archive.tar) || { echo 'the copy could not be unpacked; nothing was copied' >&2; exit 4; }\n"
+    "got=$(cd -- \"$stage/x\" && find \"./$name\" | wc -l | tr -d ' ')\n"
+    "if [ \"$got\" != \"$count\" ]; then echo \"$got of $count entries arrived; nothing was copied\" >&2; exit 4; fi\n"
+    "if { [ -e \"$to\" ] || [ -L \"$to\" ]; } && [ -d \"$stage/x/$name\" ]; then rm -f -- \"$to\" || exit 4; fi\n"
+    "mv -f -- \"$stage/x/$name\" \"$to\" || { echo \"$to: could not be replaced\" >&2; exit 4; }\n"
     "printf '%s\\n' \"$to\"\n"))
 
-(defn transfer-script (op from to into?)
-  "The script that moves (`op` `:move`) or copies (`:copy`) the remote `from` to `to` on the same
-host — INTO `to` when it is a directory, keeping the name, which it must be when `into?` — and
-never over an entry already there. Answers where it went ([[transfer]]).
+(defn unpack-script (to packed into? replace?)
+  "The script that unpacks `packed` ([[parse-pack]]'s answer) at `to` on the machine it runs on —
+INTO `to` when it is a directory, which it must be when `into?`; never over a directory, over
+another entry only when `replace?` — checked (size, SHA-256, entry count) in a staging directory
+beside the target before it is renamed into place. Answers where it went.
 
-    (includes? (sshremote/transfer-script :copy \"/a\" \"/b\" false) \"set -- /a /b 0 cp\")   ;=> true"
-  (script-with [from to (if into? "1" "0") (if (= op :move) "mv" "cp")] transfer-body))
+    (includes? (sshremote/unpack-script \"/b\" {:name \"a\" :count 1 :bytes (string/->bytes \"hi\")} false false) \"tar xpof\")   ;=> true"
+  (let (bytes (:bytes packed))
+    (str (script-with [to
+                        (:name packed)
+                        (if into? "1" "0")
+                        (if replace? "1" "0")
+                        (str (:count packed))
+                        (str (bytes/length bytes))
+                        (hash/sha256-bytes bytes)]
+           unpack-body)
+      (wrap-base64 (encoding/base64-encode-bytes bytes))
+      unpack-tail)))
 
 ;; ---- reading the answers ----------------------------------------------------------------
 
@@ -547,10 +671,16 @@ answer, a failure carrying the remote reason, or `{:failed …}`. Blocks."
       (= 0 (:exit result)) (parse-entries (:stdout result))
       else (script-failure result))))
 
+(defn run-local (script)
+  "Run `script` on THIS machine — `/bin/sh -s` reading it from standard input, as [[run]] runs one
+on a host — and answer `os/cmd`'s map: the near side of a copy between this machine and a host.
+Blocks."
+  (os/cmd "/bin/sh" ["-s"] {:stdin script :env ssh-env :timeout-ms *operation-timeout-ms*}))
+
 (defn- run-op (parts script)
-  ;; a script run for its effect: its standard output, else a failure saying why (ssh's own
-  ;; failure classified)
-  (let (result (run parts script))
+  ;; a script run for its effect on `parts`' host — nil parts: this machine — its standard
+  ;; output, else a failure saying why (ssh's own failure classified)
+  (let (result (if (nil? parts) (run-local script) (run parts script)))
     (cond
       (:failed result) (failure (str "ssh: " (:reason (:failed result))))
       (= 0 (:exit result)) (:stdout result)
@@ -565,11 +695,46 @@ answer, a failure carrying the remote reason, or `{:failed …}`. Blocks."
 or a failure saying why. Blocks."
   (let (done (run-op parts (delete-script path))) (if (failure? done) done true)))
 
-(defn transfer (parts op from to into?)
+(defn transfer (parts op from to into? &optional (replace? false))
   "Move (`op` `:move`) or copy (`:copy`) the remote `from` to `to` on `parts`' host
-([[transfer-script]]): the remote path it went to, or a failure saying why. Blocks."
-  (let (done (run-op parts (transfer-script op from to into?)))
+([[transfer-script]], over an entry there only when `replace?`): the remote path it went to, or a
+failure saying why. Blocks."
+  (let (done (run-op parts (transfer-script op from to into? replace?)))
     (if (failure? done) done (string/trim done))))
+
+(defn file-kind (parts path)
+  "What `path` is on `parts`' host — nil parts: this machine — `:dir` (a directory, or a link to
+one), `:file` (anything else there) or nil (nothing), or a failure saying why ([[kind-script]]).
+Blocks."
+  (let (done (run-op parts (kind-script path)))
+    (if (failure? done)
+      done
+      (case (string/trim done)
+        "dir" :dir
+        "file" :file
+        nil))))
+
+(defn cross-transfer (op from-parts from to-parts to into? replace?)
+  "Move (`op` `:move`) or copy (`:copy`) `from` on `from-parts`' host to `to` on `to-parts`' —
+either nil for THIS machine — a directory with everything in it: packed there, carried through
+the editor, unpacked here checked ([[pack-script]], [[unpack-script]]); INTO `to` when it is a
+directory (which it must be when `into?`), never over a directory, over another entry only when
+`replace?`. A move removes `from` only once the copy landed checked. The path it went to on
+`to-parts`' side, or a failure saying why. Blocks."
+  (let (packed-out (run-op from-parts (pack-script from *transfer-max-bytes*))
+        packed (if (failure? packed-out) packed-out (parse-pack packed-out))
+        landed (if (failure? packed)
+                 packed
+                 (run-op to-parts (unpack-script to packed into? replace?)))
+        went (if (failure? landed) landed (string/trim landed)))
+    (cond
+      (failure? went) went
+      (= op :copy) went
+      else
+        (let (removed (run-op from-parts (delete-script from)))
+          (if (failure? removed)
+            (failure (str "copied to " went ", but the original stays: " (error-message removed)))
+            went)))))
 
 ;; ---- a password, once ---------------------------------------------------------------------
 
