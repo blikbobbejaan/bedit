@@ -9,7 +9,12 @@
 #   ci     (the default) sshd runs as ROOT through sudo — the only way it can check a password —
 #          and a throwaway user `bedittest` with a random password is made for the password
 #          login (and allowed sudo WITH that password, for the `|sudo:` hop's password; a
-#          root-only file is staged for the runner's own passwordless sudo). The aliases go into
+#          root-only file is staged for the runner's own passwordless sudo). Root gets a password
+#          for the run (the `|su:` hop; locked again after), and where doas is installed a
+#          doas.conf of the run's own (`nopass` for you, a password for `bedittest`). With
+#          BEDIT_SSH_SUDO naming another sudo binary (sudo-rs), it is installed setuid as
+#          /usr/local/bin/sudo for the run — first on an ssh session's PATH — so the `|sudo:`
+#          checks run against it (BEDIT_SSH_ONLY=root runs just the root hops). The aliases go into
 #          ~/.ssh/config, which the driver's plain `ssh` reads, as a user's would. Nothing else
 #          of the machine is changed: the system's own sshd, if any, keeps its port and config.
 #   local  sshd runs as YOU (no sudo, no new user, ~/.ssh untouched): key logins only, so the
@@ -37,7 +42,8 @@ chmod 755 "$stage"
 root_file="$stage/root-only.conf"
 
 case "$mode" in
-  ci) as_root=sudo ;;
+  # the system's own sudo by its path: BEDIT_SSH_SUDO may put another first on PATH below
+  ci) as_root="$(command -v sudo)" ;;
   local) as_root= ;;
   *) echo "ssh-real.sh: unknown mode '$mode' (ci or local)" >&2; exit 2 ;;
 esac
@@ -110,11 +116,23 @@ esac
 EOF
 chmod 755 "$stage/sshd-ctl"
 
+# what the run changed of the machine beyond the stage, undone by `cleanup`
+sudo_placed=
+doas_conf_made=
+root_password_set=
+ssh_config_touched=
+
 cleanup() {
+  if [ -n "$ssh_config_touched" ]; then
+    if [ -e "$stage/ssh_config.before" ]; then cp "$stage/ssh_config.before" ~/.ssh/config; else rm -f ~/.ssh/config; fi
+  fi
+  if [ -n "$sudo_placed" ]; then "$as_root" rm -f /usr/local/bin/sudo || true; fi
   "$stage/sshd-ctl" stop >/dev/null 2>&1 || true
   if [ "$mode" = ci ]; then
-    sudo userdel -r bedittest >/dev/null 2>&1 || true
-    sudo rm -f /etc/sudoers.d/bedittest "$root_file" || true
+    "$as_root" userdel -r bedittest >/dev/null 2>&1 || true
+    "$as_root" rm -f /etc/sudoers.d/bedittest "$root_file" || true
+    if [ -n "$doas_conf_made" ]; then "$as_root" rm -f /etc/doas.conf || true; fi
+    if [ -n "$root_password_set" ]; then "$as_root" passwd -l root >/dev/null 2>&1 || true; fi
   fi
   rm -rf "$stage"
 }
@@ -187,6 +205,10 @@ export BEDIT_SSH_CTL="$stage/sshd-ctl"
 if [ "$mode" = ci ]; then
   mkdir -p ~/.ssh
   chmod 700 ~/.ssh
+  # kept as it was, put back by `cleanup`: a second run in the same job must not find this
+  # run's aliases (their keys gone with the stage) ahead of its own
+  if [ -e ~/.ssh/config ]; then cp ~/.ssh/config "$stage/ssh_config.before"; fi
+  ssh_config_touched=1
   aliases >>~/.ssh/config
   chmod 600 ~/.ssh/config
   # the password login's user, a password nobody else knows, a file in its home
@@ -211,6 +233,31 @@ if [ "$mode" = ci ]; then
   sudo chmod 440 /etc/sudoers.d/bedittest
   export BEDIT_SSH_ROOT_FILE="$root_file"
   export BEDIT_SSH_SUDO_PASSWORD=1
+  # the `|su:` hop: root's password, set for this run and locked again by `cleanup`
+  root_password="bedit-root-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  echo "root:$root_password" | sudo chpasswd
+  root_password_set=1
+  export BEDIT_SSH_ROOT_PASSWORD="$root_password"
+  # the `|doas:` hop, where doas is installed and no doas.conf is there already: the key host's
+  # user with `nopass`, the password user with its password
+  if command -v doas >/dev/null 2>&1 && [ ! -e /etc/doas.conf ]; then
+    printf 'permit nopass %s as root\npermit bedittest as root\n' "$me" | sudo tee /etc/doas.conf >/dev/null
+    doas_conf_made=1
+    sudo chown root:root /etc/doas.conf
+    sudo chmod 0400 /etc/doas.conf
+    export BEDIT_SSH_DOAS=1
+  fi
+  # another sudo as the host's (sudo-rs): installed setuid root first on PATH for this run — an
+  # ssh session's PATH puts /usr/local/bin before /usr/bin — and removed by `cleanup`. The
+  # driver checks the host's `sudo --version` names BEDIT_SSH_SUDO_EXPECT before the `|sudo:`
+  # checks run.
+  if [ -n "${BEDIT_SSH_SUDO:-}" ]; then
+    if [ -e /usr/local/bin/sudo ]; then echo "ssh-real.sh: /usr/local/bin/sudo is there already" >&2; exit 2; fi
+    sudo install -o root -g root -m 4755 "$BEDIT_SSH_SUDO" /usr/local/bin/sudo
+    sudo_placed=1
+    export BEDIT_SSH_SUDO_EXPECT="${BEDIT_SSH_SUDO_EXPECT:-sudo-rs}"
+    echo "== the host's sudo for this run: $(/usr/local/bin/sudo --version 2>&1 | head -1)"
+  fi
 else
   aliases >"$stage/ssh_config"
   printf '#!/bin/sh\nexec ssh -F %s "$@"\n' "$stage/ssh_config" >"$stage/ssh"

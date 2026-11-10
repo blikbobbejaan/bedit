@@ -24,6 +24,12 @@
 ;;   BEDIT_SSH_ROOT_FILE      a root-only file (mode 600) the key host's user reaches through a
 ;;                            passwordless sudo — the `|sudo:` hop
 ;;   BEDIT_SSH_SUDO_PASSWORD  set when the password user may sudo with its password
+;;   BEDIT_SSH_ROOT_PASSWORD  root's password, set for the run — the `|su:` hop
+;;   BEDIT_SSH_DOAS           set when doas is installed, the key host's user `permit nopass`
+;;                            and the password user `permit` (with its password) — `|doas:`
+;;   BEDIT_SSH_SUDO_EXPECT    what the host's `sudo --version` names when the stage put its own
+;;                            sudo first on PATH (`sudo-rs`): checked before the `|sudo:` checks
+;;   BEDIT_SSH_ONLY           `root`: only the root hops' checks (a second run, another sudo)
 ;;
 ;; The remote host is this machine, so the files it edits are local paths the driver checks
 ;; on disk. Exit 1 when any check failed.
@@ -69,6 +75,14 @@
 (def- root-file (or (os/env "BEDIT_SSH_ROOT_FILE") ""))
 ;; set when the password user may sudo with its password
 (def- sudo-password-user (or (os/env "BEDIT_SSH_SUDO_PASSWORD") ""))
+;; root's password, set for the run, when the stage has one (the `|su:` hop)
+(def- root-password (or (os/env "BEDIT_SSH_ROOT_PASSWORD") ""))
+;; set when doas is installed with the stage's doas.conf (the `|doas:` hop)
+(def- doas-ready (or (os/env "BEDIT_SSH_DOAS") ""))
+;; what the host's `sudo --version` must name when the stage put its own sudo first (sudo-rs)
+(def- sudo-expected (or (os/env "BEDIT_SSH_SUDO_EXPECT") ""))
+;; `root`: only the root hops' checks (a second run against another sudo)
+(def- only (or (os/env "BEDIT_SSH_ONLY") ""))
 
 ;; the files edited, a scratch directory the runner user owns
 (def- work (str (path/temp "bedit-ssh-real-")))
@@ -344,6 +358,108 @@
       (sshsudo/stop-all sockets)
       (os/cmd "rm" ["-rf" sockets]))))
 
+(defn- check-sudo-implementation ()
+  ;; the stage put a sudo of its own first on the host's PATH (sudo-rs): the `|sudo:` checks
+  ;; above ran against IT, which this proves by asking the host what `sudo` is there
+  (let (result (sshremote/run (sshpath/parse (remote key-host "/"))
+                 "command -v sudo; sudo --version 2>&1 | head -1\n")
+        said (string/trim (or (:stdout result) "")))
+    (do
+      (say "the host's sudo: " (string/replace said "\n" " — "))
+      (check (str "the host's `sudo` is the stage's " sudo-expected)
+        (includes? said sudo-expected)))))
+
+(defn- check-su-hop ()
+  ;; `/ssh:host|su::` — root's password, which the stage set for the run; su reads it only from
+  ;; a terminal, so this is the `-tt` root shell
+  (let (sockets (str "/tmp/bedit-ssh-real-su-" (rand/token 4)))
+    (do
+      (file/mkdir-private sockets)
+      (binding (*control-dir* sockets)
+        (let (spec (str "/ssh:" key-host "|su::" root-file)
+              asked (pool/ed-find-file (fresh) spec)
+              _ (said "su asks" asked)
+              wrong (key (type-text asked "not-the-password") :enter)
+              _ (said "su wrong password" wrong)
+              again (pool/ed-find-file (fresh) spec)
+              opened (key (type-text again root-password) :enter)
+              _ (said "su password" opened)
+              before (root-text root-file)
+              saved (save (type-text opened "su "))
+              _ (said "save through su" saved))
+          (do
+            (check "su asks for root's password, masked, naming whose it is"
+              (and (= true (map/get-in asked [:minibuffer :masked]))
+                (includes? (pr-str (:minibuffer asked)) "su on")))
+            (check "a wrong one is said (su ends at once), nothing opens"
+              (and (includes? (echo wrong) "refused the password")
+                (not (any? (:buffers wrong) :ssh-loading))))
+            (check "the right one opens the root-only file through su's terminal root shell"
+              (and (= true (:ssh (current opened)))
+                (= (editor/buffer/buffer-text (current opened)) before)))
+            (check "the mode line says root"
+              (includes? (pr-str (sshedit/ssh-segment opened nil (current opened))) "# root"))
+            (check "C-x C-s writes it back through the raw root shell, byte for byte"
+              (and (= (root-text root-file) (str "su " before))
+                (not (editor/buffer/buffer-modified? (current saved)))))
+            (check "and root's password is kept nowhere on the model"
+              (not (includes? (pr-str (dissoc saved :buffers)) root-password))))))
+      (sshsudo/stop-all sockets)
+      (os/cmd "rm" ["-rf" sockets]))))
+
+(defn- check-doas-hop ()
+  ;; `/ssh:host|doas::` — the key host's user has `permit nopass`, the password user `permit`
+  ;; with its password; doas, too, reads a password only from a terminal
+  (let (spec (str "/ssh:" key-host "|doas::" root-file)
+        opened (pool/ed-find-file (fresh) spec)
+        _ (said "doas nopass" opened)
+        before (root-text root-file)
+        ;; a 200 KB write: the raw terminal passes every byte, with no line length limit
+        text (str (string/repeat "doas" 50000) "\n")
+        saved (save (model/ed-apply opened
+                      (fn (buffer)
+                        (editor/buffer/replace-region buffer 0 (editor/buffer/buffer-length buffer) text))))
+        _ (said "save through doas" saved)
+        landed (root-text root-file)
+        _restore (save (model/ed-apply saved
+                         (fn (buffer)
+                           (editor/buffer/replace-region buffer
+                             0
+                             (editor/buffer/buffer-length buffer)
+                             (or before ""))))))
+    (do
+      (check "doas with `nopass` opens the root-only file, asking nothing"
+        (and (= true (:ssh (current opened))) (nil? (:minibuffer opened))
+          (= (editor/buffer/buffer-text (current opened)) before)))
+      (check "a 200 KB write crosses the raw terminal whole"
+        (= landed text))
+      (when (not (string/blank? (or pw-host "")))
+        (let (sockets (str "/tmp/bedit-ssh-real-doas-" (rand/token 4)))
+          (do
+            (file/mkdir-private sockets)
+            (binding (*control-dir* sockets)
+              (let (pw-spec (str "/ssh:" pw-host "|doas::" root-file)
+                    asked (pool/ed-find-file (fresh) pw-spec)
+                    after-ssh (key (type-text asked password) :enter)
+                    _ (said "doas password asked" after-ssh)
+                    wrong (key (type-text after-ssh "not-the-password") :enter)
+                    _ (said "doas wrong password" wrong)
+                    again (pool/ed-find-file (fresh) pw-spec)
+                    typed (key (type-text again password) :enter)
+                    _ (said "doas password" typed))
+                (do
+                  (check "doas's password is asked for, masked, after ssh's"
+                    (and (= true (map/get-in after-ssh [:minibuffer :masked]))
+                      (includes? (pr-str (:minibuffer after-ssh)) "doas on")))
+                  (check "a wrong one is said, nothing opens"
+                    (and (includes? (echo wrong) "refused the password")
+                      (not (any? (:buffers wrong) :ssh-loading))))
+                  (check "the right one opens the root-only file"
+                    (= (editor/buffer/buffer-text (current typed)) (root-text root-file))))))
+            (sshsudo/stop-all sockets)
+            (os/cmd "rm" ["-rf" sockets]))))
+      (sshsudo/stop-all control))))
+
 (defn- check-other-home ()
   (let (opened (pool/ed-find-file (fresh) (remote key-host (str "~" other-user "/" other-file))))
     (do
@@ -440,24 +556,32 @@
                 *program* (or (os/env "BEDIT_SSH_PROGRAM") "ssh"))
         (do
           (say "ssh is " *program* "; the files are in " dir)
-          (check-open-edit-save dir)
-          (check-binary-and-large dir)
-          (check-prompt-listing dir)
-          (check-dired dir)
-          (check-cross dir)
-          (check-other-home)
-          (check-multi-hop dir)
-          (check-unknown-host-key dir)
-          (if (string/blank? (or pw-host ""))
-            (say "SKIPPED the password login: the stage has none (an sshd not run as root)")
-            (do (check-password) (check-hop-password dir)))
+          (when (not (= only "root"))
+            (check-open-edit-save dir)
+            (check-binary-and-large dir)
+            (check-prompt-listing dir)
+            (check-dired dir)
+            (check-cross dir)
+            (check-other-home)
+            (check-multi-hop dir)
+            (check-unknown-host-key dir)
+            (if (string/blank? (or pw-host ""))
+              (say "SKIPPED the password login: the stage has none (an sshd not run as root)")
+              (do (check-password) (check-hop-password dir))))
+          (when (not (string/blank? sudo-expected)) (check-sudo-implementation))
           (if (string/blank? root-file)
             (say "SKIPPED the |sudo: hop: the stage has no root-only file (no passwordless sudo)")
             (check-sudo-hop))
           (if (or (string/blank? sudo-password-user) (string/blank? root-file) (string/blank? (or pw-host "")))
             (say "SKIPPED sudo's password: the stage's password user has no sudo")
             (check-sudo-password))
-          (check-dropped dir))))
+          (if (or (string/blank? root-password) (string/blank? root-file))
+            (say "SKIPPED the |su: hop: the stage set no root password")
+            (check-su-hop))
+          (if (or (string/blank? doas-ready) (string/blank? root-file))
+            (say "SKIPPED the |doas: hop: the stage has no doas")
+            (check-doas-hop))
+          (when (not (= only "root")) (check-dropped dir)))))
     (os/cmd "rm" ["-rf" work config-base control])
     (let (failures (%table-get *failures* :n 0))
       (if (= failures 0)
