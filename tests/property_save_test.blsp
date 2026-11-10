@@ -1,0 +1,126 @@
+;; Saving as a property (brood's `property`, ADR-685): a new file in any coding bedit writes —
+;; UTF-8 with or without its mark, every single-byte coding, UTF-16 either way round with or
+;; without its mark — with LF or CRLF lines, holding random text the coding can write, saved
+;; and visited again comes back as the same text, coding, line ending and mark; its bytes are
+;; exactly the text so encoded, and saving the visited buffer writes the same bytes again. The
+;; coding and line ending come the way a person sets them, through `.editorconfig`, so the
+;; property runs the visit, the save and the read the editor runs. Every file is in a scratch
+;; directory of the test run's own.
+(defmodule property-save-test
+  (:use model) ; ed-init / ed-current-buf / ed-edit
+  (:use pool) ; ed-find-file / ed-buffer-index-by-file
+  (:use charset-tables) ; *single-byte*
+  (:use editor/buffer)
+  (:use editor/buffer-file) ; buffer-eol / buffer-bom?
+  (:use test))
+
+(purge-stale-temp "bedit-property-save-")
+
+(defn- saved (m path)
+  (file-save/ed-save-buf-at m (or (ed-buffer-index-by-file m path) (error "not open: " path))))
+
+(defn- visited (path) (ed-find-file (ed-init (make-buffer "")) path))
+
+(defn- one-codepoint (code) (string/codepoints-> [code]))
+
+;; Text a coding can write, with no carriage return (a lone one is a mixed line ending, which
+;; reads back as LF on purpose) and no U+FEFF (at the start it IS the mark).
+(def- unicode-text
+  (property/string-of (property/such-that (property/character)
+                        (fn (c) (not (includes? ["\r" "\u{feff}"] c))))
+    {:max 40}))
+
+(defn- single-byte-text (row)
+  (property/string-of (property/frequency [[3 (property/string-of "abc xyz\n\t" {:min 1 :max 1})]
+                                            [2 (property/elements (map (:high row) one-codepoint))]])
+    {:max 40}))
+
+;; `{:coding :charset :bom}`: what the file is, and what `.editorconfig` names it. A UTF-16
+;; mark has no `.editorconfig` spelling; the visit's buffer is given one (`:mark-by-hand`).
+(def- codings
+  (property/one-of [(property/fmap (property/bool)
+                      (fn (bom) {:coding :utf-8 :charset (if bom "utf-8-bom" "utf-8") :bom bom}))
+                     (property/fmap (property/elements *single-byte*)
+                       (fn (row)
+                         {:coding (:coding row) :charset (first (:names row)) :bom false :row row}))
+                     (property/fmap (property/tuple (property/elements [[:utf-16-le "utf-16le"]
+                                                                         [:utf-16-be "utf-16be"]])
+                                      (property/bool))
+                       (fn ([[coding charset] bom])
+                         {:coding coding :charset charset :bom bom :mark-by-hand bom}))]))
+
+(def- files
+  (property/bind (property/tuple codings (property/elements [:lf :crlf]))
+    (fn ([coding eol])
+      (property/fmap (if (:row coding) (single-byte-text (:row coding)) unicode-text)
+        (fn (text) (assoc (dissoc coding :row) :eol eol :text text))))))
+
+;; The bytes the file must hold: the text with its line ending and mark, in its coding.
+(defn- expected-bytes (file)
+  (let (text (str (if (:bom file) "\u{feff}" "")
+               (if (= (:eol file) :crlf) (string/replace (:text file) "\n" "\r\n") (:text file))))
+    (if (= (:coding file) :utf-8)
+      (string/->bytes text)
+      (bytes/concat (charset/encode text (:coding file))))))
+
+(defn- round-trip (file)
+  (let (dir (temp-dir "bedit-property-save-")
+        _ (file/mkdir dir)
+        path (path/join dir "file.txt"))
+    (file/spit (path/join dir ".editorconfig")
+      (str "root = true\n[*]\ncharset = "
+        (:charset file)
+        "\nend_of_line = "
+        (->string (:eol file))
+        "\n"))
+    (let (_ (saved (ed-edit (visited path)
+                     (fn (b)
+                       (let (typed (insert b (:text file)))
+                         (if (:mark-by-hand file) (assoc typed :bom true) typed))))
+              path)
+          written (file/slurp-bytes path)
+          reread (visited path)
+          buffer (ed-current-buf reread)
+          _ (saved reread path)
+          rewritten (file/slurp-bytes path))
+      (assert= written (expected-bytes file))
+      (assert= (buffer-text buffer) (:text file))
+      (assert= (or (get buffer :coding) :utf-8) (:coding file))
+      (assert= (buffer-eol buffer) (if (includes? (:text file) "\n") (:eol file) :lf))
+      (assert= (buffer-bom? buffer) (:bom file))
+      (assert= rewritten written)
+      true)))
+
+(describe "saving as a property"
+  (test "a file saved in any coding, line ending and mark reads back as it was, byte for byte"
+    (check-property 40 files round-trip)))
+
+;; Bytes as a file holds them, whatever they are: a single-byte coding takes every byte, and
+;; UTF-8 text may mix CR, LF and CRLF and carry U+FEFF anywhere. `:charset` nil writes no
+;; `.editorconfig`, so the UTF-8 is recognised by itself.
+(def- raw-files
+  (property/one-of [(property/fmap (property/tuple (property/elements *single-byte*)
+                                     (property/vector-of (property/int 0 255) {:max 40}))
+                      (fn ([row octets])
+                        {:charset (first (:names row)) :bytes (apply bytes octets)}))
+                     (property/fmap (property/string-of (property/elements ["a"
+                                                                             "\r" "\n" "\r\n"
+                                                                             "\u{feff}" "é" "😀"])
+                                      {:max 30})
+                       (fn (text) {:charset nil :bytes (string/->bytes text)}))]))
+
+(defn- unchanged-by-a-save (file)
+  (let (dir (temp-dir "bedit-property-save-")
+        _ (file/mkdir dir)
+        path (path/join dir "file.txt"))
+    (when (:charset file)
+      (file/spit (path/join dir ".editorconfig")
+        (str "root = true\n[*]\ncharset = " (:charset file) "\n")))
+    (file/spit-bytes path (:bytes file))
+    (saved (visited path) path)
+    (assert= (file/slurp-bytes path) (:bytes file))
+    true))
+
+(describe "a file visited and saved unchanged"
+  (test "gives back every byte, whatever its line endings and marks"
+    (check-property 40 raw-files unchanged-by-a-save)))
