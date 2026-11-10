@@ -214,8 +214,10 @@ C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
   whole path (`/ssh:web1:/srv/a.txt`), as in Emacs: edited, it stays on that host (a rename
   there); another `/ssh:` path is another host; a path of this machine's (clear the line,
   type `/tmp/`) is here. In a local listing, a target typed as an `/ssh:` path goes there.
-  Between two machines the entry crosses as a tar stream through the editor (up to 200 MB):
-  packed where it is, unpacked where it goes in a staging directory beside the target, its
+  Between two machines the entry crosses as a tar stream piped from one ssh straight into the
+  other (`ssh FROM cat … | ssh TO sh …`), never held in the editor, so any size crosses (a side
+  reached through a root hop is carried through the editor instead, up to 200 MB): packed where
+  it is, unpacked where it goes in a staging directory beside the target, its
   size, SHA-256 and entry count checked before it is renamed into place; a move removes the
   original only once the copy has landed checked. A target that exists is asked about first
   — `y`, `n`, `!`, `q`, as locally — once the far disk has said where the entry lands (asked
@@ -244,11 +246,12 @@ C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
   server on localhost and drives all of the above through the real `ssh`: key and password
   logins, a jump host and one that takes only a password, an unknown host key, dired's
   operations (replacing an entry, copies to and from this machine and to another host through
-  a jump host), a root-only file through `|sudo:` with and without sudo's password — then again
+  a jump host, and a 64 MB copy and move streamed with the carried limit at 1 MB), a root-only file through `|sudo:` with and without sudo's password — then again
   with Ubuntu's sudo-rs (0.2.2) and the latest sudo-rs as the host's `sudo` — through `|su:`
   with root's password and `|doas:` with and without one, and sshd killed mid-session.
 - **Not there yet.** A root hop in the middle of a route (`|sudo:` then `|ssh:` on), or one
-  after another; a copy between machines larger than 200 MB (it passes through the editor's
+  after another; a copy between machines larger than 200 MB when one side is reached through a
+  root hop (its root shell has no stream to join, so that copy passes through the editor's
   memory); and a jump host's password asked for by dired's own operations (the listing before
   them has always opened the route).
 

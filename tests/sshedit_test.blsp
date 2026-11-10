@@ -30,6 +30,7 @@
     "batch=yes\n"
     "proxy=\n"
     "printf '%s\\n' \"$*\" > \"$state/last-args\"\n"
+    "printf '%s\\n' \"$*\" >> \"$state/ssh-calls\"\n"
     "while [ $# -gt 0 ]; do\n"
     "  case \"$1\" in\n"
     "    -o) case \"$2\" in BatchMode=no) batch=no ;; ProxyCommand=*) proxy=${2#ProxyCommand=} ;; esac; shift 2 ;;\n"
@@ -943,6 +944,77 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                      (is (not (nil? buffer)))
                      (is (not (:ssh buffer)))
                      (assert= (:dir buffer) local))))))
+  (test "a copy between hosts STREAMS through a pipe, past the size a carried copy may take"
+    (with-stub
+      (fn (dir)
+        (let (tree (remote-fixture dir)
+              far (path/join dir "far")
+              _ (file/mkdir far)
+              big (string/repeat "0123456789abcdef\n" 4000)
+              _ (file/spit (path/join tree "big.txt") big)
+              went (binding (*transfer-max-bytes* 1000)
+                     (sshremote/cross-transfer :move
+                       (sshpath/parse (remote tree))
+                       (path/join tree "big.txt")
+                       (sshpath/parse (str "/ssh:web2:" far))
+                       far
+                       true
+                       false))
+              calls (file/slurp (path/join dir "ssh-calls")))
+          (do
+            (assert= went (path/join far "big.txt"))
+            (assert= (file/slurp (path/join far "big.txt")) big)
+            (is (not (file/exists? (path/join tree "big.txt"))))
+            ;; the two sides of the pipe: the staged archive read on web1, the
+            ;; receiver run on web2 — and neither temporary file left behind
+            (is (regex/find "web1 cat -- /\\S*\\.bedit-pack\\." calls))
+            (is (regex/find "web2 /bin/sh /\\S*\\.bedit-recv\\." calls))
+            (is (empty? (seq/filter (file/ls (or (os/env "TMPDIR") "/tmp"))
+                          (fn (name)
+                            (and (string/starts-with? name ".bedit-recv.")
+                              (includes? calls name)))))))))))
+  (test "a streamed copy that arrives short or changed is refused, nothing left there"
+    (let (staged {:name "a.txt" :count 1 :size 6 :digest (hash/sha256 "alpha\n")}
+          target (temp-dir "bedit-ssh-")
+          _ (file/mkdir target)
+          deliver (fn (input)
+                    (let (receiver (sshremote/run-local (sshremote/receiver-script target
+                                                          staged true false "T"))
+                          path (string/trim (:stdout receiver)))
+                      (assoc (os/cmd "/bin/sh" [path] {:stdin input}) :path path)))
+          short (deliver "alp")
+          changed (deliver "alphX\n"))
+      (do
+        (assert= (:exit short) 4)
+        (is (includes? (:stderr short) "3 of 6 bytes arrived; nothing was copied"))
+        (is (includes? (:stderr changed) "the copy arrived changed; nothing was copied"))
+        (is (not (file/exists? (:path short))))
+        (is (empty? (file/ls target))))))
+  (test "a side through a root hop is carried through the editor, within its limit"
+    (with-stub (fn (dir)
+                 (let (tree (remote-fixture dir)
+                       etc (path/join dir "etc")
+                       _ (file/mkdir etc)
+                       _ (file/spit (path/join tree "big.txt") (string/repeat "x" 5000))
+                       went (binding (*transfer-max-bytes* 1000)
+                              (sshremote/cross-transfer :copy
+                                (sshpath/parse (remote tree))
+                                (path/join tree "big.txt")
+                                (sshpath/parse (str "/ssh:web1|sudo::" etc))
+                                etc
+                                true
+                                false)))
+                   (do
+                     (is (failure? went))
+                     (is (includes? (error-message went) "more than 1000 cross between machines"))
+                     (is (not (file/exists? (path/join etc "big.txt")))))))))
+  (test "the staged pack's answer"
+    (let (staged (sshremote/parse-staged (str "a\n2\n10240\n"
+                                           (hash/sha256 "x")
+                                           "\n/tmp/.bedit-pack.Ab1\n")))
+      (do (assert= (:count staged) 2) (assert= (:archive staged) "/tmp/.bedit-pack.Ab1")))
+    (is (failure? (sshremote/parse-staged "a\n2\n10240\n-\n/tmp/it's here\n")))
+    (is (failure? (sshremote/parse-staged "a\n2\n10240\nnot-a-hash\n/tmp/x\n"))))
   (test "the pack and its answer"
     (let (packed (sshremote/parse-pack "a\n1\n2\naGk=\n"))
       (do
@@ -1085,7 +1157,9 @@ run here, `dir/home` their HOME), the editor's config and the control sockets un
                              (assert= (buffer-text (ed-current-buf m)) "secret stuff\n")
                              (let (saved (file-save/ed-save-buf-at (ed-update m "#" 80 24)
                                            (ed-current-index m)))
-                               (assert= (file/slurp path) "#secret stuff\n"))))))))))))
+                               (do
+                                 (assert= (file/slurp path) "#secret stuff\n")
+                                 (is (not (buffer-modified? (ed-current-buf saved))))))))))))))))
 
 (describe "a file edited as root through `|su:` and `|doas:`"
   (test "the paths read and spell back"

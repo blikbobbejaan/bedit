@@ -34,7 +34,7 @@ use), and the remote half of each operation as a POSIX `sh` script.
   made, moved, copied and deleted on the host ([[make-directory]], [[transfer]],
   [[delete-path]]) — never over a directory, over another entry only when told to
   ([[file-kind]] is what dired asks first) — and copied or moved between two machines, or a host
-  and this one, as a checked tar stream through the editor ([[cross-transfer]]).
+  and this one, as a checked tar stream piped from one ssh to the other, never held here ([[cross-transfer]]).
 - **A root hop** (`|sudo:`, `|su:`, `|doas:`) runs every script in the host's root shell instead (`sshsudo`, [[run]],
   [[become-connect]]).
 
@@ -412,15 +412,17 @@ renamed over it). Answers where it went ([[transfer]]).
     (includes? (sshremote/kind-script \"/srv\") \"echo dir\")   ;=> true"
   (script-with [path] kind-body))
 
-;; ---- a copy between two machines ------------------------------------------------------------
-;; An entry copied or moved between hosts — or between a host and this machine — crosses as a
-;; TAR stream through the editor: packed where it is ([[pack-script]], Base64 on standard
-;; output), checked here (its byte count), and unpacked where it goes ([[unpack-script]]), staged
+;; ---- a copy CARRIED between two machines ----------------------------------------------------
+;; An entry copied or moved between hosts where one side is reached through a root hop (its root
+;; shell has no stream to join) crosses as a TAR archive through the editor: packed where it is
+;; ([[pack-script]], Base64 on standard output), checked here (its byte count), and unpacked where
+;; it goes ([[unpack-script]]), staged
 ;; beside the target, its size, SHA-256 and entry count checked before it is renamed into place.
 ;; A move removes the original only once the copy has landed checked.
 
-(def *transfer-max-bytes* (* 200 1000 1000))
-;; The largest archive a copy between machines carries: it passes through the editor's memory.
+(defdyn *transfer-max-bytes* (* 200 1000 1000))
+;; The largest archive a copy carried through the editor takes (a root hop's side): it passes
+;; through the editor's memory. A streamed copy has no limit.
 
 (def- pack-body
   ;; `$2` the largest archive sent (0: any). Answers the name, the entry count and the archive's
@@ -471,11 +473,13 @@ archive holds, the archive — or a failure when it arrived damaged or short.
     "else echo 'no base64 on this host to receive the copy' >&2; exit 4; fi\n" staging-lines
     "$dec > \"$stage/archive.tar\" <<'BEDIT_EOF' || exit 4\n"))
 
-(def- unpack-tail
-  (str "BEDIT_EOF\n"
-    "size=$(wc -c < \"$stage/archive.tar\" | tr -d ' ')\n"
+(def- received-checks
+  ;; `$stage/archive.tar` arrived: its size, SHA-256 (`-`: the sending side had no tool to say)
+  ;; and entry count checked, then unpacked and renamed into place. Answers where it went.
+  (str "size=$(wc -c < \"$stage/archive.tar\" | tr -d ' ')\n"
     "if [ \"$size\" != \"$expected\" ]; then echo \"$size of $expected bytes arrived; nothing was copied\" >&2; exit 4; fi\n"
-    "if command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum < \"$stage/archive.tar\" | cut -d' ' -f1)\n"
+    "if [ \"$digest\" = - ]; then got=-\n"
+    "elif command -v sha256sum >/dev/null 2>&1; then got=$(sha256sum < \"$stage/archive.tar\" | cut -d' ' -f1)\n"
     "elif command -v shasum >/dev/null 2>&1; then got=$(shasum -a 256 < \"$stage/archive.tar\" | cut -d' ' -f1)\n"
     "else got=$digest; fi\n"
     "if [ \"$got\" != \"$digest\" ]; then echo 'the copy arrived changed; nothing was copied' >&2; exit 4; fi\n"
@@ -486,6 +490,8 @@ archive holds, the archive — or a failure when it arrived damaged or short.
     "if { [ -e \"$to\" ] || [ -L \"$to\" ]; } && [ -d \"$stage/x/$name\" ]; then rm -f -- \"$to\" || exit 4; fi\n"
     "mv -f -- \"$stage/x/$name\" \"$to\" || { echo \"$to: could not be replaced\" >&2; exit 4; }\n"
     "printf '%s\\n' \"$to\"\n"))
+
+(def- unpack-tail (str "BEDIT_EOF\n" received-checks))
 
 (defn unpack-script (to packed into? replace?)
   "The script that unpacks `packed` ([[parse-pack]]'s answer) at `to` on the machine it runs on —
@@ -505,6 +511,109 @@ beside the target before it is renamed into place. Answers where it went.
            unpack-body)
       (wrap-base64 (encoding/base64-encode-bytes bytes))
       unpack-tail)))
+
+;; ---- a copy STREAMED between two machines ---------------------------------------------------
+;; The archive never passes through the editor: it is packed into a temporary file where it is
+;; ([[stage-pack-script]], answering its size and SHA-256), a receiving script is put in a
+;; temporary file where it goes ([[receiver-script]]), and then one local `sh` joins the two
+;; sides with an OS PIPE — `ssh FROM cat ARCHIVE | ssh TO /bin/sh RECEIVER` ([[stream-line]]) —
+;; the receiver checking size, SHA-256 and entry count in its staging directory before the
+;; rename, as the carried copy does.
+
+(def- stage-pack-body
+  ;; Answers the name, the entry count, the archive's size, its SHA-256 (`-` with no tool for
+  ;; it) and where the archive waits; the archive stays for the stream, removed after it
+  (str "if [ ! -e \"$p\" ] && [ ! -L \"$p\" ]; then echo \"$p: no such file\" >&2; exit 4; fi\n"
+    "d=$(dirname -- \"$p\"); n=$(basename -- \"$p\")\n"
+    "tmp=$(mktemp \"${TMPDIR:-/tmp}/.bedit-pack.XXXXXX\") || exit 4\n"
+    "trap 'rm -f -- \"$tmp\"; exit 4' HUP INT TERM\n"
+    "(cd -- \"$d\" && COPYFILE_DISABLE=1 tar cf - \"./$n\") > \"$tmp\" || { rm -f -- \"$tmp\"; echo \"$p: could not be packed\" >&2; exit 4; }\n"
+    "c=$(cd -- \"$d\" && find \"./$n\" | wc -l | tr -d ' ')\n" "s=$(wc -c < \"$tmp\" | tr -d ' ')\n"
+    "if command -v sha256sum >/dev/null 2>&1; then h=$(sha256sum < \"$tmp\" | cut -d' ' -f1)\n"
+    "elif command -v shasum >/dev/null 2>&1; then h=$(shasum -a 256 < \"$tmp\" | cut -d' ' -f1)\n"
+    "else h=-; fi\n" "printf '%s\\n%s\\n%s\\n%s\\n%s\\n' \"$n\" \"$c\" \"$s\" \"$h\" \"$tmp\"\n"))
+
+(defn stage-pack-script (path)
+  "The script that packs `path` (a directory with everything in it) as a tar archive into a
+temporary file for a STREAMED copy ([[parse-staged]] reads its answer: the archive is left there
+for the stream to read).
+
+    (includes? (sshremote/stage-pack-script \"/srv/a\") \"sha256sum\")   ;=> true"
+  (script-with [path] stage-pack-body))
+
+(def- safe-temp-pattern "/[A-Za-z0-9/._-]+")
+;; a temporary path a remote LOGIN shell reads as one word, unquoted: the stream's commands name
+;; one there, and every shell must read them alike
+
+(defn parse-staged (stdout)
+  "What a stage-pack script answered: `{:name :count :size :digest :archive}` — the entry's name,
+how many entries the archive holds, its size and SHA-256 (`-` when the host had no tool for it)
+and the temporary file holding it — or a failure when it does not read.
+
+    (:size (sshremote/parse-staged \"a\\n1\\n10240\\n-\\n/tmp/.bedit-pack.x\\n\"))   ;=> 10240"
+  (let (lines (lines-of stdout)
+        name (first lines)
+        count-read (string/->number (or (nth lines 1 nil) ""))
+        size (string/->number (or (nth lines 2 nil) ""))
+        digest (or (nth lines 3 nil) "")
+        archive (or (nth lines 4 nil) ""))
+    (cond
+      (or (string/blank? (or name "")) (not (int? count-read)) (not (int? size)))
+        (failure "a packed copy that does not read")
+      (not (regex/matches? "-|[0-9a-f]{64}" digest)) (failure "a packed copy with no checksum")
+      (not (regex/matches? safe-temp-pattern archive))
+        (failure (str "the packed copy waits at a path a shell would not read as one word: "
+                   archive))
+      else {:name name :count count-read :size size :digest digest :archive archive})))
+
+(def- receive-body
+  ;; `$2` the entry's name, `$3` INTO, `$4` REPLACE ([[place-function]]), `$5` the entry count,
+  ;; `$6` the archive's size, `$7` its SHA-256; the archive is the script's standard input
+  (str place-function
+    "place \"$1\" \"$2\" \"$3\" \"$4\"\n" "name=$2; count=$5; expected=$6; digest=$7\n"
+    staging-lines "cat > \"$stage/archive.tar\" || exit 4\n" received-checks))
+
+(defn receiver-script (to staged into? replace? token)
+  "The script that leaves a RECEIVER for the stream in a temporary file, answering its path: run
+as `/bin/sh RECEIVER` with the archive `staged` ([[parse-staged]]'s answer) on its standard input,
+it removes itself and unpacks the archive at `to` as [[unpack-script]] does — INTO `to` when it is
+a directory (which it must be when `into?`), never over a directory, over another entry only when
+`replace?`, checked before the rename. `token` ends its here-document.
+
+    (includes? (sshremote/receiver-script \"/b\" {:name \"a\" :count 1 :size 2 :digest \"-\"} false false \"T\") \"cat > \\\"$stage/archive.tar\\\"\")   ;=> true"
+  (str "f=$(mktemp \"${TMPDIR:-/tmp}/.bedit-recv.XXXXXX\") || exit 4\n"
+    "cat > \"$f\" <<'BEDIT_RECV_"
+    token
+    "'\n"
+    "rm -f -- \"$0\"\n"
+    (script-with [to
+                   (:name staged)
+                   (if into? "1" "0")
+                   (if replace? "1" "0")
+                   (str (:count staged))
+                   (str (:size staged))
+                   (:digest staged)]
+      receive-body)
+    "BEDIT_RECV_"
+    token
+    "\n"
+    "printf '%s\\n' \"$f\"\n"))
+
+(defn stream-side (parts remote-command local-argv)
+  "The argv one side of a stream runs: ssh running `remote-command` on `parts`' host, or
+`local-argv` on this machine when `parts` is nil.
+
+    (sshremote/stream-side nil \"cat -- /x\" [\"cat\" \"--\" \"/x\"])   ;=> [\"cat\" \"--\" \"/x\"]"
+  (if (nil? parts) local-argv (into [*program*] (ssh-argv parts remote-command))))
+
+(defn stream-line (from-argv to-argv)
+  "The command line that joins two argvs with an OS pipe — `FROM | TO` — each word quoted for
+POSIX sh: one side's output streams into the other's input and through nothing else.
+
+    (sshremote/stream-line [\"cat\" \"a b\"] [\"sh\" \"r\"])   ;=> \"cat 'a b' | sh r\""
+  (str (string/join (map from-argv os/shell-quote) " ")
+    " | "
+    (string/join (map to-argv os/shell-quote) " ")))
 
 ;; ---- reading the answers ----------------------------------------------------------------
 
@@ -763,19 +872,68 @@ Blocks."
         "file" :file
         nil))))
 
-(defn cross-transfer (op from-parts from to-parts to into? replace?)
-  "Move (`op` `:move`) or copy (`:copy`) `from` on `from-parts`' host to `to` on `to-parts`' —
-either nil for THIS machine — a directory with everything in it: packed there, carried through
-the editor, unpacked here checked ([[pack-script]], [[unpack-script]]); INTO `to` when it is a
-directory (which it must be when `into?`), never over a directory, over another entry only when
-`replace?`. A move removes `from` only once the copy landed checked. The path it went to on
-`to-parts`' side, or a failure saying why. Blocks."
+(defn- carried-transfer (from-parts from to-parts to into? replace?)
+  ;; the copy carried THROUGH the editor (a root hop's shell has no stream to join): packed as
+  ;; Base64, checked here, unpacked there — nothing past `*transfer-max-bytes*`. Where it went
   (let (packed-out (run-op from-parts (pack-script from *transfer-max-bytes*))
         packed (if (failure? packed-out) packed-out (parse-pack packed-out))
         landed (if (failure? packed)
                  packed
-                 (run-op to-parts (unpack-script to packed into? replace?)))
-        went (if (failure? landed) landed (string/trim landed)))
+                 (run-op to-parts (unpack-script to packed into? replace?))))
+    (if (failure? landed) landed (string/trim landed))))
+
+(defn- stream-failure (result to-parts)
+  ;; why the stream failed: ssh's own failure on the receiving side, or what the two sides said
+  (let (failed (when to-parts (classify result to-parts)))
+    (if failed (failure (str "ssh: " (:reason failed))) (script-failure result))))
+
+(defn- streamed-transfer (from-parts from to-parts to into? replace?)
+  ;; the copy STREAMED from one side to the other through an OS pipe, never held here: staged
+  ;; there, a receiver left where it goes, the two joined by a local `sh`, the staged archive
+  ;; removed after whatever happened. Where it went
+  (let (staged-out (run-op from-parts (stage-pack-script from))
+        staged (if (failure? staged-out) staged-out (parse-staged staged-out)))
+    (if (failure? staged)
+      staged
+      (let (archive (:archive staged)
+            receiver-out (run-op to-parts (receiver-script to staged into? replace? (rand/token 8)))
+            receiver (if (failure? receiver-out) receiver-out (string/trim receiver-out))
+            went (cond
+                   (failure? receiver) receiver
+                   (not (regex/matches? safe-temp-pattern receiver))
+                     (failure (str "the receiver waits at a path a shell would not read as one word: "
+                                receiver))
+                   else
+                     (let (line (stream-line (stream-side from-parts
+                                               (str "cat -- " archive)
+                                               ["cat" "--" archive])
+                                  (stream-side to-parts
+                                    (str "/bin/sh " receiver)
+                                    ["/bin/sh" receiver]))
+                           result (os/cmd "/bin/sh"
+                                    ["-c" line]
+                                    {:env ssh-env
+                                     :timeout-ms (+ *operation-timeout-ms*
+                                                   (math/quot (:size staged) 1000))}))
+                       (if (= 0 (:exit result))
+                         (string/trim (:stdout result))
+                         (stream-failure result to-parts)))))
+        (do (run-op from-parts (script-with [archive] "rm -f -- \"$p\"\n")) went)))))
+
+(defn cross-transfer (op from-parts from to-parts to into? replace?)
+  "Move (`op` `:move`) or copy (`:copy`) `from` on `from-parts`' host to `to` on `to-parts`' —
+either nil for THIS machine — a directory with everything in it: packed as a tar archive there and
+STREAMED to the other side through an OS pipe (`ssh FROM … | ssh TO …`, [[stream-line]]), never
+held in the editor, so no size is too large; a side through a root hop (its root shell has no
+stream to join) is carried through the editor instead, up to `*transfer-max-bytes*`. Unpacked
+where it goes in a staging directory, its size, SHA-256 and entry count checked against what the
+packing side said before it is renamed into place; INTO `to` when it is a directory (which it
+must be when `into?`), never over a directory, over another entry only when `replace?`. A move
+removes `from` only once the copy landed checked. The path it went to on `to-parts`' side, or a
+failure saying why. Blocks."
+  (let (went (if (or (:become from-parts) (:become to-parts))
+               (carried-transfer from-parts from to-parts to into? replace?)
+               (streamed-transfer from-parts from to-parts to into? replace?)))
     (cond
       (failure? went) went
       (= op :copy) went

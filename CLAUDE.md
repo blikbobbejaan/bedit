@@ -257,9 +257,14 @@ src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*pro
                             mkdir / mv / cp -pR / rm -rf (`make-directory`, `transfer`, `delete-path`,
                             `file-kind`: never over a directory, over another entry only when told
                             — a copy staged beside it and renamed over it). Between two machines,
-                            or a host and this one (`run-local`), `cross-transfer`: a tar stream
-                            through the editor (`pack-script` / `unpack-script`, ≤ 200 MB), unpacked
-                            in a staging dir, size + SHA-256 + entry count checked, then renamed; a
+                            or a host and this one (`run-local`), `cross-transfer`: a tar archive
+                            STREAMED through an OS pipe, never held here — staged where it is
+                            (`stage-pack-script`, size + SHA-256), a receiver left where it goes
+                            (`receiver-script`), one local `sh` running `ssh FROM cat | ssh TO sh
+                            RECEIVER` (`stream-line`, `stream-side`) — any size; a root-hop side
+                            is carried through the editor instead (`pack-script` /
+                            `unpack-script`, ≤ `*transfer-max-bytes*`, 200 MB). Unpacked in a
+                            staging dir, size + SHA-256 + entry count checked, then renamed; a
                             move deletes only after. `~user` resolved by the remote shell, the name
                             checked first. Jump hosts become a nested `ProxyCommand` of `ssh -W`
                             (`proxy-command`; batch mode for every hop, riding the hop's own
@@ -1672,7 +1677,7 @@ tools/ci/ssh-real.sh        CI's REAL-sshd check (`ssh-real` in ci.yml): OpenSSH
                             jump-host-only target and an unknown host key; the driver
                             (`ssh-real.blsp`) runs `/ssh:` open / save / revert / hex / large /
                             prompt listing / dired ops (replacing asked) / copies to and from this
-                            machine and to another host / `~user` / multi-hop / password / a jump
+                            machine and to another host / a 64 MB copy streamed past a 1 MB carried limit / `~user` / multi-hop / password / a jump
                             host's password / `|sudo:` with and without sudo's password / `|su:`
                             (root given a password for the run) / `|doas:` (a doas.conf of the
                             run's) / a dropped connection through the real ssh; then the root hops
