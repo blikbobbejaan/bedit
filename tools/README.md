@@ -17,7 +17,12 @@ CI runs every one of them weekly (and on demand: `gh workflow run drive.yml`) on
 driver on its own with a timeout, so one failure hides none of the rest, and keeps a log per
 driver (uploaded when any failed). A driver that needs a program the runner lacks skips itself
 (`terraform-ls`); the job installs Elixir and builds `brood-lsp` so `drive-elixir` and
-`drive-lsp` run for real.
+`drive-lsp` run for real, and checks out 20 commits so `drive-git-rebase` has a HEAD~2 (it
+skips itself in a shallower clone). A failed check prints the screen its last wait gave up
+on, so a CI log says what was painted instead. The pty harnesses route the logger into
+*Messages*, as `main` does: a log line on stderr would land on the pty and scribble over the
+screen (the first weekly run's `drive-tutor-readonly` failure was a sandbox child's warnings
+painted over a tutorial box).
 
 All of them are Brood. Two shapes, and the difference is where the editor runs:
 
@@ -40,7 +45,7 @@ All of them are Brood. Two shapes, and the difference is where the editor runs:
 | `drive-tailcalls` | A million TRACED tail calls answer `=> :liftoff`. The lesson teaching O(1) stack is boundary-traced, and a trace wrapper used to cost a frame per level (brood ADR-207). Model tests can't see it: the headless evaluator instruments nothing, which is exactly the instrumentation that broke. |
 | `drive-mdpreview` | `C-c C-p` in a `.md` buffer paints the rendered document beside it — the mode keymap's chord reaching a command whose module was not loaded, the split, and the view painting a buffer's faces from `:face-spans` data rather than a lexer. The needles (`━`, `•`) are what only the render produces. |
 | `drive-windmove` | `C-S-<right>` moves the window and `M-<left>` selects the one beside it — from a real terminal, where the frontend has to turn `ESC [ 1 ; 6 C` into `:ctrl-shift-right` (ADR-328). Each command's edge message names the direction, a needle the input cannot produce. |
-| `drive-contract` | `M-x` shows each command's declared `model -> model` contract in the margin (with its key and doc) — the marginalia the model tests build but cannot paint. |
+| `drive-contract` | `M-x` shows each command's key and docstring in the margin, and leaves out the `model any → model` contract every `defcommand` declares (shown only for one that claims otherwise) — the marginalia the model tests build but cannot paint. |
 | `drive-narrow` | `C-x n n` paints ONLY the focused region and the mode line shows `⊸ Narrowed`; `C-x n w` brings the rest back. The model tests confine point; only a frame shows the render slice + indicator. |
 | `drive-isearch` | `C-s zork` shows `1/3 I-search: zork` once typing pauses — the match count is taken by a timer of its own a slice at a time, which only the live loop arms and fires — then `C-s`, `M-r` (`ESC r`) and `C-M-s` (`ESC C-s`) by regexp, each prompt with its count. |
 | `drive-tutor-readonly` | The REAL editor refuses a backspace at a box's edge and says so, while the box stays writable — the tutorial's prose/borders are read-only at the edit primitive (`:read-only-spans`, ADR-219), not a `:post-key` guard a held key could outrun. |
