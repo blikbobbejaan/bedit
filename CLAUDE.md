@@ -238,8 +238,11 @@ src/sshpath.blsp            the TRAMP `/ssh:[user@]host[#port]:path` syntax in O
                             before it touches a path. `~` / a relative path is the REMOTE home's,
                             `~other/…` another user's (kept as typed, resolved there); a route
                             through jump hosts is TRAMP's multi-hop (`/ssh:bastion|ssh:host:/x`,
-                            `:hops` on the parts, `route-label`, `prefix`; `same-connection?`).
-                            filename, sidecar, mincomplete, dired and the handler all read it
+                            `:hops` on the parts, `route-label`, `prefix`; `same-connection?`), and
+                            a last `|sudo:` hop edits as root THERE (`/ssh:host|sudo::/etc/x`,
+                            `|sudo:www@:` another user — `:sudo` on the parts, `sudo-user?`, its own
+                            connection). filename, sidecar, mincomplete, dired and the handler all
+                            read it
 src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*program*`, a test's
                             stand-in runs the scripts locally) with one SHARED connection per host
                             (ControlMaster, the socket in `state/ssh/`, owner-only, ControlPersist
@@ -250,13 +253,31 @@ src/sshremote.blsp          the transport under `/ssh:`: the system `ssh` (`*pro
                             first), an atomic write (staged beside the file with its mode, size +
                             SHA-256 checked, renamed), `ls -1pa` for the prompt (kept 10 s, a
                             table), `stat` rows for dired (`list-entries`, GNU or BSD) and its
-                            mkdir / mv / cp -pR / rm -rf (`make-directory`, `transfer`, `delete-path`:
-                            never over an entry already there). `~user` resolved by the remote
-                            shell, the name checked first. Jump hosts become a nested
-                            `ProxyCommand` of `ssh -W` (`proxy-command`; batch mode for every hop —
-                            ssh's `-J` passes no options on), run by `/bin/sh` (`SHELL`). A password
-                            opens the connection once (`connect-with-password`: SSH_ASKPASS helper
-                            reading ssh's own stdin, refusing yes/no questions)
+                            mkdir / mv / cp -pR / rm -rf (`make-directory`, `transfer`, `delete-path`,
+                            `file-kind`: never over a directory, over another entry only when told
+                            — a copy staged beside it and renamed over it). Between two machines,
+                            or a host and this one (`run-local`), `cross-transfer`: a tar stream
+                            through the editor (`pack-script` / `unpack-script`, ≤ 200 MB), unpacked
+                            in a staging dir, size + SHA-256 + entry count checked, then renamed; a
+                            move deletes only after. `~user` resolved by the remote shell, the name
+                            checked first. Jump hosts become a nested `ProxyCommand` of `ssh -W`
+                            (`proxy-command`; batch mode for every hop, riding the hop's own
+                            ControlMaster — ssh's `-J` passes no options on), run by `/bin/sh`
+                            (`SHELL`); a route that fails is tried hop by hop (`route-failure`,
+                            `blame-route`), naming the hop. A password opens a connection once —
+                            the host's or a hop's (`connect-with-password`, `hop-parts`: SSH_ASKPASS
+                            helper reading ssh's own stdin, refusing yes/no questions). A `|sudo:`
+                            path's scripts run in `sshsudo`'s root shell (`run`, `sudo-connect`)
+src/sshsudo.blsp            the `|sudo:` hop's ROOT SHELL, kept open as TRAMP keeps one (sudo's
+                            cache cannot serve the next ssh command: no terminal, a new session
+                            each): a process per route + user holding `ssh … sudo -S -p MARKER -u
+                            USER /bin/sh -c 'echo READY; exec /bin/sh'`, over the host's
+                            ControlMaster, ended 5 min idle or when the link drops. The password is
+                            written once, only at sudo's own prompt (a NOPASSWD rule never gets
+                            it); a second prompt is a wrong one, closed before a third. Each request
+                            a script run by its own `sh` from a temp file, output and errors Base64
+                            between per-request markers (`request-text`, `parse-reply`), answered as
+                            `os/cmd`'s map. `stop-all` (a test passes its socket dir)
 src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/ssh:`), the second file
                             handler (`model/register-file-handler`, sudoedit's shape): `C-x C-f
                             /ssh:host:/etc/x`. The buffer VISITS the TRAMP path (`buffer-file` is
@@ -264,18 +285,21 @@ src/sshedit.blsp            editing a file on ANOTHER MACHINE (Emacs's TRAMP `/s
                             takes it for a file here. Every ssh call a task on `remotejob`'s queue
                             (`:ssh-proc`, one at a time, C-g stops it): `Loading…` at once, a save
                             stays modified until it lands (`file-save/ed-save-prepare` /
-                            `ed-save-landed`), a dropped connection said. A password the host wants is
-                            read masked (`passwd/ed-read-passwd`) and used once. charset as any file
-                            (binary → hex, large → asked); a directory opens in DIRED (the handler's
-                            `:dired`, `ed-ssh-dired`: listed off the loop, then
+                            `ed-save-landed`), a dropped connection said. A password the host, a
+                            jump host or the `|sudo:` hop wants is read masked
+                            (`passwd/ed-read-passwd`; the job's `:password-for`) and used once.
+                            charset as any file (binary → hex, large → asked); a directory opens in
+                            DIRED (the handler's `:dired`, `ed-ssh-dired`: listed off the loop, then
                             `dired/ed-dired-show-entries`), whose `+` `R` `C` `D` `x` go through the
                             handler's file operations (`:make-directory`, `:rename-file`,
-                            `:copy-file`, `:delete-file`, `:expand-file-name`, `:parent-directory`,
-                            Emacs's file-name-handler-alist — dired names no handler). CI's
-                            `ssh-real` job drives all of it against a real sshd
-                            (tools/ci/ssh-real.sh). Its sidecar is private (`sidecar/private-spec`); auto-revert,
-                            diff-hl, LSP, the formatter, editorconfig, dir-locals, compile, M-! and the
-                            project walk skip it (`sshpath/remote?`). The mode line says `@host`
+                            `:copy-file` — within a host, between hosts or to and from this machine,
+                            replacing an entry only when asked — `:file-kind`, `:delete-file`,
+                            `:expand-file-name`, `:parent-directory`, Emacs's
+                            file-name-handler-alist — dired names no handler). CI's `ssh-real` job
+                            drives all of it against a real sshd (tools/ci/ssh-real.sh). Its sidecar
+                            is private (`sidecar/private-spec`); auto-revert, diff-hl, LSP, the
+                            formatter, editorconfig, dir-locals, compile, M-! and the project walk
+                            skip it (`sshpath/remote?`). The mode line says `@host` (`@host # root`)
 src/bugreport.blsp          M-x report-bug (Emacs's report-emacs-bug): every error the editor CATCHES
                             (a command, a render error frame, a fontify, a loop the supervisor
                             restarted) reaches its error sink (`model/register-error-sink`),
@@ -1619,10 +1643,13 @@ tools/ci/lsp-rust.sh        CI's REAL language server check (`lsp-rust-analyzer`
                             jumping to an impl
 tools/ci/ssh-real.sh        CI's REAL-sshd check (`ssh-real` in ci.yml): OpenSSH's server on
                             localhost (a throwaway host key and config, root through sudo so it can
-                            check a password, a throwaway password user), host aliases for a key
-                            login, a jump-host-only target and an unknown host key; the driver
+                            check a password, a throwaway password user allowed sudo with its
+                            password, a root-only file), host aliases for a key login, a
+                            jump-host-only target and an unknown host key; the driver
                             (`ssh-real.blsp`) runs `/ssh:` open / save / revert / hex / large /
-                            prompt listing / dired ops / `~user` / multi-hop / password / a dropped
+                            prompt listing / dired ops (replacing asked) / copies to and from this
+                            machine and to another host / `~user` / multi-hop / password / a jump
+                            host's password / `|sudo:` with and without sudo's password / a dropped
                             connection through the real ssh. `local` mode runs sshd as you (no
                             sudo, no password check) for a quick look on a desktop
 tools/ci/drive-all.sh       CI's weekly LIVE DRIVERS run (.github/workflows/drive.yml, cron +

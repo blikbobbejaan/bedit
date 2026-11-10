@@ -154,6 +154,8 @@ C-x C-f /ssh:deploy@web1#2222:~/app/.env      # a user, a port; ~ is the REMOTE 
 C-x C-f /ssh:web1:~www/site/index.html        # another user's home there
 C-x C-f /ssh:[fe80::1]:/etc/hosts             # an IPv6 host in brackets
 C-x C-f /ssh:bastion|ssh:db1:/etc/my.cnf      # through a jump host (TRAMP's multi-hop)
+C-x C-f /ssh:web1|sudo::/etc/hosts           # as root ON web1 (TRAMP's sudo hop)
+C-x C-f /ssh:web1|sudo:www-data@:/srv/x      # as another user there
 C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
 ```
 
@@ -165,10 +167,24 @@ C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
   fish) never parses a path, and a file name with spaces, quotes or `$` is safe.
 - **Jump hosts.** `/ssh:bastion|ssh:db1:PATH` reaches db1 through bastion (any number of
   hops, each `[user@]host[#port]`): bedit hands ssh a `ProxyCommand` that runs `ssh -W` to
-  each hop in turn, in batch mode like everything else — so a jump host is reached with a key
-  or your agent, never a password. (ssh's own `-J` passes none of bedit's options on to the
+  each hop in turn, in batch mode like everything else, riding the hop's own shared
+  connection when it has one. When the route fails, each hop is tried in turn: the one that
+  refused is named, and a jump host that takes a password gets it asked for, masked, as the
+  target does (`Password for bastion (jump host)`) — it opens THAT hop's shared connection,
+  and every `-W` after rides it. (ssh's own `-J` passes none of bedit's options on to the
   jump, so a hop wanting a password would prompt on a terminal.) A `ProxyJump` in your
   `~/.ssh/config` keeps working as it always does.
+- **As root there (`|sudo:`).** `/ssh:web1|sudo::/etc/hosts` edits the file as root on web1
+  (`|sudo:USER@:` as another user; the host after `|sudo:` empty or web1 again). sudo cannot
+  remember a password between two ssh commands (each is a session of its own, with no
+  terminal), so bedit keeps a ROOT SHELL open on the host instead, as TRAMP does — one per
+  route and user, over the host's shared connection, ended five minutes after its last use or
+  when the connection drops. When sudo wants your password it is asked for, masked
+  (`Password for sudo on web1`), written to sudo once, only when sudo prompts — a `NOPASSWD`
+  rule never gets it — and kept nowhere; a wrong one is said, and sudo is not left to count
+  more tries. Dired, saving and C-x C-w work as on any remote path; the mode line says
+  `@web1 # root`. A `sudo` that insists on a terminal (`requiretty`) is said, not worked
+  around.
 - **Opening.** A `Loading…` buffer appears at once and the file replaces it when ssh answers;
   C-g stops it. The bytes come through `base64`, so the file's coding is detected as any
   file's is: a binary opens as the read-only hex view, and a file past
@@ -176,19 +192,29 @@ C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
   Tab completes a remote directory's entries (listed over ssh, kept 10 s).
 - **Directories.** A remote directory opens in dired, listed over ssh with the same `ls -l`
   columns and sorting (`s`) as a local one. RET visits a file or enters a directory, `^` goes
-  up, `g` lists it again; `+` makes a directory, `R` moves and `C` copies (marked entries or
-  the one at point, a directory with everything in it) within that host, and `D` / `x` delete
-  — for good, after a question that says so: there is no trash on the other machine. A move
-  or copy never replaces an entry already there (it is reported, not asked about: the far
-  disk cannot be asked from the editor's loop), and it stays on the one host. Each operation
-  runs off the loop; a buffer visiting a moved file follows it, one visiting a deleted file
-  is kept and marked modified.
+  up (point on the directory just left), `g` lists it again; `+` makes a directory, `R` moves
+  and `C` copies (marked entries or the one at point, a directory with everything in it), and
+  `D` / `x` delete — for good, after a question that says so: there is no trash on the other
+  machine. C-x C-j from a remote file lands on its line, as locally.
+- **Copy and move, anywhere.** In a remote listing the `R` / `C` prompt starts at the entry's
+  whole path (`/ssh:web1:/srv/a.txt`), as in Emacs: edited, it stays on that host (a rename
+  there); another `/ssh:` path is another host; a path of this machine's (clear the line,
+  type `/tmp/`) is here. In a local listing, a target typed as an `/ssh:` path goes there.
+  Between two machines the entry crosses as a tar stream through the editor (up to 200 MB):
+  packed where it is, unpacked where it goes in a staging directory beside the target, its
+  size, SHA-256 and entry count checked before it is renamed into place; a move removes the
+  original only once the copy has landed checked. A target that exists is asked about first
+  — `y`, `n`, `!`, `q`, as locally — once the far disk has said where the entry lands (asked
+  off the loop); a file said yes to is replaced atomically, a directory never is. Each
+  operation runs off the loop; a buffer visiting a moved file follows it (becoming a local or
+  remote buffer with it), one visiting a deleted file is kept and marked modified.
 - **Saving.** C-x C-s writes the file back atomically — staged in the file's directory with
   the file's mode, checked by size and SHA-256, then renamed over it — and the buffer stays
   modified until the write has landed. A connection that drops is said in the echo area and
   the buffer stays modified; C-x C-s again once it is back. C-x C-c asks about remote files as
   about any, and saves them after its questions. M-x revert-buffer and C-x RET r read the file
-  again; C-x C-w to an `/ssh:` path moves a buffer there. The mode line shows `@host`.
+  again; C-x C-w to an `/ssh:` path moves a buffer there. The mode line shows `@host`
+  (`@host # root` through `|sudo:`).
 - **Passwords and host keys.** ssh runs in batch mode, so it never waits on a prompt. A host
   that refuses every key but takes a password gets one asked for, masked, in the minibuffer;
   it opens the shared connection (through an `SSH_ASKPASS` helper reading it from ssh's own
@@ -202,11 +228,14 @@ C-x d   /ssh:web1:/var/log/                   # a remote directory in dired
   alone: they would run here, on a path that exists only there.
 - **Proven against a real sshd.** CI's `ssh-real` job (tools/ci/ssh-real.sh) runs OpenSSH's
   server on localhost and drives all of the above through the real `ssh`: key and password
-  logins, a jump host, an unknown host key, dired's operations, and sshd killed mid-session.
-- **Not there yet.** A password for a jump host; a file moved or copied from one host to
-  another, or between a host and this machine; replacing an existing entry from dired (asked
-  about locally, refused remotely); C-x C-j from a remote file lands on the listing's first
-  entry rather than the file; and hops other than `ssh:` (TRAMP's `sudo:` as the last hop).
+  logins, a jump host and one that takes only a password, an unknown host key, dired's
+  operations (replacing an entry, copies to and from this machine and to another host through
+  a jump host), a root-only file through `|sudo:` with and without sudo's password, and sshd
+  killed mid-session.
+- **Not there yet.** Hops other than `ssh:` and a last `sudo:` (TRAMP's `su:`, `doas:`, a
+  `sudo:` in the middle of a route); a copy between machines larger than 200 MB (it passes
+  through the editor's memory); and a jump host's password asked for by dired's own
+  operations (the listing before them has always opened the route).
 
 ## Collaboration status (what's built vs runnable)
 
