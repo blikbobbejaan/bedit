@@ -738,6 +738,12 @@ src/filecoding.blsp         C-x RET f (the next save's coding) and C-x RET r (re
 src/imageview.blsp          an image (PNG, JPEG, GIF, WebP, BMP) opens as a picture: brood's gui/image-thumb
                             decodes it to fit the pane, painted in half-block cells (window and
                             terminal alike) over the theme's background; one that does not decode is hex
+src/docview.blsp            a PDF opens as its pages (Emacs doc-view, the `:document` presenter): each page
+                            drawn OFF the loop (`:docview-proc`) by `pdftoppm`, else `mutool draw`, into
+                            a PNG cached under state/cache/docview/, and painted by imageview's layer
+                            (`:image-bytes`, refitted on a resize or zoom). n / SPC / PageDown, p / DEL /
+                            PageUp, M-< / M->, g a page; the mode line `Page 3/12` (`pdfinfo`). No
+                            rasteriser: the hex view, said. `:no-write`. Tests bind `*which*` / `*run*`
 src/hexl.blsp               hexl-mode: a binary file opened as a read-only hex view (pool's
                             find-file reaches it late-bound); the mode's `:no-write` facet is
                             what makes C-x C-s / C-x C-w refuse it

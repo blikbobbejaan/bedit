@@ -1,0 +1,274 @@
+(defmodule docview
+  "Viewing a PDF (Emacs's doc-view): a `.pdf` opens as its pages, one at a time, rather than as
+hex. An external rasteriser draws the page as a PNG — poppler's `pdftoppm`, else MuPDF's
+`mutool draw` — and the pane paints it through imageview's half-block layer (the buffer's
+`:image-bytes`), fitted to the pane, so a resize or a zoom refits it. The page count comes from
+`pdfinfo` (else `mutool show`), and the mode line says `Page 3/12`.
+
+A page is drawn OFF the loop, in a task on `:docview-proc` (inline when there is no loop, a
+test): the old page stays up until the new one lands, and turning again before it does cancels
+the draw in flight. Each drawn page is kept as a PNG under the editor's state dir
+(`state/cache/docview/<file's key>/`, the key the file's path, size and modification time), so a
+page seen once turns at once. With neither rasteriser installed the file opens as the hex
+view, as any binary, and says so.
+
+Keys, as doc-view's: n / SPC / PageDown the next page, p / DEL / PageUp the previous, M-< / M->
+the first and last, g a page by number, q quits. Read-only, and `:no-write` as the hex view is."
+  (:use editor/buffer :only [set-read-only]) ; the view buffer is read-only
+  (:use editor/keymap :only [keymap-bind]) ; the mode keymap below
+  (:use model) ; message / ed-current-buf / ed-set-buf / register-presenter / register-task-reply
+  (:use minibuffer :only [ed-mb-edit]) ; g's page prompt
+  (:use interactive) ; defcommand — the page commands, for M-x
+  (:use modes :only []) ; register-special-type runs at load, after modes declares its kinds
+  (:use imageview :only []) ; the half-block layer that paints `:image-bytes`
+  (:use pool :only [ed-show-named]) ; the buffer it shows in
+  (:use projects :only [file-display-name editor-state-dir])) ; its name; the page cache's home
+
+(defdyn *resolution* 100)
+;; Dots per inch a page is drawn at (Emacs's `doc-view-resolution`). A US letter page is then
+;; 850×1100 pixels — more than any pane's half-block cells hold (two pixels a cell), so the
+;; layer only ever scales DOWN to fit, and a resize or a zoom needs no new drawing.
+(sig *resolution* int)
+
+(defdyn *which* os/which)
+;; What finds a program on PATH (`name -> path or nil`); a test binds a stand-in.
+
+(defdyn *run* os/cmd)
+;; What runs a program (`prog args opts -> {:exit :stdout :stderr}`, os/cmd's); a test binds a
+;; stand-in that writes a PNG where the rasteriser would.
+
+(def- page-timeout-ms 60000) ; a page that takes longer than a minute is not coming
+
+;; ---- the rasterisers ----------------------------------------------------------
+
+(defn rasteriser ()
+  "The program that draws a page — `:pdftoppm` (poppler), else `:mutool` (MuPDF) — or nil when
+neither is installed."
+  (let (which *which*)
+    (cond
+      (which "pdftoppm") :pdftoppm
+      (which "mutool") :mutool
+      else nil)))
+
+(defn draw-command (program pdf page resolution out)
+  "`[prog args]` that draws `page` (from 1) of `pdf` at `resolution` dpi into the PNG `out`.
+
+    (docview/draw-command :mutool \"a.pdf\" 2 100 \"/c/2.png\")   ;=> [\"mutool\" [\"draw\" \"-q\" \"-r\" \"100\" \"-o\" \"/c/2.png\" \"a.pdf\" \"2\"]]"
+  (let (dpi (->string resolution)
+        number (->string page))
+    (case program
+      :pdftoppm
+      ;; -singlefile: the output is `<prefix>.png`, no page number spliced in
+        ["pdftoppm"
+          ["-png"
+            "-r"
+            dpi
+            "-f"
+            number
+            "-l"
+            number
+            "-singlefile"
+            pdf
+            (string/replace out ".png" "")]]
+      :mutool ["mutool" ["draw" "-q" "-r" dpi "-o" out pdf number]])))
+
+(defn- run-program (prog args)
+  ;; the program's result, or a failure carrying why it did not run
+  (let (runner *run*)
+    (try
+      (runner prog args {:timeout-ms page-timeout-ms})
+      (catch problem (failure (str prog ": " (error-message problem)))))))
+
+(defn parse-page-count (text)
+  "The page count in `pdfinfo`'s output (`Pages:   12`) or `mutool show`'s bare number, else nil.
+
+    (docview/parse-page-count \"Title: x\\nPages:          12\\n\")   ;=> 12
+    (docview/parse-page-count \"7\\n\")   ;=> 7"
+  (let (found (or (regex/find "(?:^|\n)Pages:\\s+(\\d+)" text) (regex/find "^\\s*(\\d+)\\s*$" text)))
+    (when found (string/->number (:text (first (:groups found)))))))
+
+(defn page-count (pdf)
+  "How many pages `pdf` has, asked of `pdfinfo` (else `mutool show`), or nil when neither says."
+  (let (which *which*
+        asked (cond
+                (which "pdfinfo") (run-program "pdfinfo" [pdf])
+                (which "mutool") (run-program "mutool" ["show" pdf "trailer/Root/Pages/Count"])
+                else nil))
+    (when (and (map? asked) (= 0 (:exit asked))) (parse-page-count (:stdout asked)))))
+
+;; ---- the page cache -------------------------------------------------------------
+
+(defn cache-dir (pdf)
+  "Where `pdf`'s drawn pages are kept: a directory under the editor's state dir named for the
+file's path, size and modification time — so an edited PDF is drawn afresh."
+  (let (stamp (str pdf "\n" (file/size pdf) "\n" (file/mtime pdf)))
+    (path/join (editor-state-dir) "cache" "docview" (string/substring (hash/sha256 stamp) 0 32))))
+
+(defn page-file (cache page resolution)
+  "The PNG page `page` drawn at `resolution` is kept in, under `cache`."
+  (path/join cache (str "page-" page "-" resolution ".png")))
+
+(defn draw-page (program pdf page resolution cache)
+  "Page `page` of `pdf` as PNG bytes — the cached drawing, else drawn now by `program` and kept
+— or a failure saying why it could not be drawn. What the task runs; it never sees the model."
+  (let (out (page-file cache page resolution))
+    (if (file/exists? out)
+      (file/slurp-bytes out)
+      (let ([prog args] (do (file/mkdir cache) (draw-command program pdf page resolution out))
+            result (run-program prog args))
+        (cond
+          (failure? result) result
+          (:timed-out result) (failure (str prog " took too long on page " page))
+          (not (= 0 (:exit result)))
+            (failure (str prog " failed on page " page ": " (string/trim (or (:stderr result) ""))))
+          (not (file/exists? out)) (failure (str prog " drew nothing for page " page))
+          else (file/slurp-bytes out))))))
+
+;; ---- the view buffer ----------------------------------------------------------------
+
+(defn- view-of (buf)
+  ;; the doc-view state on `buf`: `{:file :page :pages :program :cache}`, or nil
+  (:docview buf))
+
+(defn- view-index (m file)
+  ;; the pool index of the doc-view buffer on `file`, or nil
+  (let (index (seq/index-where (:buffers m) (fn (buf) (= file (:file (view-of buf))))))
+    (when (>= index 0) index)))
+
+(defn ed-open-document (m path root bytes)
+  "Open the PDF at `path` (`bytes` its contents, already read) as a `:docview` buffer showing
+its first page — or as the hex view, said, when no rasteriser is installed."
+  (let (program (rasteriser))
+    (if (nil? program)
+      (message (hexl/ed-open-binary m path root bytes)
+        (str "doc-view: no PDF rasteriser (install poppler's pdftoppm or MuPDF's mutool) — "
+          path " opened as hex"))
+      (let (title (str "PDF — " (path/basename path) "\n")
+            shown (ed-show-named m (file-display-name path root) title :docview)
+            view {:file path
+                  :page 1
+                  :pages (page-count path)
+                  :program program
+                  :cache (cache-dir path)})
+        (ed-docview-show (ed-set-buf shown
+                           (assoc (set-read-only (ed-current-buf shown) true)
+                             :file path
+                             :dir (path/dirname path)
+                             :docview view))
+          1)))))
+
+(defn- with-view (m index update)
+  ;; `m` with the doc-view buffer at `index` passed through `update` (`buf -> buf`)
+  (ed-set-buf-at m index (update (ed-buf-at m index))))
+
+(defn page-landed (m reply)
+  "A drawn page folded in: `reply` is `{:file :page :png}` (`:png` a failure when the draw
+failed), painted on its buffer when that buffer still wants that page; a failure is said."
+  (let (landed (dissoc m :docview-proc)
+        index (when (map? reply) (view-index landed (:file reply))))
+    (cond
+      (not (map? reply)) (message landed "doc-view: the page could not be drawn")
+      (nil? index) landed
+      (not (= (:page reply) (:page (view-of (ed-buf-at landed index))))) landed
+      (failure? (:png reply)) (message landed (str "doc-view: " (error-message (:png reply))))
+      else (with-view landed index (fn (buf) (assoc buf :image-bytes (:png reply)))))))
+
+(register-task-reply :docview-proc
+  'docview/page-landed
+  :docview/failed "drawing a PDF page"
+  {:cancel-on-quit? true})
+
+(defn ed-docview-show (m page)
+  "Show `page` of the current doc-view buffer: at once when it was drawn before, else drawn off
+the loop while the page shown stays up (a draw already in flight is cancelled)."
+  (let (buf (ed-current-buf m)
+        view (assoc (view-of buf) :page page)
+        {:keys [file program cache]} view
+        resolution *resolution*
+        cached (page-file cache page resolution)
+        turned (ed-set-buf m (assoc buf :docview view))
+        draw (fn () {:file file :page page :png (draw-page program file page resolution cache)}))
+    (do
+      (when (:docview-proc m) (task/cancel (:docview-proc m)))
+      (cond
+        (or (file/exists? cached) (ed-headless?)) (page-landed turned (draw))
+        else (assoc turned :docview-proc (task/task draw {:timeout page-timeout-ms}))))))
+
+(defn ed-docview-goto (m page)
+  "Turn the current doc-view buffer to `page`, held inside the document; turning past either
+end dings."
+  (let (view (view-of (ed-current-buf m))
+        last-page (or (:pages view) page)
+        target (math/max 1 (math/min last-page page)))
+    (cond
+      (nil? view) (ed-ding m "not a document")
+      (not (= target page)) (ed-ding m (if (< page 1) "beginning of document" "end of document"))
+      (= target (:page view)) m
+      else (ed-docview-show m target))))
+
+(defn docview-modeline (m buf)
+  "doc-view's `:modeline` segment: `Page 3/12` (`Page 3` when the count is unknown)."
+  (let (view (view-of buf))
+    (when view (str "Page " (:page view) (if (:pages view) (str "/" (:pages view)) "")))))
+
+;; ---- the commands -------------------------------------------------------------------
+
+(defn- current-page (m) (or (:page (view-of (ed-current-buf m))) 1))
+
+(defcommand cmd-docview-next-page
+  (m key)
+  "The next page of the document (doc-view `n`, SPC, PageDown)."
+  (ed-docview-goto m (inc (current-page m))))
+
+(defcommand cmd-docview-previous-page
+  (m key)
+  "The previous page of the document (doc-view `p`, DEL, PageUp)."
+  (ed-docview-goto m (dec (current-page m))))
+
+(defcommand cmd-docview-first-page
+  (m key)
+  "The document's first page (doc-view `M-<`)."
+  (ed-docview-goto m 1))
+
+(defcommand cmd-docview-last-page
+  (m key)
+  "The document's last page (doc-view `M->`); its first when the page count is unknown."
+  (ed-docview-goto m (or (:pages (view-of (ed-current-buf m))) 1)))
+
+(defcommand cmd-docview-goto-page
+  (m key)
+  "Go to a page of the document by number (doc-view `g`)."
+  (if (nil? (view-of (ed-current-buf m)))
+    (ed-ding m "not a document")
+    (assoc m
+      :minibuffer
+        {:edit (ed-mb-edit "Goto page: " "")
+         :on-complete (fn (prompted typed)
+                        (let (number (string/->number (string/trim typed)))
+                          (if (int? number)
+                            (ed-docview-goto prompted number)
+                            (message prompted (str "doc-view: not a page number: " typed)))))})))
+
+(def docview-keymap
+  (-> {}
+    (keymap-bind ["n"] 'docview/cmd-docview-next-page)
+    (keymap-bind [" "] 'docview/cmd-docview-next-page)
+    (keymap-bind [:page-down] 'docview/cmd-docview-next-page)
+    (keymap-bind ["p"] 'docview/cmd-docview-previous-page)
+    (keymap-bind [:backspace] 'docview/cmd-docview-previous-page)
+    (keymap-bind [:page-up] 'docview/cmd-docview-previous-page)
+    (keymap-bind [(keyword "alt-<")] 'docview/cmd-docview-first-page) ; M-<
+    (keymap-bind [(keyword "alt->")] 'docview/cmd-docview-last-page) ; M->
+    (keymap-bind ["g"] 'docview/cmd-docview-goto-page)))
+
+(def docview-mode-layer
+  {:name 'doc-view
+   :doc "A PDF, a page at a time — n / p turn, M-< / M-> the ends, g a page, q quits."
+   :keymap docview/docview-keymap
+   :modeline 'docview/docview-modeline
+   :commands (modes/layer-commands docview/docview-keymap)
+   ;; its text names the document, it is not the document: C-x C-s / C-x C-w refuse it
+   :no-write {:what "a document view" :why "it shows the PDF's pages; edit the PDF itself"}})
+
+(modes/register-special-type :docview 'docview/docview-mode-layer)
+(register-presenter :document 'docview/ed-open-document)

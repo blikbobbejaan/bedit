@@ -10,6 +10,29 @@ Language-level changes live in the Brood repo's `docs/devlog.md` + `docs/decisio
 
 ---
 
+## 2026-11-10
+
+### doc-view: a PDF opens as its pages
+
+**What shipped.** `C-x C-f paper.pdf` opens a `:docview` buffer showing page 1 instead of the
+hex view (`src/docview.blsp`, the `:document` presenter; `pool/binary-role` routes a binary by
+extension). `pdftoppm -png -r 100 -f N -l N -singlefile` draws the page (else `mutool draw`), in a
+task on `:docview-proc` (C-g cancels; a turn cancels the draw in flight; the old page stays up
+until the new one lands), into a PNG cached under `state/cache/docview/<sha of path, size,
+mtime>/`, so a page seen once turns at once. imageview's half-block layer paints it from
+`:image-bytes`, fitted to the pane, so a resize or a zoom refits it with no new drawing. n / SPC /
+PageDown, p / DEL / PageUp, M-< / M->, g a page by number; the mode line `Page 3/12` (`pdfinfo`,
+else `mutool show`). With neither rasteriser the file opens as hex and the echo area says why.
+`:no-write`, as the hex view.
+
+**Limit — a Brood gap.** `editor/display` has no image op, so a page is painted in half-block
+cells: two pixels a cell, which makes body text unreadable at any normal font size (a title and
+the layout read). A pixel image op (an RGBA or PNG blit in a rect, a cell fallback in a terminal)
+is the language change that would make doc-view readable; drawing at a higher dpi cannot help.
+
+**Tests.** tests/docview_test.blsp (11): the rasteriser and pdfinfo are stand-ins
+(`docview/*which*`, `docview/*run*`) that write PNGs whose colour is the page number.
+
 ## 2026-09-17
 
 ### the zoom is per pane, and it is a render op — not a font change

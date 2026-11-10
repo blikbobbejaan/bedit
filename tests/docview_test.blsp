@@ -1,0 +1,140 @@
+;; tests/docview_test.blsp — a PDF opens as its pages (doc-view): find-file on a .pdf gives a
+;; :docview buffer painting page 1, n / p / M-< / M-> / g turn it, a page drawn once is read
+;; from the cache, the mode line says `Page 2/3`, and with no rasteriser the file is the hex
+;; view. The rasteriser is a stand-in (`docview/*which*`, `docview/*run*`): no pdftoppm runs.
+
+(defmodule docview-test
+  (:use test)
+  (:use model)
+  (:use editor/buffer)
+  (:use docview))
+
+(defn- scratch-dir ()
+  (let (dir (temp-dir "bedit-docview-")) (do (file/mkdir dir) dir)))
+
+(defn- pdf-file ()
+  ;; not a real PDF — a header and a binary byte, so find-file reads it as bytes
+  (let (path (path/join (scratch-dir) "paper.pdf"))
+    (do
+      (file/spit-bytes path [37 80 68 70 45 49 46 52 10 200 0 1 10])
+      path)))
+
+(defn- png-bytes (page)
+  ;; a 2×2 picture whose red channel is the page number, so a test can tell pages apart
+  (let (pixel [page 0 0 255]
+        rgba (apply bytes/concat (map (mapcat (range 4) (fn (_) pixel)) (fn (b) (bytes/int-> b 1))))
+        path (path/join (scratch-dir) "page.png"))
+    (do
+      (gui/write-png {:width 2 :height 2 :rgba rgba} path)
+      (file/slurp-bytes path))))
+
+(defn- arg-after (args flag) (nth args (inc (index-of args flag))))
+
+(defn- fake-run (log)
+  ;; the rasteriser and pdfinfo, standing in: each call is a line appended to `log`
+  (fn (prog args _opts)
+    (do
+      (file/spit-append log (str prog "\n"))
+      (case prog
+        "pdfinfo" {:exit 0 :stdout "Title: paper\nPages:          3\n" :stderr ""}
+        "pdftoppm"
+          (let (page (string/->number (arg-after args "-f")))
+            (do
+              (file/spit-bytes (str (last args) ".png") (png-bytes page))
+              {:exit 0 :stdout "" :stderr ""}))
+        {:exit 1 :stdout "" :stderr "unexpected program"}))))
+
+(defn- runs (log program)
+  (count (seq/filter (string/split (if (file/exists? log) (file/slurp log) "") "\n")
+           (fn (line) (= line program)))))
+
+(defn- with-poppler (log thunk)
+  (binding (*which* (fn (name)
+                      (when (includes? ["pdftoppm" "pdfinfo"] name) (str "/usr/bin/" name)))
+            *run* (fake-run log))
+    (thunk)))
+
+(defn- shown-page (m)
+  ;; the page the current buffer's picture is: its first pixel's red channel
+  (bytes/at (:rgba (gui/image-thumb (:image-bytes (ed-current-buf m)) 2 2)) 0))
+
+(defn- press (m keys) (fold keys m (fn (acc key) (input/ed-update acc key 80 24))))
+
+(describe "viewing a PDF"
+  (test "find-file on a PDF opens a read-only :docview buffer on page 1"
+    (let (log (path/join (scratch-dir) "log"))
+      (with-poppler log
+        (fn ()
+          (let (opened (pool/ed-find-file (ed-init (make-buffer "")) (pdf-file))
+                buffer (ed-current-buf opened))
+            (assert= (editor/layers/buffer-type-for buffer) :docview)
+            (is (string/starts-with? (buffer-text buffer) "PDF — paper.pdf"))
+            (is (read-only? buffer))
+            (assert= (shown-page opened) 1)
+            (assert= (docview-modeline opened buffer) "Page 1/3"))))))
+  (test "n / p / M-> / M-< turn the pages, and the ends ding"
+    (let (log (path/join (scratch-dir) "log"))
+      (with-poppler log
+        (fn ()
+          (let (opened (pool/ed-find-file (ed-init (make-buffer "")) (pdf-file))
+                second (press opened ["n"])
+                last-page (press opened [(keyword "alt->")])
+                past (press last-page ["n"]))
+            (assert= (shown-page second) 2)
+            (assert= (docview-modeline second (ed-current-buf second)) "Page 2/3")
+            (assert= (shown-page (press second ["p"])) 1)
+            (assert= (shown-page (press second [:page-down])) 3)
+            (assert= (shown-page last-page) 3)
+            (assert= (shown-page past) 3)
+            (is (:command-failed past))
+            (assert= (shown-page (press last-page [(keyword "alt-<")])) 1))))))
+  (test "g goes to a page by number"
+    (let (log (path/join (scratch-dir) "log"))
+      (with-poppler log
+        (fn ()
+          (let (opened (pool/ed-find-file (ed-init (make-buffer "")) (pdf-file))
+                prompted (press opened ["g"])
+                answered ((:on-complete (:minibuffer prompted)) (dissoc prompted :minibuffer) "3"))
+            (assert= (shown-page answered) 3))))))
+  (test "a page drawn once is read from the cache"
+    (let (log (path/join (scratch-dir) "log"))
+      (with-poppler log
+        (fn ()
+          (let (opened (pool/ed-find-file (ed-init (make-buffer "")) (pdf-file))
+                back (press opened ["n" "p" "n"]))
+            (assert= (shown-page back) 2)
+            (assert= (runs log "pdftoppm") 2))))))
+  (test "a failed draw is said and the page shown stays"
+    (binding (*which* (fn (name) (when (= name "pdftoppm") "/usr/bin/pdftoppm"))
+              *run* (fn (_prog _args _opts) {:exit 1 :stdout "" :stderr "Syntax Error: broken"}))
+      (let (opened (pool/ed-find-file (ed-init (make-buffer "")) (pdf-file)))
+        (assert= (editor/layers/buffer-type-for (ed-current-buf opened)) :docview)
+        (is (nil? (:image-bytes (ed-current-buf opened))))
+        (is (includes? (:echo opened) "Syntax Error: broken"))
+        (assert= (docview-modeline opened (ed-current-buf opened)) "Page 1"))))
+  (test "with no rasteriser the PDF is the hex view, and that is said"
+    (binding (*which* (fn (_name) nil))
+      (let (opened (pool/ed-find-file (ed-init (make-buffer "")) (pdf-file)))
+        (assert= (editor/layers/buffer-type-for (ed-current-buf opened)) :hexl)
+        (is (includes? (:echo opened) "no PDF rasteriser")))))
+  (test "the view refuses a save"
+    (let (log (path/join (scratch-dir) "log"))
+      (with-poppler log
+        (fn ()
+          (let (opened (pool/ed-find-file (ed-init (make-buffer "")) (pdf-file)))
+            (is (map? (ed-mode-service (ed-current-buf opened) :no-write)))))))))
+
+(describe "the rasteriser's command lines"
+  (test "pdftoppm draws one page to a single file"
+    (assert= (draw-command :pdftoppm "a.pdf" 4 100 "/c/page-4-100.png")
+      ["pdftoppm" ["-png" "-r" "100" "-f" "4" "-l" "4" "-singlefile" "a.pdf" "/c/page-4-100"]]))
+  (test "mutool draws one page to a file"
+    (assert= (draw-command :mutool "a.pdf" 2 100 "/c/2.png")
+      ["mutool" ["draw" "-q" "-r" "100" "-o" "/c/2.png" "a.pdf" "2"]]))
+  (test "mutool stands in when pdftoppm is missing"
+    (binding (*which* (fn (name) (when (= name "mutool") "/usr/bin/mutool")))
+      (assert= (rasteriser) :mutool)))
+  (test "the page count reads pdfinfo's and mutool's answers"
+    (assert= (parse-page-count "Title: x\nPages:          12\nEncrypted: no\n") 12)
+    (assert= (parse-page-count "7\n") 7)
+    (is (nil? (parse-page-count "nothing here")))))
