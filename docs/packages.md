@@ -298,9 +298,17 @@ Built on Part 1 and on the config registries from
    next install's clean-up leaves it alone; killing the buffer leaves the copy until the
    package is reviewed again or a later session's first install clears it.
    `:package-review-updates false` in init.blsp applies an update as soon as it arrives, as
-   before. There is no "update all" yet; when there is, it should stage every update and
-   show ONE `*Package Diff*` with a section per package (folded by package, one `C-c C-c`),
-   rather than asking per package. A network fetch on the `ui-run` loop
+   before. **Updating every package (2026-11-10):** `M-x package-update-all` (`U` in
+   `*Packages*`, where Emacs's package menu marks the upgrades with `U` and runs them with `x` —
+   here the review is the confirmation) is ONE job off the loop that stages every installed
+   package with something newer, each in its own staging dir beside the others, and shows ONE
+   `*Package Diff*`: a title naming any package whose update could not be staged (and why),
+   then a folded section per package (`NAME old → new (N files changed)`; TAB opens its
+   changelog and file diffs). `C-c C-c` moves them all into place and applies each live, a
+   package that fails to move said while the rest go on; `C-c C-k` or `q` drops them all. A
+   package that is current, or a local one the registry does not publish, is left out; C-g
+   stops the job, leaving every installed copy as it was. With `:package-review-updates
+   false` the job installs them all and each is applied when it lands. A network fetch on the `ui-run` loop
    would freeze the editor, which is precisely the class of thing the actor work removed.
 5. **`M-x package-upgrade` / `package-delete` / the lockfile.** `project.lock.blsp` in the
    config dir is a **reproducible editor config**: version + sha256 per package, so the

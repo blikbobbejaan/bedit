@@ -429,7 +429,8 @@ src/package-review.blsp     what an update would change, read from the disk in t
                             the installed copy against the staged one as unified-diff files
                             (`tree-diff`), the CHANGELOG entries between the versions, and the
                             *Package Diff: NAME* section tree, painted as every diff
-                            (vcsproc's hunk sections). Applying / dropping is packages'
+                            (vcsproc's hunk sections) — and update-all's one *Package Diff*, a
+                            folded section per package (`review-all-tree`). Applying / dropping is packages'
 src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
                             hive packages that `:enhances bedit` at RUNTIME, into
                             ~/.config/bedit/packages (the elpa model) — never the build's _deps.
@@ -476,6 +477,11 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             staged off the loop, *Package Diff: NAME* (package-review), C-c C-c
                             moves the staged copy in and applies it, C-c C-k / q deletes it;
                             an open review's staging dir is kept in `:packages/reviews`.
+                            M-x package-update-all (U in *Packages*): ONE job stages every
+                            outdated package side by side (`.staging-<id>-<name>`), ONE
+                            *Package Diff* (a folded section each, `review-all-tree`), C-c C-c
+                            applies all, C-c C-k drops all; a failed one is named, the rest go
+                            on; without review each is applied as it lands.
                             The registry calls are `*registry*` (tests stub it)
 src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a function's *Help*
                             page: the whole docstring, keys in force, arguments, signature,
@@ -535,6 +541,14 @@ src/hittest.blsp            the mouse side of the view: every hit-test / hover f
                             segments / layout the view drew, so input never imports the renderer
 src/echoarea.blsp           the echo area under the bottom mode line as render ops: the message or eldoc
                             line, the minibuffer's prompt and candidate list (Plume), the which-key grid
+                            — paged when it does not fit (`ed-which-key-pages`, the last cell
+                            `page 1/3 · C-h n/p`, the page `whichkey/page`)
+src/whichkey.blsp           C-h after a prefix (Emacs which-key's `which-key-C-h-dispatch`): the
+                            paging menu — n / p turn the panel's page, u takes the chord's last
+                            key back, h lists every binding under the prefix in *Help* (Emacs's
+                            describe-prefix-bindings), a / C-g abort; any other key goes to the
+                            prefix, so the chord still completes. A prefix that binds C-h keeps
+                            it. `input/ed-dispatch` asks it before the keymap
 src/modeline.blsp           a pane's mode line: its segments (`ed-statusbar-segments`, the registered
                             chips included), the bar painted from them, the pointer's layout and the
                             hover tooltips. What `hittest` asks again, so `input` never imports the view
