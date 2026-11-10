@@ -1060,7 +1060,10 @@ src/lsp-lens.blsp           LSP CODE LENS (`codeLens`, `codeLens/resolve`): each
                             `compile/compile-run`), `showReferences` / `gotoLocation` a jump or a
                             picker, `debugSingle` said — and any other said, never sent.
                             `:lsp-code-lens` (default off), M-x lsp-code-lens-mode
-src/mincomplete.blsp        minibuffer prompt completion (path / name)
+src/mincomplete.blsp        minibuffer prompt completion (path / name); a directory's sorted listing
+                            is a `defmemo` on its path and mtime, asked only once the directory
+                            has been quiet a second (a listing in the same clock tick as an entry
+                            added could miss it)
 src/filename.blsp           a typed path read the Emacs way (`substitute-in-file-name`, which is
                             std's `path/substitute` — this is the prompt's layer over it): the prompt
                             shows the home as `~`, `//` or `/~/` restarts the path (the overridden
@@ -1178,7 +1181,9 @@ src/folds.blsp              outline FOLDING in an editable buffer (org's TAB): a
                             marker on its heading, the mode's `:fold-extent` says what it
                             covers, and the row table gives the hidden lines no rows — so the
                             view, cursor, scroll and mouse never see them; point landing
-                            inside one opens it
+                            inside one opens it. The hidden set is a `defmemo` (per process,
+                            brood ADR-670); a miss carries an older answer across an edit the
+                            splice log places outside every fold
 src/codefold.blsp           code folding, Emacs's hideshow (C-c @): every `deflanguage` gets a `:fold-extent`
                             from its indent spec (a `:blocks` node folds from its parent's line, a
                             `:brackets` node from its own; the closing line stays), a Lisp folds the
