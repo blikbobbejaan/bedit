@@ -401,6 +401,11 @@ src/package-store.blsp      what is on disk under ~/.config/bedit/packages: inst
 src/package-ledger.blsp     what a loaded package did to the image, so it can be taken back:
                             `note-loaded` records a load, `retire-package` undoes one (below).
                             No network, no buffers, no model
+src/package-review.blsp     what an update would change, read from the disk in the update's task:
+                            the installed copy against the staged one as unified-diff files
+                            (`tree-diff`), the CHANGELOG entries between the versions, and the
+                            *Package Diff: NAME* section tree, painted as every diff
+                            (vcsproc's hunk sections). Applying / dropping is packages'
 src/packages.blsp           bedit's package manager (M-x package-list): install / update / remove
                             hive packages that `:enhances bedit` at RUNTIME, into
                             ~/.config/bedit/packages (the elpa model) — never the build's _deps.
@@ -443,6 +448,10 @@ src/packages.blsp           bedit's package manager (M-x package-list): install 
                             not dropped), *Packages* and C-h P mark it. A package prompt (M-x
                             package-install, C-h P) fetches the list itself when it has none,
                             saying so (`package-prompt`); `package-info` is what C-h P shows.
+                            An update is SHOWN first (`:package-review-updates`, default on):
+                            staged off the loop, *Package Diff: NAME* (package-review), C-c C-c
+                            moves the staged copy in and applies it, C-c C-k / q deletes it;
+                            an open review's staging dir is kept in `:packages/reviews`.
                             The registry calls are `*registry*` (tests stub it)
 src/help.blsp               the C-h map: C-h b / m / w / a / l / k, C-h f (a function's *Help*
                             page: the whole docstring, keys in force, arguments, signature,

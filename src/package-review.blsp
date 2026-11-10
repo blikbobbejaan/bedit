@@ -1,0 +1,284 @@
+(defmodule package-review
+  "What a package UPDATE would change, shown before it is applied (Emacs bug #74604's wish):
+the version it goes from and to, the package's own CHANGELOG entries between the two, and a
+unified diff of every file the new version changes, as hunk sections painted as every diff
+in bedit is (`vcsproc/vcs-hunk-sections`, `diffpaint`).
+
+Pure over the disk: [[review-of]] compares the installed copy with the staged one and runs in
+the update's task, off the loop; [[review-tree]] is the *Package Diff* buffer's section tree.
+Applying or dropping the staged copy is `packages`'s."
+  (:use section) ; section — the buffer's tree
+  (:use vcsproc :only []) ; the hunk sections and faces every diff is painted with
+  (:use diffpaint :only []) ; paint-keys — the buffer's painting budget
+  (:use package-store :only [package-dir installed-version])) ; the copy installed now
+
+(def *context-lines* 3) ; lines of context around a change, as `diff -u` and git show
+
+;; ---- two texts as a unified diff ------------------------------------------------------
+;; std's `diff` parses a unified diff (`diff/parse-unified`) and diffs two texts by line
+;; (`diff/line-hunks`), but has no way to PRINT one with `@@` headers and context: its
+;; `diff/unified` takes a context count it ignores and prints the ops with no headers. Until
+;; it does, the hunks are printed here from `line-hunks` and handed to `parse-unified`, so the
+;; files come out in exactly the shape every diff view reads.
+
+(defn- text-lines (text)
+  ;; a text's lines, a final newline ending the last line rather than starting an empty one
+  (let (lines (vec (string/split text "\n")))
+    (if (and (not (empty? lines)) (= (last lines) "")) (vec (seq/drop-last lines 1)) lines)))
+
+(check-allow :trusted
+  ;; `diff/line-hunks` answers line numbers, which its signature does not say
+  (sig part (vector int -> int))
+  (defn- part (change index)
+    ;; one number of a `diff/line-hunks` change `[old-start old-count new-start new-count]`
+    (nth change index)))
+
+(defn- group-changes (changes)
+  "The zero-context `changes` (`diff/line-hunks`) in groups whose context would touch or
+overlap, each group one hunk."
+  (reverse (fold changes
+             ()
+             (fn (groups change)
+               (let (previous (first groups))
+                 (if (and previous
+                       (<= (- (part change 0) (+ (part (last previous) 0) (part (last previous) 1)))
+                         (* 2 *context-lines*)))
+                   (cons (conj previous change) (rest groups))
+                   (cons [change] groups)))))))
+
+(defn- prefixed (lines from to prefix)
+  ;; lines `[from, to)` of `lines`, each after `prefix`
+  (map (seq/subvec lines from to) (fn (line) (str prefix line))))
+
+(defn- hunk-text (old-lines new-lines group)
+  "One `@@` hunk of the change `group`, with `*context-lines*` of context each side."
+  (let (head (first group)
+        tail (last group)
+        tail-end (+ (part tail 0) (part tail 1))
+        wanted-from (- (part head 0) *context-lines*)
+        from-old (if (< wanted-from 0) 0 wanted-from)
+        from-new (- (part head 2) (- (part head 0) from-old))
+        wanted-to (+ tail-end *context-lines*)
+        to-old (if (> wanted-to (count old-lines)) (count old-lines) wanted-to)
+        to-new (+ (part tail 2) (part tail 3) (- to-old tail-end))
+        [body cursor] (fold group
+                        [[] from-old]
+                        (fn (acc change)
+                          (let ([lines at] acc
+                                old-start (part change 0)
+                                old-end (+ old-start (part change 1))
+                                new-start (part change 2))
+                            [(-> lines
+                               (into (prefixed old-lines at old-start " "))
+                               (into (prefixed old-lines old-start old-end "-"))
+                               (into (prefixed new-lines
+                                       new-start
+                                       (+ new-start (part change 3))
+                                       "+")))
+                              old-end])))
+        old-count (- to-old from-old)
+        new-count (- to-new from-new)
+        ;; a side with no lines names the line before it, as `diff -u` does
+        start (fn (from line-count) (if (= line-count 0) from (inc from))))
+    (string/join (append [(str "@@ -"
+                            (start from-old old-count)
+                            ","
+                            old-count
+                            " +"
+                            (start from-new new-count)
+                            ","
+                            new-count
+                            " @@")]
+                   body
+                   (prefixed old-lines cursor to-old " "))
+      "\n")))
+
+(defn unified-text (path old new)
+  "The unified diff of file `path` from text `old` to text `new` (nil for a side the file is
+not on), `--- a/PATH` / `+++ b/PATH` headed, or nil when they are the same.
+
+    (package-review/unified-text \"f\" \"a\\nb\\n\" \"a\\nc\\n\")   ;=> \"--- a/f\\n+++ b/f\\n@@ -1,2 +1,2 @@\\n a\\n-b\\n+c\\n\""
+  (let (old-lines (if (nil? old) [] (text-lines old))
+        new-lines (if (nil? new) [] (text-lines new))
+        changes (diff/line-hunks (string/join old-lines "\n") (string/join new-lines "\n")))
+    (when (not (empty? changes))
+      (str (if (nil? old) "--- /dev/null" (str "--- a/" path))
+        "\n"
+        (if (nil? new) "+++ /dev/null" (str "+++ b/" path))
+        "\n"
+        (string/join (map (group-changes changes)
+                       (fn (group) (hunk-text old-lines new-lines group)))
+          "\n")
+        "\n"))))
+
+;; ---- two package trees --------------------------------------------------------------
+
+(defn- relative-files (dir)
+  ;; every file under `dir`, as paths relative to it
+  (let (prefix (str dir "/"))
+    (into #{}
+      (map (or (file/walk-files dir) ())
+        (fn (path)
+          (if (string/starts-with? path prefix)
+            (string/substring path (string/length prefix) (string/length path))
+            path))))))
+
+(defn- file-text (path)
+  ;; the text of the file at `path`, :binary for one that is not text, nil when it is not there
+  (cond
+    (not (file/exists? path)) nil
+    else
+      (let (text (check-allow :discarded-catch (try (file/slurp path) (catch _ :binary))))
+        (if (and (string? text) (includes? text "\u{0}")) :binary text))))
+
+(defn tree-diff (old-dir new-dir)
+  "What changed from the files under `old-dir` to those under `new-dir` (either may be
+missing): a vector of parsed diff files (`diff/parse-unified`'s `{:old-path :new-path :headers
+:hunks}`), by path, with `:label` — `added`, `deleted` or `modified`. A file that is not text
+on either side is listed with no hunks, its header saying `Binary files differ`."
+  (let (old-files (if (file/dir? old-dir) (relative-files old-dir) #{})
+        new-files (if (file/dir? new-dir) (relative-files new-dir) #{}))
+    (vec (seq/keep (sort (set/union old-files new-files))
+           (fn (path)
+             (let (old (when (contains? old-files path) (file-text (path/join old-dir path)))
+                   new (when (contains? new-files path) (file-text (path/join new-dir path)))
+                   label (cond
+                           (nil? old) "added"
+                           (nil? new) "deleted"
+                           else "modified"))
+               (cond
+                 (and (= old :binary) (= new :binary))
+                   (when (not (= (file/slurp-bytes (path/join old-dir path))
+                                (file/slurp-bytes (path/join new-dir path))))
+                     {:old-path path
+                      :new-path path
+                      :headers ["Binary files differ"]
+                      :hunks []
+                      :label label})
+                 (= old new) nil
+                 (or (= old :binary) (= new :binary))
+                   {:old-path (when old path)
+                    :new-path (when new path)
+                    :headers ["Binary files differ"]
+                    :hunks []
+                    :label label}
+                 else
+                   (when-let (text (unified-text path old new))
+                     (assoc (first (diff/parse-unified text)) :label label)))))))))
+
+;; ---- the changelog --------------------------------------------------------------------
+
+(def *changelog-names* ["CHANGELOG.md" "CHANGELOG" "Changelog.md" "changelog.md" "NEWS.md" "NEWS"])
+
+(defn- heading-version (line)
+  ;; the version a changelog heading names (`## [1.2.0] - 2026-11-01`, `## v1.2.0`), or nil
+  (when (string/starts-with? line "#")
+    (:text (regex/find "\\d+\\.\\d+(?:\\.\\d+)?(?:-[0-9A-Za-z.]+)?" line))))
+
+(defn changelog-between (text old new)
+  "The lines of changelog `text` (Markdown, a `#` heading per version, as Keep a Changelog
+writes one) for the versions after `old` up to and including `new` — each section whole, its
+heading first, in the order the file has them. `[]` when it has none; with `old` nil, every
+section up to `new`.
+
+    (package-review/changelog-between \"# Log\\n## 1.1.0\\n- b\\n## 1.0.0\\n- a\" \"1.0.0\" \"1.1.0\")   ;=> [\"## 1.1.0\" \"- b\"]"
+  (let (wanted? (fn (version)
+                  (and version
+                    (or (nil? old) (version/newer? version old))
+                    (or (nil? new) (not (version/newer? version new))))))
+    (:kept (fold (string/split text "\n")
+             {:kept [] :keeping? false}
+             (fn (acc line)
+               (let (version (heading-version line)
+                     keeping? (if version (wanted? version) (:keeping? acc)))
+                 {:kept (if keeping? (conj (:kept acc) line) (:kept acc)) :keeping? keeping?}))))))
+(sig changelog-between (string any any -> vector))
+
+(defn- changelog-of (dir old new)
+  ;; the changelog lines the package under `dir` ships for `old` → `new`, or []
+  (let (file (seq/find (map *changelog-names* (fn (name) (path/join dir name))) file/exists?)
+        text (when file (file-text file)))
+    (if (string? text) (changelog-between text old new) [])))
+
+(defn review-of (name staged-dir new-version)
+  "What updating package `name` to the copy staged in `staged-dir` (its package directory)
+would change: `{:name :old-version :new-version :changelog :files}` — the version installed
+now, the staged one's (`new-version`), its changelog lines between them
+([[changelog-between]]) and the files it changes ([[tree-diff]]). Reads the disk only, so an
+update's task builds it off the loop."
+  (let (old-version (installed-version name))
+    {:name name
+     :old-version old-version
+     :new-version new-version
+     :changelog (changelog-of staged-dir old-version new-version)
+     :files (tree-diff (package-dir name) staged-dir)}))
+
+;; ---- the *Package Diff* buffer ----------------------------------------------------
+
+(theme/defchrome package-review-face-title {:fg *text* :bold true}) ; `foo 1.0.0 → 1.1.0`
+(theme/defchrome package-review-face-heading {:fg *blue* :bold true}) ; Changelog / Files headings
+(theme/defchrome package-review-face-hint {:fg *subtext*}) ; the keys line
+
+(defn review-buffer-name (name)
+  "The buffer an update of package `name` is reviewed in."
+  (str "*Package Diff: " name "*"))
+
+(defn- file-section (file paint)
+  (let (path (or (:new-path file) (:old-path file) "?"))
+    (section :file
+      {:path path}
+      (str (string/pad-right (:label file) 10) " " path)
+      (if (empty? (:hunks file))
+        (:headers file)
+        (vcsproc/vcs-hunk-sections file {:path path} (contains? paint path)))
+      {:key path})))
+
+(defn review-tree (review)
+  "The section tree of a *Package Diff* buffer for `review` ([[review-of]]): the versions and
+the keys, the changelog entries when the package ships any, then each changed file with its
+hunks — painted as every diff is, within one buffer's budget (`diffpaint/paint-keys`)."
+  (let (files (:files review)
+        paint (diffpaint/paint-keys (map files
+                                      (fn (file) [(or (:new-path file) (:old-path file)) file])))
+        changelog (:changelog review))
+    (section :package-review
+      (:name review)
+      nil
+      (seq/reject [(section :title
+                     nil
+                     (str (:name review)
+                       " "
+                       (or (:old-version review) "(not installed)")
+                       " → "
+                       (:new-version review))
+                     ["C-c C-c applies this update · C-c C-k drops it · TAB folds"]
+                     {:separator true})
+                    (when (not (empty? changelog))
+                      (section :changelog nil "Changelog" changelog {:separator true}))
+                    (section :files
+                      nil
+                      (str "Files changed (" (count files) ")")
+                      (if (empty? files)
+                        ["(no file changed)"]
+                        (map files (fn (file) (file-section file paint)))))]
+        nil?))))
+
+(defn review-faces (row line)
+  "The *Package Diff* `:section-faces`: a hunk as every diff paints one, a file heading as a
+diff's, the title bold, the section headings and the keys line quiet."
+  (let (type (:type row)
+        heading? (:heading? row))
+    (cond
+      (= type :hunk) (vcsproc/vcs-hunk-spans row line)
+      (and (= type :title) heading?) (vcsproc/vcs-whole-line 0 line package-review-face-title)
+      (= type :title) (vcsproc/vcs-whole-line 0 line package-review-face-hint)
+      (and (contains? #{:changelog :files} type) heading?)
+        (vcsproc/vcs-whole-line 0 line package-review-face-heading)
+      (and (= type :changelog) (string/starts-with? line "#"))
+        (vcsproc/vcs-whole-line 0 line package-review-face-title)
+      (= type :file) (vcsproc/vcs-whole-line 0 line vcsproc/vcs-face-file)
+      else '())))
+
+(defn review-bands (row line)
+  "The *Package Diff* `:section-bands`: a hunk's heading bar and its tinted lines."
+  (when (= (:type row) :hunk) (vcsproc/vcs-hunk-band row line)))

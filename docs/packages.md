@@ -285,7 +285,22 @@ Built on Part 1 and on the config registries from
    the list themselves when it has never been fetched: the prompt opens at once saying so,
    and its candidates arrive with the answer. An update reloads the plugin's files in load
    order (brood's `reflect/source-load-order`), so a changed macro reaches its callers on the
-   one reload. A network fetch on the `ui-run` loop
+   one reload. **An update is shown before it is applied (2026-11-10, Emacs bug #74604's
+   wish):** `u` in `*Packages*` and `M-x package-update` stage the new version off the loop and
+   open `*Package Diff: NAME*` — `NAME old → new`, the package's own `CHANGELOG.md` (or `NEWS`)
+   entries for the versions after the installed one up to the new one, then every file the
+   new version adds, deletes or changes as hunk sections painted as every diff in bedit is
+   (`src/package-review.blsp` over `vcsproc/vcs-hunk-sections` and `diffpaint`; TAB folds).
+   `C-c C-c` moves the staged copy into place and applies it live; `C-c C-k` or `q` deletes
+   the staged copy and keeps the installed one. Until `C-c C-c` the installed copy is never
+   touched, so a failed fetch, a refusal, a C-g, a drop or a review left open all keep it. An
+   open review's staging dir is noted in the runtime's `:packages/reviews` registry so the
+   next install's clean-up leaves it alone; killing the buffer leaves the copy until the
+   package is reviewed again or a later session's first install clears it.
+   `:package-review-updates false` in init.blsp applies an update as soon as it arrives, as
+   before. There is no "update all" yet; when there is, it should stage every update and
+   show ONE `*Package Diff*` with a section per package (folded by package, one `C-c C-c`),
+   rather than asking per package. A network fetch on the `ui-run` loop
    would freeze the editor, which is precisely the class of thing the actor work removed.
 5. **`M-x package-upgrade` / `package-delete` / the lockfile.** `project.lock.blsp` in the
    config dir is a **reproducible editor config**: version + sha256 per package, so the
