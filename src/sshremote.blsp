@@ -26,7 +26,10 @@ use), and the remote half of each operation as a POSIX `sh` script.
   (a host-key confirmation above all). The connection then serves the operations without it.
 
 - **A route through jump hosts** (`/ssh:bastion|ssh:host:`, `sshpath`'s `:hops`) is a nested
-  `ProxyCommand` of `ssh -W`, every hop in batch mode ([[proxy-command]]).
+  `ProxyCommand` of `ssh -W`, every hop in batch mode ([[proxy-command]]) and riding the hop's
+  own shared connection when it has one. When the route fails, each hop is tried in turn
+  ([[route-failure]]): the one that refused is named, and a password it would take opens ITS
+  connection, once ([[hop-parts]], [[connect-with-password]]).
 - **Dired's side.** A directory listed as `ls -l` facts ([[list-entries]]), and its entries
   made, moved, copied and deleted on the host ([[make-directory]], [[transfer]],
   [[delete-path]]) — a move or copy never over an entry already there.
@@ -86,10 +89,14 @@ reach one runs commands as you on that host. Its path."
 (defn jump-argv (hops)
   "The ssh run that carries a connection through the LAST of the jump hosts `hops` (`-W`, to
 the target host and port as the ssh using it expands `%h` and `%p`), itself reached through
-the ones before it ([[proxy-command]], nested). Always batch mode: a jump host is reached with
-a key or the agent, never a password — no prompt can reach a person from inside another ssh.
+the ones before it ([[proxy-command]], nested). Always batch mode — no prompt can reach a person
+from inside another ssh — but through the hop's own SHARED connection when one is open
+(`ControlPath`, `ControlMaster=no`: use it, never make one): a jump host that wants a password
+gets it once, when its connection is opened ([[route-failure]], [[hop-parts]],
+[[connect-with-password]]), and every -W after that rides it.
 
     (last (sshremote/jump-argv [{:host \"bastion\"}]))   ;=> \"bastion\""
+  ;; the ControlPath's `%%C`: the ssh running this ProxyCommand hands `%C` on, for THIS one to expand
   (let (hop (last hops)
         earlier (vec (take hops (dec (count hops)))))
     (into []
@@ -98,6 +105,8 @@ a key or the agent, never a password — no prompt can reach a person from insid
                 "BatchMode=yes"
                 "-o"
                 "ControlMaster=no"
+                "-o"
+                (str "ControlPath=" (escape-percent (control-dir)) "/%%C")
                 "-o"
                 (str "ConnectTimeout=" *connect-timeout-seconds*)
                 "-o"
@@ -602,6 +611,46 @@ password is `:auth`."
     (cond
       (:failed result) {:failed (:failed result)}
       else true)))
+
+;; ---- a jump host's own connection -----------------------------------------------------------
+
+(defn hop-parts (parts index)
+  "Jump host `index` of `parts`' route as a host of its own — reached through the hops before it
+— so its shared connection can be opened (with a password: [[connect-with-password]]); the
+ProxyCommand's `-W` through it then rides that connection ([[jump-argv]]).
+
+    (sshremote/hop-parts {:host \"web1\" :hops [{:host \"a\"} {:host \"b\"}]} 1)   ;=> {:host \"b\" :hops [{:host \"a\"}]}"
+  (let (hops (or (:hops parts) [])
+        earlier (vec (take hops index))
+        hop (nth hops index))
+    (if (empty? earlier) hop (assoc hop :hops earlier))))
+
+(defn route-failure (parts)
+  "Which jump host on `parts`' route fails, tried in order, each in batch mode — `{:failed …
+:hop index}` ([[classify]]'s answer for THAT host, so a refusal or an unknown host key names it,
+and `:password?` says it would take a password) — or nil when every hop answers, so a failure
+was the target's own. A hop that answers keeps its shared connection open: the route rides it.
+The command each runs is `true`, whose exit is ignored: a jump host that allows no shell (a
+forced command) is still connected. Blocks."
+  (letrec (try-hop (fn (index)
+                     (when (< index (count (or (:hops parts) [])))
+                       (let (result (ssh-call (hop-parts parts index) "true" "" true {}))
+                         (if (:failed result)
+                           {:failed (:failed result) :hop index}
+                           (try-hop (inc index)))))))
+    (try-hop 0)))
+
+(defn blame-route (parts answer)
+  "`answer` of an operation on `parts`' host, with a failure the route may have caused —
+authentication, the connection — laid on the jump host that caused it ([[route-failure]]): the
+same answer when `parts` has no hops, the operation did not fail that way, or every hop
+answers. Blocks."
+  (let (failed (when (map? answer) (:failed answer)))
+    (if (and failed
+          (not (empty? (or (:hops parts) [])))
+          (contains? #{:auth :connection :timeout} (:error failed)))
+      (or (route-failure parts) answer)
+      answer)))
 
 ;; ---- the directory listings the path prompt completes from -------------------------------
 ;; A remote directory's entries, kept a few seconds per directory, so typing within it asks
