@@ -1,0 +1,91 @@
+(defmodule reopen
+  "A killed buffer opened again (Emacs bug#51883's wish; a browser's reopen-closed-tab): every
+kill of a FILE buffer is remembered — its file, point and the window's start — newest first, on
+the model's `:killed-files`, capped at [[*killed-files-max*]]. `M-x reopen-killed-buffer`
+(C-x x U) opens the newest again where it was left; repeated, the one killed before it. A file
+gone since is skipped and said. Recorded by a slot keeper (`model/register-slot-keeper`), so
+every kill path is remembered: C-x k, a companion taken with its source, another frame's kill."
+  (:use editor/buffer) ; buffer-file / buffer-point / goto-char
+  (:use editor/pane :only [pane-leaf-paths pane-payload-at pane-update-selected])
+  (:use interactive) ; defcommand
+  (:use model)) ; ed-buf-at / message / register-slot-keeper / the file handlers
+
+(def *killed-files-max* 32)
+
+(defn- pane-top (m index)
+  ;; the scroll of the first pane showing pool buffer `index`, or nil when none shows it
+  ;; (by payload, not path: a lone pane's path is the empty list, which is falsy)
+  (let (layout (:layout m)
+        payload (seq/find (map (pane-leaf-paths layout) (fn (path) (pane-payload-at layout path)))
+                  (fn (payload) (= index (:buffer payload)))))
+    (when payload (:top payload))))
+
+(defn killed-entry (m index)
+  "What reopening pool buffer `index` of `m` needs — `{:file :point :top}` — or nil for a
+buffer that cannot be reopened by its file: one with none, a `Loading…` buffer, or one its file
+handler owns under a plain path (a root file: its `:file` would open as you, not as root)."
+  (let (buffer (ed-buf-at m index)
+        file (buffer-file buffer)
+        handler (ed-buffer-handler buffer))
+    (when (and (string? file)
+            (not (:file-loading buffer))
+            (or (nil? handler) (not (nil? (ed-path-handler file)))))
+      {:file file :point (buffer-point buffer) :top (pane-top m index)})))
+
+(defn ed-remember-killed (m killed)
+  "The slot keeper's drop: `m` remembering the buffer in pool slot `killed` for
+[[cmd-reopen-killed-buffer]], newest first, its file in the list once."
+  (let (entry (killed-entry m killed))
+    (if (nil? entry)
+      m
+      (let (others (seq/reject (or (:killed-files m) [])
+                     (fn (kept) (= (:file kept) (:file entry)))))
+        (assoc m :killed-files (vec (take (cons entry others) *killed-files-max*)))))))
+
+(defn- gone? (m entry)
+  ;; whether `entry`'s file has gone since — a path a handler claims (another machine's) is
+  ;; not asked from the loop: its open says so
+  (and (nil? (ed-path-handler (:file entry))) (not (file/exists? (:file entry)))))
+
+(defn- placed (m index entry)
+  ;; pool buffer `index`, just opened, back where `entry` left it: point (clamped to the text,
+  ;; which may have changed on disk) and the selected pane's scroll when it shows it
+  (let (buffer (ed-buf-at m index)
+        at (ed-set-buf-at m
+             index
+             (goto-char buffer (math/max 0 (math/min (or (:point entry) 0) (buffer-length buffer)))))
+        top (:top entry))
+    (if (and (int? top) (= index (ed-current-index at)))
+      (assoc at
+        :layout (pane-update-selected (:layout at) (fn (pane) (assoc pane :top top :point nil))))
+      at)))
+
+(defcommand cmd-reopen-killed-buffer
+  (m key)
+  "Open the file buffer killed last again (C-x x U, M-x reopen-killed-buffer): its file read
+afresh, point and the window's start where they were; repeated, the one killed before it. A file
+that has gone since is skipped, and said; one open again already is passed over. Emacs has no
+such command (bug#51883 asks for it); a browser's reopen-closed-tab is the model."
+  (letrec (pick (fn (entries skipped)
+                  (cond
+                    (empty? entries) [nil [] skipped]
+                    (gone? m (first entries))
+                      (pick (rest entries) (conj skipped (:file (first entries))))
+                    (ed-buffer-index-by-file m (:file (first entries)))
+                      (pick (rest entries) skipped)
+                    else [(first entries) (vec (rest entries)) skipped])))
+    (let ([entry left skipped] (pick (or (:killed-files m) []) [])
+          remaining (assoc m :killed-files left)
+          gone-note (if (empty? skipped)
+                      ""
+                      (str " (gone since, skipped: " (string/join skipped ", ") ")")))
+      (if (nil? entry)
+        (message remaining (str "no killed file buffer to reopen" gone-note))
+        (let (opened (pool/ed-find-file-soon remaining
+                       (:file entry)
+                       (fn (landed index) (placed landed index entry))))
+          (if (empty? skipped) opened (message opened (str "reopened " (:file entry) gone-note))))))))
+
+;; before the rows that let go of the buffer's link and caches, so it reads the buffer and the
+;; panes as the kill found them
+(register-slot-keeper :killed-files {:order 12 :drop 'reopen/ed-remember-killed})

@@ -7,9 +7,8 @@ running (`model/register-exit-query`)."
   (:use interactive) ; defcommand
   (:use model)
   (:use minibuffer)
-  (:use sidecar :only [ed-forget-auto-save])
   (:use autorevert :only [ed-revert-at])
-  (:use projects :only [file-display-name recent-files])
+  (:use projects :only [recent-files])
   (:use file-save :only [ed-save-buf-at ed-save-pending? ed-when-saves-land ed-write-buf-as])
   (:use pool)) ; find-file, the path prompt
 
@@ -30,34 +29,132 @@ dired (`ed-path-prompt`) — prefilled with the current file's path (else the cu
 A buffer whose mode refuses writing (`ed-no-write-refusal` — a hex view) is refused."
   (if-let (refusal (ed-no-write-refusal (ed-current-buf m) "written"))
     (message m refusal)
-    (assoc m
-      :minibuffer
-        (ed-path-prompt "Write file: "
-          (or (buffer-file (ed-current-buf m)) (str (ed-default-dir m) "/"))
-          (if (:recent-files m) (recent-files) [])
-          (fn (answered path)
-            (let (handler (ed-path-handler path))
-              (if (nil? handler)
-                (ed-write-file-to answered path)
-                (ed-handler-call handler :write-file answered answered path))))))))
+    (ed-ask-path m "Write file: " ed-write-file-answered)))
+
+(defn- ed-ask-path (m prompt on-complete)
+  ;; the path prompt C-x C-w and rename-visited-file share: prefilled with the current file's
+  ;; path, else the current directory
+  (assoc m
+    :minibuffer
+      (ed-path-prompt prompt
+        (or (buffer-file (ed-current-buf m)) (str (ed-default-dir m) "/"))
+        (if (:recent-files m) (recent-files) [])
+        on-complete)))
+
+(defn- ed-write-file-answered (m path)
+  ;; C-x C-w answered with `path`: a path a file handler claims is that handler's to write
+  (let (handler (ed-path-handler path))
+    (if (nil? handler)
+      (ed-write-file-to m path)
+      (ed-handler-call handler :write-file m m path))))
 
 (defn- ed-write-file-to (m path)
   "C-x C-w to plain `path`: the buffer written there OFF the loop, as a save is
 (`file-save/ed-write-buf-as`), and backed by it once the write lands — no longer its file
 handler's, if it was. A write that fails leaves it visiting what it did."
-  (ed-write-buf-as m (ed-current-index m) path (fn (landed index) (ed-retarget landed index path))))
+  ;; once the text has landed in `path`, the buffer visits it, no longer its file handler's
+  (ed-write-buf-as m
+    (ed-current-index m)
+    path
+    (fn (landed index) (ed-visit-moved landed index path true))))
 
-(defn- ed-retarget (m index path)
-  ;; pool buffer `index`, whose text has just landed in `path`, made to visit it: named for it,
-  ;; its handler's marks dropped, its old sidecar removed, and — a shared buffer now being a
-  ;; different document — the registry entry (and every other frame's copy) following it
-  (let (old (ed-buf-at m index)
-        retargeted (assoc (ed-buffer-unhandled old)
-                     :file path
-                     :name (file-display-name path (ed-project-root m))))
-    (do
-      (ed-forget-auto-save old)
-      (hosted/hosted-rekey-slot (ed-set-buf-at m index retargeted) index (hosted/hosted-key old)))))
+;; ---- rename the visited file (Emacs 29's `rename-visited-file`) ---------------------
+
+(defcommand cmd-rename-visited-file
+  (m key)
+  "Rename the current buffer's file and visit it under the new name (M-x rename-visited-file,
+Emacs 29's): asked with the path prompt, prefilled with the file. The file is moved on disk
+(`file/move`, across filesystems too) OFF the loop, then the buffer follows it as C-x C-w's
+does (`pool/ed-visit-moved`: its name, its mode when the new name asks for another, its sidecar,
+another frame's copy, the recent files); its unsaved edits stay unsaved. A directory as the
+answer takes the file into it under its name. An existing file is never replaced, nor one
+another buffer visits. A file not yet on disk is only renamed in the editor; a buffer with no
+file is written, as C-x C-w writes it. A file reached through a file handler (another machine,
+root) is renamed by the handler's `:rename-file` when it has one, and refused otherwise."
+  (let (buffer (ed-current-buf m)
+        file (buffer-file buffer)
+        handler (ed-buffer-handler buffer))
+    (cond
+      (nil? file) (ed-ask-path m "Rename visited file to: " ed-write-file-answered)
+      (and handler (nil? (:rename-file handler)))
+        (message m (str "cannot rename " file " from here: its file handler offers no rename"))
+      else
+        (ed-ask-path m
+          "Rename visited file to: "
+          (fn (answered path) (ed-rename-visited answered (ed-current-index answered) path))))))
+
+(defn- rename-target (handler from to)
+  ;; where renaming `from` to the answer `to` goes: into `to` when it is a local directory
+  (cond
+    handler to
+    (file/dir? to) (path/join to (path/basename from))
+    else (path/normalize to)))
+
+(defn ed-rename-visited (m index to)
+  "`m` with pool buffer `index`'s file renamed to `to` ([[cmd-rename-visited-file]]) — or the
+reason it is not, said."
+  (let (buffer (ed-buf-at m index)
+        from (or (buffer-file buffer) "")
+        handler (ed-buffer-handler buffer)
+        target (rename-target handler from to)
+        visitor (ed-buffer-index-by-file m target))
+    (cond
+      (string/blank? from) (message m (str (buffer-name buffer) " visits no file"))
+      (= target from) (message m (str (buffer-name buffer) " already visits " from))
+      (not (= handler (ed-path-handler target)))
+        (message m (str "cannot rename " from " to " target ": not the same kind of file"))
+      visitor
+        (message m
+          (str "cannot rename to "
+            target
+            ": buffer "
+            (buffer-name (ed-buf-at m visitor))
+            " visits it"))
+      (and (nil? handler) (file/exists? target))
+        (message m (str "cannot rename to " target ": it exists"))
+      (:rename-proc m) (message m "a rename is still running — try again when it lands")
+      ;; never written: nothing on disk to move, the buffer just takes the new name
+      (and (nil? handler) (not (file/exists? from)))
+        (message (ed-file-moved m from target) (str "now visiting " target " (not yet saved)"))
+      else
+        (let (job {:from from :to target}
+              work (fn () (rename-work handler from target)))
+          (if (ed-headless?)
+            (ed-rename-landed (assoc m :rename-job job) (work))
+            (assoc (message m (str "Renaming " from "…"))
+              :rename-proc (task/task work)
+              :rename-job job))))))
+
+(defn rename-work (handler from to)
+  "What a rename's task does: `from` moved to `to` — by `handler`'s `:rename-file` for a file it
+owns, else `file/move` — answering `{:to where-it-went}` or `{:error reason}`. Never raises."
+  (try
+    (let (went (if (nil? handler)
+                 (file/move from to)
+                 (ed-handler-call handler :rename-file nil from to false)))
+      {:to (if (string? went) went to)})
+    (catch failure {:error (error-message failure)})))
+
+(defn ed-rename-landed (m answer)
+  "Fold a rename's `answer` ([[rename-work]]'s; nil when its task failed): every buffer visiting
+the old file follows it (`pool/ed-file-moved`), or the failure is said and the buffer left as it
+was."
+  (let (job (:rename-job m)
+        rest-m (dissoc m :rename-proc :rename-job))
+    (cond
+      (nil? job) rest-m
+      (or (nil? answer) (:error answer))
+        (message rest-m
+          (str "rename failed: "
+            (or (:error answer) "it did not finish")
+            " — "
+            (:from job)
+            " is unchanged"))
+      else
+        (message (ed-file-moved rest-m (:from job) (:to answer))
+          (str "renamed " (:from job) " to " (:to answer))))))
+
+(register-task-reply :rename-proc 'lifecycle/ed-rename-landed nil "renaming")
 
 (defcommand cmd-revert-buffer
   (m key)
@@ -342,7 +439,7 @@ way). ESC is *not* quit (it's `keyboard-escape-quit`; see `modes`)."
   ;; the keys this window timed since the slow-turn log last recorded them (brood ADR-612)
   (let (m (slowlog/flush-latency m 1))
     (if (:frame? m)
-      (assoc m :done true)
+      (frames/frames-leave m)
       (ed-quit-ask (dissoc m :deferred-saves :superseded) (ed-unsaved-file-indices m) false))))
 
 (defcommand cmd-save

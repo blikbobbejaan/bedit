@@ -83,6 +83,11 @@ stay untouched.
    windows close with them).
 5. **`C-x 5 o` other-frame**: raise the next frame's window (`gui/focus`) — the primary
    keeps the frame list, so a secondary frame asks the primary (`:editor`) to do it.
+5a. **`C-x 5 u` undelete-frame** (Emacs 29): a frame that closes (C-x 5 0, C-x C-c in it, its ✕)
+   sends the primary its panes by buffer NAME (`frames-closed-record`); the primary keeps the
+   last 16 and opens the newest again as a new frame over the same registry, each pane back on
+   its buffer and scroll (a buffer killed since leaves its pane on another). Not kept: the
+   window's size and position, its tabs, its minibuffer history.
 6. Per frame: layout, minibuffer, undo of a slot's cache, kill ring (the OS clipboard makes
    yank cross frames anyway), mode line. Shared: the buffers, their text and markers, the
    registry. The logger, LSP, sandbox and the async services stay the primary's (`:editor`);

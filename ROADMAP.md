@@ -303,7 +303,10 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
   `just-one-space` (`M-SPC`) / `delete-horizontal-space` (`M-\`), `transpose-words`
   (`M-t`) / `transpose-lines` (`C-x C-t`), `zap-to-char` (`M-z`), `fill-paragraph`
   (`M-q`, `*fill-column*` = 70; `ed-fill-text` is a candidate to promote to std).
-- ✅ **Files / buffers** — `write-file` (`C-x C-w`), `revert-buffer`, read-only toggle
+- ✅ **Files / buffers** — `write-file` (`C-x C-w`), `rename-visited-file` (Emacs 29: the file moved
+  on disk, the buffer following it, its mode chosen again), `reopen-killed-buffer` (`C-x x U`:
+  the file buffer killed last opened again where it was, then the one before — bug#51883's
+  wish), `revert-buffer`, read-only toggle
   (`C-x C-q`), `goto-line` (`M-g g`), **recentf** browser (`C-x C-r`) over the
   persisted `~/.cache/brood/recent-files.blsp` cache (find-file also floats last-used
   entries to the top of a directory listing).
@@ -344,7 +347,8 @@ A batch of everyday Emacs commands + discoverability, all on existing primitives
 - ✅ **The everyday tail** (2026-09-13) — `C-x C-b`, `M-/` dabbrev (redo → `C-?`), `M-!` /
   `M-|`, `C-x C-o`, `sort-lines`, `delete-trailing-whitespace`, `M-=`, `C-x i`; which-key in
   columns.
-- ✅ **Frames** (2026-09-13) — `C-x 5 2` / `o` / `0`: a second OS window is a process on the same
+- ✅ **Frames** (2026-09-13) — `C-x 5 2` / `o` / `0`, and `C-x 5 u` (Emacs 29's undelete-frame: the
+  frame closed last reopened on its buffers, laid out as it was): a second OS window is a process on the same
   buffers, through Brood's `editor/buffer-registry` (ADR-345); `docs/frames-plan.md`.
 - ✅ **lisp-mode** (2026-09-13) — `.lisp`/`.cl`/`.asd`, via `deflisp`, Emacs's lisp-mode indent.
 - ✅ **More modes** (2026-09-13) — Clojure/EDN, Scheme/Racket, Fennel (`deflisp`); JSON, YAML, TOML,

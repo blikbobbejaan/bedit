@@ -1,0 +1,135 @@
+;; M-x rename-visited-file (Emacs 29's, src/lifecycle.blsp): the file moved on disk and the
+;; buffer visiting it under the new name — its mode chosen again for the new name, its unsaved
+;; edits kept unsaved — refusing to replace a file, and a buffer with no file written as C-x C-w
+;; writes it. Headless, so the move runs inline.
+(defmodule rename-visited-test
+  (:use test)
+  (:use model)
+  (:use input) ; ed-update — a typed key
+  (:use pool) ; ed-find-file / ed-file-moved
+  (:use lifecycle) ; cmd-rename-visited-file / ed-rename-visited
+  (:use main :only []) ; the released image: every row loaded
+  (:use editor/buffer))
+
+(purge-stale-temp "bedit-rename-")
+
+(defn- fixture (name text)
+  "A file `name` holding `text` in a fresh temp directory; its path."
+  (let (dir (temp-dir "bedit-rename-")
+        _ (file/mkdir dir)
+        path (path/join dir name))
+    (do (file/spit path text) path)))
+
+(defn- visited (name text)
+  "`[model path]`: a file `name` holding `text`, visited."
+  (let (path (fixture name text)) [(ed-find-file (ed-init (make-buffer "")) path) path]))
+
+(defn- rename-to (m path)
+  "M-x rename-visited-file answered with `path`, handed over whole as RET would."
+  (let (asked (cmd-rename-visited-file m nil)
+        answer (or (:on-complete (:minibuffer asked)) (error (str "asked nothing: " (:echo asked)))))
+    (answer (dissoc asked :minibuffer) path)))
+
+(describe "rename-visited-file"
+  (test "moves the file and the buffer visits the new name"
+    (let ([m path] (visited "notes.txt" "hello\n")
+          target (path/join (path/dirname path) "renamed.txt")
+          renamed (rename-to m target))
+      (refute (file/exists? path))
+      (assert= (file/slurp target) "hello\n")
+      (assert= (buffer-file (ed-current-buf renamed)) target)
+      (assert= (buffer-name (ed-current-buf renamed)) "renamed.txt")
+      (is (includes? (:echo renamed) "renamed "))
+      (refute (buffer-modified? (ed-current-buf renamed)))))
+
+  (test "unsaved edits stay unsaved: the file on disk keeps its text"
+    (let ([m path] (visited "notes.txt" "hello\n")
+          edited (ed-update m "x" 80 24)
+          target (path/join (path/dirname path) "moved.txt")
+          renamed (rename-to edited target))
+      (assert= (file/slurp target) "hello\n")
+      (is (buffer-modified? (ed-current-buf renamed)))
+      (assert= (buffer-text (ed-current-buf renamed)) "xhello\n")))
+
+  (test "a new extension chooses the mode again"
+    (let ([m path] (visited "notes.txt" "# Title\n")
+          before (:type (ed-current-buf m))
+          renamed (rename-to m (path/join (path/dirname path) "notes.md")))
+      (assert= (:type (ed-current-buf renamed)) :markdown)
+      (refute (= before :markdown))))
+
+  (test "a directory as the answer takes the file into it"
+    (let ([m path] (visited "notes.txt" "a\n")
+          into (path/join (path/dirname path) "sub")
+          _ (file/mkdir into)
+          renamed (rename-to m into))
+      (assert= (buffer-file (ed-current-buf renamed)) (path/join into "notes.txt"))
+      (is (file/exists? (path/join into "notes.txt")))))
+
+  (test "an existing file is never replaced"
+    (let ([m path] (visited "notes.txt" "mine\n")
+          other (path/join (path/dirname path) "other.txt")
+          _ (file/spit other "theirs\n")
+          refused (rename-to m other))
+      (assert= (file/slurp other) "theirs\n")
+      (assert= (file/slurp path) "mine\n")
+      (assert= (buffer-file (ed-current-buf refused)) path)
+      (is (includes? (:echo refused) "exists"))))
+
+  (test "nor a file another buffer visits"
+    (let ([m path] (visited "notes.txt" "mine\n")
+          new-file (path/join (path/dirname path) "fresh.txt")
+          ;; open (not yet on disk) in a second buffer, then back to notes.txt
+          both (ed-find-file (ed-find-file m new-file) path)
+          refused (rename-to both new-file))
+      (assert= (buffer-file (ed-current-buf refused)) path)
+      (is (includes? (:echo refused) "visits it"))))
+
+  (test "the same name is said, nothing moved"
+    (let ([m path] (visited "notes.txt" "a\n")
+          same (rename-to m path))
+      (is (file/exists? path))
+      (is (includes? (:echo same) "already visits"))))
+
+  (test "a file not yet on disk is only renamed in the editor"
+    (let (dir (path/dirname (fixture "x.txt" ""))
+          fresh (path/join dir "new.txt")
+          m (ed-find-file (ed-init (make-buffer "")) fresh)
+          target (path/join dir "newer.txt")
+          renamed (rename-to m target))
+      (refute (file/exists? target))
+      (assert= (buffer-file (ed-current-buf renamed)) target)
+      (is (includes? (:echo renamed) "not yet saved"))))
+
+  (test "a buffer with no file is written there, as C-x C-w writes it"
+    (let (dir (path/dirname (fixture "x.txt" ""))
+          target (path/join dir "scratch.txt")
+          m (ed-update (ed-init (make-buffer "" "*scratch*")) "z" 80 24)
+          written (rename-to m target))
+      (assert= (file/slurp target) "z")
+      (assert= (buffer-file (ed-current-buf written)) target)
+      (refute (buffer-modified? (ed-current-buf written)))))
+
+  (test "a file whose handler offers no rename is refused (a root file)"
+    (let ([m path] (visited "hosts" "127.0.0.1\n")
+          rooted (ed-set-buf m (assoc (ed-current-buf m) :sudo true :sudo-user "root"))
+          refused (cmd-rename-visited-file rooted nil))
+      (refute (:minibuffer refused))
+      (is (includes? (:echo refused) "offers no rename"))
+      (is (file/exists? path)))))
+
+(describe "a moved file's buffer takes the new name's mode"
+  (test "dired's R of notes.txt to notes.md (pool/ed-file-moved)"
+    (let ([m path] (visited "notes.txt" "# Title\n")
+          target (path/join (path/dirname path) "notes.md")
+          _ (file/move path target)
+          moved (ed-file-moved m path target))
+      (assert= (:type (ed-current-buf moved)) :markdown)))
+
+  (test "a mode chosen by hand stays when the name's mode does not change"
+    (let ([m path] (visited "a.txt" "x\n")
+          by-hand (ed-set-mode m :fundamental)
+          target (path/join (path/dirname path) "b.txt")
+          _ (file/move path target)
+          moved (ed-file-moved by-hand path target))
+      (assert= (:type (ed-current-buf moved)) :fundamental))))

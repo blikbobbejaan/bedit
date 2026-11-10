@@ -100,9 +100,13 @@ nothing."
         index (hosted-index-by-key m old-key))
     (if (nil? index)
       m
-      (ed-set-buf-at m
-        index
-        (frames-with-coding (assoc (ed-buf-at m index) :name name :file (:file meta)) meta)))))
+      ;; and in the mode the new name asks for, as the frame that renamed it chose
+      (let (old (ed-buf-at m index))
+        (ed-set-buf-at m
+          index
+          (pool/ed-retype-for-file (frames-with-coding (assoc old :name name :file (:file meta))
+                                     meta)
+            (buffer-file old)))))))
 
 (defn- frames-with-coding (buffer meta)
   "`buffer` writing its file as registry `meta` says: `:eol :crlf` or none, `:bom true` or none, its
@@ -140,20 +144,86 @@ or a served session's loop restarted over the buffers its dead one left (`remote
       (fn (acc entry)
         (frames-adopt acc (:key entry) (:name entry) (:proc entry) (or (:meta entry) {}))))))
 
-(sig frames-seed-model (pid string map -> model))
-(defn frames-seed-model (registry show live)
+(sig frames-seed-model (pid string map &optional any -> model))
+(defn frames-seed-model (registry show live &optional (layout nil))
   "A fresh frame's model: `ed-init` on a scratch, every registry entry adopted as a linked
 slot, `show` (the buffer the frame was opened on) selected, the live flags `live` merged
 (the primary's `:gui` / `:os-clipboard` / `:recent-files` / `:project-root` / `:hl-line` …),
-the registry watched, and `:frame? true` — a frame's quit is a frame quit."
+the registry watched, and `:frame? true` — a frame's quit is a frame quit. With `layout` (a
+deleted frame's panes by buffer NAME, [[frames-closed-record]]) the panes are laid out as
+they were ([[frames-restore-layout]])."
   (let (fresh (merge (ed-init (make-buffer "" "*scratch*")) live)
         adopted (assoc (frames-adopt-registry fresh registry) :frame? true)
         index (ed-buffer-index-by-name adopted show))
     ;; a buffer the registry has not shared yet (a report a `display-buffer` rule sent here as
     ;; it was made) is shown when it arrives (`ed-ev-registry-added`)
-    (if (nil? index)
-      (assoc adopted :frame-show show)
-      (assoc (ed-show-index adopted index) :status (str "editing " show)))))
+    (cond
+      (nil? index) (assoc adopted :frame-show show)
+      (nil? layout) (assoc (ed-show-index adopted index) :status (str "editing " show))
+      else (frames-restore-layout (ed-show-index adopted index) layout index))))
+
+;; ---- a deleted frame, and undeleting it (Emacs 29's `undelete-frame`) ----------------
+;; A frame that closes tells the primary what it showed — its panes, each naming its buffer
+;; by NAME, since pool indices are each frame's own — and the primary keeps the last
+;; [[*deleted-frames-max*]] of them (Emacs's `undelete-frame-mode` keeps 16). C-x 5 u opens
+;; the newest again: a new frame process over the same registry, its panes on the same
+;; buffers, scrolled where they were. A buffer killed since leaves its pane on the frame's
+;; selected buffer. The window's size and position are the window manager's, not kept.
+
+(def *deleted-frames-max* 16)
+
+(defn frames-closed-record (m)
+  "What a closing frame `m` leaves for C-x 5 u: `{:show :layout}` — the selected buffer's
+name, and the pane tree with each pane's pool index replaced by its buffer's name
+(`:buffer-name`), its scroll and point kept."
+  {:show (buffer-name (ed-current-buf m))
+   :layout (editor/pane/pane-map (:layout m)
+             (fn (payload)
+               (let (index (:buffer payload))
+                 (assoc (dissoc payload :buffer)
+                   :buffer-name
+                     (when (and (int? index) (< index (count (:buffers m))))
+                       (buffer-name (ed-buf-at m index)))))))})
+
+(defn frames-restore-layout (m layout fallback)
+  "`m` with the pane tree `layout` (as [[frames-closed-record]] names it) as its layout: each
+pane on the pool buffer of its `:buffer-name`, else on pool index `fallback` at its top, the
+pane selected as it was."
+  (assoc m
+    :layout
+      (editor/pane/pane-map layout
+        (fn (saved)
+          (let (index (ed-buffer-index-by-name m (or (:buffer-name saved) ""))
+                payload (dissoc saved :buffer-name))
+            (if (nil? index)
+              (assoc (dissoc payload :point :mark) :buffer fallback :top 0)
+              (assoc payload :buffer index)))))))
+
+(defn frames-remember-deleted (m record)
+  "The primary `m` keeping a deleted frame's `record` for C-x 5 u, newest first, capped at
+[[*deleted-frames-max*]]."
+  (assoc m
+    :deleted-frames (vec (take (cons record (or (:deleted-frames m) [])) *deleted-frames-max*))))
+
+(defn frames-take-deleted (m)
+  "`[m' record]`: the newest deleted frame's record taken off the primary `m`'s list, or
+`[m nil]` when no frame was deleted."
+  (let (deleted (or (:deleted-frames m) []))
+    (if (empty? deleted)
+      [m nil]
+      [(assoc m :deleted-frames (vec (rest deleted))) (first deleted)])))
+
+(defn frames-leave (m)
+  "A frame `m` closing (C-x 5 0, C-x C-c in a frame, its window's X): what it showed sent to
+the primary for C-x 5 u ([[frames-closed-record]]), and its loop ended."
+  (do
+    (when-let (primary (proc/whereis :editor))
+      (when (not (= primary (self))) (send primary [:frame-deleted (frames-closed-record m)])))
+    (assoc m :done true)))
+
+(defn ed-ev-frame-deleted (m input textrows cols rows)
+  "`[:frame-deleted record]` from a frame that closed: kept for C-x 5 u."
+  (frames-remember-deleted m (second input)))
 
 (def *frame-live-keys*
   ;; the primary's model keys a frame inherits — the live-editor flags `main` sets, not
@@ -169,14 +239,14 @@ opened from it, or the primary restarted after its loop died (`lifeline`): the
 [[*frame-live-keys*]] that are set."
   (fold *frame-live-keys* {} (fn (acc key) (if (nil? (get m key)) acc (assoc acc key (get m key))))))
 
-(defn- frames-main (registry show live opts)
+(defn- frames-main (registry show live opts layout)
   "The body of a frame process: open its window (this process polls it — the runtime
 routes a window's input to the process that opened it), run `ui-run` on the seed model
 with the editor's own view and update, and leave. Everything the frame links to
 (`:hosted`) is unsubscribed when the loop ends; the buffer processes live on."
   (let (display (gui-display opts))
     (try
-      (let (m (assoc (frames-seed-model registry show live) :window (:window display)))
+      (let (m (assoc (frames-seed-model registry show live layout) :window (:window display)))
         (log/info (str "frame "
                     (:window display)
                     " opened on "
@@ -196,15 +266,15 @@ with the editor's own view and update, and leave. Everything the frame links to
       (catch e
         (do (log/warn (str "frame failed: " (error-message e))) ((get display :leave)) (throw e))))))
 
-(sig frames-spawn (model map -> model))
-(defn frames-spawn (m opts &optional (name nil))
+(sig frames-spawn (model map &optional any any -> model))
+(defn frames-spawn (m opts &optional (name nil) (layout nil))
   "Open a new frame on the buffer named `name`, the current buffer by default: spawn its
 process (`frames-main`), monitor it and record it in `:frames` (`{pid → window title}`), so the
 primary can raise, list and close it. `opts` are the window options (`:app-id` / `:title`)."
   (let (registry (:buffer-reg m)
         show (or name (buffer-name (ed-current-buf m)))
         live (frames-live-of m)
-        pid (spawn (frames-main registry show live opts)))
+        pid (spawn (frames-main registry show live opts layout)))
     (monitor pid)
     (message (assoc m :frames (conj (or (:frames m) []) pid))
       (str "frame opened on " show))))
@@ -270,15 +340,43 @@ it does not stop, and says so: stopped there it would stay frozen with its unsav
     "Close this frame (C-x 5 0, Emacs `delete-frame`): a frame just leaves its loop — the
 buffers live on in the registry, the other frames keep them. On the primary, with no other
 frame open, this is `C-x C-c`; with frames open the primary cannot be deleted (close the
-others first, or quit)."
+others first, or quit). A frame closed is kept for C-x 5 u ([[cmd-undelete-frame]])."
     (cond
-      (:frame? m) (assoc m :done true)
+      (:frame? m) (frames-leave m)
       (empty? (or (:frames m) [])) ((reflect/eval 'lifecycle/cmd-quit) m key)
       else
         (message m
           (str (count (:frames m))
             " other frame(s) open — close them first, or C-x C-c to quit all")))))
 
+(defn frames-undelete-show (m record)
+  "The buffer an undeleted frame opens on: the one `record` had selected, else the first of its
+panes' buffers still open in the primary `m`, else `m`'s current buffer — a frame opened on a
+buffer killed since would wait for it for ever."
+  (let (panes (map (editor/pane/pane-leaf-paths (:layout record))
+                (fn (path) (:buffer-name (editor/pane/pane-payload-at (:layout record) path))))
+        open? (fn (name) (and (string? name) (not (nil? (ed-buffer-index-by-name m name))))))
+    (or (seq/find (cons (:show record) panes) open?) (buffer-name (ed-current-buf m)))))
+
+(defcommand cmd-undelete-frame
+  (m key)
+  "Open the frame closed last again (C-x 5 u, Emacs 29's `undelete-frame`): a new frame on the
+buffers it showed, laid out as it was, each pane scrolled where it was; repeated, the one closed
+before it, back to the last 16. A buffer killed since leaves its pane on another. A frame asks
+the primary, which keeps the closed frames."
+  (cond
+    (:terminal m) (message m "a terminal has one frame (bedit -nw)")
+    (nil? (:buffer-reg m)) (message m "frames need the live editor (no buffer registry)")
+    (:frame? m)
+      (do (send :editor [:undelete-frame]) (message m "asked the primary to undelete a frame"))
+    else
+      (let ([taken record] (frames-take-deleted m))
+        (if (nil? record)
+          (message m "no deleted frame to undelete")
+          (frames-spawn taken
+            (assoc (config/window-options (config/peek-init)) :title *app-name*)
+            (frames-undelete-show taken record)
+            (:layout record))))))
 (defcommand cmd-other-frame
   (m key)
   "Raise the next frame's window (C-x 5 o, Emacs `other-frame`). The primary raises its
@@ -313,6 +411,10 @@ after the last."
       (if (nil? next) (send (self) :focus) (send next :focus))
       m)))
 
+(defn ed-ev-undelete-frame (m input textrows cols rows)
+  "`[:undelete-frame]` from a frame: the primary opens the frame closed last again."
+  (cmd-undelete-frame m nil))
+
 ;; ---- registration: the inbound events this module owns -----------------------------
 ;; Buffers appearing / vanishing / renamed in another frame, and a frame's requests to the
 ;; primary. Registered at load (`model/register-event-handler`), and safe to be: a
@@ -324,5 +426,7 @@ after the last."
 (register-event-handler :registry-renamed 'frames/ed-ev-registry-renamed)
 (register-event-handler :make-frame 'frames/ed-ev-make-frame)
 (register-event-handler :other-frame 'frames/ed-ev-other-frame)
+(register-event-handler :frame-deleted 'frames/ed-ev-frame-deleted)
+(register-event-handler :undelete-frame 'frames/ed-ev-undelete-frame)
 (register-down-handler :frames 'frames/frames-down)
 (register-presenter :new-frame 'frames/frames-spawn-showing)

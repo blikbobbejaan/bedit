@@ -584,6 +584,10 @@ src/lastsession.blsp        the last session in a project reopened (Emacs deskto
                             there with no file named opens them again; a file gone since is skipped
 src/saveplace.blsp          a file reopens where it was left (Emacs save-place, `:save-place`): its
                             point kept when its buffer is killed or the editor quits
+src/reopen.blsp             a killed FILE buffer opened again (C-x x U, M-x reopen-killed-buffer;
+                            bug#51883, a browser's reopen-closed-tab): a slot keeper (order 12)
+                            keeps each killed file's path, point and window start on `:killed-files`,
+                            newest first, capped; a file gone since is skipped and said
 src/solong.blsp             so-long (Emacs so-long-mode, `:so-long-threshold`): a file opened with a line
                             longer than the threshold truncates (`:long-lines :truncate` on the buffer)
                             and the per-line services (show-paren, rainbow, whitespace, spell, eldoc)
