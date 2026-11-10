@@ -54,12 +54,17 @@ promise by GitHub, so a change on their side shows up here as "the editor opened
 3. **OS input**: it types `os-input ` and C-x C-s through the OS's own input — System Events'
    `keystroke` on macOS, `WScript.Shell.SendKeys` on Windows — and waits for the file to have
    it. That is the window's real keyboard path, the frontend's key translation included. It
-   is TRIED and reported, not required, on both: a hosted macOS runner may refuse it
-   (Accessibility permission for `osascript`, error 1002) and Windows's foreground lock may
-   keep the window from taking the keys. The log says which (`OS input: NOT proven …`). (Until
+   is REQUIRED on both (`REAL_WINDOW_OS_INPUT=require` in ci.yml). The keys go to whatever is
+   in front, so the script (written to the artifact as `os-input.ps1` / `os-input.applescript`)
+   first asks for the bedit window — `AppActivate` on Windows, the process owning the window
+   titled with the file made frontmost on macOS — again and again until the OS says it IS in
+   front (`GetForegroundWindow`'s title; System Events' `frontmost`), up to 30 s, and only
+   then types; the log says what was in front before and after the keys, and when the window
+   was never confirmed in front (it types anyway, so the file decides). (Until
    2026-11-09 the driver waited for the OS-typed word at the START of the file, though the keys
-   land at point, after the loop phase's word; with that fixed, both runners' OS typing was
-   seen arriving on the first run — a candidate for `require` once it holds.)
+   land at point, after the loop phase's word: those were the four `NOT proven` runs on each
+   OS. Every run after the fix typed and saved — eight of eight on each — before the switch to
+   `require`.)
 
 The step has a timeout (the driver kills the editor past `REAL_WINDOW_TIMEOUT_MS`, the step's
 `timeout-minutes` backs it), and the pictures (`before.png`, `after.png`, `os-input.png`,
@@ -115,7 +120,7 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; `recover_test` reads the sidecar's ACL back with `icacls`) |
 | terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |
 | a real window: opens on the desktop, paints (captured, not blank), typed keys reach the loop, C-x C-s writes the file | ✅ `real-window.sh` | ✅ `real-window.sh` (Linux too: Xvfb and headless Weston) |
-| the OS keyboard reaching that window | tried each run (System Events), reported, not required | tried each run (SendKeys), reported, not required; Linux: required, xdotool (XTEST) under Xvfb |
+| the OS keyboard reaching that window | ✅ required each run (System Events, once the window is frontmost) | ✅ required each run (SendKeys, once the window is in the foreground); Linux: required, xdotool (XTEST) under Xvfb |
 | font discovery, file watching (auto-revert) | not run — headless | not run — headless |
 
 ## Fixed on the way

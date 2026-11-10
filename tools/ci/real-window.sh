@@ -18,8 +18,8 @@
 #
 # REAL_WINDOW_OS_INPUT (require | try | off) says whether the driver also types through the
 # OS's own input (xdotool on X11, SendKeys on Windows, System Events on macOS); by default
-# `require` under x11 when xdotool is installed, `try` on a desktop, `off` under wayland (no
-# input tool reaches a headless Weston). REAL_WINDOW_TIMEOUT_MS bounds the whole run
+# `require` under x11 when xdotool is installed, `try` on a desktop (CI sets `require` on its
+# macOS and Windows desktops), `off` under wayland (no input tool reaches a headless Weston). REAL_WINDOW_TIMEOUT_MS bounds the whole run
 # (default 300000): past it the editor is killed and the check fails.
 set -euo pipefail
 

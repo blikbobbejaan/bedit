@@ -230,9 +230,92 @@ log says which window had the focus before and after the keys."
       "focused=$(xdotool getwindowfocus)\n"
       "echo \"focus after typing: $focused ($(xdotool getwindowname \"$focused\" 2>/dev/null || echo '?'))\"\n")))
 
-(defn- os-input-command (text)
-  "`[program arguments]` that type `text` then C-x C-s into the focused bedit window through
-this OS's own input, or a string saying why there is none."
+(defn- windows-os-input-script (text)
+  "The PowerShell script that types `text` then C-x C-s into the bedit window through SendKeys.
+SendKeys types into whatever window is in the FOREGROUND, and `AppActivate` answering true does
+not make it so (Windows's foreground lock can leave the window flashing on the taskbar), so the
+script asks again until `GetForegroundWindow` is the window titled with the file, and only then
+types. Past 30 s it says what WAS in front and types anyway, so the file decides and the log
+says why it did not change. The log says which window was in front before and after the keys."
+  (str "$ErrorActionPreference = 'Stop'\n"
+    "$name = '" *file-name* "'\n"
+    "Add-Type -TypeDefinition @'\n"
+    "using System;\n"
+    "using System.Runtime.InteropServices;\n"
+    "using System.Text;\n"
+    "public static class BeditForeground {\n"
+    "  [DllImport(\"user32.dll\")] static extern IntPtr GetForegroundWindow();\n"
+    "  [DllImport(\"user32.dll\", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr window, StringBuilder text, int length);\n"
+    "  public static string Title() { var text = new StringBuilder(512); GetWindowText(GetForegroundWindow(), text, 512); return text.ToString(); }\n"
+    "}\n"
+    "'@\n"
+    "$shell = New-Object -ComObject WScript.Shell\n"
+    "$deadline = (Get-Date).AddSeconds(30)\n"
+    "$attempts = 0\n"
+    "while ($true) {\n"
+    "  $attempts++\n"
+    "  [void]$shell.AppActivate($name)\n"
+    "  Start-Sleep -Milliseconds 300\n"
+    "  $title = [BeditForeground]::Title()\n"
+    "  if ($title -like ('*' + $name + '*')) { break }\n"
+    "  if ((Get-Date) -gt $deadline) { Write-Output (\"the bedit window was not confirmed in the foreground in 30 s (\" + $attempts + \" tries; in front: '\" + $title + \"'); typing anyway\"); break }\n"
+    "  Start-Sleep -Milliseconds 200\n"
+    "}\n"
+    "Write-Output (\"foreground before typing (try \" + $attempts + \"): \" + $title)\n"
+    "$shell.SendKeys('" text "')\n"
+    "Start-Sleep -Milliseconds 300\n"
+    "$shell.SendKeys('^x')\n"
+    "Start-Sleep -Milliseconds 200\n"
+    "$shell.SendKeys('^s')\n"
+    "Write-Output (\"foreground after typing: \" + [BeditForeground]::Title())\n"))
+
+(defn- macos-os-input-script (text)
+  "The AppleScript that types `text` then C-x C-s into the bedit window through System Events.
+`keystroke` types into the FRONTMOST process, so the script finds the process owning a window
+titled with the file and makes it frontmost, asking again until it IS, and only then types. Past
+30 s (or when no process lists the window: System Events' window list is Accessibility's) it
+says what was frontmost and types anyway, so the file decides. The log says which process was
+frontmost before and after the keys."
+  (str "on frontName()\n"
+    "  tell application \"System Events\" to return name of first process whose frontmost is true\n"
+    "end frontName\n"
+    "set deadline to (current date) + 30\n"
+    "set attempts to 0\n"
+    "repeat\n"
+    "  set attempts to attempts + 1\n"
+    "  set beditProcess to missing value\n"
+    "  tell application \"System Events\"\n"
+    "    repeat with candidate in (processes whose background only is false)\n"
+    "      try\n"
+    "        if (count of (windows of candidate whose name contains \"" *file-name* "\")) > 0 then set beditProcess to contents of candidate\n"
+    "      end try\n"
+    "    end repeat\n"
+    "    if beditProcess is not missing value then set frontmost of beditProcess to true\n"
+    "  end tell\n"
+    "  delay 0.3\n"
+    "  if beditProcess is not missing value then\n"
+    "    tell application \"System Events\" to set atFront to frontmost of beditProcess\n"
+    "    if atFront then exit repeat\n"
+    "  end if\n"
+    "  if (current date) > deadline then\n"
+    "    log \"the bedit window was not confirmed frontmost in 30 s (\" & attempts & \" tries; frontmost: \" & frontName() & \"); typing anyway\"\n"
+    "    exit repeat\n"
+    "  end if\n"
+    "  delay 0.2\n"
+    "end repeat\n"
+    "log \"frontmost before typing (try \" & attempts & \"): \" & frontName()\n"
+    "tell application \"System Events\" to keystroke \"" text "\"\n"
+    "delay 0.3\n"
+    "tell application \"System Events\" to keystroke \"x\" using control down\n"
+    "delay 0.2\n"
+    "tell application \"System Events\" to keystroke \"s\" using control down\n"
+    "log \"frontmost after typing: \" & frontName()\n"))
+
+(defn- os-input-command (text out)
+  "`[program arguments]` that type `text` then C-x C-s into the bedit window through this OS's
+own input once that window has the keyboard, or a string saying why there is none. The Windows
+and macOS scripts are written to `out` (os-input.ps1, os-input.applescript), so the artifact
+holds exactly what ran."
   (case (os/type)
     :linux
       (cond
@@ -240,26 +323,21 @@ this OS's own input, or a string saying why there is none."
         (nil? (os/which "xdotool")) "xdotool is not installed"
         else ["sh" ["-c" (linux-os-input-script text)]])
     :windows
-      ["powershell"
-        ["-NoProfile" "-NonInteractive" "-Command"
-          (str "$shell = New-Object -ComObject WScript.Shell; "
-            "if (-not $shell.AppActivate('" *file-name* "')) { Write-Error 'AppActivate found no bedit window'; exit 1 }; "
-            "Start-Sleep -Milliseconds 400; $shell.SendKeys('" text "'); Start-Sleep -Milliseconds 300; "
-            "$shell.SendKeys('^x'); Start-Sleep -Milliseconds 200; $shell.SendKeys('^s')")]]
+      (let (script (path/join out "os-input.ps1"))
+        (do
+          (file/spit script (windows-os-input-script text))
+          ["powershell" ["-NoProfile" "-NonInteractive" "-ExecutionPolicy" "Bypass" "-File" script]]))
     :macos
-      ["osascript"
-        ["-e" "delay 0.4"
-          "-e" (str "tell application \"System Events\" to keystroke \"" text "\"")
-          "-e" "delay 0.3"
-          "-e" "tell application \"System Events\" to keystroke \"x\" using control down"
-          "-e" "delay 0.2"
-          "-e" "tell application \"System Events\" to keystroke \"s\" using control down"]]
+      (let (script (path/join out "os-input.applescript"))
+        (do
+          (file/spit script (macos-os-input-script text))
+          ["osascript" [script]]))
     "no OS input tool for this OS"))
 
 (defn- os-input-phase (window out file expected)
   "Type through the OS's input and save; nil when the file came to start with `expected`, else
 why not. The keys land at point, which the loop phase left after its own typing."
-  (let (command (os-input-command *os-typed*))
+  (let (command (os-input-command *os-typed* out))
     (if (string? command)
       command
       (do
