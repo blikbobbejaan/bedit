@@ -846,7 +846,11 @@ src/language-core.blsp      `deflanguage` declares a tree-sitter language from O
                             `:fallback`: a buffer opened while the grammar is missing is typed
                             as the lexer's stand-in (`model/ed-grammar-fallback`) and becomes
                             the parsed mode when the grammar arrives (`ed-grammars-arrived`);
-                            JSON stays lexed past a megabyte (`:fallback-above`). `:injections`
+                            JSON stays lexed past a megabyte (`:fallback-above`). A language with
+                            no stand-in (Rust, Go, C) stays its parsed mode without its grammar,
+                            and its services answer without one (`spec-grammar?`): no colours, RET
+                            keeps the line's indentation, nothing folds — never a parse that
+                            raises into the view's `render error`. `:injections`
                             (brood ADR-489) is the code embedded in a language — a Terraform
                             heredoc named BASH / JSON / PY, a Dockerfile `RUN` line as shell,
                             Elixir's `~H` as HEEx (heex-mode) — coloured with the embedded
