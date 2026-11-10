@@ -1,0 +1,147 @@
+;; tools/ci/windows-proofs.blsp — what brood does on Windows that its unit tests reach only as
+;; compiled code, done for real on CI's Windows runner (tools/ci/platform-smoke.sh runs it).
+;;
+;;     nest run tools/ci/windows-proofs.blsp -- grammar CC
+;;     nest run tools/ci/windows-proofs.blsp -- replace DIR [DIR ...]
+;;
+;; `grammar CC`: a grammar library that crashes, built here with the C compiler CC (gcc or
+;; clang), is QUARANTINED on Windows both ways brood quarantines one (ADR-660, ADR-672):
+;;
+;; 1. vetted in a child (`editor/treesit/vet-grammar`): the child dies of an access violation,
+;;    the verdict says `crashed (EXCEPTION_ACCESS_VIOLATION)`, its file is written under
+;;    `$XDG_STATE_HOME/brood/grammar-verdicts/<sha256>.blsp`, and a load here refuses the
+;;    library, saying why — an error, not a crash of this runtime;
+;; 2. loaded UNVETTED (`BROOD_GRAMMAR_VET=0`) in another runtime, which dies in its first parse:
+;;    the unhandled-exception filter writes the quarantine as the process dies, and this
+;;    runtime reads it back as `:by :crash`.
+;;
+;; brood's own tests of both (tests/grammar_vet_test.blsp) need `cc` and skip on Windows.
+;;
+;; `replace DIR …`: `file/replace` (an editor's save, brood ADR-671) in each DIR — a FAT32
+;; volume, a SUBST drive, a UNC path through the machine's own admin share: places where
+;; `ReplaceFileW` may be refused and brood falls back to `MoveFileExW`. Each file is replaced
+;; over an existing one and written new, read back, and the directory checked for a temp file
+;; left behind.
+;;
+;; Prints `windows-proofs: ok …` per proof; any failure prints why and exits 1.
+(def *args* (let (all (system/argv) at (index-of all "--")) (if (>= at 0) (vec (drop all (inc at))) [])))
+
+(defn- say (& parts) (io/puts (apply str "windows-proofs: " parts)))
+
+(defn- fail (& parts)
+  (do
+    (io/puts (apply str "windows-proofs: FAIL: " parts) :to *err*)
+    (system/halt 1)))
+
+(defn- expect (ok? & parts) (when (not ok?) (apply fail parts)))
+
+;; ---- a grammar that crashes -------------------------------------------------------------
+
+(defn- crashing-grammar (lang)
+  "C source for a grammar library whose entry point `tree_sitter_<lang>` answers an ABI-14
+language with every table null and a lexer that writes through a null pointer: it loads, and
+its first parse dies of an access violation (brood's tests/grammar_vet_test.blsp `vetcrash`)."
+  (str "#include <stdint.h>\n"
+    "#ifdef _WIN32\n#define EXPORT __declspec(dllexport)\n#else\n#define EXPORT\n#endif\n"
+    "struct fake_language { uint32_t counts[9]; uint16_t max_alias_sequence_length;\n"
+    "  const void *tables[13]; int (*lex_fn)(void *, uint16_t); const void *rest[32]; };\n"
+    "static int crash_lex(void *lexer, uint16_t state) { *(volatile int *)0 = 1; return 0; }\n"
+    "static const struct fake_language language = {{14}, 0, {0}, crash_lex, {0}};\n"
+    "EXPORT const void *tree_sitter_" lang "(void) { return &language; }\n"))
+
+(defn- build-grammar (compiler dir lang)
+  "Compile the crashing grammar `lang` into `dir`; its library's path."
+  (let (source (path/join dir (str lang ".c"))
+        library (path/join dir (str "tree-sitter-" lang ".dll"))
+        _ (file/spit source (crashing-grammar lang))
+        ;; MinGW's gcc: no libgcc DLL beside the library for the child to find
+        static (if (includes? (string/lower (path/basename compiler)) "gcc") ["-static-libgcc"] [])
+        result (os/cmd compiler (append ["-shared" "-o" library source] static) {:timeout-ms 120000}))
+    (do
+      (expect (os/cmd-ok? result) compiler " could not build " library ": " (:stderr result) (:stdout result))
+      library)))
+
+(defn- verdict-file (verdict)
+  "Where a quarantine is kept: `$XDG_STATE_HOME/brood/grammar-verdicts/<sha256>.blsp`."
+  (path/join (os/env "XDG_STATE_HOME") "brood" "grammar-verdicts" (str (:sha256 verdict) ".blsp")))
+
+(defn- prove-vetting (compiler dir)
+  (let (library (build-grammar compiler dir "vetcrash")
+        verdict (editor/treesit/vet-grammar library :vetcrash {:timeout-ms 20000}))
+    (do
+      (say "vetted " library ": " (pr-str (map/select-keys verdict [:verdict :by :reason :cached])))
+      (expect (= (:verdict verdict) :quarantined) "the crashing grammar was not quarantined: " (pr-str verdict))
+      (expect (= (:by verdict) :vet) "the quarantine was not the vetting child's: " (pr-str verdict))
+      ;; elsewhere (a local run of this script) the child dies of SIGSEGV
+      (expect (includes? (:reason verdict)
+                (if (= (os/type) :windows) "crashed (EXCEPTION_ACCESS_VIOLATION)" "crashed (SIGSEGV)"))
+        "the reason does not name the access violation: " (:reason verdict))
+      (expect (file/exists? (verdict-file verdict)) "no verdict file at " (verdict-file verdict))
+      (expect (= (:verdict (editor/treesit/grammar-verdict library)) :quarantined) "the kept verdict is not a quarantine")
+      (let (refused (check-allow :discarded-catch
+                      (try
+                        (do (%tree-sitter-load-grammar library :vetcrash) nil)
+                        (catch e (error-message e)))))
+        (expect (and (string? refused) (includes? refused "quarantined"))
+          "a load of the quarantined library was not refused: " (pr-str refused)))
+      (say "ok: a grammar that crashes its vetting child is quarantined, kept at "
+        (verdict-file verdict)
+        ", and refused at load"))))
+
+(defn- prove-runtime-crash (compiler dir)
+  (let (library (build-grammar compiler dir "crashrun")
+        script (path/join dir "crash.blsp")
+        _ (file/spit script
+            (str "(%tree-sitter-load-grammar " (pr-str library) " :crashrun)\n"
+              "(%tree-sitter-parse \"x\" :crashrun)\n"
+              "(io/puts \"survived\")\n"))
+        result (os/cmd (os/exe-path) ["run" script] {:env {"BROOD_GRAMMAR_VET" "0"} :cwd dir :timeout-ms 180000})
+        output (str (:stdout result) (:stderr result))
+        verdict (editor/treesit/grammar-verdict library))
+    (do
+      (say "the unvetted runtime exited " (:exit result) "; its output:\n" output)
+      (expect (not (includes? output "survived")) "the runtime survived a parse through a null pointer")
+      (expect (not (= 0 (:exit result))) "the crashed runtime exited 0")
+      (expect (and verdict (= (:verdict verdict) :quarantined))
+        "the crash left no quarantine: " (pr-str verdict))
+      (expect (= (:by verdict) :crash) "the quarantine was not the crash handler's: " (pr-str verdict))
+      (say "ok: a runtime that crashes in a grammar's parse quarantines it as it dies ("
+        (pr-str (map/select-keys verdict [:by :signal :reason]))
+        ")"))))
+
+(defn- prove-grammar (compiler)
+  (let (dir (str (path/temp "bedit-windows-grammar-")))
+    (do
+      (file/mkdir dir)
+      (expect (os/env "XDG_STATE_HOME") "set XDG_STATE_HOME to a scratch directory: the quarantines are written there")
+      (prove-vetting compiler dir)
+      (prove-runtime-crash compiler dir)
+      (try (file/rmdir dir) (catch e (say "the scratch directory stays: " e))))))
+
+;; ---- file/replace where ReplaceFileW may be refused ------------------------------------
+
+(defn- prove-replace (dir)
+  (let (target (path/join dir "bedit-replace-proof.txt")
+        fresh (path/join dir "bedit-replace-new.txt")
+        _ (when (file/exists? target) (file/rm target))
+        _ (when (file/exists? fresh) (file/rm fresh))
+        before (into #{} (file/ls dir))
+        _ (file/spit target "the old text\r\n")
+        _ (file/replace target "the new text\n")
+        _ (file/replace target "the newer text\n")
+        _ (file/replace fresh "a file that was not there\n")
+        after (into #{} (file/ls dir))
+        left (set/difference after (conj before "bedit-replace-proof.txt" "bedit-replace-new.txt")))
+    (do
+      (expect (= (file/slurp target) "the newer text\n") "file/replace in " dir " left " (pr-str (file/slurp target)))
+      (expect (= (file/slurp fresh) "a file that was not there\n") "file/replace of a new file in " dir " left "
+        (pr-str (file/slurp fresh)))
+      (expect (empty? left) "file/replace left " (pr-str (vec left)) " in " dir)
+      (file/rm target)
+      (file/rm fresh)
+      (say "ok: file/replace over an existing file and a new one in " dir))))
+
+(case (first *args*)
+  "grammar" (if (nil? (second *args*)) (fail "usage: grammar CC") (prove-grammar (second *args*)))
+  "replace" (if (empty? (rest *args*)) (fail "usage: replace DIR [DIR ...]") (doseq (dir (rest *args*)) (prove-replace dir)))
+  (fail "usage: nest run tools/ci/windows-proofs.blsp -- grammar CC | replace DIR [DIR ...]"))

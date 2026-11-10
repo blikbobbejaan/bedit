@@ -25,7 +25,24 @@ built from brood for that OS with the gui, headless (`BROOD_GUI_HEADLESS=1`), ru
    to the desktop's opener — a stub, no browser is started), `clipboard_test` (the kill ring
    over the clipboard seam), `keymaps_test` and `userkeys_test` (key profiles, init.blsp key
    strings), `startup_test` (the missing-font warning), `recover_test` (auto-save sidecars,
-   their owner-only permission read back on both OSes).
+   their owner-only permission read back on both OSes);
+4. on Windows, `tools/ci/windows-proofs.blsp` — what brood's own tests reach there only as
+   compiled code:
+   - **a grammar that crashes is quarantined.** A few lines of C built on the runner (MinGW's
+     `gcc`, else `clang`) into a DLL whose first parse writes through a null pointer. Vetted
+     in a child (`editor/treesit/vet-grammar`), it must come back `:quarantined` with
+     `crashed (EXCEPTION_ACCESS_VIOLATION)`, its verdict file written under
+     `XDG_STATE_HOME`, and a load here refused, saying why; loaded UNVETTED
+     (`BROOD_GRAMMAR_VET=0`) by another runtime, its parse must kill that runtime and the
+     unhandled-exception filter must write the quarantine as it dies (`:by :crash`, brood
+     ADR-660 / ADR-672). brood's `grammar_vet_test` covers both but needs `cc` and skips on
+     Windows;
+   - **`file/replace` where `ReplaceFileW` may be refused** (brood ADR-671's fallback to
+     `MoveFileExW`): a save over an existing file and of a new one, read back, and no temp
+     file left — on a FAT32 volume (a VHD made, formatted and mounted with `diskpart`), a
+     `subst` drive, and a UNC path through the runner's own admin share
+     (`\\localhost\C$\…`). A setup the runner cannot give is skipped with a warning
+     (`NOT proven: …`), never passed.
 
 That script runs under bash — on Windows Git Bash, which sets `HOME` and puts `sh` on `PATH`,
 neither of which a Windows desktop launch has. So Windows runs a second step under
@@ -115,7 +132,8 @@ Option-as-Meta and Windows's AltGr (brood ADR-541).
 | clipboard seam | ✅ | ✅ |
 | key mapping (Option-as-Meta, AltGr) | ✅ brood unit tests | ✅ brood unit tests |
 | missing-font warning | ✅ (names Font Book) | ✅ (names the Fonts settings) |
-| a save survives a crash mid-write | ✅ `file/replace`: a synced temp file renamed over the file (brood ADR-621), owner, mode and a symlink kept | ✅ `file/replace`: a flushed temp file put in the file's place by `ReplaceFileW` (brood ADR-671), its ACL, attributes and creation time kept; a file another program holds open is refused after about a second, said, and left whole (brood's `windows_replace_tests`) |
+| a save survives a crash mid-write | ✅ `file/replace`: a synced temp file renamed over the file (brood ADR-621), owner, mode and a symlink kept | ✅ `file/replace`: a flushed temp file put in the file's place by `ReplaceFileW` (brood ADR-671), its ACL, attributes and creation time kept; a file another program holds open is refused after about a second, said, and left whole (brood's `windows_replace_tests`); on FAT32, a `subst` drive and a UNC share too (`windows-proofs.blsp`) |
+| a grammar that crashes is quarantined (brood ADR-660) | ✅ brood's `grammar_vet_test` | ✅ `windows-proofs.blsp`: by its vetting child (an access violation) and by the runtime it crashed (the unhandled-exception filter) |
 | auto-save sidecars: location, recovery | ✅ | ✅ |
 | auto-save sidecars: owner-only | ✅ mode 0600 | ✅ a one-entry DACL (brood `file/spit-private`, KI-365 fixed; `recover_test` reads the sidecar's ACL back with `icacls`) |
 | terminal buffers (C-x p t, M-x claude) | ✅ `sh -c` under a pty | ✅ `cmd.exe` under ConPTY (brood KI-369 fixed, ADR-597); a password read is found by the prompt's text, since ConPTY has no echo mode to ask |

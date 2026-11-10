@@ -157,7 +157,14 @@ home, but no `BROOD_GUI_HEADLESS` — the window opens on whatever display there
 (to the loop by its registered name, then through the OS's own input), saves, and is captured
 and checked. CI runs it on every OS through `ci/real-window.sh` (docs/platforms.md); locally,
 `tools/ci/real-window.sh nest /tmp/rw x11` runs it inside a private Xvfb, so nothing opens on
-your screen.
+your screen. Its OS-input scripts (macOS, Windows) are written next to the pictures as
+`os-input.applescript` / `os-input.ps1`, so a failed run's artifact holds exactly what ran.
+
+`ci/windows-proofs.blsp` is what `ci/platform-smoke.sh` runs last on Windows: a crashing grammar
+DLL built on the runner and quarantined both ways (vetting child, crashed runtime), and
+`file/replace` on a FAT32 VHD, a `subst` drive and a UNC admin share (docs/platforms.md). Both
+halves run on Linux too, for a look before a push: `XDG_STATE_HOME=/tmp/s nest run
+tools/ci/windows-proofs.blsp -- grammar cc` and `… -- replace /tmp/somewhere`.
 
 Open the PNG with anything that shows images — an agent's file reader does. For an assertion
 rather than a look, write a test over `gui/render-frame` instead (`tests/window_paint_test.blsp`).
